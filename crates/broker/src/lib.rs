@@ -8,7 +8,7 @@
 use asv_domain::{AgentSessionId, CredentialId, CredentialMetadata};
 use asv_identity::WorkloadIdentity;
 use asv_ipc_protocol::{ErrorCode, Request, Response, PROTOCOL_VERSION};
-use asv_policy::PolicyEngine;
+use asv_policy::{AuthorizationRequest, PolicyEngine};
 use std::collections::HashMap;
 
 /// In-memory session table. M1 replaces this with persistent, encrypted state;
@@ -154,7 +154,7 @@ pub fn handle(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request
         }
 
         Request::Authorize {
-            request,
+            mut request,
             capability,
             approval,
         } => {
@@ -164,35 +164,53 @@ pub fn handle(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request
                     message: "session is not owned by the authenticated peer".into(),
                 };
             }
+            bind_peer_identity(&mut request, peer);
             Response::Authorization {
                 explanation: state.policy.authorize(&request, capability, approval),
             }
         }
 
-        Request::ExplainAuthorization { request } => {
+        Request::ExplainAuthorization { mut request } => {
             if !state.sessions.belongs_to(request.session, peer) {
                 return Response::Error {
                     code: ErrorCode::Denied,
                     message: "session is not owned by the authenticated peer".into(),
                 };
             }
+            bind_peer_identity(&mut request, peer);
             Response::Authorization {
                 explanation: state.policy.explain(&request),
             }
         }
 
-        Request::SubmitApproval { request, ttl_secs } => {
-            if !state.sessions.belongs_to(request.session, peer) {
-                return Response::Error {
-                    code: ErrorCode::Denied,
-                    message: "session is not owned by the authenticated peer".into(),
-                };
-            }
-            Response::ApprovalIssued {
-                approval: state.policy.issue_approval(&request, ttl_secs, 1),
+        Request::SubmitApproval { .. } => {
+            // An agent connection may never approve its own request. UAT-015
+            // requires the broker to block *until a human approves*, and
+            // ADR-0004 keeps approval lifecycle an application concern whose
+            // validity arrives as trusted context. Exposing this method on the
+            // agent IPC made the gate self-satisfying: the agent minted the
+            // very approval it was being asked to earn.
+            //
+            // The human control plane is a separate channel (M4) and does not
+            // reach this variant. Until it exists, the honest state is a
+            // closed door rather than a pretend approval.
+            Response::Error {
+                code: ErrorCode::Denied,
+                message: "approval must be issued by the human control plane, not by the requesting agent session".into(),
             }
         }
     }
+}
+
+/// Rebinds the client-declared identity context to kernel-attested facts.
+///
+/// `PolicyContext.peer_uid` arrives inside the request body, so it is
+/// attacker-controlled: nothing stopped a caller from claiming `uid: 0` while
+/// running as an unprivileged user, and policy decisions that referenced the
+/// uid would have been made against a lie. The broker knows the real uid from
+/// `SO_PEERCRED`, so the declared value is overwritten rather than trusted.
+fn bind_peer_identity(request: &mut AuthorizationRequest, peer: &WorkloadIdentity) {
+    request.context.peer_uid = peer.credentials.uid;
 }
 
 /// Seeds a credential for tests and for the M0 CLI smoke path.
@@ -302,17 +320,26 @@ mod tests {
                 peer_uid: peer.credentials.uid,
             },
         };
-        let approval = match handle(
+
+        // The agent path cannot mint an approval, so the gate holds closed.
+        let unapproved = handle(
             &mut state,
             &peer,
-            Request::SubmitApproval {
+            Request::Authorize {
                 request: request.clone(),
-                ttl_secs: 60,
+                capability: None,
+                approval: None,
             },
-        ) {
-            Response::ApprovalIssued { approval } => approval,
-            other => panic!("expected approval, got {other:?}"),
-        };
+        );
+        assert!(
+            matches!(&unapproved, Response::Authorization { explanation } if !explanation.decision.is_allowed()),
+            "a protected push without approval was not gated: {unapproved:?}"
+        );
+
+        // The human control plane issues the approval out of band; M3 grants it
+        // directly against the policy engine rather than over the agent IPC.
+        let approval = state.policy.issue_approval(&request, 60, 1);
+
         let first = handle(
             &mut state,
             &peer,
@@ -338,6 +365,97 @@ mod tests {
         assert!(
             matches!(replay, Response::Authorization { explanation } if !explanation.decision.is_allowed())
         );
+    }
+
+    /// H1: an agent must not be able to mint its own approval. UAT-015 requires
+    /// "broker blocks until approval" from a human, and the ADR-0004 consequence
+    /// note says approval validity is *supplied* as trusted context, not that the
+    /// agent supplies it. If this test fails, an agent can approve itself.
+    #[test]
+    fn agent_cannot_submit_its_own_approval() {
+        let mut state = BrokerState::default();
+        let agent_peer = peer();
+        let session = match handle(
+            &mut state,
+            &agent_peer,
+            Request::CreateSession {
+                workspace: "/repo".into(),
+            },
+        ) {
+            Response::SessionCreated { session } => session,
+            other => panic!("expected session creation, got {other:?}"),
+        };
+        let request = AuthorizationRequest {
+            session,
+            action: asv_domain::Action::GitPush,
+            resource: asv_domain::Resource::Repository {
+                owner: "acme".into(),
+                name: "app".into(),
+            },
+            context: PolicyContext {
+                workspace: "/repo".into(),
+                protected_ref: Some("main".into()),
+                request_digest: Some("release-digest".into()),
+                peer_uid: agent_peer.credentials.uid,
+            },
+        };
+        match handle(
+            &mut state,
+            &agent_peer,
+            Request::SubmitApproval {
+                request: request.clone(),
+                ttl_secs: 60,
+            },
+        ) {
+            Response::Error { code, .. } => assert_eq!(code, ErrorCode::Denied),
+            other => {
+                panic!("agent minted its own approval, defeating the approval gate: {other:?}")
+            }
+        }
+    }
+
+    /// H2: `PolicyContext.peer_uid` arrives inside the request body, so it is
+    /// attacker-controlled. The broker must overwrite it with the
+    /// kernel-attested uid before policy sees it, otherwise any uid-aware rule
+    /// would be decided against a lie the caller invented.
+    #[test]
+    fn policy_context_peer_uid_is_overwritten_by_kernel_evidence() {
+        let mut state = BrokerState::default();
+        let agent_peer = peer();
+        let session = match handle(
+            &mut state,
+            &agent_peer,
+            Request::CreateSession {
+                workspace: "/repo".into(),
+            },
+        ) {
+            Response::SessionCreated { session } => session,
+            other => panic!("expected session creation, got {other:?}"),
+        };
+        let real_uid = agent_peer.credentials.uid;
+        let mut request = AuthorizationRequest {
+            session,
+            action: asv_domain::Action::GitPush,
+            resource: asv_domain::Resource::Repository {
+                owner: "acme".into(),
+                name: "app".into(),
+            },
+            context: PolicyContext {
+                workspace: "/repo".into(),
+                protected_ref: None,
+                request_digest: None,
+                peer_uid: 0,
+            },
+        };
+        assert_eq!(request.context.peer_uid, 0, "client declared a forged uid");
+
+        bind_peer_identity(&mut request, &agent_peer);
+
+        assert_eq!(
+            request.context.peer_uid, real_uid,
+            "forged peer_uid survived into the policy context"
+        );
+        assert_ne!(request.context.peer_uid, 0);
     }
 
     /// Metadata listing is the only credential surface, and it must be empty by

@@ -1,0 +1,12 @@
+#!/bin/sh
+# UAT executor shim: the typed sddk UAT runner spawns processes with
+# `env_clear()` and an empty env allowlist (sddk-gateway/src/runner.rs:78 and
+# sddk-cli/src/uat.rs:4094). Nothing inherited reaches the child, so `cc` and the
+# rustup shims cannot be resolved without re-injecting the environment here.
+# Usage: uat-cargo <cargo args...>
+PATH="/home/linuxbrew/.linuxbrew/bin:/home/rubentxu/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+HOME=/home/rubentxu
+CARGO_HOME=/home/rubentxu/.cargo
+RUSTUP_HOME=/home/rubentxu/.rustup
+export PATH HOME CARGO_HOME RUSTUP_HOME
+exec /home/rubentxu/.cargo/bin/cargo "$@"

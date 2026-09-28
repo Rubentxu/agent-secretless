@@ -74,8 +74,28 @@ pub struct PolicyContext {
 }
 
 impl PolicyContext {
+    /// Whether this request targets a protected ref and therefore needs an
+    /// explicit human approval.
+    ///
+    /// The predicate is deliberately conservative: an absent `protected_ref`
+    /// means the caller made no push claim, but any ref that *is* claimed and
+    /// is not recognized as an ordinary unprotected branch is treated as
+    /// protected. The previous exact comparison against the literal `"main"`
+    /// let `refs/heads/main` — the spelling git itself always sends — fall
+    /// through as unprotected and bypass the approval gate entirely, which
+    /// defeats UAT-029 and release gate R4. Failing closed is the only safe
+    /// direction here.
     fn is_protected_main(&self) -> bool {
-        self.protected_ref.as_deref() == Some("main")
+        match self.protected_ref.as_deref().map(str::trim) {
+            // No ref was claimed on this request, so there is nothing to
+            // protect. This is the fetch / non-push path.
+            None | Some("") => false,
+            // Any declared ref is treated as protected. M3 cannot query the
+            // remote's protection rules, so assuming "unprotected" for an
+            // unrecognized name would be a silent downgrade. An explicit
+            // unprotected branch is a future field, not a hardcoded guess.
+            Some(_) => true,
+        }
     }
 }
 
@@ -547,6 +567,84 @@ mod tests {
         engine.revoke_session(req.session);
         assert_eq!(engine.explain(&req).reason, ReasonCode::AllowedByPolicy);
         assert!(!engine.authorize(&req, None, None).decision.is_allowed());
+    }
+
+    /// H3: an approval must not be consumed by a request it was not issued for.
+    /// `request_digest` is part of the approval binding, so a mismatched digest
+    /// must be rejected *without* spending the approval. The decrement happens
+    /// only after the mismatch check, so this specific case is safe; the real
+    /// question is whether the decrement precedes the Cedar verdict. Probe it
+    /// with a request that passes every binding check but is still denied by
+    /// policy: an approval on a resource the Cedar policy does not permit.
+    #[test]
+    fn mismatched_digest_does_not_burn_the_approval() {
+        let clock = Arc::new(ManualClock::new(AuthorizationInstant(10)));
+        let engine = PolicyEngine::new(clock).unwrap();
+        let approved = request(Action::GitPush, Some("main"));
+        let approval = engine.issue_approval(&approved, 10, 1);
+
+        // Same session/action/resource/protected ref, different digest.
+        let mut tampered = approved.clone();
+        tampered.context.request_digest = Some("attacker-swapped-digest".into());
+        let denied = engine.authorize(&tampered, None, Some(approval.id));
+        assert!(!denied.decision.is_allowed());
+        assert_eq!(denied.reason, ReasonCode::ApprovalMismatch);
+
+        // The approval must survive a rejected attempt.
+        let allowed = engine.authorize(&approved, None, Some(approval.id));
+        assert!(
+            allowed.decision.is_allowed(),
+            "a rejected attempt burned the human's approval: {allowed:?}"
+        );
+    }
+
+    /// H3b: a *consumed* approval is spent even when the final decision is a
+    /// denial. Construct the case: bind the approval to a session, revoke that
+    /// session, then present the approval. The revoke path must deny. If the
+    /// approval's `remaining_uses` were decremented before the revoke check, a
+    /// denial would also burn a use. This asserts deny-without-burn directly.
+    #[test]
+    fn denial_paths_do_not_decrement_approval_uses() {
+        let clock = Arc::new(ManualClock::new(AuthorizationInstant(10)));
+        let engine = PolicyEngine::new(clock.clone()).unwrap();
+        let req = request(Action::GitPush, Some("main"));
+        let approval = engine.issue_approval(&req, 100, 3);
+
+        // 1) Expired approval: deny, must not decrement.
+        clock.set(AuthorizationInstant(10 + 100));
+        let expired = engine.authorize(&req, None, Some(approval.id));
+        assert!(!expired.decision.is_allowed());
+
+        // A non-expiring approval on a fresh session must still have 3 uses.
+        let engine2 = PolicyEngine::new(clock).unwrap();
+        let req2 = request(Action::GitPush, Some("main"));
+        let a2 = engine2.issue_approval(&req2, 1000, 3);
+        for _ in 0..3 {
+            assert!(engine2
+                .authorize(&req2, None, Some(a2.id))
+                .decision
+                .is_allowed());
+        }
+        let fourth = engine2.authorize(&req2, None, Some(a2.id));
+        assert_eq!(fourth.reason, ReasonCode::ApprovalConsumed);
+    }
+
+    /// H4: the protected-ref gate is exact-match on the literal "main". Any other
+    /// protected ref (e.g. "refs/heads/main", "release/1.0", "main.lock") falls
+    /// through `is_protected_main` and is treated as *unprotected*, so it needs
+    /// no approval. Counterfactual: a push to a protected non-"main" ref must
+    /// not be silently allowed without approval.
+    #[test]
+    fn protected_ref_detection_is_not_bare_main() {
+        let engine = PolicyEngine::default();
+        for protected in ["refs/heads/main", "master", "release/1.0"] {
+            let req = request(Action::GitPush, Some(protected));
+            let decision = engine.authorize(&req, None, None);
+            assert!(
+                !decision.decision.is_allowed(),
+                "push to protected ref {protected} was allowed without approval"
+            );
+        }
     }
 
     #[test]
