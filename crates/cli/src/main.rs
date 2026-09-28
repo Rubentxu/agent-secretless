@@ -37,6 +37,12 @@ enum Command {
         #[arg(long)]
         workspace: String,
     },
+    /// Launch a command in a strict ASV session with a broker-owned SSH signer.
+    Run {
+        /// Command and arguments after `--`.
+        #[arg(required = true, trailing_var_arg = true)]
+        command: Vec<String>,
+    },
     /// List credential metadata. Never values.
     Credentials,
 }
@@ -52,12 +58,18 @@ async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
     let socket = cli.socket.unwrap_or_else(default_socket);
 
-    let request = match cli.command {
+    let command = match cli.command {
+        Command::Run { command } => return run_command(command),
+        command => command,
+    };
+
+    let request = match command {
         Command::Status => Request::Ping {
             protocol: PROTOCOL_VERSION,
         },
         Command::Session { workspace } => Request::CreateSession { workspace },
         Command::Credentials => Request::ListCredentialMetadata,
+        Command::Run { .. } => unreachable!("run handled before broker IPC"),
     };
 
     match call(&socket, &request) {
@@ -74,6 +86,51 @@ async fn main() -> std::io::Result<()> {
 
 fn default_socket() -> PathBuf {
     PathBuf::from("/run/user/1000/asv/broker.sock")
+}
+
+const QUARANTINED_ENV_NAMES: &[&str] = &[
+    "GITHUB_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+];
+
+fn run_command(command: Vec<String>) -> std::io::Result<()> {
+    let Some(program) = command.first() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "asv run requires a command",
+        ));
+    };
+
+    let session_dir = std::env::temp_dir().join(format!(
+        "asv-session-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let agent = asv_ssh_agent::AgentSession::start(&session_dir)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    let mut child = std::process::Command::new(program);
+    child.args(&command[1..]);
+    for name in QUARANTINED_ENV_NAMES {
+        child.env_remove(name);
+    }
+    child
+        .env("SSH_AUTH_SOCK", agent.socket_path())
+        .env("ASV_SESSION_ID", std::process::id().to_string())
+        .env("ASV_SESSION_MODE", "strict");
+
+    let status = child.status()?;
+    drop(agent); // revoke and remove the socket before returning to the shell
+    if let Some(code) = status.code() {
+        std::process::exit(code);
+    }
+    Err(std::io::Error::other("child terminated by signal"))
 }
 
 fn call(socket: &std::path::Path, request: &Request) -> std::io::Result<Response> {

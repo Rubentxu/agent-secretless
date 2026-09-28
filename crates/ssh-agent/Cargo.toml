@@ -1,0 +1,18 @@
+[package]
+name = "asv-ssh-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Broker-owned SSH-agent-compatible signer for Agent Secretless Vault."
+
+[dependencies]
+ed25519-dalek.workspace = true
+rand.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

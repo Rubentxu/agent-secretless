@@ -7,6 +7,7 @@ members = [
     "crates/broker",
     "crates/cli",
     "crates/vault",
+    "crates/ssh-agent",
 ]
 # M0 deliberately contains no connector crates. docs/15-ROADMAP.md M0 Exit
 # requires the UAT threat harness to run "even though no connector exists yet",
@@ -23,6 +24,7 @@ repository = "https://github.com/rubentxu/agent-secretless"
 asv-domain = { path = "crates/domain" }
 asv-ipc-protocol = { path = "crates/ipc-protocol" }
 asv-identity = { path = "crates/identity" }
+asv-ssh-agent = { path = "crates/ssh-agent" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -45,6 +47,7 @@ rand = "0.8"
 sha2 = "0.10"
 hmac = "0.12"
 subtle = "2"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 # M0 accepts a locked dependency set; versions are pinned after a compatibility
 # and advisory review per docs/17-IMPLEMENTATION-BOOTSTRAP.md section 8, which
