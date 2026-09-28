@@ -1,0 +1,67 @@
+{
+  "schema": "sddk.archive.archive-manifest.v1",
+  "cycle_id": "p-20a1ee316faf2ba3/m0-foundations-v2",
+  "work_item": "f5781180-1a29-4ca6-ad52-b8cbc2605e6f",
+  "milestone": "M0 Foundations",
+  "status": "archived",
+  "released_tag": "v0.1.0",
+  "released_sha": "9a89f8c9e0a88c4b6b172a5d8e6db3beedb545ee",
+  "head_at_archive": "3b333a6e99497b7b0cd054afdb936417f1a65dc8",
+  "artifacts": [
+    {
+      "path": "docs/receipts/m0-implementation-receipt.md",
+      "sha256": "9fe803e96afe732d52de2ec26f53463f4e70e436043e259af09ebc98edb47871"
+    },
+    {
+      "path": "docs/receipts/m0-verification-report.md",
+      "sha256": "90cb6c686d0261e9b78cc3744866d39446ec1fe1d2d8dc876135ff56bec941d8"
+    },
+    {
+      "path": "docs/receipts/m0-merge-receipt.json",
+      "sha256": "1c24a0372908aabb0b249d427dc9e9f472c5b3745b932a1ab0a4c5dfb127ea88"
+    },
+    {
+      "path": "docs/receipts/m0-release-receipt.json",
+      "sha256": "1322242ba927e965beab91ecd93a65abe281b20ae1d5adf0715e744f28bc0a9d"
+    },
+    {
+      "path": "docs/m0-specification.md",
+      "sha256": "27c4c0b7117a101439ffaab04076d60c98665f3966aae13e8357a701a09481bf"
+    },
+    {
+      "path": "docs/exploration-report.md",
+      "sha256": "7a1f9f110cb036d6b4447707255d9deca60a7c966329f8894f658d9d100580c4"
+    }
+  ],
+  "gate_receipts": [
+    "gate-requirements-testable-418347d177166b8e-1",
+    "gate-implementation-complete-a40a058c6ee3cbe9-1",
+    "gate-tests-pass-96413c018144bdf1-1",
+    "gate-policy-compliant-96413c018144bdf1-1",
+    "gate-debt-severity-assigned-96413c018144bdf1-1",
+    "gate-debt-priority-assigned-96413c018144bdf1-1",
+    "gate-no-pending-effects-5e33b65829703308-1",
+    "gate-release-uat-approved-5e33b65829703308-1",
+    "gate-ledger-valid-27a5b9180631454e-1",
+    "gate-vault-index-current-27a5b9180631454e-1"
+  ],
+  "carried_debt": {
+    "hard_defects": 5,
+    "p0": 3,
+    "p1": 2,
+    "backlog_items": [
+      "bl-bl-01M3KYNZMQ0003877X9M0FY740",
+      "bl-bl-01M3KYNZP20003877X9F2XFQM0",
+      "bl-bl-01M3KYNZQE0003877X9ATK6FM0",
+      "bl-bl-01M3KYNZRZ0003877X94Y3C880",
+      "bl-bl-01M3KYNZTB0003877X8Z3CR8M0"
+    ],
+    "handling": "Triaged in the SDDK backlog. The signed spec pack is normative and was not patched; tools/check-gates.py reports the defects instead."
+  },
+  "known_negative_knowledge": [
+    "argv is readable by every same-uid process: a property of the kernel, not a control ASV can implement.",
+    "Same-uid processes can read broker memory while the broker runs as the invoking user. Only a dedicated broker uid (M7) makes denial unconditional.",
+    "A local green result is not evidence when CI builds with -D warnings: the two environments disagreed until the falsification script was made to set the same flag."
+  ],
+  "next_cycle": "M1 Local vault + secure ingestion"
+}
