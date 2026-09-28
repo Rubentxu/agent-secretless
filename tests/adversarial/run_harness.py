@@ -595,13 +595,49 @@ def _send_create_session(sock: Path, workspace: str) -> str:
     return _raw_request(sock, json.dumps({"method": "create_session", "workspace": workspace}))
 
 
-def probe_cli_argv_surface(workdir: Path, socket_path: Path) -> ProbeResult:
-    """A secret passed to the real `asv` binary never appears in its output.
+def _cmdline_blobs_for(pid: int) -> list[str]:
+    """Returns the NUL-joined cmdline of `pid` and of each of its live children.
 
-    The CLI is what an agent actually executes, and a secret in `argv` would land
-    in shell history, `ps` output and the process cmdline at once. This runs the
-    real binary with a canary-shaped workspace path and checks every output
-    stream plus the process's own cmdline while it runs.
+    `/proc/<pid>/cmdline` is the vector `ps`, shell history and process listings
+    read, so it is a distinct leak surface from stdout/stderr. The entry only
+    exists while the process lives, which is why callers must sample it while
+    the child is running rather than after `communicate()`.
+    """
+    pids = [pid]
+    try:
+        # `children` is a convenience file; fall back to scanning for reparented
+        # ones is not attempted because a leaked child is out of scope here.
+        kids = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+        pids.extend(int(k) for k in kids)
+    except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
+        pass
+
+    blobs = []
+    for target in pids:
+        try:
+            raw = Path(f"/proc/{target}/cmdline").read_bytes()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if raw:
+            blobs.append(raw.replace(b"\0", b" ").decode("utf-8", "replace"))
+    return blobs
+
+
+def probe_cli_argv_surface(workdir: Path, socket_path: Path) -> ProbeResult:
+    """The CLI must not *offer* a secret-ingestion surface, and must not echo input.
+
+    `docs/02-THREAT-MODEL.md` forbids raw secrets as ordinary CLI flags, so the
+    product's obligation is (a) to expose no flag that ingests a secret, and
+    (b) to never echo a request field back. Both are checked here.
+
+    The `--workspace` value is a canary so that if the CLI ever *does* echo the
+    field, the probe catches it. That the canary also appears in
+    `/proc/<pid>/cmdline` while the process lives is not a product defect: on
+    Linux `argv` is readable by every same-uid process and `ps`/shell history see
+    it regardless. M0 therefore does not claim an argv boundary, and the harness
+    reports the kernel truth instead of asserting a control the OS does not
+    offer. The supported ingestion channel (no-echo TTY / dedicated pipe) is
+    M1 work; the M0 CLI deliberately has no credential-ingestion command at all.
     """
     cli = _require_binary("asv", "cli-argv")
     if isinstance(cli, ProbeResult):
@@ -632,10 +668,73 @@ def probe_cli_argv_surface(workdir: Path, socket_path: Path) -> ProbeResult:
                 "cli-argv", "INVALID",
                 f"unexpected CLI output: {result.stdout[:160]!r}",
             )
+
+    help_text = subprocess.run(
+        [str(cli), "--help"], capture_output=True, text=True, timeout=60, cwd=workdir
+    )
+    combined = (help_text.stdout + help_text.stderr).lower()
+    for forbidden in ["get-secret", "export-secret", "show-secret", "reveal", "password", "token"]:
+        if forbidden in combined:
+            return ProbeResult(
+                "cli-argv", "FAIL",
+                f"CLI advertises a secret-ingestion surface `{forbidden}`: {help_text.stdout[:200]!r}",
+            )
+
+    return ProbeResult(
+        "cli-argv", "PASS",
+        "no secret-ingestion surface advertised; request field never echoed "
+        "(argv/cmdline visibility is a same-uid kernel property, not an ASV control)",
+    )
+
+
+def selfcheck_live_cmdline(workdir: Path, socket_path: Path) -> ProbeResult:
+    """Prove `/proc/<pid>/cmdline` reading works, so the kernel-limit claim is falsifiable.
+
+    The `cli-argv` probe reports that argv visibility is a property of the kernel
+    rather than an ASV control. That is a claim about the environment, and a
+    claim is only worth reporting if it can be wrong. This self-check plants the
+    canary in a live process's argv, requires the reader to find it, and
+    requires the entry to be gone once the process exits. Without it, the
+    kernel-limit wording would be exactly the kind of unfalsified assertion this
+    harness was rewritten to eliminate.
+    """
+    marker = f"{CANARY}-selfcheck"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)", marker]
+    )
+    try:
+        found = False
+        for _ in range(100):
+            if any(marker in blob for blob in _cmdline_blobs_for(proc.pid)):
+                found = True
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.02)
+        if not found:
+            return ProbeResult(
+                "selfcheck-cmdline", "INVALID",
+                "could not read the planted canary from a live /proc cmdline",
+            )
+        if _cmdline_blobs_for(proc.pid) and not any(
+            marker in blob for blob in _cmdline_blobs_for(proc.pid)
+        ):
+            return ProbeResult(
+                "selfcheck-cmdline", "INVALID",
+                "cmdline reader returned an unstable result",
+            )
+    finally:
+        proc.kill()
+        proc.wait()
+    if _cmdline_blobs_for(proc.pid):
         return ProbeResult(
-            "cli-argv", "PASS",
-            "canary accepted as input, absent from stdout, stderr and the process cmdline",
+            "selfcheck-cmdline", "INVALID",
+            "cmdline entry still readable after the process exited",
         )
+    return ProbeResult(
+        "selfcheck-cmdline", "PASS",
+        "canary readable in a live /proc cmdline and gone after exit",
+    )
 
 
 SELF_CHECKS = [
@@ -644,6 +743,7 @@ SELF_CHECKS = [
     selfcheck_argv,
     selfcheck_filesystem,
     selfcheck_ptrace,
+    selfcheck_live_cmdline,
 ]
 
 PROBES = [

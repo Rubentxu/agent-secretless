@@ -50,10 +50,24 @@ INJECTIONS = [
         "    tracing::warn!(raw = %String::from_utf8_lossy(&buf[..n]));\n    let response = match decode_request(&buf[..n]) {",
     ),
     (
+        # Reflects the request field back in an error message, so the canary
+        # reaches the client through the response bytes. The log is untouched,
+        # which is what separates this from `secret-in-broker-log`: the two
+        # injections must fail through different probes, otherwise one of them
+        # is untested.
         "secret-in-ipc-response",
         "crates/broker/src/lib.rs",
-        "let id = state.sessions.create(workspace, peer);",
-        "let id = state.sessions.create(workspace.clone(), peer);\n            tracing::warn!(leaked = %workspace);",
+        """        Request::CreateSession { workspace } => {
+            let id = state.sessions.create(workspace, peer);
+            Response::SessionCreated { session: id }
+        }""",
+        """        Request::CreateSession { workspace } => {
+            let id = state.sessions.create(workspace.clone(), peer);
+            Response::Error {
+                code: ErrorCode::InvalidRequest,
+                message: format!("session opened for {workspace}"),
+            }
+        }""",
     ),
     (
         "secret-in-cli-output",

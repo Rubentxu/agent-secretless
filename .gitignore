@@ -2,6 +2,10 @@
 /target/
 **/*.rs.bk
 
+# Python bytecode from the adversarial harness
+__pycache__/
+*.py[cod]
+
 # SDDK runtime state and cycle artifacts are machine-owned, not source.
 .sddk/
 *.sqlite
