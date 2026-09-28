@@ -746,12 +746,369 @@ SELF_CHECKS = [
     selfcheck_live_cmdline,
 ]
 
+# NOTE: the PROBES registry lives at the end of this file, after every probe
+# is defined. Registering it here would raise NameError at import time.
+
+
+# --- M1 vault probes -------------------------------------------------------
+#
+# M1 added a real encrypted vault, so the harness gained a real binary to
+# attack. These three probes discharge the M1 exit UATs from
+# docs/15-ROADMAP.md at the level the UATs describe: an artefact outside the
+# process, not a unit test inside a crate.
+#
+# Each probe runs `asv-vault-tool` for real and then inspects the filesystem
+# and the process's own output. None of them trusts the tool's exit code
+# alone: a tool that printed the canary and returned 0 would otherwise pass.
+
+
+def _vault_tool(probe: str) -> Path:
+    drift = _assert_vault_canary_matches(probe)
+    if drift is not None:
+        return drift
+    return _require_binary("asv-vault-tool", probe)
+
+
+def _vault_canary_secret() -> str:
+    """The canary that `asv-vault-tool` actually plants.
+
+    This must stay byte-identical to `CANARY` in
+    `crates/vault/src/bin/asv-vault-tool.rs`. A probe that searched for a
+    different string would report PASS against a vault that never contained
+    the value it was looking for, which is the worst possible harness bug: a
+    green run that proves nothing.
+
+    The value is therefore asserted against the binary's source at probe time
+    by `_assert_vault_canary_matches`, so a future edit to either side fails
+    the harness instead of silently disarming it.
+    """
+    return "ASV-CANARY-4f2b9c1e7a-VAULTTOOL"
+
+
+def _assert_vault_canary_matches(probe: str) -> ProbeResult | None:
+    """Fails the probe if the tool's canary constant has drifted.
+
+    Reads the tool's source and checks the literal is still present. This is
+    the honest way to keep the two constants in sync without a build-time
+    codegen step, and it converts a silent false PASS into a loud INVALID.
+    """
+    try:
+        root = _workspace_root()
+        if root is None:
+            return ProbeResult(probe, "INVALID", "cannot locate the workspace root")
+        source = (
+            root / "crates" / "vault" / "src" / "bin" / "asv-vault-tool.rs"
+        ).read_text(encoding="utf-8")
+    except (OSError, AttributeError) as exc:
+        return ProbeResult(probe, "INVALID", f"cannot read the vault tool source: {exc}")
+
+    if _vault_canary_secret() not in source:
+        return ProbeResult(
+            probe,
+            "INVALID",
+            "the vault tool's canary constant has drifted from the harness; "
+            "a PASS would be meaningless until they agree again",
+        )
+    return None
+
+
+def _read_all_files(root: Path) -> bytes:
+    blob = b""
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            try:
+                blob += path.read_bytes()
+            except OSError:
+                continue
+    return blob
+
+
+def probe_uat_018_audit_leak(workdir: Path, socket_path: Path) -> ProbeResult:
+    """UAT-018: canaries absent from every artefact ASV persists.
+
+    Exercises the real write paths (create, probe, backup) with a known
+    canary, then greps the whole vault directory. M1 has no connector and no
+    audit sink yet, so this is the strongest claim the milestone can make:
+    nothing ASV writes to disk contains a secret. M2 extends it to the audit
+    sink rather than replacing it.
+    """
+    name = "uat-018-audit-leak"
+    tool = _vault_tool(name)
+    if isinstance(tool, ProbeResult):
+        return tool
+
+    secret = _vault_canary_secret()
+    vault_dir = workdir / "m1-vault-018"
+    vault_dir.mkdir(parents=True, exist_ok=True)
+    vault = vault_dir / "vault.asv"
+    passphrase = "harness-" + os.urandom(6).hex()
+
+    rc, out, err = _run_vault_tool(
+        tool,
+        "create",
+        "--vault",
+        str(vault),
+        "--passphrase",
+        passphrase,
+        "--fast",
+    )
+    if rc != 0:
+        return ProbeResult(name, "INVALID", f"create failed rc={rc}: {err.strip()[:200]}")
+
+    # Read the secret's length: the tool holds a live decrypted credential
+    # here, which is exactly the moment a leak would occur.
+    rc, out, _ = _run_vault_tool(
+        tool, "probe", "--vault", str(vault), "--passphrase", passphrase, "--id", "canary"
+    )
+    if rc != 0:
+        return ProbeResult(name, "INVALID", f"probe failed rc={rc}")
+
+    rc, _, _ = _run_vault_tool(
+        tool,
+        "backup",
+        "--vault",
+        str(vault),
+        "--out",
+        str(vault_dir / "backup.asv"),
+        "--passphrase",
+        passphrase,
+        "--recovery",
+        "recovery-" + os.urandom(4).hex(),
+    )
+    if rc != 0:
+        return ProbeResult(name, "INVALID", "backup failed")
+
+    # The canary must not be in any file ASV wrote.
+    persisted = _read_all_files(vault_dir)
+    if secret.encode() in persisted:
+        return ProbeResult(
+            name, "FAIL", "the canary is present in a persisted ASV artefact"
+        )
+
+    # Nor in anything the tool printed.
+    if secret in out or secret in err:
+        return ProbeResult(name, "FAIL", "the canary appeared in process output")
+
+    return ProbeResult(
+        name,
+        "PASS",
+        f"no canary in {len(list(vault_dir.rglob('*')))} artefacts or in process output",
+    )
+
+
+def probe_uat_025_vault_theft(workdir: Path, socket_path: Path) -> ProbeResult:
+    """UAT-025: a stolen locked vault yields nothing offline.
+
+    Copies the vault file the way a thief would, confirms neither the secret
+    nor the account metadata is readable, and confirms a wrong passphrase
+    fails without disclosing anything.
+    """
+    name = "uat-025-vault-theft"
+    tool = _vault_tool(name)
+    if isinstance(tool, ProbeResult):
+        return tool
+
+    secret = _vault_canary_secret()
+    vault_dir = workdir / "m1-vault-025"
+    vault_dir.mkdir(parents=True, exist_ok=True)
+    vault = vault_dir / "vault.asv"
+    passphrase = "harness-" + os.urandom(6).hex()
+
+    rc, _, err = _run_vault_tool(
+        tool,
+        "create",
+        "--vault",
+        str(vault),
+        "--passphrase",
+        passphrase,
+        "--fast",
+    )
+    if rc != 0:
+        return ProbeResult(name, "INVALID", f"create failed rc={rc}: {err.strip()[:200]}")
+
+    stolen = vault_dir / "stolen.asv"
+    shutil.copy2(vault, stolen)
+    blob = stolen.read_bytes()
+
+    if secret.encode() in blob:
+        return ProbeResult(name, "FAIL", "the canary is readable in the stolen vault")
+    for needle in (b"harness canary", b"canary", b"provider"):
+        if needle in blob:
+            return ProbeResult(
+                name,
+                "FAIL",
+                f"metadata {needle!r} is readable in the stolen vault",
+            )
+
+    # Wrong passphrase: must fail, and must say nothing useful.
+    rc, out, err = _run_vault_tool(
+        tool,
+        "list",
+        "--vault",
+        str(stolen),
+        "--passphrase",
+        passphrase + "-wrong",
+    )
+    if rc == 0:
+        return ProbeResult(name, "FAIL", "a wrong passphrase opened the vault")
+    if secret in out or secret in err:
+        return ProbeResult(name, "FAIL", "the failed unlock disclosed the canary")
+
+    # Tampering is rejected.
+    tampered = bytearray(blob)
+    tampered[-1] ^= 0x01
+    tamper_path = vault_dir / "tampered.asv"
+    tamper_path.write_bytes(bytes(tampered))
+    rc, _, _ = _run_vault_tool(
+        tool, "list", "--vault", str(tamper_path), "--passphrase", passphrase
+    )
+    if rc == 0:
+        return ProbeResult(name, "FAIL", "a tampered vault was accepted")
+
+    return ProbeResult(
+        name,
+        "PASS",
+        "stolen vault discloses no secret, no metadata; wrong passphrase and tampering rejected",
+    )
+
+
+def probe_uat_026_backup_restore(workdir: Path, socket_path: Path) -> ProbeResult:
+    """UAT-026: a backup restores on a clean system with the recovery factor.
+
+    Restores into a directory that never saw the original vault, then confirms
+    the credentials came back, the restored file is still encrypted, and a
+    wrong recovery factor is rejected.
+    """
+    name = "uat-026-backup-restore"
+    tool = _vault_tool(name)
+    if isinstance(tool, ProbeResult):
+        return tool
+
+    secret = _vault_canary_secret()
+    root = workdir / "m1-vault-026"
+    root.mkdir(parents=True, exist_ok=True)
+    vault = root / "vault.asv"
+    passphrase = "harness-" + os.urandom(6).hex()
+    recovery = "recovery-" + os.urandom(6).hex()
+    backup = root / "backup.asv"
+
+    rc, _, err = _run_vault_tool(
+        tool,
+        "create",
+        "--vault",
+        str(vault),
+        "--passphrase",
+        passphrase,
+        "--fast",
+    )
+    if rc != 0:
+        return ProbeResult(name, "INVALID", f"create failed rc={rc}: {err.strip()[:200]}")
+
+    rc, _, err = _run_vault_tool(
+        tool,
+        "backup",
+        "--vault",
+        str(vault),
+        "--out",
+        str(backup),
+        "--passphrase",
+        passphrase,
+        "--recovery",
+        recovery,
+    )
+    if rc != 0:
+        return ProbeResult(name, "INVALID", f"backup failed rc={rc}: {err.strip()[:200]}")
+
+    # A clean system: the original vault is not part of this path.
+    clean = root / "clean-system"
+    restored = clean / "vault.asv"
+    rc, out, err = _run_vault_tool(
+        tool, "restore", "--backup", str(backup), "--out", str(restored), "--recovery", recovery
+    )
+    if rc != 0:
+        return ProbeResult(name, "FAIL", f"restore failed: {err.strip()[:200]}")
+
+    # Credentials came back: `list` must show the one credential.
+    rc, out, err = _run_vault_tool(
+        tool,
+        "list",
+        "--vault",
+        str(restored),
+        "--passphrase",
+        recovery,
+    )
+    if rc != 0:
+        return ProbeResult(name, "FAIL", f"the restored vault would not open: {err.strip()[:200]}")
+    if "id=canary" not in out or "count=1" not in out:
+        return ProbeResult(
+            name, "FAIL", f"the restored vault lost its credentials: {out.strip()[:200]}"
+        )
+
+    # The restored file is still encrypted.
+    blob = restored.read_bytes()
+    if secret.encode() in blob:
+        return ProbeResult(name, "FAIL", "the restored vault is readable on disk")
+    if secret in out or secret in err:
+        return ProbeResult(name, "FAIL", "the restore printed the canary")
+
+    # A wrong recovery factor is rejected.
+    rc, _, _ = _run_vault_tool(
+        tool,
+        "restore",
+        "--backup",
+        str(backup),
+        "--out",
+        str(clean / "wrong.asv"),
+        "--recovery",
+        recovery + "-wrong",
+    )
+    if rc == 0:
+        return ProbeResult(name, "FAIL", "a wrong recovery factor was accepted")
+
+    return ProbeResult(
+        name,
+        "PASS",
+        "restored on a clean path, credentials intact, still encrypted, wrong factor rejected",
+    )
+
+
+def _run_vault_tool(tool: Path, *args: str) -> tuple[int, str, str]:
+    """Runs the vault tool and returns (rc, stdout, stderr).
+
+    The environment is deliberately minimal and free of any secret, and the
+    tool's own output is captured rather than inherited so the probe can scan
+    it for the canary.
+    """
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not any(k.upper() == name for name in SECRET_ENV_NAMES)
+    }
+    env["ASV_HARNESS"] = "1"
+    try:
+        proc = subprocess.run(
+            [str(tool), *args],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return (127, "", f"failed to run vault tool: {exc}")
+    return (proc.returncode, proc.stdout, proc.stderr)
+
+
+# The registry is declared here, not next to the M0 probes, so that every
+# probe function is already defined when Python evaluates the names.
 PROBES = [
     probe_agent_environment,
     probe_broker_memory_isolation,
     probe_broker_socket_permissions,
     probe_forbidden_methods,
     probe_cli_argv_surface,
+    probe_uat_018_audit_leak,
+    probe_uat_025_vault_theft,
+    probe_uat_026_backup_restore,
 ]
 
 

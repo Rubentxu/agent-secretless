@@ -6,6 +6,7 @@ members = [
     "crates/identity",
     "crates/broker",
     "crates/cli",
+    "crates/vault",
 ]
 # M0 deliberately contains no connector crates. docs/15-ROADMAP.md M0 Exit
 # requires the UAT threat harness to run "even though no connector exists yet",
@@ -24,6 +25,7 @@ asv-ipc-protocol = { path = "crates/ipc-protocol" }
 asv-identity = { path = "crates/identity" }
 
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -32,6 +34,17 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "
 clap = { version = "4", features = ["derive", "env"] }
 secrecy = "0.10"
 zeroize = { version = "1", features = ["derive"] }
+
+# M1 crypto primitives. docs/07-VAULT-CRYPTO-MEMORY.md §3 names these
+# explicitly and forbids inventing a cipher or KDF, so the choices here are
+# pinned by the spec, not by preference.
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+aead = "0.5"
+rand = "0.8"
+sha2 = "0.10"
+hmac = "0.12"
+subtle = "2"
 
 # M0 accepts a locked dependency set; versions are pinned after a compatibility
 # and advisory review per docs/17-IMPLEMENTATION-BOOTSTRAP.md section 8, which

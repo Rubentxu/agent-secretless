@@ -82,6 +82,21 @@ INJECTIONS = [
         "Command::Session { workspace } => Request::CreateSession { workspace },",
         "Command::Session { workspace } => {\n                eprintln!(\"debug workspace={workspace}\");\n                Request::CreateSession { workspace }\n            }",
     ),
+    (
+        # M1: the vault tool reveals the stored secret. This is the crudest
+        # possible leak in the new path, which is exactly why it is worth
+        # injecting: it proves the uat-018 probe scans the *tool's own output*
+        # and not just the files it writes. A probe that only grepped the
+        # artefacts on disk would report PASS here.
+        #
+        # The injection must still compile under `-D warnings`, so it replaces
+        # the existing `writeln!` rather than adding an early return that would
+        # leave the rest of the arm unreachable.
+        "secret-in-vault-tool-output",
+        "crates/vault/src/bin/asv-vault-tool.rs",
+        '            writeln!(out, "id={id} len={len}")?;',
+        '            let leaked = store.with_secret(&key, &id, |b| String::from_utf8_lossy(b).into_owned())?;\n            writeln!(out, "id={id} len={len} secret={leaked}")?;',
+    ),
 ]
 
 

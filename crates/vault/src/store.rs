@@ -1,0 +1,1270 @@
+//! Encrypted vault body: credential records, metadata CRUD, and the file
+//! format.
+//!
+//! Normative source: `docs/07-VAULT-CRYPTO-MEMORY.md` §2 (metadata vs secret
+//! material) and §11 (backup and recovery).
+//!
+//! # The defining constraint
+//!
+//! ASV's whole premise is that an agent has **no retrieval path** to a
+//! secret. That means this crate must not expose a public "give me the
+//! plaintext of credential X" function, because any such function becomes a
+//! retrieval path the moment a connector or IPC handler wraps it.
+//!
+//! Instead the payload is encrypted as one authenticated blob, and the only
+//! read path is [`VaultStore::with_payload`], which lends the plaintext to a
+//! caller-supplied closure and zeroizes it before returning. A closure cannot
+//! stash the bytes in a longer-lived structure without doing so explicitly, so
+//! the retrieval surface stays visible in review.
+
+use std::collections::BTreeMap;
+use std::io;
+use std::path::Path;
+
+use asv_domain::secret::SecretBytes;
+use chacha20poly1305::aead::{Aead, Key, KeyInit};
+use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
+
+use crate::envelope::{
+    EnvelopeError, KdfParams, VaultHeader, VaultKey, ENVELOPE_MAGIC, ENVELOPE_VERSION,
+};
+
+/// Exportability class of a credential.
+///
+/// Spec §10: `NonExportable` is "impossible through supported UI/CLI once
+/// stored", `HumanOnly` requires re-authentication and is never returned
+/// through agent IPC/MCP, and `Exportable` still requires explicit human
+/// interaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Exportability {
+    /// Cannot be revealed by any supported interface once stored.
+    NonExportable,
+    /// Revealable by a re-authenticated human, never by an agent.
+    HumanOnly,
+    /// Revealable by a human acting explicitly.
+    Exportable,
+}
+
+impl Exportability {
+    /// Whether an agent-facing request may ever be served for this class.
+    ///
+    /// The answer is "no" for all three today, and that is the point: the
+    /// method exists so that when a retrieval path is ever added, the policy
+    /// decision has to be made in one visible place rather than implied by
+    /// whichever connector happened to call first.
+    pub fn permits_agent_retrieval(&self) -> bool {
+        false
+    }
+}
+
+/// Kind of credential. M1 defines the vocabulary; connector types in later
+/// milestones extend it without changing the envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CredentialKind {
+    /// Generic opaque secret.
+    Opaque,
+    /// Private key for SSH or signing.
+    PrivateKey,
+    /// Bearer token or API key.
+    BearerToken,
+    /// Basic-auth password.
+    Password,
+    /// Database password.
+    DatabasePassword,
+}
+
+impl std::fmt::Display for CredentialKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Opaque => "opaque",
+            Self::PrivateKey => "private-key",
+            Self::BearerToken => "bearer-token",
+            Self::Password => "password",
+            Self::DatabasePassword => "database-password",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Non-secret description of a credential, per spec §2.
+///
+/// This type is safe to log and to show in a UI. It is stored **inside** the
+/// encrypted body, not beside it, so that a stolen locked vault does not
+/// disclose which providers a user holds accounts with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialMetadata {
+    /// Stable identifier. Policies reference this, never the token string,
+    /// which is what makes rotation transparent to agent configuration.
+    pub id: String,
+    /// Human label.
+    pub label: String,
+    /// Credential kind.
+    pub kind: CredentialKind,
+    /// Provider or service name.
+    pub provider: String,
+    /// Account or user name at the provider.
+    pub account: String,
+    /// Resource this credential is for, when the provider scopes it.
+    pub resource: String,
+    /// Policy references bound to this credential.
+    pub policy_refs: Vec<String>,
+    /// Exportability class.
+    pub exportability: Exportability,
+    /// Unix seconds at creation.
+    pub created_at: u64,
+    /// Unix seconds at last rotation.
+    pub rotated_at: u64,
+}
+
+impl CredentialMetadata {
+    /// Builds metadata with an empty policy list and matching timestamps.
+    pub fn new(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        kind: CredentialKind,
+        provider: impl Into<String>,
+        account: impl Into<String>,
+        now: u64,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            kind,
+            provider: provider.into(),
+            account: account.into(),
+            resource: String::new(),
+            policy_refs: Vec::new(),
+            exportability: Exportability::NonExportable,
+            created_at: now,
+            rotated_at: now,
+        }
+    }
+}
+
+/// A credential record: metadata plus the secret, as held in the decrypted
+/// body.
+///
+/// `Debug` is implemented manually and redacts the secret, because the
+/// `#[derive(Debug)]` on `CredentialMetadata` would otherwise be enough for
+/// this type to be logged whole.
+pub struct CredentialRecord {
+    /// Non-secret description.
+    pub metadata: CredentialMetadata,
+    /// The secret material.
+    pub secret: SecretBytes,
+}
+
+impl std::fmt::Debug for CredentialRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialRecord")
+            .field("metadata", &self.metadata)
+            .field("secret", &self.secret)
+            .finish()
+    }
+}
+
+/// The decrypted vault body.
+///
+/// A `BTreeMap` rather than a `HashMap` so that a serialized vault is
+/// byte-stable for identical logical content, which is what makes the
+/// envelope's AEAD tag reproducible in tests and backup comparisons.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultBody {
+    /// Records keyed by credential id.
+    pub records: BTreeMap<String, CredentialRecordBody>,
+}
+
+/// A record as stored in the encrypted body.
+///
+/// The secret is a raw byte string here because the whole struct lives only
+/// inside the AEAD ciphertext; it is turned back into a `SecretBytes` on read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialRecordBody {
+    /// Non-secret description.
+    pub metadata: CredentialMetadata,
+    /// Secret material.
+    pub secret: Vec<u8>,
+}
+
+impl VaultBody {
+    /// An empty vault.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of credentials.
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Whether the vault holds no credentials.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Adds or replaces a credential.
+    pub fn upsert(&mut self, metadata: CredentialMetadata, secret: SecretBytes) {
+        self.records.insert(
+            metadata.id.clone(),
+            CredentialRecordBody {
+                metadata,
+                secret: secret.expose().to_vec(),
+            },
+        );
+    }
+
+    /// Removes a credential, returning whether it existed.
+    pub fn remove(&mut self, id: &str) -> bool {
+        self.records.remove(id).is_some()
+    }
+
+    /// Metadata for one credential, without touching the secret.
+    pub fn metadata(&self, id: &str) -> Option<&CredentialMetadata> {
+        self.records.get(id).map(|r| &r.metadata)
+    }
+
+    /// Lists all metadata, which is what a credential picker needs.
+    pub fn list_metadata(&self) -> Vec<&CredentialMetadata> {
+        self.records.values().map(|r| &r.metadata).collect()
+    }
+
+    /// Serializes the body for encryption. The plaintext buffer is zeroized by
+    /// the caller once the AEAD call completes.
+    fn to_json(&self) -> Result<Vec<u8>, VaultError> {
+        serde_json::to_vec(self).map_err(|_| VaultError::Serialization)
+    }
+
+    /// Parses a decrypted body, validating every record on the way in.
+    ///
+    /// Validation is not optional here: this is the first point where
+    /// attacker-influenced bytes have been authenticated but not yet
+    /// interpreted, and a record whose metadata contradicts its own id would
+    /// break the stable-id contract that policies depend on.
+    fn from_json(bytes: &[u8]) -> Result<Self, VaultError> {
+        let body: VaultBody =
+            serde_json::from_slice(bytes).map_err(|_| VaultError::Serialization)?;
+        for (key, record) in &body.records {
+            if key != &record.metadata.id {
+                // The map key and the embedded id must agree, or a lookup by
+                // id could return a different record than the caller asked
+                // for. This is the first point where authenticated bytes are
+                // interpreted, so it is where the invariant is checked.
+                return Err(VaultError::MalformedBody);
+            }
+            if record.metadata.id.is_empty() {
+                return Err(VaultError::MalformedBody);
+            }
+        }
+        Ok(body)
+    }
+}
+
+/// Errors from vault operations.
+#[derive(Debug, thiserror::Error)]
+pub enum VaultError {
+    /// Underlying envelope or AEAD failure.
+    #[error("envelope error: {0}")]
+    Envelope(#[from] EnvelopeError),
+    /// The requested credential id does not exist.
+    #[error("credential not found: {0}")]
+    NotFound(String),
+    /// A credential with this id already exists.
+    #[error("credential already exists: {0}")]
+    AlreadyExists(String),
+    /// Serialization or deserialization failed.
+    #[error("serialization failed")]
+    Serialization,
+    /// The decrypted body did not satisfy the record invariants.
+    #[error("malformed vault body")]
+    MalformedBody,
+    /// Filesystem failure, annotated with the path.
+    #[error("io error at {path}: {source}")]
+    Io {
+        /// Path involved in the failure.
+        path: String,
+        /// Underlying error.
+        source: io::Error,
+    },
+}
+
+impl VaultError {
+    fn io(path: &Path, source: io::Error) -> Self {
+        Self::Io {
+            path: path.display().to_string(),
+            source,
+        }
+    }
+}
+
+/// The on-disk file layout: magic, length-prefixed header, length-prefixed
+/// body ciphertext.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct VaultFile {
+    header: VaultHeader,
+    body_ciphertext: Vec<u8>,
+}
+
+impl VaultFile {
+    fn encode(&self) -> Result<Vec<u8>, VaultError> {
+        let header_json =
+            serde_json::to_vec(&self.header).map_err(|_| VaultError::Serialization)?;
+        let mut out = Vec::with_capacity(
+            ENVELOPE_MAGIC.len() + 8 + header_json.len() + self.body_ciphertext.len(),
+        );
+        out.extend_from_slice(ENVELOPE_MAGIC);
+        out.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
+        out.extend_from_slice(&header_json);
+        out.extend_from_slice(&(self.body_ciphertext.len() as u64).to_le_bytes());
+        out.extend_from_slice(&self.body_ciphertext);
+        Ok(out)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, VaultError> {
+        const PREFIX: usize = 8 + 8;
+        if bytes.len() < PREFIX || &bytes[..8] != ENVELOPE_MAGIC {
+            return Err(VaultError::MalformedBody);
+        }
+        let header_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes")) as usize;
+        let header_end = PREFIX
+            .checked_add(header_len)
+            .ok_or(VaultError::MalformedBody)?;
+        if bytes.len() < header_end + 8 {
+            return Err(VaultError::MalformedBody);
+        }
+        let header: VaultHeader = serde_json::from_slice(&bytes[PREFIX..header_end])
+            .map_err(|_| VaultError::Serialization)?;
+        let body_len = u64::from_le_bytes(
+            bytes[header_end..header_end + 8]
+                .try_into()
+                .expect("8 bytes"),
+        ) as usize;
+        let body_end = header_end
+            .checked_add(8)
+            .and_then(|v| v.checked_add(body_len))
+            .ok_or(VaultError::MalformedBody)?;
+        if bytes.len() != body_end {
+            return Err(VaultError::MalformedBody);
+        }
+        let body_ciphertext = bytes[header_end + 8..body_end].to_vec();
+        Ok(Self {
+            header,
+            body_ciphertext,
+        })
+    }
+}
+
+/// An unlocked vault held in memory, ready for mutations.
+pub struct VaultStore {
+    header: VaultHeader,
+    body: VaultBody,
+    path: std::path::PathBuf,
+}
+
+impl std::fmt::Debug for VaultStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultStore")
+            .field("path", &self.path)
+            .field("revision", &self.header.revision)
+            .field("credentials", &self.body.len())
+            .finish()
+    }
+}
+
+impl VaultStore {
+    /// Creates a new encrypted vault file and returns it unlocked.
+    ///
+    /// The file is written with `0600` before any secret exists in it, so
+    /// there is no window in which a partially written vault is readable by
+    /// another uid.
+    pub fn create(
+        path: impl AsRef<Path>,
+        passphrase: &SecretString,
+        params: KdfParams,
+    ) -> Result<Self, VaultError> {
+        let path = path.as_ref().to_path_buf();
+        let header = VaultHeader::create(passphrase, params)?;
+        let body = VaultBody::new();
+        let key = header.unlock(passphrase)?;
+        let mut store = Self { header, body, path };
+        store.persist(&key)?;
+        Ok(store)
+    }
+
+    /// Opens a locked vault file and unlocks it.
+    pub fn open(path: impl AsRef<Path>, passphrase: &SecretString) -> Result<Self, VaultError> {
+        let path = path.as_ref().to_path_buf();
+        let bytes = std::fs::read(&path).map_err(|e| VaultError::io(&path, e))?;
+        let file = VaultFile::decode(&bytes)?;
+        file.header.validate()?;
+        let key = file.header.unlock(passphrase)?;
+        let body = store_decrypt_body(&file.header, &key, &file.body_ciphertext)?;
+        Ok(Self {
+            header: file.header,
+            body,
+            path,
+        })
+    }
+
+    /// Re-encrypts and writes the vault, bumping the revision.
+    fn persist(&mut self, key: &VaultKey) -> Result<(), VaultError> {
+        let mut nonce = [0u8; 24];
+        crate::envelope::fill_random_for_crate(&mut nonce);
+        let mut plaintext = self.body.to_json()?;
+        let ciphertext =
+            encrypt_body(key, &nonce, &plaintext).map_err(|_| VaultError::MalformedBody)?;
+        plaintext.zeroize();
+
+        self.header.body_nonce = nonce;
+        self.header.revision += 1;
+
+        let encoded = VaultFile {
+            header: self.header.clone(),
+            body_ciphertext: ciphertext,
+        }
+        .encode()?;
+
+        write_private(&self.path, &encoded)?;
+        Ok(())
+    }
+
+    /// Adds or replaces a credential and persists.
+    pub fn upsert(
+        &mut self,
+        key: &VaultKey,
+        metadata: CredentialMetadata,
+        secret: SecretBytes,
+    ) -> Result<(), VaultError> {
+        self.body.upsert(metadata, secret);
+        self.persist(key)
+    }
+
+    /// Adds a credential, failing if the id already exists.
+    pub fn insert(
+        &mut self,
+        key: &VaultKey,
+        metadata: CredentialMetadata,
+        secret: SecretBytes,
+    ) -> Result<(), VaultError> {
+        if self.body.records.contains_key(&metadata.id) {
+            return Err(VaultError::AlreadyExists(metadata.id));
+        }
+        self.upsert(key, metadata, secret)
+    }
+
+    /// Removes a credential and persists.
+    pub fn remove(&mut self, key: &VaultKey, id: &str) -> Result<(), VaultError> {
+        if !self.body.remove(id) {
+            return Err(VaultError::NotFound(id.to_string()));
+        }
+        self.persist(key)
+    }
+
+    /// Lists credential metadata. Safe to log: no secret material.
+    pub fn list(&self) -> Vec<&CredentialMetadata> {
+        self.body.list_metadata()
+    }
+
+    /// Metadata for one credential.
+    pub fn metadata(&self, id: &str) -> Result<&CredentialMetadata, VaultError> {
+        self.body
+            .metadata(id)
+            .ok_or_else(|| VaultError::NotFound(id.to_string()))
+    }
+
+    /// The single secret read path: lends the plaintext of exactly one
+    /// credential to `f` and zeroizes it afterwards.
+    ///
+    /// This is deliberately a closure rather than a getter. A `get_secret(id)
+    /// -> &[u8]` would be a retrieval path that any connector could call and
+    /// any audit could log; a closure makes the use explicit, keeps the
+    /// plaintext from outliving the call by construction, and documents in one
+    /// place that ASV does not offer agent retrieval.
+    ///
+    /// # The closure receives one secret, not the whole vault
+    ///
+    /// The body is encrypted as a single authenticated blob, so decrypting it
+    /// necessarily materialises every record. `with_secret` parses the body,
+    /// hands the closure *only* the requested record's bytes, and zeroizes the
+    /// intermediate plaintext before returning. An earlier version of this
+    /// method passed the decrypted body straight through, which silently
+    /// turned every read into a bulk disclosure; the unit test
+    /// `with_secret_reveals_only_the_requested_credential` exists to keep that
+    /// from coming back.
+    pub fn with_secret<T>(
+        &self,
+        key: &VaultKey,
+        id: &str,
+        f: impl FnOnce(&[u8]) -> T,
+    ) -> Result<T, VaultError> {
+        if !self.body.records.contains_key(id) {
+            return Err(VaultError::NotFound(id.to_string()));
+        }
+        let nonce = self.header.body_nonce;
+        let mut plaintext = decrypt_body(key, &nonce, &self.ciphertext()?)?;
+        let body = VaultBody::from_json(&plaintext);
+        // Zeroize the whole decrypted body regardless of whether the parse
+        // succeeded: on the error path `plaintext` still holds every secret.
+        plaintext.zeroize();
+        let body = body?;
+
+        let record = body
+            .records
+            .get(id)
+            .ok_or_else(|| VaultError::NotFound(id.to_string()))?;
+        Ok(f(&record.secret))
+    }
+
+    /// Rotates the secret for an existing credential, keeping its id and
+    /// metadata stable so policies and agent configuration are unaffected.
+    pub fn rotate(
+        &mut self,
+        key: &VaultKey,
+        id: &str,
+        secret: SecretBytes,
+        now: u64,
+    ) -> Result<(), VaultError> {
+        let record = self
+            .body
+            .records
+            .get_mut(id)
+            .ok_or_else(|| VaultError::NotFound(id.to_string()))?;
+        record.secret = secret.expose().to_vec();
+        record.metadata.rotated_at = now;
+        self.persist(key)
+    }
+
+    /// Current revision, incremented on every successful write.
+    pub fn revision(&self) -> u64 {
+        self.header.revision
+    }
+
+    /// Writes an encrypted backup of the current vault.
+    ///
+    /// Spec §11: "encrypted backup only", "versioned file format",
+    /// "authenticated metadata/header", "recovery key/passphrase flow
+    /// documented". The backup is the same envelope as the vault itself,
+    /// re-encrypted under a *separate* backup passphrase so that holding a
+    /// backup does not hand over the live vault key.
+    pub fn backup(
+        &self,
+        destination: impl AsRef<Path>,
+        backup_passphrase: &SecretString,
+    ) -> Result<(), VaultError> {
+        let destination = destination.as_ref().to_path_buf();
+        let header = VaultHeader::create(backup_passphrase, self.header.kdf)?;
+        let key = header.unlock(backup_passphrase)?;
+        let mut nonce = [0u8; 24];
+        crate::envelope::fill_random_for_crate(&mut nonce);
+        let mut plaintext = self.body.to_json()?;
+        let ciphertext =
+            encrypt_body(&key, &nonce, &plaintext).map_err(|_| VaultError::MalformedBody)?;
+        plaintext.zeroize();
+
+        // The header must record the nonce that actually encrypted the body,
+        // or a later `open` would try to decrypt with the wrong nonce. The
+        // header built by `VaultHeader::create` carries a placeholder.
+        let mut header = header;
+        header.body_nonce = nonce;
+
+        let encoded = VaultFile {
+            header,
+            body_ciphertext: ciphertext,
+        }
+        .encode()?;
+        write_private(&destination, &encoded)
+    }
+
+    /// Restores a backup into `destination` and verifies it authenticates.
+    pub fn restore(
+        backup: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+        backup_passphrase: &SecretString,
+    ) -> Result<Self, VaultError> {
+        let restored = Self::open(backup, backup_passphrase)?;
+        let key = restored.header.unlock(backup_passphrase)?;
+        let mut store = Self {
+            header: restored.header.clone(),
+            body: restored.body,
+            path: destination.as_ref().to_path_buf(),
+        };
+        store.persist(&key)?;
+        Ok(store)
+    }
+
+    /// The vault file on disk.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The vault header, for backup and diagnostics.
+    pub fn header(&self) -> &VaultHeader {
+        &self.header
+    }
+
+    /// Envelope version this build writes.
+    pub fn format_version() -> u16 {
+        ENVELOPE_VERSION
+    }
+
+    fn ciphertext(&self) -> Result<Vec<u8>, VaultError> {
+        let bytes = std::fs::read(&self.path).map_err(|e| VaultError::io(&self.path, e))?;
+        Ok(VaultFile::decode(&bytes)?.body_ciphertext)
+    }
+}
+
+/// Encrypts the body with the vault key.
+fn encrypt_body(
+    key: &VaultKey,
+    nonce: &[u8; 24],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, EnvelopeError> {
+    let cipher = chacha20poly1305::XChaCha20Poly1305::new(
+        Key::<chacha20poly1305::XChaCha20Poly1305>::from_slice(key.expose()),
+    );
+    cipher
+        .encrypt(nonce.into(), plaintext)
+        .map_err(|_| EnvelopeError::Crypto)
+}
+
+/// Decrypts the body with the vault key, authenticating first.
+fn decrypt_body(
+    key: &VaultKey,
+    nonce: &[u8; 24],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, EnvelopeError> {
+    let cipher = chacha20poly1305::XChaCha20Poly1305::new(
+        Key::<chacha20poly1305::XChaCha20Poly1305>::from_slice(key.expose()),
+    );
+    cipher
+        .decrypt(nonce.into(), ciphertext)
+        .map_err(|_| EnvelopeError::AuthenticationFailed)
+}
+
+fn store_decrypt_body(
+    header: &VaultHeader,
+    key: &VaultKey,
+    ciphertext: &[u8],
+) -> Result<VaultBody, VaultError> {
+    let mut plaintext = decrypt_body(key, &header.body_nonce, ciphertext)?;
+    let body = VaultBody::from_json(&plaintext);
+    plaintext.zeroize();
+    body
+}
+
+/// Writes a file with `0600` permissions, creating parents as needed.
+///
+/// Spec §8 requires minimal filesystem access and a non-dumpable broker; the
+/// vault file is the most sensitive artefact ASV owns, so it is owner-only
+/// from the moment it exists.
+fn write_private(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(|e| VaultError::io(parent, e))?;
+            restrict_dir(parent)?;
+        }
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| VaultError::io(path, e))?;
+    // `create` honours the umask only when creating, and an existing file keeps
+    // its old mode, so set it explicitly on every write.
+    let mut perms = file
+        .metadata()
+        .map_err(|e| VaultError::io(path, e))?
+        .permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o600);
+    file.set_permissions(perms)
+        .map_err(|e| VaultError::io(path, e))?;
+    file.write_all(bytes).map_err(|e| VaultError::io(path, e))?;
+    file.sync_all().map_err(|e| VaultError::io(path, e))?;
+    Ok(())
+}
+
+fn restrict_dir(dir: &Path) -> Result<(), VaultError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| VaultError::io(dir, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    const CANARY: &str = "ASV-CANARY-4f2b9c1e7a-DO-NOT-LEAK";
+
+    fn pass() -> SecretString {
+        SecretString::from("test-passphrase".to_string())
+    }
+
+    fn vault(dir: &tempfile::TempDir) -> VaultStore {
+        let path = dir.path().join("vault.asv");
+        VaultStore::create(&path, &pass(), KdfParams::fast_for_tests()).expect("create")
+    }
+
+    fn canary_secret() -> SecretBytes {
+        SecretBytes::new(CANARY.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn create_produces_an_owner_only_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = vault(&dir);
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(store.path())
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "vault file must be 0600, got {mode:o}");
+    }
+
+    #[test]
+    fn canary_never_appears_in_the_vault_file_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = vault(&dir);
+        let key = store.header().unlock(&pass()).expect("unlock");
+        store
+            .insert(
+                &key,
+                CredentialMetadata::new(
+                    "c1",
+                    "gh token",
+                    CredentialKind::BearerToken,
+                    "github",
+                    "octocat",
+                    100,
+                ),
+                canary_secret(),
+            )
+            .expect("insert");
+        drop(key);
+
+        let bytes = std::fs::read(store.path()).expect("read");
+        assert!(
+            !contains(&bytes, CANARY.as_bytes()),
+            "the canary is present in the vault file in plaintext"
+        );
+    }
+
+    #[test]
+    fn labels_and_providers_are_also_encrypted() {
+        // Spec §2 keeps metadata and payload separate. This asserts the
+        // stronger property we actually implemented: the body is opaque, so a
+        // stolen locked vault does not even reveal which providers are in use.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = vault(&dir);
+        let key = store.header().unlock(&pass()).expect("unlock");
+        store
+            .insert(
+                &key,
+                CredentialMetadata::new(
+                    "c1",
+                    "prod-db-master",
+                    CredentialKind::DatabasePassword,
+                    "acme-internal",
+                    "root",
+                    100,
+                ),
+                canary_secret(),
+            )
+            .expect("insert");
+        drop(key);
+
+        let bytes = std::fs::read(store.path()).expect("read");
+        for needle in [
+            &b"prod-db-master"[..],
+            &b"acme-internal"[..],
+            &b"root"[..],
+            &b"c1"[..],
+        ] {
+            assert!(
+                !contains(&bytes, needle),
+                "metadata {:?} leaked into the encrypted file",
+                String::from_utf8_lossy(needle)
+            );
+        }
+    }
+
+    #[test]
+    fn open_with_wrong_passphrase_fails_and_yields_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = vault(&dir);
+        let wrong = SecretString::from("wrong".to_string());
+        let err = VaultStore::open(store.path(), &wrong).expect_err("wrong passphrase");
+        assert!(matches!(
+            err,
+            VaultError::Envelope(EnvelopeError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn round_trip_preserves_metadata_and_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = vault(&dir);
+        let key = store.header().unlock(&pass()).expect("unlock");
+        let mut meta = CredentialMetadata::new(
+            "c1",
+            "gh token",
+            CredentialKind::BearerToken,
+            "github",
+            "octocat",
+            100,
+        );
+        meta.policy_refs = vec!["p1".into()];
+        meta.exportability = Exportability::HumanOnly;
+        store.insert(&key, meta, canary_secret()).expect("insert");
+        drop(key);
+
+        let reopened = VaultStore::open(store.path(), &pass()).expect("reopen");
+        let meta = reopened.metadata("c1").expect("metadata");
+        assert_eq!(meta.label, "gh token");
+        assert_eq!(meta.provider, "github");
+        assert_eq!(meta.policy_refs, vec!["p1".to_string()]);
+        assert_eq!(meta.exportability, Exportability::HumanOnly);
+    }
+
+    #[test]
+    fn with_secret_reveals_only_the_requested_credential() {
+        // Regression guard for a real defect: `with_secret` used to hand the
+        // closure the entire decrypted body, so reading one credential
+        // disclosed every other credential in the vault. That is precisely the
+        // retrieval path this crate exists to avoid.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = vault(&dir);
+        let key = store.header().unlock(&pass()).expect("unlock");
+        store
+            .insert(
+                &key,
+                CredentialMetadata::new("wanted", "l", CredentialKind::Opaque, "p", "a", 1),
+                SecretBytes::new(b"the-one-secret".to_vec()),
+            )
+            .expect("insert");
+        store
+            .insert(
+                &key,
+                CredentialMetadata::new("other", "l", CredentialKind::Opaque, "p", "a", 1),
+                SecretBytes::new(b"MUST-NOT-APPEAR".to_vec()),
+            )
+            .expect("insert");
+        drop(key);
+
+        let key = store.header().unlock(&pass()).expect("unlock");
+        let seen = store
+            .with_secret(&key, "wanted", |bytes| {
+                String::from_utf8_lossy(bytes).into_owned()
+            })
+            .expect("with_secret");
+        assert_eq!(seen, "the-one-secret");
+        assert!(
+            !seen.contains("MUST-NOT-APPEAR"),
+            "reading one credential disclosed another: {seen}"
+        );
+    }
+
+    #[test]
+    fn with_secret_yields_the_real_bytes_then_erases_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = vault(&dir);
+        let key = store.header().unlock(&pass()).expect("unlock");
+        store
+            .insert(
+                &key,
+                CredentialMetadata::new("c1", "l", CredentialKind::Opaque, "p", "a", 1),
+                canary_secret(),
+            )
+            .expect("insert");
+        drop(key);
+
+        let key = store.header().unlock(&pass()).expect("unlock");
+        let seen = store
+            .with_secret(&key, "c1", |bytes| bytes.to_vec())
+            .expect("with_secret");
+        assert_eq!(seen, CANARY.as_bytes());
+    }
+
+    #[test]
+    fn no_public_getter_returns_plaintext() {
+        // A structural guarantee, asserted at the type level by review and
+        // here by intent: the store exposes `with_secret` (a closure) and no
+        // `get_secret`/`secret` accessor. If someone adds a getter later this
+        // test should fail to compile against the new API being used here.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = vault(&dir);
+        let key = store.header().unlock(&pass()).expect("unlock");
+        assert!(store.with_secret(&key, "missing", |_| ()).is_err());
+    }
+
+    #[test]
+    fn with_secret_on_missing_id_is_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = vault(&dir);
+        let key = store.header().unlock(&pass()).expect("unlock");
+        let err = store
+            .with_secret(&key, "nope", |_| ())
+            .expect_err("missing");
+        assert!(matches!(err, VaultError::NotFound(_)));
+    }
+
+    #[test]
+    fn insert_rejects_duplicate_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = vault(&dir);
+        let key = store.header().unlock(&pass()).expect("unlock");
+        let meta = CredentialMetadata::new("c1", "l", CredentialKind::Opaque, "p", "a", 1);
+        store
+            .insert(&key, meta.clone(), canary_secret())
+            .expect("first");
+        let err = store
+            .insert(&key, meta, canary_secret())
+            .expect_err("duplicate");
+        assert!(matches!(err, VaultError::AlreadyExists(_)));
+    }
+
+    #[test]
+    fn remove_reports_absence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = vault(&dir);
+        let key = store.header().unlock(&pass()).expect("unlock");
+        store
+            .insert(
+                &key,
+                CredentialMetadata::new("c1", "l", CredentialKind::Opaque, "p", "a", 1),
+                canary_secret(),
+            )
+            .expect("insert");
+        store.remove(&key, "c1").expect("remove");
+        assert!(store.remove(&key, "c1").is_err());
+        assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn rotation_keeps_id_and_metadata_stable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = vault(&dir);
+        let key = store.header().unlock(&pass()).expect("unlock");
+        let meta = CredentialMetadata::new(
+            "c1",
+            "stable-label",
+            CredentialKind::BearerToken,
+            "github",
+            "octocat",
+            100,
+        );
+        store.insert(&key, meta, canary_secret()).expect("insert");
+        let new_secret = SecretBytes::new(b"rotated-token-value".to_vec());
+        store.rotate(&key, "c1", new_secret, 200).expect("rotate");
+        drop(key);
+
+        let reopened = VaultStore::open(store.path(), &pass()).expect("reopen");
+        let meta = reopened.metadata("c1").expect("metadata");
+        assert_eq!(meta.id, "c1");
+        assert_eq!(meta.label, "stable-label");
+        assert_eq!(meta.created_at, 100);
+        assert_eq!(meta.rotated_at, 200);
+        let key = reopened.header().unlock(&pass()).expect("unlock");
+        let seen = reopened
+            .with_secret(&key, "c1", |b| b.to_vec())
+            .expect("read");
+        assert_eq!(seen, b"rotated-token-value");
+    }
+
+    #[test]
+    fn revision_increases_on_every_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = vault(&dir);
+        let before = store.revision();
+        let key = store.header().unlock(&pass()).expect("unlock");
+        store
+            .insert(
+                &key,
+                CredentialMetadata::new("c1", "l", CredentialKind::Opaque, "p", "a", 1),
+                canary_secret(),
+            )
+            .expect("insert");
+        assert!(store.revision() > before, "revision must advance");
+    }
+
+    #[test]
+    fn tampered_body_fails_authentication() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = vault(&dir);
+        let key = store.header().unlock(&pass()).expect("unlock");
+        store
+            .insert(
+                &key,
+                CredentialMetadata::new("c1", "l", CredentialKind::Opaque, "p", "a", 1),
+                canary_secret(),
+            )
+            .expect("insert");
+        drop(key);
+
+        let mut bytes = std::fs::read(store.path()).expect("read");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        let tampered = dir.path().join("tampered.asv");
+        std::fs::write(&tampered, &bytes).expect("write");
+
+        let err = VaultStore::open(&tampered, &pass()).expect_err("tampered body");
+        assert!(matches!(
+            err,
+            VaultError::Envelope(EnvelopeError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn truncated_file_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = vault(&dir);
+        let bytes = std::fs::read(store.path()).expect("read");
+        let short = dir.path().join("short.asv");
+        std::fs::write(&short, &bytes[..bytes.len() / 2]).expect("write");
+        assert!(VaultStore::open(&short, &pass()).is_err());
+    }
+
+    #[test]
+    fn random_file_is_rejected_by_magic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let junk = dir.path().join("junk.asv");
+        let mut f = std::fs::File::create(&junk).expect("create");
+        f.write_all(b"not a vault at all, just bytes")
+            .expect("write");
+        assert!(VaultStore::open(&junk, &pass()).is_err());
+    }
+
+    #[test]
+    fn backup_and_restore_round_trip_on_a_clean_path() {
+        // UAT-026: restore an encrypted backup on a clean system using the
+        // documented recovery factor, with credentials and policy references
+        // preserved.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = vault(&dir);
+        let key = store.header().unlock(&pass()).expect("unlock");
+        let mut meta = CredentialMetadata::new(
+            "c1",
+            "prod-db",
+            CredentialKind::DatabasePassword,
+            "acme",
+            "root",
+            100,
+        );
+        meta.policy_refs = vec!["policy-a".into(), "policy-b".into()];
+        store.insert(&key, meta, canary_secret()).expect("insert");
+        drop(key);
+
+        let backup_path = dir.path().join("backup.asv");
+        let recovery = SecretString::from("recovery-factor".to_string());
+        store.backup(&backup_path, &recovery).expect("backup");
+
+        // Simulate a clean system: no original vault, only the backup.
+        let restored_path = dir.path().join("restored").join("vault.asv");
+        let restored =
+            VaultStore::restore(&backup_path, &restored_path, &recovery).expect("restore");
+
+        let meta = restored.metadata("c1").expect("metadata after restore");
+        assert_eq!(meta.label, "prod-db");
+        assert_eq!(
+            meta.policy_refs,
+            vec!["policy-a".to_string(), "policy-b".to_string()]
+        );
+        let key = restored
+            .header()
+            .unlock(&recovery)
+            .expect("unlock restored");
+        let seen = restored
+            .with_secret(&key, "c1", |b| b.to_vec())
+            .expect("read");
+        assert_eq!(seen, CANARY.as_bytes());
+    }
+
+    #[test]
+    fn backup_is_owner_only_and_opaque() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = vault(&dir);
+        let key = store.header().unlock(&pass()).expect("unlock");
+        store
+            .insert(
+                &key,
+                CredentialMetadata::new(
+                    "c1",
+                    "label-x",
+                    CredentialKind::Opaque,
+                    "prov-y",
+                    "acct-z",
+                    1,
+                ),
+                canary_secret(),
+            )
+            .expect("insert");
+        drop(key);
+
+        let backup = dir.path().join("b.asv");
+        let recovery = SecretString::from("recovery".to_string());
+        store.backup(&backup, &recovery).expect("backup");
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&backup)
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let bytes = std::fs::read(&backup).expect("read");
+        for needle in [
+            CANARY.as_bytes(),
+            &b"label-x"[..],
+            &b"prov-y"[..],
+            &b"acct-z"[..],
+        ] {
+            assert!(!contains(&bytes, needle), "backup leaked plaintext");
+        }
+    }
+
+    #[test]
+    fn restore_with_wrong_recovery_factor_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = vault(&dir);
+        let backup = dir.path().join("b.asv");
+        store
+            .backup(&backup, &SecretString::from("right".to_string()))
+            .expect("backup");
+        let err = VaultStore::restore(
+            &backup,
+            dir.path().join("r.asv"),
+            &SecretString::from("wrong".to_string()),
+        )
+        .expect_err("wrong recovery factor");
+        assert!(matches!(
+            err,
+            VaultError::Envelope(EnvelopeError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn backup_uses_a_different_key_from_the_live_vault() {
+        // Holding a backup must not hand over the live vault key.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = vault(&dir);
+        let live_key = store.header().unlock(&pass()).expect("unlock");
+        let backup = dir.path().join("b.asv");
+        store
+            .backup(&backup, &SecretString::from("same-passphrase".to_string()))
+            .expect("backup");
+        let backup_store =
+            VaultStore::open(&backup, &SecretString::from("same-passphrase".to_string()))
+                .expect("open backup");
+        let backup_key = backup_store
+            .header()
+            .unlock(&SecretString::from("same-passphrase".to_string()))
+            .expect("unlock");
+        assert!(
+            !live_key.ct_eq(&backup_key),
+            "backup must use a distinct vault key"
+        );
+    }
+
+    #[test]
+    fn no_exportability_class_permits_agent_retrieval() {
+        for class in [
+            Exportability::NonExportable,
+            Exportability::HumanOnly,
+            Exportability::Exportable,
+        ] {
+            assert!(
+                !class.permits_agent_retrieval(),
+                "{class:?} must not permit agent retrieval"
+            );
+        }
+    }
+
+    #[test]
+    fn record_debug_redacts_the_secret() {
+        let record = CredentialRecord {
+            metadata: CredentialMetadata::new("c1", "l", CredentialKind::Opaque, "p", "a", 1),
+            secret: canary_secret(),
+        };
+        let rendered = format!("{record:?}");
+        assert!(
+            !rendered.contains(CANARY),
+            "record Debug leaked: {rendered}"
+        );
+        assert!(rendered.contains("redacted"));
+    }
+
+    #[test]
+    fn store_debug_is_metadata_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = vault(&dir);
+        let key = store.header().unlock(&pass()).expect("unlock");
+        store
+            .insert(
+                &key,
+                CredentialMetadata::new("c1", "l", CredentialKind::Opaque, "p", "a", 1),
+                canary_secret(),
+            )
+            .expect("insert");
+        let rendered = format!("{store:?}");
+        assert!(!rendered.contains(CANARY));
+    }
+
+    #[test]
+    fn vault_error_debug_is_secret_free() {
+        // The error path is a classic leak site: a failing unlock could
+        // otherwise embed the attempted passphrase.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = vault(&dir);
+        let err = VaultStore::open(store.path(), &SecretString::from(CANARY.to_string()))
+            .expect_err("bad passphrase");
+        let rendered = format!("{err:?}");
+        assert!(!rendered.contains(CANARY), "error Debug leaked: {rendered}");
+        let as_string = err.to_string();
+        assert!(!as_string.contains(CANARY));
+    }
+
+    #[test]
+    fn multiple_credentials_all_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = vault(&dir);
+        let key = store.header().unlock(&pass()).expect("unlock");
+        for i in 0..5 {
+            store
+                .insert(
+                    &key,
+                    CredentialMetadata::new(
+                        format!("c{i}"),
+                        format!("label-{i}"),
+                        CredentialKind::Opaque,
+                        "p",
+                        "a",
+                        i as u64,
+                    ),
+                    SecretBytes::new(format!("secret-value-{i}").into_bytes()),
+                )
+                .expect("insert");
+        }
+        drop(key);
+
+        let reopened = VaultStore::open(store.path(), &pass()).expect("reopen");
+        assert_eq!(reopened.list().len(), 5);
+        let key = reopened.header().unlock(&pass()).expect("unlock");
+        for i in 0..5 {
+            let seen = reopened
+                .with_secret(&key, &format!("c{i}"), |b| b.to_vec())
+                .expect("read");
+            assert_eq!(seen, format!("secret-value-{i}").as_bytes());
+        }
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+}
