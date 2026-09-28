@@ -56,6 +56,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Build the binaries the harness attacks
+        # The harness attacks real `asv-brokerd` and `asv` processes, so they
+        # have to exist before it runs. Without this step every probe that needs
+        # a binary reports INVALID, which is the harness correctly refusing to
+        # pass rather than the product being broken.
+        run: cargo build --workspace --locked
+
       - name: Run the threat harness
         # A green harness is only meaningful if it can fail, so the same job
         # runs the falsification suite. If this ever passes vacuously again, the
