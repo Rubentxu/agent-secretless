@@ -1056,3 +1056,75 @@ permit (principal, action == Action::"attacker_supplied_garbage", resource);
             .is_allowed());
     }
 }
+
+/// Closes backlog item `bl-bl-01M3MG517Q0003879086VZVGC0` (M3-era, recorded
+/// during M4 design).
+///
+/// The item reported two defects. Both were fixed in `10b76ad`; neither had a
+/// test that would fail if the fix were undone, which is why the item stayed
+/// open. This is that test.
+///
+/// Defect 1: `cedar_decision` presented every `Resource` variant as
+/// `Repository::`, so a rule scoped to `resource is Api` was vacuously false
+/// and `Database`/`Host` shared the mistake. Fixed by `entity_type`.
+///
+/// Defect 2: `PolicySet::from_str` received `schema=None`, so a correctly
+/// spelled rule naming an invented action parsed and granted `Allow`. Fixed by
+/// validating against `SCHEMA_JSON` in `ValidationMode::Strict`.
+#[test]
+fn a_rule_naming_an_invented_action_is_rejected_at_load_time() {
+    // Spelled correctly as Cedar, and semantically exactly the attack the
+    // backlog item described: a verb this system does not have. Without a
+    // schema this parses and allows, because Cedar has no vocabulary to check
+    // it against.
+    let invented = r#"
+permit(principal is AgentSession, action == Action::"DetonateEverything", resource is Repository);
+"#;
+    assert!(
+        PolicyEngine::from_policy_text(invented).is_err(),
+        "a rule naming an action outside the schema must be a load-time error. If this \
+         parses, the schema is not being applied and any verb can be granted."
+    );
+}
+
+/// The other half of defect 2: the entity type must follow the resource
+/// variant, so a rule scoped to `Api` is not silently false for a Repository
+/// and not silently true for everything.
+#[test]
+fn the_entity_type_follows_the_resource_variant() {
+    for (expected, resource) in [
+        (
+            "Repository",
+            Resource::Repository {
+                owner: "o".into(),
+                name: "r".into(),
+            },
+        ),
+        (
+            "Database",
+            Resource::Database {
+                name: "d".into(),
+                role: "rw".into(),
+            },
+        ),
+        (
+            "Host",
+            Resource::Host {
+                hostname: "h".into(),
+            },
+        ),
+        (
+            "Api",
+            Resource::Api {
+                audience: Authority::canonicalize("api.github.com").expect("canonical spelling"),
+            },
+        ),
+    ] {
+        assert_eq!(
+            entity_type(&resource),
+            expected,
+            "a rule scoped to `resource is {expected}` must be able to match this variant; \
+             a hardcoded type would make it vacuously false"
+        );
+    }
+}
