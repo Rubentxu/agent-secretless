@@ -1,0 +1,69 @@
+{
+  "schema": "sddk.release.release-receipt.v1",
+  "cycle_id": "p-20a1ee316faf2ba3/m0-foundations-v2",
+  "work_item": "f5781180-1a29-4ca6-ad52-b8cbc2605e6f",
+  "tag": "v0.1.0",
+  "release_type": "minor",
+  "version_derivation": {
+    "rule": "SEMVER derived from commit history, not chosen by hand.",
+    "basis": "The history contains one feat commit (`feat(m0): add compiling workspace with enforced secretless boundaries`) plus fixes and docs. A new public capability is a MINOR; the fixes are PATCH-level and do not force a MAJOR.",
+    "result": "0.1.0"
+  },
+  "milestone_exit_criteria": {
+    "source": "agent-secretless-vault-spec/docs/15-ROADMAP.md, M0 Exit",
+    "broker_and_cli_use_kernel_peer_credentials": {
+      "status": "verified",
+      "evidence": [
+        "peer_credentials_come_from_the_kernel",
+        "peer_cannot_forge_its_own_identity",
+        "pidfd_pinning_succeeds_for_a_live_process"
+      ]
+    },
+    "untrusted_dtos_cannot_deserialize_into_secret_types": {
+      "status": "verified",
+      "evidence": [
+        "every_forbidden_method_name_fails_to_decode",
+        "metadata_dto_has_no_secret_field",
+        "oversized_message_is_rejected_before_parsing"
+      ]
+    },
+    "canary_never_appears_in_debug_or_error_serialization": {
+      "status": "verified",
+      "evidence": [
+        "debug_never_contains_canary",
+        "debug_in_collections_never_contains_canary",
+        "panic_message_never_contains_canary",
+        "domain_errors_render_identifiers_not_secrets"
+      ]
+    },
+    "uat_threat_harness_runs_with_no_connector": {
+      "status": "verified",
+      "evidence": "Five ATTACK_* scripts run against real asv-brokerd and asv processes. crates/ contains broker, cli, domain, identity and ipc-protocol only: zero connector crates exist, which is the condition the roadmap names."
+    }
+  },
+  "gate_receipts": [
+    "gate-requirements-testable-418347d177166b8e-1",
+    "gate-implementation-complete-a40a058c6ee3cbe9-1",
+    "gate-tests-pass-96413c018144bdf1-1",
+    "gate-policy-compliant-96413c018144bdf1-1",
+    "gate-debt-severity-assigned-96413c018144bdf1-1",
+    "gate-debt-priority-assigned-96413c018144bdf1-1",
+    "gate-no-pending-effects-5e33b65829703308-1",
+    "gate-release-uat-approved-5e33b65829703308-1"
+  ],
+  "debt_carried": {
+    "hard_defects": 5,
+    "composition": "3 P0 gate-map defects, 2 P1 ungated UATs",
+    "handling": "Registered as triaged SDDK backlog items. The signed spec pack is normative and was not patched; tools/check-gates.py reports them instead.",
+    "why_not_patched": "Editing a signed, normative pack to make a gate check pass would be the exact class of shortcut this project exists to reject."
+  },
+  "known_limitations_shipped": [
+    "No vault. M0 verifies boundary properties, not protection of stored secret material.",
+    "Same-uid processes can read broker memory. A dedicated broker uid is M7.",
+    "argv is readable by every same-uid process. No ASV change affects this; the M0 CLI has no credential-ingestion command."
+  ],
+  "external_reproduction": {
+    "clean_clone_verified": true,
+    "detail": "Cloned from the published remote into an empty directory with its own target dir. 35 tests, clippy 0 under -D warnings, fmt clean, harness 11/11, falsification 3/3, spec pack 37/37. Source tree byte-identical to local."
+  }
+}

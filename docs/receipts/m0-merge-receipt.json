@@ -1,0 +1,40 @@
+{
+  "schema": "sddk.release.merge-receipt.v1",
+  "cycle_id": "p-20a1ee316faf2ba3/m0-foundations-v2",
+  "route": "local",
+  "branch": "main",
+  "base": "main",
+  "tag": "v0.1.0",
+  "release_type": "minor",
+  "observed": {
+    "head": "9a89f8c9e0a88c4b6b172a5d8e6db3beedb545ee",
+    "origin_main": "9a89f8c9e0a88c4b6b172a5d8e6db3beedb545ee",
+    "tag_commit": "9a89f8c9e0a88c4b6b172a5d8e6db3beedb545ee",
+    "tag_object": "63e608e2321ad7038d36db7fce90de2270d507bb",
+    "head_equals_origin_main": true,
+    "head_equals_tag": true
+  },
+  "applied": [
+    {
+      "capability": "git.push",
+      "capability_ref": "cap-git-push-091c641b0259"
+    },
+    {
+      "capability": "git.tag",
+      "capability_ref": "cap-git-tag-63a51ad3b7eb"
+    }
+  ],
+  "verification": {
+    "argv": ["git", "ls-remote", "origin", "refs/tags/v0.1.0*"],
+    "exit_code": 0,
+    "remote_tag_present": true,
+    "spec_pack": "37/37 unchanged",
+    "ci": {
+      "conclusion": "success",
+      "jobs": ["rust toolchain gates", "adversarial harness", "signed spec pack integrity"]
+    },
+    "harness": "11 passed, 0 leaked, 0 invalid",
+    "falsifiability": "3/3 injected leaks detected through three distinct probes"
+  },
+  "note": "M0 has no vault. This release ships boundary enforcement and a harness proven able to fail, not a working credential store. The README states this in its first paragraph."
+}
