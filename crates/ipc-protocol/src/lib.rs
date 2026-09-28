@@ -14,7 +14,10 @@
 //!   protobuf open pending fuzz ergonomics, so JSON is used here only to get the
 //!   boundary right; the decoder is length-bounded and the method set is closed.
 
-use asv_domain::{AgentSessionId, CredentialId, CredentialKind, Exportability};
+use asv_domain::{
+    AgentSessionId, ApprovalId, CapabilityId, CredentialId, CredentialKind, Exportability,
+};
+use asv_policy::{Approval, AuthorizationRequest, ExplainResult};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -44,6 +47,19 @@ pub enum Request {
     ListCredentialMetadata,
     /// Deletes a credential record.
     DeleteCredential { id: CredentialId },
+    /// Evaluates a bounded authorization request without exposing secrets.
+    Authorize {
+        request: AuthorizationRequest,
+        capability: Option<CapabilityId>,
+        approval: Option<ApprovalId>,
+    },
+    /// Explains a decision without consuming grants or approvals.
+    ExplainAuthorization { request: AuthorizationRequest },
+    /// Records an exact human approval for a bounded request.
+    SubmitApproval {
+        request: AuthorizationRequest,
+        ttl_secs: u64,
+    },
 }
 
 /// Broker responses. Every variant is safe to return to an agent: none of them
@@ -56,6 +72,8 @@ pub enum Response {
     SessionEnded { session: AgentSessionId },
     CredentialMetadata { entries: Vec<CredentialMetadataDto> },
     CredentialDeleted { id: CredentialId },
+    Authorization { explanation: ExplainResult },
+    ApprovalIssued { approval: Approval },
     Error { code: ErrorCode, message: String },
 }
 

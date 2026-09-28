@@ -9,6 +9,7 @@ description = "Versioned broker IPC. Untrusted DTOs never deserialize into secre
 
 [dependencies]
 asv-domain.workspace = true
+asv-policy.workspace = true
 serde = { workspace = true }
 serde_json = "1"
 thiserror.workspace = true

@@ -184,6 +184,15 @@ fn print_response(response: &Response) {
             }
         }
         Response::CredentialDeleted { id } => println!("credential {id} deleted"),
+        Response::Authorization { explanation } => {
+            println!(
+                "authorization: {:?} ({:?})",
+                explanation.decision, explanation.reason
+            );
+        }
+        Response::ApprovalIssued { approval } => {
+            println!("approval {} issued for {:?}", approval.id, approval.action);
+        }
         Response::Error { code, message } => {
             // `code` is the stable, scriptable part; `message` is for humans.
             eprintln!("{code:?}: {message}");

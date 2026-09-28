@@ -8,6 +8,7 @@ members = [
     "crates/cli",
     "crates/vault",
     "crates/ssh-agent",
+    "crates/policy",
 ]
 # M0 deliberately contains no connector crates. docs/15-ROADMAP.md M0 Exit
 # requires the UAT threat harness to run "even though no connector exists yet",
@@ -25,6 +26,7 @@ asv-domain = { path = "crates/domain" }
 asv-ipc-protocol = { path = "crates/ipc-protocol" }
 asv-identity = { path = "crates/identity" }
 asv-ssh-agent = { path = "crates/ssh-agent" }
+asv-policy = { path = "crates/policy" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -48,6 +50,7 @@ sha2 = "0.10"
 hmac = "0.12"
 subtle = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+cedar-policy = "=4.7.1"
 
 # M0 accepts a locked dependency set; versions are pinned after a compatibility
 # and advisory review per docs/17-IMPLEMENTATION-BOOTSTRAP.md section 8, which

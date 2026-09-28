@@ -1,0 +1,18 @@
+[package]
+name = "asv-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ASV deny-by-default Cedar policy adapter"
+
+[dependencies]
+asv-domain.workspace = true
+cedar-policy.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json = "1"

@@ -8,6 +8,7 @@
 use asv_domain::{AgentSessionId, CredentialId, CredentialMetadata};
 use asv_identity::WorkloadIdentity;
 use asv_ipc_protocol::{ErrorCode, Request, Response, PROTOCOL_VERSION};
+use asv_policy::PolicyEngine;
 use std::collections::HashMap;
 
 /// In-memory session table. M1 replaces this with persistent, encrypted state;
@@ -55,6 +56,13 @@ impl SessionStore {
         self.sessions.get(&id).map(|r| r.peer_pid)
     }
 
+    pub fn belongs_to(&self, id: AgentSessionId, peer: &WorkloadIdentity) -> bool {
+        self.sessions
+            .get(&id)
+            .map(|record| record.peer_pid == peer.credentials.pid)
+            .unwrap_or(false)
+    }
+
     /// Ends a session. Returns whether it existed, so a caller can distinguish
     /// "revoked" from "never existed" instead of silently succeeding.
     pub fn end(&mut self, id: AgentSessionId) -> bool {
@@ -76,6 +84,7 @@ impl SessionStore {
 pub struct BrokerState {
     pub sessions: SessionStore,
     pub credentials: Vec<CredentialMetadata>,
+    pub policy: PolicyEngine,
 }
 
 /// Handles one authenticated request.
@@ -115,6 +124,7 @@ pub fn handle(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request
 
         Request::EndSession { session } => {
             if state.sessions.end(session) {
+                state.policy.revoke_session(session);
                 Response::SessionEnded { session }
             } else {
                 // Fail closed: an unknown session is an error, not a no-op.
@@ -142,6 +152,46 @@ pub fn handle(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request
                 Response::CredentialDeleted { id }
             }
         }
+
+        Request::Authorize {
+            request,
+            capability,
+            approval,
+        } => {
+            if !state.sessions.belongs_to(request.session, peer) {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: "session is not owned by the authenticated peer".into(),
+                };
+            }
+            Response::Authorization {
+                explanation: state.policy.authorize(&request, capability, approval),
+            }
+        }
+
+        Request::ExplainAuthorization { request } => {
+            if !state.sessions.belongs_to(request.session, peer) {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: "session is not owned by the authenticated peer".into(),
+                };
+            }
+            Response::Authorization {
+                explanation: state.policy.explain(&request),
+            }
+        }
+
+        Request::SubmitApproval { request, ttl_secs } => {
+            if !state.sessions.belongs_to(request.session, peer) {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: "session is not owned by the authenticated peer".into(),
+                };
+            }
+            Response::ApprovalIssued {
+                approval: state.policy.issue_approval(&request, ttl_secs, 1),
+            }
+        }
     }
 }
 
@@ -157,6 +207,7 @@ mod tests {
     use super::*;
     use asv_domain::CredentialKind;
     use asv_identity::PeerCredentials;
+    use asv_policy::{AuthorizationRequest, PolicyContext};
 
     fn peer() -> WorkloadIdentity {
         WorkloadIdentity::from_peer(PeerCredentials {
@@ -221,6 +272,72 @@ mod tests {
             Response::Error { code, .. } => assert_eq!(code, ErrorCode::InvalidRequest),
             other => panic!("double revoke must fail, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn protected_push_requires_exact_single_use_approval() {
+        let mut state = BrokerState::default();
+        let peer = peer();
+        let session = match handle(
+            &mut state,
+            &peer,
+            Request::CreateSession {
+                workspace: "/repo".into(),
+            },
+        ) {
+            Response::SessionCreated { session } => session,
+            other => panic!("expected session creation, got {other:?}"),
+        };
+        let request = AuthorizationRequest {
+            session,
+            action: asv_domain::Action::GitPush,
+            resource: asv_domain::Resource::Repository {
+                owner: "acme".into(),
+                name: "app".into(),
+            },
+            context: PolicyContext {
+                workspace: "/repo".into(),
+                protected_ref: Some("main".into()),
+                request_digest: Some("release-digest".into()),
+                peer_uid: peer.credentials.uid,
+            },
+        };
+        let approval = match handle(
+            &mut state,
+            &peer,
+            Request::SubmitApproval {
+                request: request.clone(),
+                ttl_secs: 60,
+            },
+        ) {
+            Response::ApprovalIssued { approval } => approval,
+            other => panic!("expected approval, got {other:?}"),
+        };
+        let first = handle(
+            &mut state,
+            &peer,
+            Request::Authorize {
+                request: request.clone(),
+                capability: None,
+                approval: Some(approval.id),
+            },
+        );
+        assert!(
+            matches!(first, Response::Authorization { explanation } if explanation.decision.is_allowed())
+        );
+
+        let replay = handle(
+            &mut state,
+            &peer,
+            Request::Authorize {
+                request,
+                capability: None,
+                approval: Some(approval.id),
+            },
+        );
+        assert!(
+            matches!(replay, Response::Authorization { explanation } if !explanation.decision.is_allowed())
+        );
     }
 
     /// Metadata listing is the only credential surface, and it must be empty by
