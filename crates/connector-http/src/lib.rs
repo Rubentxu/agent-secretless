@@ -23,6 +23,8 @@
 //! regression test enforces it, so a new config reader fails the build instead
 //! of waiting for a review.
 
+#[cfg(test)]
+mod fake_origin;
 pub mod transport;
 
 pub use transport::{resolve_and_pin, AddressPolicy, PinnedClient, TransportError};

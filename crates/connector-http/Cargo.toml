@@ -12,3 +12,15 @@ asv-domain.workspace = true
 reqwest.workspace = true
 url.workspace = true
 thiserror.workspace = true
+
+# The fake servers need a real certificate, not a fixture string: "TLS host
+# preservation" is a claim about SNI and certificate verification, and it can
+# only be falsified by a handshake that actually happens.
+[dev-dependencies]
+rcgen = "0.13"
+# The fake origin speaks real TLS, so it needs a server-side rustls. The
+# provider feature has to match reqwest's: `rustls-tls` resolves to reqwest's
+# `__rustls-ring`, so a mismatch leaves rustls unable to pick a
+# CryptoProvider and it panics at handshake time with a message that does not
+# mention which crate is wrong.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

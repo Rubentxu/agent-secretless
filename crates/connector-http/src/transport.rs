@@ -28,6 +28,24 @@ pub enum TransportError {
 
     #[error("URL is not usable: {0}")]
     InvalidUrl(String),
+
+    #[error("request to {audience} failed: {reason}")]
+    RequestFailed { audience: String, reason: String },
+}
+
+/// Bridges the HTTP stack's error into this crate's vocabulary.
+///
+/// The `audience` is passed explicitly rather than read out of the reqwest
+/// error, because reqwest's `url` is the request URL and reporting that would
+/// leak a path the audit record has no business repeating. The caller knows
+/// which audience it was talking to; that is what belongs in the record.
+impl From<(Authority, reqwest::Error)> for TransportError {
+    fn from((audience, error): (Authority, reqwest::Error)) -> Self {
+        Self::RequestFailed {
+            audience: audience.to_string(),
+            reason: error.to_string(),
+        }
+    }
 }
 
 /// Which resolved addresses may be connected to.
@@ -184,6 +202,21 @@ impl PinnedClient {
         resolved: &ResolvedAudience,
         policy: AddressPolicy,
     ) -> Result<Self, TransportError> {
+        Self::build_with_roots(resolved, policy, &[])
+    }
+
+    /// Builds a client that additionally trusts `extra_roots`.
+    ///
+    /// This exists so a test can point a pinned client at a real local origin
+    /// and still exercise genuine certificate verification, instead of reaching
+    /// for `danger_accept_invalid_certs` and proving nothing. Production calls
+    /// [`PinnedClient::build`], which passes no extra roots and therefore
+    /// trusts exactly what the platform trusts.
+    pub fn build_with_roots(
+        resolved: &ResolvedAudience,
+        policy: AddressPolicy,
+        extra_roots: &[reqwest::Certificate],
+    ) -> Result<Self, TransportError> {
         if resolved.port == 0 {
             return Err(TransportError::UnroutableAudience(
                 resolved.authority.to_string(),
@@ -205,7 +238,13 @@ impl PinnedClient {
         }
         let mut builder = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .danger_accept_invalid_certs(false);
+            // Belt and braces: even a future refactor cannot turn this into an
+            // accepting verifier, because the two settings are stated here.
+            .danger_accept_invalid_certs(false)
+            .danger_accept_invalid_hostnames(false);
+        for root in extra_roots {
+            builder = builder.add_root_certificate(root.clone());
+        }
         // Every surviving address is registered, not just the first: collapsing
         // the list would silently turn pinning into "whichever got picked".
         for address in &resolved.addresses {
@@ -525,5 +564,195 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("api.github.com"), "{rendered}");
         assert!(rendered.contains("169.254.169.254"), "{rendered}");
+    }
+}
+
+/// The end-to-end transport tests. These are the ones that make the DoD claims
+/// falsifiable: they need a real handshake and a real socket, because no mock
+/// can tell us whether the hostname survived address pinning.
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use crate::fake_origin::{self, Reply};
+
+    /// Loopback has to be opted into here, explicitly, and only here. If a
+    /// production caller ever needed it, this helper would be the wrong place
+    /// to find it.
+    fn loopback_policy() -> AddressPolicy {
+        AddressPolicy {
+            allow_loopback: true,
+        }
+    }
+
+    /// A hand-built audience pointing the approved name at the fake origin's
+    /// port. Going through the resolver would need a real DNS answer, and the
+    /// property under test is what happens *after* the name is resolved.
+    fn pinned_to(origin: &fake_origin::FakeOrigin) -> ResolvedAudience {
+        ResolvedAudience {
+            authority: Authority::canonicalize(&origin.certified_for).expect("valid"),
+            port: origin.port,
+            addresses: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+        }
+    }
+
+    /// A client that trusts the fake origin's certificate. This is the single
+    /// concession to testability, and it lives in the test module rather than
+    /// in `build`, which keeps every production path fully verifying.
+    fn trusting_client(
+        origin: &fake_origin::FakeOrigin,
+        resolved: &ResolvedAudience,
+    ) -> PinnedClient {
+        let certificate = reqwest::Certificate::from_pem(origin.ca_pem.as_bytes())
+            .expect("the fake origin emits a parseable PEM");
+        PinnedClient::build_with_roots(resolved, loopback_policy(), &[certificate])
+            .expect("a loopback-pinned audience builds a client")
+    }
+
+    /// Reads the `Location` of a redirect response, or reports no redirect.
+    fn next_hop(
+        response: &reqwest::blocking::Response,
+        base: &Url,
+    ) -> Result<Option<Url>, TransportError> {
+        if !response.status().is_redirection() {
+            return Ok(None);
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| {
+                TransportError::InvalidUrl("redirect without a Location header".to_string())
+            })?
+            .to_str()
+            .map_err(|error| TransportError::InvalidUrl(error.to_string()))?;
+        base.join(location)
+            .map(Some)
+            .map_err(|error| TransportError::InvalidUrl(error.to_string()))
+    }
+
+    /// The core of DoD 1.3: a pinned client connects to a bare IP but must
+    /// still send TLS SNI and `Host:` for the approved authority. Pinning that
+    /// dropped the hostname would fail verification here.
+    #[test]
+    fn a_pinned_client_preserves_the_tls_host_and_the_host_header() {
+        let origin = fake_origin::start(Reply::Body(r#"{"number":1}"#.to_string()));
+        let resolved = pinned_to(&origin);
+        let client = trusting_client(&origin, &resolved);
+        let url = client.url(&resolved, "/repos/o/r/issues/1").expect("url");
+
+        let response = client.client().get(url).send().expect("TLS completes");
+        assert!(response.status().is_success(), "{:?}", response.status());
+
+        let seen = origin.last().expect("the origin saw a request");
+        assert!(
+            seen.header("host")
+                .is_some_and(|host| host.starts_with("api.github.com")),
+            "Host must name the authority, not the pinned IP: {:?}",
+            seen.host_header
+        );
+        assert!(
+            !seen.request_line.contains("127.0.0.1"),
+            "the request line must address the host, not the IP: {}",
+            seen.request_line
+        );
+    }
+
+    /// A client that does not trust the fake certificate must fail. Without
+    /// this, the test above could be passing because verification was
+    /// disabled somewhere rather than because pinning is correct.
+    #[test]
+    fn an_untrusted_certificate_is_still_rejected() {
+        let origin = fake_origin::start(Reply::Body("{}".to_string()));
+        let resolved = pinned_to(&origin);
+        let client = PinnedClient::build(&resolved, loopback_policy())
+            .expect("client builds, will not trust");
+        let url = client.url(&resolved, "/").expect("url");
+        assert!(
+            client.client().get(url).send().is_err(),
+            "an untrusted certificate must not be accepted"
+        );
+    }
+
+    /// A cross-origin `Location` must never be followed, and above all the
+    /// credential must not be re-emitted to the new host. The second origin
+    /// listens on a different port, so a leaked request would be observable.
+    #[test]
+    fn a_cross_origin_redirect_never_reaches_the_other_origin() {
+        let target = fake_origin::start(Reply::Body("stolen".to_string()));
+        let source = fake_origin::start(Reply::Redirect(format!(
+            "https://api.github.com:{}/stolen",
+            target.port
+        )));
+
+        let resolved = pinned_to(&source);
+        let client = trusting_client(&source, &resolved);
+        let url = client.url(&resolved, "/repos/o/r/issues/1").expect("url");
+
+        let result = PinnedClient::follow_same_origin(url.clone(), &url, |next| {
+            let response = client
+                .client()
+                .get(next.clone())
+                .send()
+                .map_err(|error| TransportError::from((resolved.authority.clone(), error)))?;
+            next_hop(&response, next)
+        });
+
+        assert!(
+            matches!(result, Err(TransportError::CrossOriginRedirect { .. })),
+            "got {result:?}"
+        );
+        assert_eq!(
+            target.connections(),
+            0,
+            "the cross-origin host must never receive a connection"
+        );
+    }
+
+    /// A same-origin redirect is followed for the permitted hops only. The fake
+    /// origin always answers with the same `Location`, so this is a real loop
+    /// and it has to terminate on the budget rather than by luck.
+    #[test]
+    fn a_same_origin_redirect_loop_terminates_against_a_real_socket() {
+        let origin = fake_origin::start(Reply::Redirect("/repos/o/r/issues/1".to_string()));
+        let resolved = pinned_to(&origin);
+        let client = trusting_client(&origin, &resolved);
+        let url = client.url(&resolved, "/start").expect("url");
+
+        let result = PinnedClient::follow_same_origin(url.clone(), &url, |next| {
+            let response = client
+                .client()
+                .get(next.clone())
+                .send()
+                .map_err(|error| TransportError::from((resolved.authority.clone(), error)))?;
+            next_hop(&response, next)
+        });
+
+        assert!(
+            matches!(result, Err(TransportError::TooManyRedirects { .. })),
+            "got {result:?}"
+        );
+        assert_eq!(
+            origin.observed().len(),
+            MAX_REDIRECTS + 1,
+            "one initial attempt plus exactly the permitted hops"
+        );
+    }
+
+    /// Guards the harness itself. If the fake origin stopped answering, every
+    /// test above could pass for the wrong reason; this one fails loudly.
+    #[test]
+    fn the_fake_origin_actually_answers() {
+        let origin = fake_origin::start(Reply::Body("alive".to_string()));
+        let resolved = pinned_to(&origin);
+        let client = trusting_client(&origin, &resolved);
+        let url = client.url(&resolved, "/").expect("url");
+        let body = client
+            .client()
+            .get(url)
+            .send()
+            .expect("the origin answers")
+            .text()
+            .expect("a readable body");
+        assert_eq!(body, "alive");
+        assert!(origin.connections() >= 1);
     }
 }
