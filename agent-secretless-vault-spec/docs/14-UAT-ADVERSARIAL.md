@@ -245,3 +245,40 @@ is, treat the threshold as applying to a developer-grade local Linux host and
 record the actual host in the UAT evidence so a regression can be told apart
 from a slower machine.
 
+## UAT-031 — untrusted DTO cannot become a secret-bearing domain type
+
+Feed the broker's IPC decoder hostile and malformed frames.
+
+Expected:
+
+- a frame that would deserialize into a secret-bearing domain type is refused,
+  not partially applied;
+- `MAX_MESSAGE_BYTES` overrun is refused without a large heap allocation.
+
+## UAT-032 — canary never appears in debug or error serialization
+
+Exercise every `Debug`, `Display` and error-conversion path with the canary
+secret fixture installed.
+
+Expected: the exact canary string is absent from all formatted output, including
+error chains and `tracing` fields.
+
+## UAT-033 — PostgreSQL connection carries no client-visible password
+
+An agent runs `psql` through the M6 connector.
+
+Expected:
+
+- the password is absent from the environment, the process tree, the connection
+  string, and any file the client writes;
+- an unauthorized database or role is denied before authentication completes;
+- revoking the session tears the connection down.
+
+## UAT-034 — device-bound vault resists offline extraction
+
+Copy the vault database from a device-bound (TPM-wrapped) vault and attempt
+offline inspection on a host that does not hold the sealing key.
+
+Expected: no plaintext secret is recoverable, and the failure path leaves no
+partially decrypted record.
+
