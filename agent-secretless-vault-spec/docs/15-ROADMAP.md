@@ -172,8 +172,8 @@ earlier milestones have no second credential to rotate.
 
 Performance smoke lands here because its 100 brokered read requests need the
 HTTP broker path, and its overhead budget is only meaningful once that path
-exists. The numeric budget is still undefined; it is tracked as an open
-backlog item and is a prerequisite for closing M4.
+exists. The numeric threshold is `NFR-PERF-001` in `01-PRODUCT-SPEC.md`: p95
+local authorization under 5 ms. Measuring it is M4 work.
 
 ---
 

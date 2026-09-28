@@ -107,9 +107,13 @@ Every supported integration has one of the defined posture labels. No documentat
 
 Before final release:
 
-- all required UAT green,
+- all required UAT green, where "required" is the UAT owned by each milestone
+  exit in `15-ROADMAP.md` as enforced by `tools/check-gates.py`,
 - fuzz regression corpus green,
 - full supported-kernel matrix green,
 - dependency vulnerabilities triaged,
 - known security limitations published,
-- no open severity-critical/high issue that violates core secretless invariants.
+- no open severity-critical/high issue that violates core secretless invariants,
+- `NFR-PERF-001` measured and within budget: p95 local authorization under
+  5 ms, evidenced by UAT-030 with the measured host recorded. A performance
+  claim without a recorded host and percentile is not a pass.

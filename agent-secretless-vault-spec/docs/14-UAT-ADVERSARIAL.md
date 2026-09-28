@@ -231,4 +231,17 @@ Expected: denied or approval-gated by ASV integration policy; no raw key/token e
 
 ## UAT-030 — performance smoke
 
-A normal sequence of 100 brokered read requests and SSH signatures stays within agreed local overhead budget and exhibits no resource leak after session teardown.
+A normal sequence of 100 brokered read requests and SSH signatures exhibits no
+resource leak after session teardown, and p95 local authorization stays under
+**5 ms** on a normal workstation.
+
+The 5 ms threshold is `NFR-PERF-001` in `01-PRODUCT-SPEC.md`, and it excludes
+human approval and upstream provider latency. This UAT is the falsifiable
+check for that NFR; the two documents were previously written without
+referencing each other, which left the milestone gate unfalsifiable.
+
+"Normal workstation" is not numerically defined by any spec document. Until it
+is, treat the threshold as applying to a developer-grade local Linux host and
+record the actual host in the UAT evidence so a regression can be told apart
+from a slower machine.
+
