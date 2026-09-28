@@ -81,8 +81,38 @@ Stated so this report cannot be read as claiming more than it verifies:
   pack as triaged SDDK backlog items (3x P0, 2x P1). The pack is normative and
   unmodified; `tools/check-gates.py` reports them rather than patching.
 
+## What a second machine found
+
+Publishing the repository and putting the same gates in CI was not ceremony. It
+found two defects that every local run had missed, in work that had been
+verified minutes earlier.
+
+**The harness had never been run against a clean build.** The first CI run
+reported INVALID on all four probes that need a real binary, because the
+workflow never built them. The harness was right: a probe with no process to
+attack proves nothing.
+
+**The falsification suite disagreed with CI.** The `secret-in-ipc-response`
+injection rebound `id` and stopped using it. That is an error under CI's
+`-D warnings` and nothing at all locally, so locally it built and the suite
+reported 3/3, while on the runner the injection never compiled, the harness
+reported INVALID for a missing binary, and the suite concluded it had missed a
+real leak. The fix is not only the injection: `_build` now sets
+`RUSTFLAGS=-D warnings` on every build, so a local green cannot disagree with
+CI. A local run that passes while CI fails is the most misleading signal
+available, because it looks like proof.
+
+Both times the harness failed loudly rather than going green, which is the
+behaviour the rewrite exists to produce.
+
+**Environment difference worth recording.** On the GitHub runner the ptrace
+probe reports `READ-MEM-DENIED`; on the development machine it reports
+`READ-MEM-SUCCEEDED-CANARY-FOUND`. Same code, different kernel hardening. The
+harness reports the verdict verbatim and the self-check accepts either, which is
+why a decidable verdict is the requirement and a particular one is not.
+
 ## Release readiness
 
-The `origin` remote is unverified: `gh repo view` reports the repository does
-not exist. No push has been attempted. Release is blocked on that decision and
-on the cycle's release phase.
+The repository is published at `https://github.com/Rubentxu/agent-secretless`
+(public, MIT). CI runs the same gates: 3/3 jobs green at `9fb60bc`, harness
+11/11 and falsification 3/3 on a clean runner.
