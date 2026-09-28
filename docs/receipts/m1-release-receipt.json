@@ -1,0 +1,57 @@
+{
+  "schema": "sddk.release.release-receipt.v1",
+  "cycle_id": "p-20a1ee316faf2ba3/m1-vault",
+  "work_item": "9cfc9605-a12e-4223-bbdf-5d33fbcb9588",
+  "tag": "v0.2.0",
+  "release_type": "minor",
+  "version_derivation": {
+    "rule": "SEMVER derived from the completed feature history and previous tag.",
+    "basis": "M1 adds the first public encrypted vault and secure ingestion capability after v0.1.0 foundations. This is a MINOR release, not a patch or breaking major.",
+    "previous": "0.1.0",
+    "result": "0.2.0"
+  },
+  "milestone_exit_criteria": {
+    "source": "agent-secretless-vault-spec/docs/15-ROADMAP.md, M1 Exit UAT",
+    "uat_018_audit_leak": {
+      "status": "verified",
+      "evidence": ["m1_exit_uat::uat_018_audit_leak", "harness::uat-018-audit-leak", "4/4 falsification including vault-tool output mutation"]
+    },
+    "uat_025_vault_theft": {
+      "status": "verified",
+      "evidence": ["m1_exit_uat::uat_025_vault_theft", "harness::uat-025-vault-theft", "wrong passphrase and tamper rejection"]
+    },
+    "uat_026_backup_restore": {
+      "status": "verified",
+      "evidence": ["m1_exit_uat::uat_026_backup_restore", "harness::uat-026-backup-restore", "clean-path restore with policy references preserved"]
+    }
+  },
+  "gate_receipts": [
+    "gate-exploration-sufficient-ba173ae39e2b2d22-1",
+    "gate-requirements-testable-6e33e52897c43c48-1",
+    "gate-implementation-complete-a0103f69b74743b4-1",
+    "gate-tests-pass-e57827b05d1a01ab-1",
+    "gate-policy-compliant-e57827b05d1a01ab-1",
+    "gate-debt-severity-assigned-e57827b05d1a01ab-1",
+    "gate-debt-priority-assigned-e57827b05d1a01ab-1"
+  ],
+  "debt_carried": {
+    "hard_defects": 5,
+    "composition": "3 P0 gate-map defects, 2 P1 ungated UATs",
+    "handling": "Registered as triaged SDDK backlog items. The signed spec pack remains byte-identical and tools/check-gates.py continues to report them.",
+    "orphaned_uat": [27, 30]
+  },
+  "known_limitations_shipped": [
+    "memfd_secret unavailable on the current kernel; runtime fallback is mlock where permitted, non-dumpable process and zeroize.",
+    "Same-UID process inspection remains M7 scope.",
+    "Connector-specific audit sink coverage is deferred to M2 because M1 has no connector."
+  ],
+  "external_reproduction": {
+    "ci_run_id": 36430984849,
+    "ci_conclusion": "success",
+    "jobs": ["rust toolchain gates", "adversarial harness", "signed spec pack integrity"],
+    "workspace_tests": "94 passed, 0 failed",
+    "harness": "14 passed, 0 leaked, 0 invalid",
+    "falsification": "4/4 injected leaks detected",
+    "tag_remote": "v0.2.0 -> 1623b2e6b2eb60095928e0fa18acc62d99f4dcdb"
+  }
+}

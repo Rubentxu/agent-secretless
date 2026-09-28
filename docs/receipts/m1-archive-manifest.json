@@ -1,0 +1,63 @@
+{
+  "schema": "sddk.archive.archive-manifest.v1",
+  "cycle_id": "p-20a1ee316faf2ba3/m1-vault",
+  "work_item": "9cfc9605-a12e-4223-bbdf-5d33fbcb9588",
+  "milestone": "M1 Local vault + secure ingestion",
+  "status": "archived",
+  "released_tag": "v0.2.0",
+  "released_sha": "1623b2e6b2eb60095928e0fa18acc62d99f4dcdb",
+  "head_at_archive": "1623b2e6b2eb60095928e0fa18acc62d99f4dcdb",
+  "remote_main": "1623b2e6b2eb60095928e0fa18acc62d99f4dcdb",
+  "remote_tag_object": "96f175371a900570adb6a535744f9cc7a97f8e94",
+  "ci_run_id": 36430984849,
+  "artifacts": [
+    "docs/receipts/m1-merge-receipt.json",
+    "docs/receipts/m1-release-receipt.json",
+    "docs/receipts/m1-archive-manifest.json",
+    "cycle-artifacts/m1-vault/exploration-report.md",
+    "cycle-artifacts/m1-vault/specification.md",
+    "cycle-artifacts/m1-vault/implementation-receipt.md",
+    "cycle-artifacts/m1-vault/verification-report.md"
+  ],
+  "gate_receipts": [
+    "gate-exploration-sufficient-ba173ae39e2b2d22-1",
+    "gate-requirements-testable-6e33e52897c43c48-1",
+    "gate-implementation-complete-a0103f69b74743b4-1",
+    "gate-tests-pass-e57827b05d1a01ab-1",
+    "gate-policy-compliant-e57827b05d1a01ab-1",
+    "gate-debt-severity-assigned-e57827b05d1a01ab-1",
+    "gate-debt-priority-assigned-e57827b05d1a01ab-1",
+    "gate-no-pending-effects-facc8a93f2a9d4ad-1",
+    "gate-release-uat-approved-facc8a93f2a9d4ad-1"
+  ],
+  "archive_gates": {
+    "ledger_valid": {
+      "event_count": 63,
+      "last_hash": "sha256:7fa9481f573ee457fa1658deb32e4cae091b368e033e0ca535bc66a98500e7b8",
+      "chain_valid": true
+    },
+    "vault_index_current": {
+      "nodes": 1,
+      "backlinks": 0,
+      "errors": 0,
+      "warnings": 0,
+      "inserted": 0,
+      "updated": 0,
+      "deleted": 0,
+      "index_current": true
+    }
+  },
+  "carried_debt": {
+    "hard_defects": 5,
+    "p0": 3,
+    "p1": 2,
+    "orphaned_uat": [27, 30],
+    "handling": "Retained in SDDK backlog. Signed normative pack remains unchanged."
+  },
+  "known_negative_knowledge": [
+    "memfd_secret is unavailable on the current kernel; the runtime fallback is observed and documented.",
+    "Same-UID process inspection is not solved by no-echo ingestion or memfd probing; it remains M7 scope.",
+    "M1 has no connector-specific audit sink; UAT-018 is bounded to vault persistence and tool output until M2."
+  ],
+  "next_milestone": "M2 Agent sessions + SSH signer"
+}

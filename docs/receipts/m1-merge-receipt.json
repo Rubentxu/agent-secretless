@@ -1,0 +1,41 @@
+{
+  "schema": "sddk.release.merge-receipt.v1",
+  "cycle_id": "p-20a1ee316faf2ba3/m1-vault",
+  "route": "local",
+  "branch": "main",
+  "base": "main",
+  "tag": "v0.2.0",
+  "release_type": "minor",
+  "observed": {
+    "head": "1623b2e6b2eb60095928e0fa18acc62d99f4dcdb",
+    "origin_main": "1623b2e6b2eb60095928e0fa18acc62d99f4dcdb",
+    "tag_commit": "1623b2e6b2eb60095928e0fa18acc62d99f4dcdb",
+    "tag_object": "96f175371a900570adb6a535744f9cc7a97f8e94",
+    "head_equals_origin_main": true,
+    "head_equals_tag": true
+  },
+  "applied": [
+    {
+      "capability": "git.push",
+      "capability_ref": "cap-git-push-04247a3cfb97"
+    },
+    {
+      "capability": "git.tag",
+      "capability_ref": "cap-git-tag-fe4ea3f50681"
+    }
+  ],
+  "verification": {
+    "argv": ["git", "ls-remote", "origin", "refs/tags/v0.2.0*"],
+    "exit_code": 0,
+    "remote_tag_present": true,
+    "ci": {
+      "run_id": 36430984849,
+      "conclusion": "success",
+      "jobs": ["rust toolchain gates", "adversarial harness", "signed spec pack integrity"]
+    },
+    "harness": "14 passed, 0 leaked, 0 invalid",
+    "falsifiability": "4/4 injected leaks detected through four distinct probes",
+    "m1_uat": "UAT-018, UAT-025, UAT-026 passed"
+  },
+  "note": "M1 ships the first encrypted local vault and secure ingestion boundary. Same-UID process inspection remains M7 scope; memfd_secret was unavailable on the current kernel and the documented fallback was observed."
+}
