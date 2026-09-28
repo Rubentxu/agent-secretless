@@ -31,6 +31,9 @@ pub enum TransportError {
 
     #[error("request to {audience} failed: {reason}")]
     RequestFailed { audience: String, reason: String },
+
+    #[error("the response from {audience} is larger than this transport will buffer")]
+    ResponseTooLarge { audience: String },
 }
 
 /// Bridges the HTTP stack's error into this crate's vocabulary.
@@ -183,6 +186,22 @@ pub struct PinnedClient {
     inner: reqwest::blocking::Client,
 }
 
+/// What one redirect-aware attempt concluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Redirect<T> {
+    /// The attempt produced its final value.
+    Done(T),
+    /// The provider asked for another hop, to this URL.
+    Hop(Url),
+}
+
+impl<T> Redirect<T> {
+    /// Whether this attempt is finished.
+    pub fn is_done(&self) -> bool {
+        matches!(self, Redirect::Done(_))
+    }
+}
+
 /// How many redirect hops D7 permits before denying.
 pub const MAX_REDIRECTS: usize = 3;
 
@@ -292,40 +311,48 @@ impl PinnedClient {
         }
     }
 
-    /// Follows at most [`MAX_REDIRECTS`] same-origin hops.
+    /// Follows at most [`MAX_REDIRECTS`] same-origin hops and returns the value
+    /// the final attempt produced.
     ///
     /// This is deliberately not a method on the client: redirect acceptance is
     /// a pure function of the URLs, so it can be tested with no client, no
     /// network and no credential in scope.
     ///
-    /// The caller supplies `send_attempt`, which receives the request to make.
-    /// A hop is only followed after the origin check passes, and this layer
-    /// never adds a header: the caller re-injects the credential per hop from
-    /// the secret port, so it is never carried across a hop by this code.
-    pub fn follow_same_origin<F>(
+    /// The caller supplies `send_attempt`, which receives the URL to try and
+    /// returns either the final value or the next hop to follow. A hop is only
+    /// followed after the origin check passes, and this layer never adds a
+    /// header: the caller re-injects the credential per hop from the secret
+    /// port, so it is never carried across a hop by this code.
+    ///
+    /// `T` is the attempt's payload, so the final value leaves here without
+    /// being stashed somewhere a redirect could overwrite it.
+    pub fn follow_same_origin<T, E, F>(
         mut url: Url,
         origin: &Url,
         mut send_attempt: F,
-    ) -> Result<Url, TransportError>
+    ) -> Result<T, E>
     where
-        F: FnMut(&Url) -> Result<Option<Url>, TransportError>,
+        E: From<TransportError>,
+        F: FnMut(&Url) -> Result<Redirect<T>, E>,
     {
         let mut hops = 0usize;
         loop {
             match send_attempt(&url)? {
-                None => return Ok(url),
-                Some(next) => {
+                Redirect::Done(value) => return Ok(value),
+                Redirect::Hop(next) => {
                     hops += 1;
                     if hops > MAX_REDIRECTS {
                         return Err(TransportError::TooManyRedirects {
                             limit: MAX_REDIRECTS,
-                        });
+                        }
+                        .into());
                     }
                     if !Self::is_same_origin(origin, &next) {
                         return Err(TransportError::CrossOriginRedirect {
                             origin: origin.origin().ascii_serialization(),
                             target: next.origin().ascii_serialization(),
-                        });
+                        }
+                        .into());
                     }
                     url = next;
                 }
@@ -418,10 +445,11 @@ mod tests {
         let origin = url("https://api.github.com/repos/a/b/issues/1");
         let evil = url("https://evil.example/steal");
         let mut attempts = 0;
-        let result = PinnedClient::follow_same_origin(origin.clone(), &origin, |_| {
-            attempts += 1;
-            Ok(Some(evil.clone()))
-        });
+        let result: Result<u16, TransportError> =
+            PinnedClient::follow_same_origin(origin.clone(), &origin, |_| {
+                attempts += 1;
+                Ok(Redirect::Hop(evil.clone()))
+            });
         assert!(result.is_err(), "cross-origin hop must be denied");
         assert_eq!(attempts, 1, "must not retry a denied hop");
     }
@@ -432,10 +460,11 @@ mod tests {
         let origin = url("https://api.github.com/a");
         let next = url("https://api.github.com/b");
         let mut attempts = 0;
-        let result = PinnedClient::follow_same_origin(origin.clone(), &origin, |_| {
-            attempts += 1;
-            Ok(Some(next.clone()))
-        });
+        let result: Result<u16, TransportError> =
+            PinnedClient::follow_same_origin(origin.clone(), &origin, |_| {
+                attempts += 1;
+                Ok(Redirect::Hop(next.clone()))
+            });
         assert!(matches!(
             result,
             Err(TransportError::TooManyRedirects { limit: 3 })
@@ -608,13 +637,14 @@ mod wire_tests {
             .expect("a loopback-pinned audience builds a client")
     }
 
-    /// Reads the `Location` of a redirect response, or reports no redirect.
+    /// Reads the `Location` of a redirect response, or reports the final
+    /// answer's own status.
     fn next_hop(
         response: &reqwest::blocking::Response,
         base: &Url,
-    ) -> Result<Option<Url>, TransportError> {
+    ) -> Result<Redirect<u16>, TransportError> {
         if !response.status().is_redirection() {
-            return Ok(None);
+            return Ok(Redirect::Done(response.status().as_u16()));
         }
         let location = response
             .headers()
@@ -625,7 +655,7 @@ mod wire_tests {
             .to_str()
             .map_err(|error| TransportError::InvalidUrl(error.to_string()))?;
         base.join(location)
-            .map(Some)
+            .map(Redirect::Hop)
             .map_err(|error| TransportError::InvalidUrl(error.to_string()))
     }
 

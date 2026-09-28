@@ -39,6 +39,22 @@ macro_rules! opaque_id {
             pub const fn as_uuid(&self) -> &Uuid {
                 &self.0
             }
+
+            /// Returns the wire form, as owned text.
+            ///
+            /// Allocated per call, which is the honest shape here: `uuid`'s
+            /// `Hyphenated` is a *formatter* that renders on demand and keeps no
+            /// buffer, so there is no slice to borrow and no way to get one
+            /// without inventing one. An earlier attempt to force a borrow with
+            /// `String::leak` would have traded an allocation for a leak, and
+            /// a leak is the worse of the two by a wide margin.
+            ///
+            /// Returns `String` rather than `&str` precisely so the compiler
+            /// keeps saying so at every call site instead of letting a `&'static
+            /// str` look like a free borrow.
+            pub fn to_wire(&self) -> String {
+                self.0.to_string()
+            }
         }
 
         impl Default for $name {

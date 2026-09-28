@@ -23,8 +23,25 @@
 //! regression test enforces it, so a new config reader fails the build instead
 //! of waiting for a review.
 
-#[cfg(test)]
-mod fake_origin;
+/// A local TLS origin for tests.
+///
+/// Compiled into the library rather than only into its own test module, because
+/// the interesting assertions live one crate over: the broker's tests need to
+/// drive a real socket through the real connector and still not touch the
+/// network. Gated on `cfg(test)` *or* the `test-support` feature so this never
+/// ships in a production binary.
+#[cfg(any(test, feature = "test-support"))]
+pub mod fake_origin;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use fake_origin::Certificate;
+pub mod github;
 pub mod transport;
 
-pub use transport::{resolve_and_pin, AddressPolicy, PinnedClient, TransportError};
+pub use github::{
+    validate_repo, CreatedIssue, CreatedRelease, GithubClient, GithubError, IssueSummary,
+    RepoError, RepoRef, SecretError, SecretPort, SecretSink,
+};
+pub use transport::{
+    resolve_and_pin, AddressPolicy, PinnedClient, Redirect, ResolvedAudience, TransportError,
+};

@@ -120,15 +120,19 @@ dependencies = [
 name = "asv-broker"
 version = "0.4.0"
 dependencies = [
+ "asv-connector-http",
  "asv-domain",
  "asv-identity",
  "asv-ipc-protocol",
  "asv-policy",
+ "asv-vault",
  "libc",
  "nix",
  "rand 0.8.8",
+ "secrecy",
  "serde_json",
  "subtle",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -158,8 +162,10 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
+ "serde_json",
  "thiserror",
  "url",
+ "zeroize",
 ]
 
 [[package]]

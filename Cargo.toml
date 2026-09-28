@@ -30,6 +30,7 @@ asv-identity = { path = "crates/identity" }
 asv-ssh-agent = { path = "crates/ssh-agent" }
 asv-policy = { path = "crates/policy" }
 asv-connector-http = { path = "crates/connector-http" }
+asv-vault = { path = "crates/vault" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -58,10 +59,14 @@ cedar-policy = "=4.7.1"
 # M4 HTTP transport (design v2 D1). reqwest with rustls, default features off:
 # redirect handling and per-host address pinning have to be first-class, not
 # something we re-derive on top of a lower-level stack. `url` parses the
-# canonical authority form the policy already validated.
+# canonical authority form the policy already validated. `json` is what lets
+# `RequestBuilder::json` build a semantic GitHub body; without it every
+# request would hand-serialise into a string, which is how a title containing
+# a quote turns into request structure.
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "blocking",
+    "json",
 ] }
 url = "2"
 

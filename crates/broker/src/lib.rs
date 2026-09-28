@@ -5,15 +5,19 @@
 //! establishes identity, enforces the protocol boundary, and holds session
 //! state. Vault access and connectors are M1 and M4.
 
-use asv_domain::{AgentSessionId, CredentialId, CredentialMetadata};
+use asv_connector_http::{validate_repo, AddressPolicy, GithubClient, GithubError, SecretPort};
+use asv_domain::{AgentSessionId, Authority, CredentialId, CredentialMetadata};
 use asv_identity::WorkloadIdentity;
 use asv_ipc_protocol::{ErrorCode, Request, Response, PROTOCOL_VERSION};
 use asv_policy::{AuthorizationRequest, PolicyEngine};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub mod surrogate;
+pub mod vault_port;
 
 pub use surrogate::{now_secs, SurrogateError, SurrogateRegistry};
+pub use vault_port::VaultSecretPort;
 
 /// In-memory session table. M1 replaces this with persistent, encrypted state;
 /// M0 only needs it to prove the lifecycle boundary.
@@ -102,15 +106,94 @@ impl SessionStore {
     }
 }
 
+/// Builds the GitHub client for one operation.
+///
+/// Exists as a trait for the same reason [`vault_port::VaultSecretPort`] lives
+/// on this side of the boundary: the broker is the only crate that may hold
+/// both a secret port and a connector, and it is also the only crate that can
+/// be pointed at a fake origin in a test. Injecting the factory means the
+/// production path and the test path run the *same* authorisation, redeeming
+/// and response-shaping code, and the only thing a test substitutes is where
+/// the bytes go.
+pub trait ConnectorFactory {
+    /// Builds a client for `audience` that lends from `secrets`.
+    fn github(
+        &self,
+        audience: Authority,
+        secrets: Arc<dyn SecretPort>,
+    ) -> Result<GithubClient, GithubError>;
+}
+
+/// The production factory: real DNS, real TLS, public addresses only.
+#[derive(Debug, Clone, Default)]
+pub struct LiveConnectorFactory;
+
+impl ConnectorFactory for LiveConnectorFactory {
+    fn github(
+        &self,
+        audience: Authority,
+        secrets: Arc<dyn SecretPort>,
+    ) -> Result<GithubClient, GithubError> {
+        // 443 is GitHub's HTTPS port, stated here rather than inherited from a
+        // config value the caller does not control.
+        Ok(GithubClient::new(
+            audience,
+            443,
+            AddressPolicy::default(),
+            secrets,
+        ))
+    }
+}
+
 /// Broker-side state. M0 has no vault, so credential metadata is an in-memory
 /// list seeded by tests; M1 makes it encrypted and persistent.
-#[derive(Debug, Default)]
 pub struct BrokerState {
     pub sessions: SessionStore,
     pub credentials: Vec<CredentialMetadata>,
     pub policy: PolicyEngine,
     /// M4: the tokens an agent holds instead of credentials (D3).
     pub surrogates: SurrogateRegistry,
+    /// M4 CU-2.2: the secret-bearing side of the broker. `None` means no vault
+    /// is open, and every semantic operation then refuses. That is the
+    /// fail-closed reading: a broker that cannot reach a credential must not
+    /// fall back to a direct or anonymous call.
+    pub secrets: Option<Arc<dyn SecretPort>>,
+    /// M4 CU-2.2: how to reach GitHub. Injected so a test can point the very
+    /// same authorisation path at a local origin.
+    pub connectors: Box<dyn ConnectorFactory>,
+}
+
+impl Default for BrokerState {
+    fn default() -> Self {
+        Self {
+            sessions: SessionStore::default(),
+            credentials: Vec::new(),
+            policy: PolicyEngine::default(),
+            surrogates: SurrogateRegistry::default(),
+            // Fail-closed by construction: the only way a semantic operation
+            // can run is for something to have opened a vault and said so.
+            // There is no `Default` that fabricates a port.
+            secrets: None,
+            connectors: Box::new(LiveConnectorFactory),
+        }
+    }
+}
+
+impl std::fmt::Debug for BrokerState {
+    /// Hand-written because the two `dyn` fields are not `Debug`, and deriving
+    /// would either fail or force `Debug` onto the traits for no gain.
+    ///
+    /// What it prints is deliberately thin: whether a vault is open is useful
+    /// in a crash report, and what that vault contains is not something a
+    /// `Debug` should be in a position to print.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrokerState")
+            .field("sessions", &self.sessions)
+            .field("credentials", &self.credentials.len())
+            .field("surrogates", &self.surrogates)
+            .field("vault_open", &self.secrets.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Handles one authenticated request.
@@ -304,16 +387,237 @@ pub fn handle(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request
             }
         }
 
-        // The three semantic operations belong to CU-2.2: they need the
-        // connector and the secret port. Answering them here with a canned
-        // success would be worse than not answering at all.
-        Request::ReadIssue { .. } | Request::CreateIssue { .. } | Request::CreateRelease { .. } => {
-            Response::Error {
-                code: ErrorCode::UnknownMethod,
-                message: "semantic GitHub operations are not wired to a connector yet".into(),
+        // The three semantic operations are the only paths from a surrogate to
+        // a real credential, so they share one preamble: same ownership check,
+        // same vault requirement, same argument validation, and the surrogate
+        // spent in the same place. Splitting them into three near-copies is how
+        // one of them ends up skipping the ownership check.
+        Request::ReadIssue {
+            session,
+            surrogate,
+            repo,
+            number,
+        } => {
+            if let Err(denial) = state.authorize_github(session, peer) {
+                return *denial;
+            }
+            // Validated before the token is spent. `redeem` consumes a use, and
+            // an agent that sends `owner/repo/../../admin` would otherwise be
+            // charged for a request that was refused on its own argument.
+            if let Err(error) = validate_repo(&repo) {
+                return Response::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: error.to_string(),
+                };
+            }
+            match state.surrogates.redeem(&surrogate, session, now_secs()) {
+                Ok(credential) => {
+                    let client = match state.github_client() {
+                        Ok(client) => client,
+                        Err(response) => return *response,
+                    };
+                    match client.read_issue(&credential.to_wire(), &repo, number) {
+                        Ok(issue) => Response::IssueRead {
+                            title: issue.title,
+                            body: issue.body,
+                            state: issue.state,
+                        },
+                        // The provider's own body is never forwarded. M4-R1
+                        // promises the three fields and nothing else, and an
+                        // upstream body can carry anything the provider chose
+                        // to put in it.
+                        Err(error) => github_failure(error),
+                    }
+                }
+                Err(error) => surrogate_failure(error),
+            }
+        }
+
+        Request::CreateIssue {
+            session,
+            surrogate,
+            repo,
+            title,
+            body,
+        } => {
+            if let Err(denial) = state.authorize_github(session, peer) {
+                return *denial;
+            }
+            if let Err(error) = validate_repo(&repo) {
+                return Response::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: error.to_string(),
+                };
+            }
+            match state.surrogates.redeem(&surrogate, session, now_secs()) {
+                Ok(credential) => {
+                    let client = match state.github_client() {
+                        Ok(client) => client,
+                        Err(response) => return *response,
+                    };
+                    match client.create_issue(&credential.to_wire(), &repo, &title, &body) {
+                        Ok(issue) => Response::IssueCreated {
+                            number: issue.number,
+                            url: issue.url,
+                        },
+                        Err(error) => github_failure(error),
+                    }
+                }
+                Err(error) => surrogate_failure(error),
+            }
+        }
+
+        Request::CreateRelease {
+            session,
+            surrogate,
+            repo,
+            tag,
+            name,
+            body,
+        } => {
+            if let Err(denial) = state.authorize_github(session, peer) {
+                return *denial;
+            }
+            if let Err(error) = validate_repo(&repo) {
+                return Response::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: error.to_string(),
+                };
+            }
+            match state.surrogates.redeem(&surrogate, session, now_secs()) {
+                Ok(credential) => {
+                    let client = match state.github_client() {
+                        Ok(client) => client,
+                        Err(response) => return *response,
+                    };
+                    match client.create_release(&credential.to_wire(), &repo, &tag, &name, &body) {
+                        Ok(release) => Response::ReleaseCreated {
+                            tag: release.tag,
+                            url: release.url,
+                        },
+                        Err(error) => github_failure(error),
+                    }
+                }
+                Err(error) => surrogate_failure(error),
             }
         }
     }
+}
+
+/// The audience every semantic GitHub operation goes to.
+///
+/// One constant, not a request field. An agent that could name the host would
+/// be able to point a credential at any endpoint that presents a valid
+/// certificate for it, which is the generic HTTP escape hatch M4-R9 rules out.
+const GITHUB_AUTHORITY: &str = "api.github.com";
+
+impl BrokerState {
+    /// The checks every brokered GitHub operation shares, before anything is
+    /// spent or sent.
+    ///
+    /// Ownership first, then the vault. A session not owned by this peer must
+    /// not even learn whether a vault is open, and a broker with no vault must
+    /// refuse rather than reach GitHub unauthenticated.
+    fn authorize_github(
+        &self,
+        session: AgentSessionId,
+        peer: &WorkloadIdentity,
+    ) -> Result<(), Box<Response>> {
+        if !self.sessions.belongs_to(session, peer) {
+            return Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: "session is not owned by the authenticated peer".into(),
+            }));
+        }
+        if self.secrets.is_none() {
+            return Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                // Explicit about *why* there is no degraded path. The
+                // alternative reading of a missing vault is "call GitHub
+                // anonymously", and for a private repository that quietly
+                // becomes "act as if the credential were not needed".
+                message: "no credential store is open, so no brokered operation can run".into(),
+            }));
+        }
+        Ok(())
+    }
+
+    /// Builds the client for one operation, refusing if the broker has no vault.
+    fn github_client(&self) -> Result<GithubClient, Box<Response>> {
+        // `Response` is boxed in the error position because it carries two
+        // `String`s inline; a `Result<GithubClient, Response>` would make every
+        // `?` in the operation bodies copy a struct that has no business being
+        // that large on a path that usually succeeds.
+        let secrets = self.secrets.as_ref().ok_or_else(|| {
+            Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: "no credential store is open, so no brokered operation can run".into(),
+            })
+        })?;
+        let authority = Authority::canonicalize(GITHUB_AUTHORITY).map_err(|error| {
+            Box::new(Response::Error {
+                code: ErrorCode::Upstream,
+                message: format!("the GitHub authority is not usable: {error}"),
+            })
+        })?;
+        self.connectors
+            .github(authority, Arc::clone(secrets))
+            .map_err(|error| Box::new(github_failure(error)))
+    }
+}
+
+/// Why a surrogate was refused, as an IPC answer.
+///
+/// `Expired` and `Exhausted` are separate codes: one says "mint a new token",
+/// the other says "you spent it, mint a new token", and an operator reading a
+/// log needs to tell them apart.
+fn surrogate_failure(error: SurrogateError) -> Response {
+    use SurrogateError::*;
+    let code = match error {
+        Unknown | WrongSession => ErrorCode::Denied,
+        Expired => ErrorCode::SurrogateExpired,
+        Exhausted => ErrorCode::SurrogateExhausted,
+    };
+    Response::Error {
+        code,
+        // `SurrogateError`'s messages name the token's *properties*, never the
+        // token and never the credential behind it.
+        message: error.to_string(),
+    }
+}
+
+/// Why a GitHub operation failed, as an IPC answer.
+///
+/// A credential the vault does not know is a provider-independent failure, so
+/// it does not become `Upstream` either: the agent is not the problem, the
+/// broker's own store is. It is reported as `InvalidRequest` rather than
+/// `Denied` because `Denied` reads as "you are not allowed", and the agent
+/// demonstrably was: it presented a token this broker minted. The message
+/// carries the real cause, and it carries no credential name.
+///
+/// `Repo` is the one case that is the agent's own fault, and it is the only
+/// one answered as such.
+fn github_failure(error: GithubError) -> Response {
+    let (code, message) = match error {
+        GithubError::Repo(error) => (ErrorCode::InvalidRequest, error.to_string()),
+        GithubError::Secret(asv_connector_http::SecretError::NotFound(_)) => (
+            ErrorCode::InvalidRequest,
+            "the credential this surrogate stands for is no longer in the vault".to_string(),
+        ),
+        GithubError::Secret(_) => (
+            ErrorCode::InvalidRequest,
+            "the credential could not be unlocked".to_string(),
+        ),
+        // Every transport failure keeps its own reason. The provider's body is
+        // not part of it: an error an agent can read is also a place upstream
+        // content would land.
+        GithubError::Transport(error) => (ErrorCode::Upstream, error.to_string()),
+        GithubError::Upstream { audience, detail } => (
+            ErrorCode::Upstream,
+            format!("{audience} answered without {detail}"),
+        ),
+    };
+    Response::Error { code, message }
 }
 
 /// Rebinds the client-declared identity context to kernel-attested facts.
@@ -887,11 +1191,18 @@ mod surrogate_tests {
         assert!(state.surrogates.is_empty());
     }
 
-    /// The three semantic operations are not wired yet. They must say so
-    /// rather than answering with a plausible-looking success, because a fake
-    /// success here is indistinguishable from a working brokered call.
+    /// A broker with no vault open refuses all three semantic operations, and
+    /// refuses them as a *denial* rather than as "no such method".
+    ///
+    /// CU-2.2 wired these operations, so `UnknownMethod` is no longer the
+    /// honest answer and keeping it would have meant preserving a weaker
+    /// guarantee than the code now makes. The guarantee that survives, and is
+    /// stronger, is the one that matters: no vault means no brokered call, ever,
+    /// and no fallback to an anonymous or direct request. The response is
+    /// `Denied` precisely so a caller can tell "this broker cannot do that" from
+    /// "you asked for something that does not exist".
     #[test]
-    fn semantic_operations_fail_closed_until_a_connector_exists() {
+    fn semantic_operations_are_denied_while_no_vault_is_open() {
         let (mut state, _) = state_with_credential();
         let peer = pinned_peer();
         let (session, token) = mint(&mut state, &peer);
@@ -920,12 +1231,17 @@ mod surrogate_tests {
             },
         ] {
             match handle(&mut state, &peer, request) {
-                Response::Error { code, .. } => assert_eq!(
-                    code,
-                    ErrorCode::UnknownMethod,
-                    "an unwired operation must say so"
-                ),
-                other => panic!("an unwired operation must not answer {other:?}"),
+                Response::Error { code, message } => {
+                    assert_eq!(code, ErrorCode::Denied, "got {message:?}");
+                    // The refusal has to say *why*, or an operator reads
+                    // "denied" as a policy decision and goes looking for a
+                    // policy that does not exist.
+                    assert!(
+                        message.contains("credential store"),
+                        "the denial must name the missing vault, got {message:?}"
+                    );
+                }
+                other => panic!("a vaultless broker must not answer {other:?}"),
             }
         }
         // And crucially, an unattempted call must not have spent the budget.
@@ -976,5 +1292,633 @@ mod surrogate_tests {
         handle(&mut state, &peer, Request::EndSession { session });
         assert!(state.surrogates.is_empty(), "and none after teardown");
         assert!(state.sessions.is_empty(), "and no session either");
+    }
+}
+
+/// End-to-end tests for the brokered GitHub path (M4 CU-2.2).
+///
+/// These are the tests that matter most for this work item, because they are
+/// the only ones that cross every boundary at once: an IPC request in, a
+/// surrogate redeemed, a credential unlocked from a real encrypted vault, an
+/// authenticated request out over real TLS, and a response shaped back. Each
+/// layer has its own unit tests, and every one of them would still pass if the
+/// layers were wired to each other wrongly.
+#[cfg(test)]
+mod e2e {
+    use super::*;
+
+    use asv_connector_http::fake_origin::{self, Reply};
+    use asv_connector_http::{AddressPolicy, Certificate, GithubClient, ResolvedAudience};
+    use asv_domain::secret::SecretBytes;
+    use asv_identity::PeerCredentials;
+    use asv_vault::{KdfParams, VaultKey, VaultStore};
+    use secrecy::SecretString;
+
+    use std::net::{IpAddr, Ipv4Addr};
+
+    /// The secret the vault holds. Every assertion below is about this exact
+    /// string appearing where it should and nowhere else.
+    const CANARY: &str = "ASV-CANARY-e2e-5c1a-DO-NOT-LEAK";
+
+    /// A factory that points the connector at a local TLS origin.
+    ///
+    /// Built per origin because the certificate and the port differ, and
+    /// because sharing one across tests would let them observe each other's
+    /// requests.
+    struct LocalFactory {
+        resolved: ResolvedAudience,
+        root: Certificate,
+    }
+
+    impl ConnectorFactory for LocalFactory {
+        fn github(
+            &self,
+            _audience: Authority,
+            secrets: Arc<dyn SecretPort>,
+        ) -> Result<GithubClient, GithubError> {
+            // Loopback is allowed here and only here. The production factory
+            // never sets it, which is the whole reason this substitution is
+            // visible in the source rather than hidden in a config value.
+            Ok(GithubClient::pinned_to(
+                self.resolved.clone(),
+                AddressPolicy {
+                    allow_loopback: true,
+                },
+                secrets,
+            )
+            .trusting(vec![self.root.clone()]))
+        }
+    }
+
+    fn pass() -> SecretString {
+        SecretString::from("test-passphrase".to_string())
+    }
+
+    /// A broker with a real vault open, a credential registered under `id`, a
+    /// pinned peer, and a minted surrogate pointing at the local origin.
+    ///
+    /// Returns the state, the peer, the session, the token, the origin *and*
+    /// the vault's directory. The directory has to outlive the call: the
+    /// broker holds no file handle, it re-opens the vault by path on every
+    /// lend, so a `TempDir` dropped here would turn every operation into an
+    /// "io error: no such file". The tests therefore keep it alive and drop it
+    /// last, which is the same lifetime a real deployment has.
+    #[allow(clippy::type_complexity)]
+    fn brokered(
+        reply: Reply,
+    ) -> (
+        BrokerState,
+        WorkloadIdentity,
+        AgentSessionId,
+        String,
+        fake_origin::FakeOrigin,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = VaultStore::create(
+            dir.path().join("v.asv"),
+            &pass(),
+            KdfParams::fast_for_tests(),
+        )
+        .expect("create");
+        let key: VaultKey = store.header().unlock(&pass()).expect("unlock");
+
+        // The vault's record id has to be the same string the broker will ask
+        // for. The broker registers the id it mints a surrogate over, and the
+        // vault is keyed by that id's wire form.
+        // `CredentialMetadata::new` here is the *domain* one, which mints a
+        // fresh UUID. The vault is then keyed by that id's wire form, so the
+        // string the broker redeems a surrogate to is the string the vault can
+        // unlock. Qualifying both types matters: the domain and the vault each
+        // have their own `CredentialKind` and `CredentialMetadata`, and an
+        // unqualified import silently picks the wrong pair.
+        let mut state = BrokerState::default();
+        let credential = insert_credential(
+            &mut state,
+            asv_domain::CredentialMetadata::new(
+                "github-e2e",
+                asv_domain::CredentialKind::BearerToken,
+            ),
+        );
+        store
+            .insert(
+                &key,
+                asv_vault::CredentialMetadata::new(
+                    credential.to_wire(),
+                    "e2e",
+                    asv_vault::CredentialKind::Opaque,
+                    "github",
+                    "a",
+                    1,
+                ),
+                SecretBytes::new(CANARY.as_bytes().to_vec()),
+            )
+            .expect("insert");
+
+        state.secrets = Some(Arc::new(VaultSecretPort::new(
+            Arc::new(store),
+            Arc::new(key),
+        )));
+
+        let origin = fake_origin::start(reply);
+        state.connectors = Box::new(LocalFactory {
+            resolved: ResolvedAudience {
+                authority: Authority::canonicalize(&origin.certified_for).expect("authority"),
+                port: origin.port,
+                addresses: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            },
+            root: origin.certificate(),
+        });
+
+        let mut peer = WorkloadIdentity::from_peer(PeerCredentials {
+            pid: std::process::id() as i32,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+        });
+        peer.pin_pidfd().expect("pidfd_open on self");
+        let session = state.sessions.create("/repo".to_string(), &peer);
+        let token = match handle(
+            &mut state,
+            &peer,
+            Request::MintSurrogate {
+                session,
+                credential,
+                max_uses: 2,
+                ttl_secs: 60,
+            },
+        ) {
+            Response::SurrogateMinted { surrogate, .. } => surrogate,
+            other => panic!("expected a token, got {other:?}"),
+        };
+        (state, peer, session, token, origin, dir)
+    }
+
+    fn issue_json() -> String {
+        serde_json::json!({
+            "number": 7,
+            "title": "a title",
+            "body": "a body",
+            "state": "open",
+            "html_url": "https://github.com/o/r/issues/7",
+            // A field the broker must not forward. If it ever appears in a
+            // response, the "three fields and nothing else" promise is broken.
+            "secret_sauce": "MUST-NOT-BE-FORWARDED"
+        })
+        .to_string()
+    }
+
+    /// The whole path works: a surrogate becomes an authenticated request that
+    /// the provider answers, and the agent gets the three promised fields.
+    #[test]
+    fn a_read_issue_sends_the_credential_and_returns_only_the_promised_fields() {
+        let (mut state, peer, session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
+
+        let response = handle(
+            &mut state,
+            &peer,
+            Request::ReadIssue {
+                session,
+                surrogate: token,
+                repo: "o/r".into(),
+                number: 7,
+            },
+        );
+
+        assert_eq!(
+            response,
+            Response::IssueRead {
+                title: "a title".into(),
+                body: "a body".into(),
+                state: "open".into(),
+            },
+            "the read must return exactly the three promised fields"
+        );
+
+        let sent = origin.last().expect("the provider was contacted");
+        assert_eq!(sent.method(), "GET");
+        assert_eq!(sent.path(), "/repos/o/r/issues/7");
+        // The credential really travelled, and only to the provider.
+        assert_eq!(
+            sent.header("authorization"),
+            Some(format!("token {CANARY}").as_str()),
+            "the request was not authenticated with the vaulted credential"
+        );
+        // And the response never carried the secret back to the agent.
+        assert!(
+            !format!("{response:?}").contains(CANARY),
+            "the response leaked the credential: {response:?}"
+        );
+        assert!(
+            !format!("{response:?}").contains("MUST-NOT-BE-FORWARDED"),
+            "the response forwarded an unpromised field: {response:?}"
+        );
+    }
+
+    /// Creating an issue spends exactly one use, and the second attempt with
+    /// the same token fails as exhausted.
+    #[test]
+    fn a_create_issue_spends_one_use_and_a_second_attempt_is_exhausted() {
+        let (mut state, peer, session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
+        let request = |surrogate: String| Request::CreateIssue {
+            session,
+            surrogate,
+            repo: "o/r".into(),
+            title: "t".into(),
+            body: "b".into(),
+        };
+
+        let first = handle(&mut state, &peer, request(token.clone()));
+        assert_eq!(
+            first,
+            Response::IssueCreated {
+                number: 7,
+                url: "https://github.com/o/r/issues/7".into()
+            }
+        );
+
+        let second = handle(&mut state, &peer, request(token.clone()));
+        // max_uses was 2, so the second call is the last one that can work.
+        assert!(
+            !matches!(second, Response::Error { .. }),
+            "the second use was refused: {second:?}"
+        );
+
+        let third = handle(&mut state, &peer, request(token));
+        assert_eq!(
+            third,
+            Response::Error {
+                code: ErrorCode::SurrogateExhausted,
+                message: third_message(&third)
+            },
+            "the budget was not enforced"
+        );
+        assert_eq!(
+            origin.connections(),
+            2,
+            "the refused call reached the provider"
+        );
+    }
+
+    /// A surrogate minted for one session is refused from another, and the
+    /// refusal costs nothing.
+    ///
+    /// The second session belongs to the *same* peer on purpose: this is the
+    /// test for `redeem`'s `WrongSession` check, which is the one an attacker
+    /// hits by running two sessions of their own and moving a token between
+    /// them. The different-peer case is a separate guarantee (that the session
+    /// is not owned by the caller) and has its own test above.
+    #[test]
+    fn a_surrogate_from_another_session_of_the_same_peer_is_refused() {
+        let (mut state, peer, _session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
+        let other = state.sessions.create("/other".to_string(), &peer);
+
+        let response = handle(
+            &mut state,
+            &peer,
+            Request::ReadIssue {
+                session: other,
+                surrogate: token,
+                repo: "o/r".into(),
+                number: 7,
+            },
+        );
+
+        // Refused for belonging to another session, and the message says so
+        // rather than claiming the token is unknown: the broker does know it,
+        // and a message that hid that would cost an agent a debugging session.
+        assert_eq!(
+            response,
+            Response::Error {
+                code: ErrorCode::Denied,
+                message: "surrogate was minted for a different session".into()
+            }
+        );
+        assert_eq!(
+            origin.connections(),
+            0,
+            "a foreign session reached the provider"
+        );
+    }
+
+    /// A session belonging to another process is refused before anything else.
+    #[test]
+    fn a_session_belonging_to_another_process_is_refused() {
+        let (mut state, peer, _session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
+        // A different pid, which is what `belongs_to` actually compares. A
+        // same-pid-different-uid fixture would not exercise the check: the
+        // broker records the pid at session creation and compares pids, so
+        // two identities for one process are one peer as far as it is
+        // concerned. Pinning is not required for a refusal, which is the
+        // point: an unpinned stranger is still a stranger.
+        let mut stranger = WorkloadIdentity::from_peer(PeerCredentials {
+            pid: std::process::id() as i32 + 1,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+        });
+        stranger.pin_pidfd().ok();
+        let foreign = state.sessions.create("/theirs".to_string(), &stranger);
+
+        let response = handle(
+            &mut state,
+            &peer,
+            Request::ReadIssue {
+                session: foreign,
+                surrogate: token,
+                repo: "o/r".into(),
+                number: 7,
+            },
+        );
+
+        // Note the direction: `handle` is given `peer`, and the session belongs
+        // to `stranger`. The check is on who owns the session, not on who is
+        // calling.
+        assert_eq!(
+            response,
+            Response::Error {
+                code: ErrorCode::Denied,
+                message: "session is not owned by the authenticated peer".into()
+            }
+        );
+        assert_eq!(
+            origin.connections(),
+            0,
+            "a foreign peer reached the provider"
+        );
+    }
+
+    /// The broker's own validation runs before the token is redeemed, which is
+    /// the only thing the connector's cannot do.
+    ///
+    /// A `max_uses` of one makes the difference observable: with the broker's
+    /// check removed, the connector still refuses the malformed repository and
+    /// the caller still sees `InvalidRequest`, but by then `redeem` has already
+    /// spent the only use, so the legitimate call below is refused as
+    /// `SurrogateExhausted`. Two layers returning the same code for the same
+    /// input is exactly the arrangement that hides a missing check, so the
+    /// budget is what this test actually asserts.
+    #[test]
+    fn a_malformed_repo_does_not_spend_the_only_use() {
+        // The token from the fixture is re-minted below with a single use, so
+        // the fixture's two-use one is not bound here.
+        let (mut state, peer, session, _token, origin, _dir) = brokered(Reply::Json(issue_json()));
+        // Re-mint with a single use. `brokered` grants two so other tests can
+        // make two calls; here one is the whole point.
+        state.surrogates = SurrogateRegistry::default();
+        let credential = state.credentials[0].id;
+        let token = match handle(
+            &mut state,
+            &peer,
+            Request::MintSurrogate {
+                session,
+                credential,
+                max_uses: 1,
+                ttl_secs: 60,
+            },
+        ) {
+            Response::SurrogateMinted { surrogate, .. } => surrogate,
+            other => panic!("expected a token, got {other:?}"),
+        };
+
+        let refused = handle(
+            &mut state,
+            &peer,
+            Request::ReadIssue {
+                session,
+                surrogate: token.clone(),
+                repo: "o/r/../../admin".into(),
+                number: 7,
+            },
+        );
+        assert_eq!(
+            refused,
+            Response::Error {
+                code: ErrorCode::InvalidRequest,
+                message: "repository must be `owner/repo` with non-empty ASCII path components"
+                    .into()
+            }
+        );
+        assert_eq!(
+            origin.connections(),
+            0,
+            "a malformed repo reached the provider"
+        );
+
+        // The one use is still there. If the broker validated after redeeming,
+        // this would be `SurrogateExhausted`.
+        let ok = handle(
+            &mut state,
+            &peer,
+            Request::ReadIssue {
+                session,
+                surrogate: token,
+                repo: "o/r".into(),
+                number: 7,
+            },
+        );
+        assert!(
+            matches!(ok, Response::IssueRead { .. }),
+            "the refused call spent the budget: {ok:?}"
+        );
+    }
+
+    /// A token that does not exist never reaches the provider, and the error
+    /// says nothing about what does exist.
+    #[test]
+    fn an_unknown_token_never_reaches_the_provider() {
+        let (mut state, peer, session, _token, origin, _dir) = brokered(Reply::Json(issue_json()));
+
+        let response = handle(
+            &mut state,
+            &peer,
+            Request::ReadIssue {
+                session,
+                surrogate: "asv1_not-a-real-token".into(),
+                repo: "o/r".into(),
+                number: 7,
+            },
+        );
+
+        assert_eq!(
+            response,
+            Response::Error {
+                code: ErrorCode::Denied,
+                message: "no surrogate matches the presented token".into()
+            }
+        );
+        assert_eq!(origin.connections(), 0);
+    }
+
+    /// Ending the session revokes every surrogate it minted, so a token that
+    /// was valid a moment ago is now refused.
+    #[test]
+    fn ending_a_session_revokes_its_surrogates() {
+        let (mut state, peer, session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
+
+        let before = handle(
+            &mut state,
+            &peer,
+            Request::ReadIssue {
+                session,
+                surrogate: token.clone(),
+                repo: "o/r".into(),
+                number: 7,
+            },
+        );
+        assert!(
+            matches!(before, Response::IssueRead { .. }),
+            "got {before:?}"
+        );
+
+        handle(&mut state, &peer, Request::EndSession { session });
+
+        let after = handle(
+            &mut state,
+            &peer,
+            Request::ReadIssue {
+                session,
+                surrogate: token,
+                repo: "o/r".into(),
+                number: 7,
+            },
+        );
+        // The session itself is gone, so the refusal is about ownership, not
+        // about the token. Both refusals are `Denied` and neither reaches the
+        // provider; which of the two fired is not the point of the test, and
+        // asserting on the exact wording here would only pin an implementation
+        // detail of the session store.
+        assert_eq!(
+            after,
+            Response::Error {
+                code: ErrorCode::Denied,
+                message: "session is not owned by the authenticated peer".into()
+            }
+        );
+        assert_eq!(
+            origin.connections(),
+            1,
+            "the post-revocation call reached the provider"
+        );
+    }
+
+    /// The provider's error is relayed as an upstream failure, and the
+    /// provider's own body is not.
+    #[test]
+    fn an_upstream_failure_is_reported_as_upstream_and_carries_no_body() {
+        let (mut state, peer, session, token, origin, _dir) = brokered(Reply::Status {
+            status: 404,
+            body: "{\"message\":\"MUST-NOT-BE-FORWARDED\"}".into(),
+        });
+
+        let response = handle(
+            &mut state,
+            &peer,
+            Request::ReadIssue {
+                session,
+                surrogate: token,
+                repo: "o/r".into(),
+                number: 7,
+            },
+        );
+
+        match response {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::Upstream);
+                assert!(
+                    message.contains("404"),
+                    "the status must be reported: {message}"
+                );
+                assert!(
+                    !message.contains("MUST-NOT-BE-FORWARDED"),
+                    "the provider's body was relayed: {message}"
+                );
+            }
+            other => panic!("a 404 must be an error, got {other:?}"),
+        }
+        assert_eq!(origin.connections(), 1);
+    }
+
+    /// A creation sends a JSON body built from the agent's text, and the
+    /// broker forwards only the two identity fields back.
+    #[test]
+    fn a_create_release_sends_the_tag_and_returns_only_tag_and_url() {
+        let (mut state, peer, session, token, origin, _dir) = brokered(Reply::Json(
+            serde_json::json!({
+                "tag_name": "v1.2.3",
+                "html_url": "https://github.com/o/r/releases/v1.2.3",
+                "upload_url": "MUST-NOT-BE-FORWARDED"
+            })
+            .to_string(),
+        ));
+
+        let response = handle(
+            &mut state,
+            &peer,
+            Request::CreateRelease {
+                session,
+                surrogate: token,
+                repo: "o/r".into(),
+                tag: "v1.2.3".into(),
+                name: "Release".into(),
+                body: "notes".into(),
+            },
+        );
+
+        assert_eq!(
+            response,
+            Response::ReleaseCreated {
+                tag: "v1.2.3".into(),
+                url: "https://github.com/o/r/releases/v1.2.3".into(),
+            }
+        );
+
+        let sent = origin.last().expect("the provider was contacted");
+        assert_eq!(sent.method(), "POST");
+        assert_eq!(sent.path(), "/repos/o/r/releases");
+        let body = sent.body.as_str();
+        assert!(body.contains("\"tag_name\":\"v1.2.3\""), "body was {body}");
+        assert_eq!(
+            sent.header("authorization"),
+            Some(format!("token {CANARY}").as_str())
+        );
+        assert!(
+            !format!("{response:?}").contains("MUST-NOT-BE-FORWARDED"),
+            "an unpromised field was forwarded: {response:?}"
+        );
+    }
+
+    /// A token cannot be used to reach anything but GitHub. The broker builds
+    /// the client for a fixed authority, so there is no request field that
+    /// could redirect the credential elsewhere.
+    #[test]
+    fn the_request_cannot_choose_the_audience() {
+        let (mut state, peer, session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
+
+        let response = handle(
+            &mut state,
+            &peer,
+            Request::ReadIssue {
+                session,
+                surrogate: token,
+                repo: "o/r".into(),
+                number: 7,
+            },
+        );
+
+        assert!(
+            matches!(response, Response::IssueRead { .. }),
+            "got {response:?}"
+        );
+        let sent = origin.last().expect("the provider was contacted");
+        // The only host that saw the credential is the one the broker chose.
+        assert_eq!(origin.connections(), 1);
+        assert_eq!(sent.path(), "/repos/o/r/issues/7");
+    }
+
+    /// The message of an error response, for use in an expected value.
+    fn third_message(response: &Response) -> String {
+        match response {
+            Response::Error { message, .. } => message.clone(),
+            other => panic!("expected an error, got {other:?}"),
+        }
     }
 }

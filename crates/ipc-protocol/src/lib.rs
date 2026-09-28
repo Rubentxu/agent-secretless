@@ -234,6 +234,26 @@ pub enum ErrorCode {
     Denied,
     /// The request was well-formed but semantically invalid.
     InvalidRequest,
+    /// The surrogate's time window has passed.
+    ///
+    /// Split from `Denied` for the agent's benefit, not the operator's: "your
+    /// token ran out of time" and "your token was never valid" both mean "mint
+    /// a new one", but only one of them is worth a bug report. Collapsing them
+    /// would make a working integration look broken.
+    SurrogateExpired,
+    /// The surrogate's use budget is spent.
+    ///
+    /// Separate from `SurrogateExpired` for the same reason, and with a second
+    /// audience: a caller that always exhausts its budget has a budgeting
+    /// bug, and the distinct code is what makes that visible.
+    SurrogateExhausted,
+    /// The provider answered, or failed to, in a way the broker relays.
+    ///
+    /// Not `Internal`. The broker did its job and the network or the provider
+    /// did not, and an agent that cannot tell those apart will retry a
+    /// non-retryable failure or file a bug against the broker for a DNS
+    /// timeout.
+    Upstream,
 }
 
 #[derive(Debug, thiserror::Error)]

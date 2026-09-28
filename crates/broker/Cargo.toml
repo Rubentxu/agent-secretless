@@ -16,6 +16,13 @@ asv-domain.workspace = true
 asv-ipc-protocol.workspace = true
 asv-identity = { workspace = true }
 asv-policy.workspace = true
+# M4 CU-2.2: the broker is the secret-bearing process, so it is the side that
+# implements the connector's `SecretPort` and the only one that may name a
+# `CredentialId`. The dependency points *out* of the connector, never into it:
+# `asv-connector-http` does not depend on the vault, and adding one would make
+# D2's one-way dependency a comment instead of a fact.
+asv-connector-http.workspace = true
+asv-vault.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -30,3 +37,11 @@ subtle.workspace = true
 
 [dev-dependencies]
 serde_json = "1"
+tempfile = "3"
+# `SecretString` is `secrecy`'s, not ours. The vault takes one to unlock, so a
+# test that opens a real vault needs the same type the production path uses.
+secrecy.workspace = true
+# The end-to-end tests drive the real connector against a local TLS origin.
+# A dev-dependency, not a normal one: the broker binary must not be able to
+# start a test server even if someone asks nicely.
+asv-connector-http = { workspace = true, features = ["test-support"] }
