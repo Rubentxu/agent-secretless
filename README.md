@@ -172,6 +172,12 @@ is not edited in place.
 | M7 | Dedicated broker uid, hardening profile |
 | M9–M10 | eBPF redirection, isolated exec |
 
+## Security
+
+Please do not report vulnerabilities through public issues. See
+[SECURITY.md](SECURITY.md) for what counts as a vulnerability here, what is a
+known limitation of the current milestone, and how to check a boundary yourself.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
