@@ -42,6 +42,13 @@ STASH_DIR: Path | None = None
 #: format one, and another read an environment variable the harness never set.
 #: Both were reported as "harness passed" and were mistakes in this test, not
 #: blind spots in the harness. Keep each entry to a real, executed path.
+#:
+#: "Still compiles" is stricter than it looks. CI builds with `-D warnings`, so
+#: an injection that leaves an unused binding is a build failure there and a
+#: pass here. The third entry below was caught exactly that way: it rebound `id`
+#: and then stopped using it. `RUSTFLAGS` is therefore set for every build this
+#: script performs, so a local run rejects what CI would reject. Without it the
+#: two environments disagree and the local result is the untrustworthy one.
 INJECTIONS = [
     (
         "secret-in-broker-log",
@@ -62,7 +69,7 @@ INJECTIONS = [
             Response::SessionCreated { session: id }
         }""",
         """        Request::CreateSession { workspace } => {
-            let id = state.sessions.create(workspace.clone(), peer);
+            state.sessions.create(workspace.clone(), peer);
             Response::Error {
                 code: ErrorCode::InvalidRequest,
                 message: format!("session opened for {workspace}"),
@@ -113,12 +120,25 @@ def _restore(path: Path) -> None:
 
 
 def _build() -> subprocess.CompletedProcess[str]:
+    """Builds the workspace the way CI does: warnings are errors.
+
+    CI sets `-D warnings`, so an injection that compiles with a warning fails
+    there and passes here. A green local run that CI rejects is the worst kind
+    of false signal, because it looks like the harness proved something. The
+    flag is set unconditionally rather than inherited, so the two environments
+    cannot disagree.
+    """
+    env = dict(os.environ)
+    flags = env.get("RUSTFLAGS", "")
+    if "-D warnings" not in flags:
+        env["RUSTFLAGS"] = f"{flags} -D warnings".strip()
     return subprocess.run(
         ["cargo", "build", "--workspace"],
         capture_output=True,
         text=True,
         timeout=900,
         cwd=WORKSPACE,
+        env=env,
     )
 
 
