@@ -58,6 +58,11 @@ A milestone closes only when its exit UAT is green.
 - canary never appears in debug/error serialization tests,
 - UAT threat harness can launch arbitrary attack scripts even though no connector exists yet.
 
+### Exit UAT
+
+- UAT-031,
+- UAT-032.
+
 ---
 
 ## M1 — Local vault + secure ingestion
@@ -220,6 +225,10 @@ local authorization under 5 ms. Measuring it is M4 work.
 - unauthorized DB/role denied,
 - connection teardown on revoke.
 
+### Exit UAT
+
+- UAT-033.
+
 ---
 
 ## M7 — Linux hardened sessions
@@ -291,6 +300,11 @@ Stress long-running agent sessions, high socket churn and map cleanup.
 - explicit list of supported client/runtime combinations,
 - reliable cleanup and fail-closed behavior.
 
+This is a go/no-go research gate, not a shipped connector: its experiments
+reuse the surrogate and hardened session delivered by earlier milestones, so it
+re-runs their acceptance set rather than owning any of its own. It is
+therefore DELEGATED to `16-SECURITY-RELEASE-GATES` and is not gated on UAT.
+
 ### No-go fallback
 
 Keep explicit proxy + service shims; eBPF remains egress/telemetry only.
@@ -352,6 +366,12 @@ Order by value and achievable secretless property:
 
 Each connector must ship with its own adversarial tests and security classification.
 
+### Exit
+
+No fixed UAT set: each connector is gated by the acceptance tests it
+introduces, and the set grows with the catalog. Completion is DELEGATED to
+`16-SECURITY-RELEASE-GATES`, which requires the full matrix.
+
 ---
 
 ## M12 — TPM/hardware-backed vault
@@ -369,6 +389,10 @@ Each connector must ship with its own adversarial tests and security classificat
 - device-bound theft test,
 - documented recovery before destructive enrollment,
 - clean fallback on unsupported hardware.
+
+### Exit UAT
+
+- UAT-034.
 
 ---
 
@@ -414,6 +438,11 @@ Minimum supported story:
 - transparent eBPF bridge only if M8/M9 passed,
 - compatibility worker clearly labelled,
 - CLI + optional MCP control surface.
+
+### Exit
+
+Release aggregation, not an independent gate: it is the union of the milestones
+above. Completion is DELEGATED to `16-SECURITY-RELEASE-GATES`.
 
 ## Prioritization rule after v1
 
