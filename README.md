@@ -1,5 +1,7 @@
 # Agent Secretless Vault (ASV)
 
+[![verify](https://github.com/rubentxu/agent-secretless/actions/workflows/verify.yml/badge.svg)](https://github.com/rubentxu/agent-secretless/actions/workflows/verify.yml)
+
 A local credential control plane that lets an AI agent **use an identity without
 ever being handed the credential material**.
 
@@ -119,6 +121,13 @@ Every probe carries a self-check that plants a canary in the exact vector the
 probe scans and requires the probe to find it. A probe that cannot detect its
 own planted canary reports `INVALID` and fails the run, rather than passing
 vacuously.
+
+**This is checked on CI, not just locally.** Putting the same gates in GitHub
+Actions immediately found two defects that every local run had missed: a
+workflow that never built the binaries it attacked, and a build that passed
+locally while failing under CI's `-D warnings`. The harness reported both
+loudly instead of going green. A security project that only its author's
+machine can break is not verified.
 
 ## What is *not* protected yet
 

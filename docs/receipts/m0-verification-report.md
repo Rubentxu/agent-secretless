@@ -111,6 +111,30 @@ probe reports `READ-MEM-DENIED`; on the development machine it reports
 harness reports the verdict verbatim and the self-check accepts either, which is
 why a decidable verdict is the requirement and a particular one is not.
 
+## Reproduction from a clean clone
+
+Everything above was produced on the machine that wrote the code, which is the
+weakest possible evidence. To check that a stranger gets the same result, the
+published repository was cloned into an empty directory and every gate re-run
+there with its own target directory:
+
+```text
+git clone https://github.com/rubentxu/agent-secretless.git
+cd agent-secretless
+(cd agent-secretless-vault-spec && sha256sum -c SHA256SUMS)   37/37
+cargo build --workspace --locked                              Finished in 2.21s
+cargo test --workspace --locked                               35 passed
+cargo clippy --workspace --all-targets --locked -- -D warnings 0 warnings
+cargo fmt --all -- --check                                    clean
+python3 tests/adversarial/run_harness.py                      11 passed, 0 invalid
+python3 tests/adversarial/test_falsifiability.py              3/3 detected
+python3 tools/check-gates.py                                  5 hard defects (expected)
+```
+
+The clone's source tree is byte-identical to the local one, and the working
+tree is clean after the injections were reverted. The repository is
+self-contained: no local path, toolchain quirk or untracked file is required.
+
 ## Release readiness
 
 The repository is published at `https://github.com/Rubentxu/agent-secretless`
