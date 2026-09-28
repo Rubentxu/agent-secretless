@@ -58,25 +58,68 @@ Rather than auditing every call site, `SecretBytes` omits `Debug`, `Clone` and
 guarantee: no future call site can accidentally log or serialize a secret, because the
 code would not compile.
 
-### F4 - Cross-crate integration tests cannot rely on CARGO_BIN_EXE
+### F4 - Locating a cargo-built binary is harder than it looks
 
-Cargo only sets `CARGO_BIN_EXE_*` for binaries of the crate under test, so the broker
-integration test cannot use it for the `asv` CLI. It also does not surface
-`CARGO_TARGET_DIR` when the target dir comes from cargo's global config rather than the
-environment, so probing the env alone silently misses a real target dir. The reliable
-anchor is the test binary's own path, which always lives in `<target>/<profile>/deps/`.
+Cargo sets `CARGO_BIN_EXE_*` only for binaries of the crate under test, so the
+broker integration test cannot use it for the `asv` CLI. Worse, cargo does not
+export the target directory as an environment variable when it is redirected
+through `[build] target-dir` in `~/.cargo/config.toml`, which this machine does.
+Probing `CARGO_TARGET_DIR` or assuming `<workspace>/target` therefore finds
+nothing on a correctly configured machine and turns a green build into a false
+failure.
+
+Two different anchors solve it, one per context:
+
+- The Rust integration test anchors on `std::env::current_exe()`, which always
+  lives in `<target>/<profile>/deps/`.
+- The standalone Python harness has no such anchor, so it asks
+  `cargo metadata --no-deps` for the real `target_directory`.
+
+Both are needed: a single "clever" resolution path would have left one of the
+two callers silently broken.
 
 ## Verification observed at report time
 
 - `cargo test --workspace` -> 35 passed, 0 failed
 - `cargo clippy --workspace --all-targets` -> 0 warnings
 - `cargo fmt --all -- --check` -> clean
-- `tests/adversarial/run_harness.py` -> 5/5, exit 0, output digest
-  `sha256:ea41623633206d973ac635c283b4eb0661629790753659e09f546a9d2be03991`
+- `tests/adversarial/run_harness.py` -> 10 probes and self-checks, exit 0
+- `tests/adversarial/test_falsifiability.py` -> 3/3 injected leaks detected, exit 0
 - Spec pack `SHA256SUMS` -> 37/37 match
 
-The harness is falsifiable: injecting a raw token into the session environment makes it
-exit 1 on two independent probes.
+### F5 - The first harness was green because it could not fail
+
+The harness shipped in the initial M0 commit generated a canary, compared it
+against probe output, and never planted it in anything. Every probe passed
+vacuously: the harness was structurally incapable of reporting FAIL, so its 5/5
+result was evidence of nothing.
+
+Falsifying it exposed three further problems, all now fixed:
+
+1. The harness launched `python3` children against a synthetic environment and
+   never invoked an ASV binary, so it probed nothing the product does. It now
+   starts a real `asv-brokerd` and a real `asv` CLI process.
+2. Each probe needed to prove it could detect a leak at all. Five self-checks
+   now plant the canary in the exact vector a probe scans and require it to be
+   found, so a probe that cannot fail is reported INVALID rather than PASS.
+3. Binary discovery assumed `<workspace>/target`, but this machine redirects the
+   target directory through `~/.cargo/config.toml`, which cargo does not export
+   as an environment variable. The harness now asks `cargo metadata` for the
+   real path.
+
+Two of my own falsification injections were also wrong and are recorded here
+because the failure mode is instructive: one changed `SecretBytes::Debug` when
+no vault exists to format one, and another read an environment variable the
+harness never set. Both were reported as "harness passed". A missing canary and
+a broken injection look identical from the outside, which is why the
+injections now carry a comment requiring each to sit on an executed path.
+
+A separate, genuine finding came out of the memory probe. The 64 KiB read buffer
+in the broker held the full raw request for the process lifetime, so a
+same-uid peer could read a client's own request bytes out of the broker's heap.
+The buffer is now zeroized after decoding. Retaining the *decoded* request is
+not a leak, since it is data the client just sent; the harness reports the
+memory verdict verbatim rather than pretending a same-uid boundary exists.
 
 ## Known unknowns
 

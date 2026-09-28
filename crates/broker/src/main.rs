@@ -10,6 +10,7 @@ use asv_identity::WorkloadIdentity;
 use asv_ipc_protocol::{decode_request, encode_response, Response};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use zeroize::Zeroize;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -79,6 +80,10 @@ fn serve(state: &mut BrokerState, stream: UnixStream) -> std::io::Result<()> {
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
 
+    // The raw request bytes may carry secret-shaped material: a hostile client
+    // controls every field. Leaving them in a heap buffer keeps them readable by
+    // any same-uid peer for the process lifetime, which is exactly the leak the
+    // adversarial harness looks for. Zeroize as soon as decoding is done.
     let mut buf = vec![0u8; asv_ipc_protocol::MAX_MESSAGE_BYTES + 1];
     let n = reader.read(&mut buf)?;
     if n == 0 {
@@ -94,6 +99,10 @@ fn serve(state: &mut BrokerState, stream: UnixStream) -> std::io::Result<()> {
             message: e.to_string(),
         },
     };
+
+    // Scrub the request bytes before anything else can return or panic, so the
+    // material does not outlive this call even on the error path.
+    buf.zeroize();
 
     let bytes = match encode_response(&response) {
         Ok(b) => b,

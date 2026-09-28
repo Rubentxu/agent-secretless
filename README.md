@@ -42,12 +42,20 @@ cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets
 python3 tests/adversarial/run_harness.py     # adversarial leak probes
+python3 tests/adversarial/test_falsifiability.py  # prove the harness can fail
 python3 tools/check-gates.py                 # spec gate-map audit
 ```
 
-The harness exits non-zero when a canary escapes, and its checks are themselves
-falsifiable: injecting a raw token into the session environment makes it fail on
-two independent probes.
+The harness plants a canary in the vectors a secret would occupy and scans a
+real `asv-brokerd` process for it, rather than launching probes against an
+environment where no secret was ever placed.
+
+Its green result is only worth something because `test_falsifiability.py` can
+prove otherwise: that script injects three real leaks into the source, rebuilds,
+and requires the harness to reject each one. An earlier revision of the harness
+passed 5/5 while never planting the canary anywhere, so it could not fail and
+proved nothing. `test_falsifiability.py` is the regression test for exactly that
+failure mode.
 
 ## Running it
 
