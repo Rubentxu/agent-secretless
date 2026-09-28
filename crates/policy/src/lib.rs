@@ -3,9 +3,10 @@
 //! Cedar is kept behind this adapter. The public types contain authorization
 //! metadata only and cannot carry credential material.
 
-use asv_domain::{Action, AgentSessionId, ApprovalId, CapabilityId, Decision, Resource};
+use asv_domain::{Action, AgentSessionId, ApprovalId, Authority, CapabilityId, Decision, Resource};
 use cedar_policy::{
-    Authorizer, Context, Entities, EntityUid, PolicySet, Request, RestrictedExpression,
+    Authorizer, Context, Entities, EntityUid, PolicySet, Request, RestrictedExpression, Schema,
+    ValidationMode, Validator,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -19,7 +20,184 @@ permit (principal, action == Action::"git_fetch", resource);
 permit (principal, action == Action::"ssh_connect", resource);
 permit (principal, action == Action::"git_push", resource)
 when { context.protected_ref == false || context.approved == true };
+
+// M4 semantic GitHub actions (D6). The scope is `resource is Api`, which only
+// fires now that the Cedar entity type follows the Resource variant (D6) —
+// before this, the entity was hardcoded to Repository and every `is Api` rule
+// was vacuously false.
+//
+// Approval does not live here. `Authority` proves the audience is spelled one
+// way, and `audience_is_approved` proves it is approved; both run in Rust
+// before Cedar is consulted, so no policy text can widen the reachable host
+// set. `http_request` is absent on purpose: the generic escape hatch is not
+// authorizable.
+permit (
+    principal,
+    action in [Action::"github_issue_read", Action::"github_issue_create",
+                Action::"github_release_create"],
+    resource is Api
+);
 "#;
+
+/// Audiences a semantic HTTP action may ever target (D6; the design v2 open
+/// question resolved it as a compile-time constant, not configuration).
+///
+/// This is the approval half of the allowlist. [`Authority`] proves a host is
+/// *spelled* one way; this proves it is *approved*. Both are required, because
+/// `evil.example` canonicalizes perfectly and would otherwise pass.
+pub(crate) const ALLOWED_AUDIENCES: &[&str] = &["api.github.com"];
+
+/// Whether an audience may be targeted at all (D6).
+///
+/// Fail-closed: an unparseable or unapproved authority is never allowed. This
+/// runs before Cedar, so a policy typo cannot widen the reachable set.
+fn audience_is_approved(audience: &Authority) -> bool {
+    ALLOWED_AUDIENCES
+        .iter()
+        .any(|allowed| Authority::canonicalize(allowed) == Ok(audience.clone()))
+}
+
+/// The Cedar schema (D11), in the JSON shape Cedar 4.7.1 accepts: a namespace
+/// (here the empty default) holding `entityTypes` and `actions`.
+///
+/// Without it, `PolicySet::from_str` validates nothing: a mis-spelled action
+/// silently stops matching (fail-closed, so an availability bug), while a
+/// *correctly spelled* rule naming an invented action parses and ALLOWS
+/// (a real exposure). The schema closes the action namespace, so a rule that
+/// names a verb this system does not have is a validation error at load time.
+const SCHEMA_JSON: &str = r#"{
+  "": {
+    "commonTypes": {},
+    "entityTypes": {
+      "AgentSession": {},
+      "Repository": {},
+      "Database": {},
+      "Host": {},
+      "Api": {
+        "shape": {
+          "type": "Record",
+          "attributes": {
+            "audience": { "type": "String" }
+          }
+        }
+      }
+    },
+    "actions": {
+      "git_fetch": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Repository"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
+      "git_push": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Repository"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
+      "ssh_connect": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Host"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
+      "postgres_connect": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Database"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
+      "http_request": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Host"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
+      "github_issue_read": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Api"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
+      "github_issue_create": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Api"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
+      "github_release_create": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Api"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      }
+    }
+  }
+}"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct AuthorizationInstant(pub u64);
@@ -107,6 +285,13 @@ pub struct AuthorizationRequest {
     pub context: PolicyContext,
 }
 
+impl AuthorizationRequest {
+    /// The stable resource identifier handed to Cedar.
+    pub fn resource_name(&self) -> String {
+        resource_name(&self.resource)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityGrant {
     pub id: CapabilityId,
@@ -189,8 +374,33 @@ impl Default for PolicyEngine {
 
 impl PolicyEngine {
     pub fn new(clock: Arc<dyn Clock>) -> Result<Self, PolicyError> {
-        let policies = PolicySet::from_str(POLICY_TEXT)
+        Self::from_policy_text_with_clock(POLICY_TEXT, clock)
+    }
+
+    /// Loads policy text, validating it against the schema (D11).
+    ///
+    /// Validation is the point: a rule naming an action this system does not
+    /// have is a load-time error, not a rule that would quietly ALLOW it.
+    pub fn from_policy_text(policy_text: &str) -> Result<Self, PolicyError> {
+        Self::from_policy_text_with_clock(policy_text, Arc::new(SystemClock))
+    }
+
+    fn from_policy_text_with_clock(
+        policy_text: &str,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, PolicyError> {
+        let schema = Schema::from_json_str(SCHEMA_JSON)
+            .map_err(|error| PolicyError::Engine(format!("invalid built-in schema: {error}")))?;
+        let policies = PolicySet::from_str(policy_text)
             .map_err(|error| PolicyError::Engine(error.to_string()))?;
+        let validator = Validator::new(schema);
+        let validation = validator.validate(&policies, ValidationMode::Strict);
+        if !validation.validation_passed() {
+            return Err(PolicyError::Engine(format!(
+                "policy failed schema validation: {:?}",
+                validation.validation_errors().collect::<Vec<_>>()
+            )));
+        }
         Ok(Self {
             authorizer: Authorizer::new(),
             policies,
@@ -443,13 +653,23 @@ impl PolicyEngine {
         request: &AuthorizationRequest,
         approval_validated: bool,
     ) -> Result<bool, PolicyError> {
+        // D6 second layer, evaluated before Cedar: an unapproved audience is
+        // denied without ever reaching the authorizer, so no policy text can
+        // widen the reachable host set. The first layer (the `Authority` type)
+        // already proved the spelling; this one proves approval.
+        if let Resource::Api { audience } = &request.resource {
+            if !audience_is_approved(audience) {
+                return Ok(false);
+            }
+        }
         let principal = EntityUid::from_str(&format!("AgentSession::\"{}\"", request.session))
             .map_err(|error| PolicyError::Engine(error.to_string()))?;
         let action = EntityUid::from_str(&format!("Action::\"{}\"", action_name(&request.action)))
             .map_err(|error| PolicyError::Engine(error.to_string()))?;
         let resource = EntityUid::from_str(&format!(
-            "Repository::\"{}\"",
-            resource_name(&request.resource)
+            "{}::\"{}\"",
+            entity_type(&request.resource),
+            request.resource_name()
         ))
         .map_err(|error| PolicyError::Engine(error.to_string()))?;
         let protected = if request.context.is_protected_main() {
@@ -480,12 +700,34 @@ impl PolicyEngine {
     }
 }
 
+/// The Cedar action name. Exhaustive on purpose (D6): the old catch-all arm
+/// collapsed every non-Git/SSH action to `"unsupported"`, which silently made
+/// the semantic GitHub path inexecutable. A new variant now breaks the build
+/// here, on purpose.
 fn action_name(action: &Action) -> &'static str {
     match action {
         Action::GitFetch => "git_fetch",
         Action::GitPush => "git_push",
         Action::SshConnect => "ssh_connect",
-        _ => "unsupported",
+        Action::PostgresConnect => "postgres_connect",
+        Action::HttpRequest => "http_request",
+        Action::GitHubIssueRead => "github_issue_read",
+        Action::GitHubIssueCreate => "github_issue_create",
+        Action::GitHubReleaseCreate => "github_release_create",
+    }
+}
+
+/// The Cedar entity type for a resource (D6).
+///
+/// This must follow the `Resource` variant. It used to be hardcoded to
+/// `Repository`, which made every `resource is Api` rule *vacuously* false —
+/// a rule that can never fire hides the bug instead of reporting it.
+fn entity_type(resource: &Resource) -> &'static str {
+    match resource {
+        Resource::Repository { .. } => "Repository",
+        Resource::Database { .. } => "Database",
+        Resource::Host { .. } => "Host",
+        Resource::Api { .. } => "Api",
     }
 }
 
@@ -501,6 +743,23 @@ fn resource_name(resource: &Resource) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asv_domain::Authority;
+
+    fn api_request(action: Action, audience: &str) -> AuthorizationRequest {
+        AuthorizationRequest {
+            session: AgentSessionId::new(),
+            action,
+            resource: Resource::Api {
+                audience: Authority::canonicalize(audience).expect("valid authority"),
+            },
+            context: PolicyContext {
+                workspace: "/repo".into(),
+                protected_ref: None,
+                request_digest: Some("digest".into()),
+                peer_uid: 1000,
+            },
+        }
+    }
 
     fn request(action: Action, protected_ref: Option<&str>) -> AuthorizationRequest {
         AuthorizationRequest {
@@ -528,6 +787,144 @@ mod tests {
             .is_allowed());
         assert!(!engine
             .authorize(&request(Action::GitHubIssueCreate, None), None, None)
+            .decision
+            .is_allowed());
+    }
+
+    // --- CU-1.2 RED: entity typing, schema and the audience allowlist (D6/D11)
+
+    /// D6: the Cedar entity type must come from the `Resource` variant, not be
+    /// hardcoded to `Repository`. Before this, `resource is Api` was
+    /// *vacuously* false for every Api request, so a rule about APIs could
+    /// never fire — and a rule that never fires hides the bug instead of
+    /// failing loudly.
+    #[test]
+    fn cedar_entity_type_follows_the_resource_variant() {
+        assert_eq!(
+            entity_type(&Resource::Repository {
+                owner: "a".into(),
+                name: "b".into()
+            }),
+            "Repository"
+        );
+        assert_eq!(
+            entity_type(&Resource::Database {
+                name: "a".into(),
+                role: "b".into()
+            }),
+            "Database"
+        );
+        assert_eq!(
+            entity_type(&Resource::Host {
+                hostname: "a".into()
+            }),
+            "Host"
+        );
+        assert_eq!(
+            entity_type(&Resource::Api {
+                audience: Authority::canonicalize("api.github.com").expect("valid")
+            }),
+            "Api"
+        );
+    }
+
+    /// The two layers of D6 must not collapse: canonicalization proves a host
+    /// is spelled one way; the allowlist proves it is *approved*. A
+    /// well-formed but unapproved audience canonicalizes fine and must still
+    /// be denied.
+    #[test]
+    fn unapproved_audience_is_denied_even_though_it_canonicalizes() {
+        let engine = PolicyEngine::default();
+        let evil = api_request(Action::GitHubIssueRead, "evil.example");
+        // The type accepted it, so nothing upstream can catch it...
+        assert_eq!(evil.resource_name(), "api:evil.example");
+        // ...and policy must.
+        assert!(!engine.authorize(&evil, None, None).decision.is_allowed());
+    }
+
+    /// The approved audience is reachable for the semantic read, and the
+    /// action namespace is closed: `http.request` is the generic escape hatch
+    /// and stays unauthorizable.
+    #[test]
+    fn approved_audience_allows_the_semantic_read_but_not_http_request() {
+        let engine = PolicyEngine::default();
+        assert!(engine
+            .authorize(
+                &api_request(Action::GitHubIssueRead, "api.github.com"),
+                None,
+                None
+            )
+            .decision
+            .is_allowed());
+        assert!(!engine
+            .authorize(
+                &api_request(Action::HttpRequest, "api.github.com"),
+                None,
+                None
+            )
+            .decision
+            .is_allowed());
+    }
+
+    /// Case-folding equivalence must survive policy too: the spec accepts a
+    /// case-folded hostname, so `API.GITHUB.COM.` and `api.github.com` are the
+    /// same approved audience, while a lookalike suffix is not.
+    #[test]
+    fn audience_comparison_is_canonical_not_textual() {
+        let engine = PolicyEngine::default();
+        assert!(engine
+            .authorize(
+                &api_request(Action::GitHubIssueRead, "API.GITHUB.COM."),
+                None,
+                None
+            )
+            .decision
+            .is_allowed());
+        assert!(!engine
+            .authorize(
+                &api_request(Action::GitHubIssueRead, "api.github.com.evil.example"),
+                None,
+                None
+            )
+            .decision
+            .is_allowed());
+    }
+
+    /// D11: the schema closes the action namespace. A policy naming an action
+    /// that does not exist must be a *validation error*, not a rule that
+    /// silently parses and would allow an invented verb.
+    #[test]
+    fn a_policy_naming_an_invented_action_fails_validation() {
+        let invented = r#"
+permit (principal, action == Action::"attacker_supplied_garbage", resource);
+"#;
+        let result = PolicyEngine::from_policy_text(invented);
+        assert!(
+            result.is_err(),
+            "a rule naming a non-existent action must be rejected, not parsed"
+        );
+    }
+
+    /// The shipped policy and schema must agree: the built-in policy has to
+    /// validate against the built-in schema, and the semantic GitHub actions
+    /// must be reachable only through the allowlisted audience.
+    #[test]
+    fn built_in_policy_validates_against_the_built_in_schema() {
+        let engine = PolicyEngine::default();
+        assert!(engine
+            .authorize(
+                &api_request(Action::GitHubIssueCreate, "api.github.com"),
+                None,
+                None
+            )
+            .decision
+            .is_allowed());
+        assert!(!engine
+            .authorize(
+                &api_request(Action::GitHubIssueCreate, "evil.example"),
+                None,
+                None
+            )
             .decision
             .is_allowed());
     }
