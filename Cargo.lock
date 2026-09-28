@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "asv-broker"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "asv-domain",
  "asv-identity",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "asv-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "asv-domain",
  "asv-ipc-protocol",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "asv-domain"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "secrecy",
  "serde",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "asv-identity"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "asv-domain",
  "libc",
@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "asv-ipc-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "asv-domain",
  "nix",
@@ -153,7 +153,7 @@ dependencies = [
 
 [[package]]
 name = "asv-ssh-agent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ed25519-dalek",
  "rand",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "asv-vault"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "asv-domain",
