@@ -600,9 +600,19 @@ impl AuthenticatedAttempt {
         client: &reqwest::blocking::Client,
         audience: &str,
     ) -> Result<reqwest::blocking::Response, TransportError> {
-        let request = self
-            .request
-            .expect("a sink is only sent after the port attached the credential");
+        let request = self.request.ok_or_else(|| {
+            // A `Sink` with no request attached is a programming error, and
+            // panicking here would turn it into a denial of service for the
+            // broker process: any caller that can construct a Sink without
+            // lending a credential first would take the whole broker down
+            // instead of getting an error it could report. The invariant is
+            // still checked, it is just checked by returning instead of by
+            // aborting.
+            TransportError::RequestFailed {
+                audience: audience.to_string(),
+                reason: "the sink was never given a credential".to_string(),
+            }
+        })?;
         // The reqwest error is deliberately dropped. Its `Display` can echo the
         // request URL and its `Debug` can include the request itself, and a
         // request carries the header this module exists to keep unnamed.
