@@ -22,7 +22,6 @@ fn wait_for_port(port: u16, deadline: Duration) -> bool {
 }
 
 #[test]
-#[ignore = "environment sshd rejects the ephemeral AuthorizedKeys source; rerun on a supported user-key test host"]
 fn uat_028_openssh_authenticates_through_the_broker_socket() {
     let dir = tempdir().expect("tempdir");
     let session = AgentSession::start(dir.path().join("session")).expect("agent session");
@@ -50,26 +49,15 @@ fn uat_028_openssh_authenticates_through_the_broker_socket() {
     assert!(listed.status.success(), "ssh-add failed: {:?}", listed);
     let listed_text = String::from_utf8(listed.stdout).expect("ssh-add output");
     std::fs::write(&authorized, &listed_text).expect("authorized keys");
-
-    let command = dir.path().join("authorized_keys_command");
-    std::fs::write(
-        &command,
-        format!("#!/bin/sh\ncat {}\n", authorized.display()),
-    )
-    .expect("authorized keys command");
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700))
-            .expect("command permissions");
-    }
-
+    let identity = dir.path().join("identity");
+    std::fs::write(identity.with_extension("pub"), &listed_text).expect("identity public key");
     let config = dir.path().join("sshd_config");
     std::fs::write(
         &config,
         format!(
-            "Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile none\nAuthorizedKeysCommand {} %u\nAuthorizedKeysCommandUser {user}\nStrictModes no\nUsePAM no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nPubkeyAcceptedAlgorithms +ssh-ed25519\nAllowUsers {user}\nLogLevel DEBUG3\nPidFile none\n",
+            "Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile {}\nStrictModes no\nUsePAM no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nPubkeyAcceptedAlgorithms +ssh-ed25519\nAllowUsers {user}\nLogLevel DEBUG3\nPidFile none\n",
             host_key.display(),
-            command.display(),
+            authorized.display(),
         ),
     )
     .expect("sshd config");
@@ -100,6 +88,8 @@ fn uat_028_openssh_authenticates_through_the_broker_socket() {
             "-o",
             "IdentitiesOnly=yes",
             "-o",
+            "PubkeyAuthentication=unbound",
+            "-o",
             "PasswordAuthentication=no",
             "-o",
             "StrictHostKeyChecking=no",
@@ -110,6 +100,8 @@ fn uat_028_openssh_authenticates_through_the_broker_socket() {
         ])
         .arg("-o")
         .arg(format!("IdentityAgent={}", session.socket_path().display()))
+        .arg("-o")
+        .arg(format!("IdentityFile={}", identity.display()))
         .args(["-p"])
         .arg(port.to_string())
         .arg(format!("{user}@127.0.0.1"))

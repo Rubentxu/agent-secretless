@@ -153,14 +153,21 @@ fn serve_connection(
     key: Arc<SigningKey>,
     revoked: Arc<AtomicBool>,
 ) -> Result<(), AgentError> {
-    let payload = read_frame(&mut stream)?;
-    let response = if revoked.load(Ordering::Acquire) {
-        failure_response()
-    } else {
-        handle_message(&payload, &key, &revoked)
-    };
-    write_frame(&mut stream, &response)?;
-    Ok(())
+    loop {
+        let payload = match read_frame(&mut stream) {
+            Ok(payload) => payload,
+            Err(AgentError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                return Ok(())
+            }
+            Err(error) => return Err(error),
+        };
+        let response = if revoked.load(Ordering::Acquire) {
+            failure_response()
+        } else {
+            handle_message(&payload, &key, &revoked)
+        };
+        write_frame(&mut stream, &response)?;
+    }
 }
 
 /// Handles one unframed SSH-agent payload. Public for deterministic protocol

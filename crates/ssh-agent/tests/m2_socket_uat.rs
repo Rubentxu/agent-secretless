@@ -25,8 +25,7 @@ fn put_string(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-fn frame(socket: &std::path::Path, payload: &[u8]) -> Vec<u8> {
-    let mut stream = UnixStream::connect(socket).expect("connect agent socket");
+fn send_frame(stream: &mut UnixStream, payload: &[u8]) -> Vec<u8> {
     stream
         .write_all(&(payload.len() as u32).to_be_bytes())
         .expect("write length");
@@ -36,6 +35,11 @@ fn frame(socket: &std::path::Path, payload: &[u8]) -> Vec<u8> {
     let mut response = vec![0u8; u32::from_be_bytes(length) as usize];
     stream.read_exact(&mut response).expect("read response");
     response
+}
+
+fn frame(socket: &std::path::Path, payload: &[u8]) -> Vec<u8> {
+    let mut stream = UnixStream::connect(socket).expect("connect agent socket");
+    send_frame(&mut stream, payload)
 }
 
 fn parse_string(input: &[u8], offset: &mut usize) -> Vec<u8> {
@@ -99,6 +103,29 @@ fn uat_001_real_socket_lists_public_key_and_signs_without_export() {
         .expect("signature verifies");
     assert_eq!(key_offset, public_blob.len());
     assert!(!signed.windows(32).any(|window| window == [0u8; 32]));
+
+    session.revoke().expect("revoke");
+}
+
+#[test]
+fn uat_015_one_connection_accepts_identity_and_sign_requests() {
+    let dir = tempdir().expect("tempdir");
+    let mut session = AgentSession::start(dir.path().join("session")).expect("start session");
+    let socket = session.socket_path().to_path_buf();
+    let mut stream = UnixStream::connect(&socket).expect("connect agent socket");
+
+    let identities = send_frame(&mut stream, &[REQUEST_IDENTITIES]);
+    assert_eq!(identities[0], IDENTITIES_ANSWER);
+    let mut offset = 5;
+    let public_blob = parse_string(&identities, &mut offset);
+    let _comment = parse_string(&identities, &mut offset);
+
+    let mut request = vec![SIGN_REQUEST];
+    put_string(&mut request, &public_blob);
+    put_string(&mut request, b"git-upload-pack /repo.git");
+    put_u32(&mut request, 0);
+    let signed = send_frame(&mut stream, &request);
+    assert_eq!(signed[0], SIGN_RESPONSE);
 
     session.revoke().expect("revoke");
 }
