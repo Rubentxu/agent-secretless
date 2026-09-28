@@ -1,0 +1,26 @@
+# Code owners.
+#
+# Every line here is a real fact about who owns the code, not a placeholder.
+# `sddk knowledge scan` quarantines any file with no declared owner, because
+# knowledge nobody is accountable for is knowledge nobody reviews. On a public
+# repository the same reasoning applies to code: an unowned path is a path
+# nobody is obliged to keep safe.
+#
+# The signed specification pack is imported verbatim and must never be edited in
+# place, so it is listed here explicitly rather than inherited from a wildcard.
+
+# Default owner for everything not matched below.
+*                               @Rubentxu
+
+# The normative spec pack: owned, but changes are a deliberate act, not a
+# drive-by fix. A defect in it is recorded and gated, never patched silently.
+agent-secretless-vault-spec/    @Rubentxu
+
+# The adversarial harness is the project's evidence. A change here can turn a
+# red result green without the product changing, so it is held to the same
+# standard as the code it measures.
+tests/adversarial/              @Rubentxu
+
+# Verification evidence. These are records of what was observed; editing one
+# retroactively is falsification, not documentation.
+docs/receipts/                  @Rubentxu
