@@ -79,6 +79,175 @@ opaque_id!(
     ApprovalId
 );
 
+opaque_id!(
+    /// Handle for a broker-minted surrogate token (M4 design D3).
+    ///
+    /// The surrogate is the credential-shaped string the agent presents to the
+    /// broker. It stands in for a [`CredentialId`] in the wire and session
+    /// records, which is exactly why it is a separate newtype: an agent holding
+    /// one has no handle on the credential behind it (ADR-0011).
+    SurrogateId
+);
+
+/// A canonicalized, DNS-only authority that a policy may name (M4 design D5).
+///
+/// Canonicalization is a **type**, not a helper function, on purpose. A
+/// `canonicalize()` free function is a convention a call-site can forget, and
+/// a forgotten call turns an allowlist comparison into a spelling contest
+/// (`API.GITHUB.COM` vs `api.github.com`). The only constructor here is
+/// fallible, so a non-canonical audience cannot be represented at all.
+///
+/// Accepted form is a bare lowercase ASCII DNS name with a single optional
+/// trailing dot. Everything else is rejected rather than guessed:
+///
+/// - userinfo (`user@host`) — hides which host is really meant;
+/// - `..` and empty labels;
+/// - percent-encoding, which can hide the label separator;
+/// - non-ASCII (IDNA is *denied*, not supported — see the design's open
+///   question; a decision, not an omission);
+/// - IPv6 literals, which have no DNS resolution to pin;
+/// - any scheme, and any non-default port.
+///
+/// The type carries no secret, so `Debug`/`Display` stay safe by construction.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Authority(String);
+
+impl Authority {
+    /// Canonicalizes `raw` into an authority, or explains why it cannot.
+    ///
+    /// The rules are the single source of truth for "the same host" in this
+    /// codebase; the Cedar allowlist and the connector's address pinning both
+    /// consume the result.
+    pub fn canonicalize(raw: &str) -> Result<Self, AuthorityError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(AuthorityError::Empty);
+        }
+        if trimmed != raw {
+            // Leading/trailing whitespace is never a legitimate host spelling
+            // and accepting it would let `"api.github.com "` slip past a
+            // textual allowlist comparison.
+            return Err(AuthorityError::SurroundingWhitespace {
+                input: raw.to_string(),
+            });
+        }
+        if !trimmed.is_ascii() {
+            return Err(AuthorityError::NotAscii {
+                input: raw.to_string(),
+            });
+        }
+        if trimmed.contains('@') {
+            return Err(AuthorityError::UserInfo {
+                input: raw.to_string(),
+            });
+        }
+        if trimmed.contains('%') {
+            return Err(AuthorityError::PercentEncoded {
+                input: raw.to_string(),
+            });
+        }
+        if trimmed.contains('/') || trimmed.contains(':') {
+            return Err(AuthorityError::NotBareHost {
+                input: raw.to_string(),
+            });
+        }
+        if trimmed.starts_with('[') || trimmed.ends_with(']') {
+            return Err(AuthorityError::IpLiteral {
+                input: raw.to_string(),
+            });
+        }
+
+        let without_trailing_dot = trimmed.strip_suffix('.').unwrap_or(trimmed);
+        if without_trailing_dot.is_empty() {
+            return Err(AuthorityError::Empty);
+        }
+
+        let mut labels = Vec::new();
+        for label in without_trailing_dot.split('.') {
+            if label.is_empty() {
+                return Err(AuthorityError::EmptyLabel {
+                    input: raw.to_string(),
+                });
+            }
+            if label.len() > 63 {
+                return Err(AuthorityError::LabelTooLong {
+                    input: raw.to_string(),
+                });
+            }
+            if label.starts_with('-') || label.ends_with('-') {
+                return Err(AuthorityError::MalformedLabel {
+                    input: raw.to_string(),
+                });
+            }
+            if !label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            {
+                return Err(AuthorityError::MalformedLabel {
+                    input: raw.to_string(),
+                });
+            }
+            labels.push(label.to_ascii_lowercase());
+        }
+
+        if labels.len() < 2 {
+            // A single label is not a routable authority; denying it keeps the
+            // allowlist from ever naming a bare `localhost`-style shortcut.
+            return Err(AuthorityError::SingleLabel {
+                input: raw.to_string(),
+            });
+        }
+
+        Ok(Self(labels.join(".")))
+    }
+
+    /// The canonical lowercase ASCII form, e.g. `api.github.com`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Authority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for Authority {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Why an authority could not be canonicalized. Every variant names a shape
+/// that is either ambiguous or unsupported, never a secret.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AuthorityError {
+    #[error("authority is empty")]
+    Empty,
+    #[error("authority is not plain ASCII: {input:?}")]
+    NotAscii { input: String },
+    #[error("authority has leading or trailing whitespace: {input:?}")]
+    SurroundingWhitespace { input: String },
+    #[error("authority must not carry userinfo: {input:?}")]
+    UserInfo { input: String },
+    #[error("authority must not be percent-encoded: {input:?}")]
+    PercentEncoded { input: String },
+    #[error("authority must be a bare host, without scheme or port: {input:?}")]
+    NotBareHost { input: String },
+    #[error("IPv6 literals are not supported as authorities: {input:?}")]
+    IpLiteral { input: String },
+    #[error("authority has an empty label: {input:?}")]
+    EmptyLabel { input: String },
+    #[error("authority label is longer than 63 bytes: {input:?}")]
+    LabelTooLong { input: String },
+    #[error("authority label is malformed: {input:?}")]
+    MalformedLabel { input: String },
+    #[error("authority must have at least two labels: {input:?}")]
+    SingleLabel { input: String },
+}
+
 /// Classification of a credential. Extensible per FR-001, but never a
 /// `HashMap<String, String>`: an explicit enum is what lets policy reason about
 /// a credential's capabilities.
@@ -209,6 +378,11 @@ pub enum Action {
     HttpRequest,
     PostgresConnect,
     GitHubIssueCreate,
+    /// Read one issue's non-secret metadata (M4-R9, design v2).
+    ///
+    /// Read is a *semantic* operation on purpose: UAT-030 requires brokered
+    /// reads end to end, and a generic `HttpRequest` is not authorizable.
+    GitHubIssueRead,
     GitHubReleaseCreate,
 }
 
@@ -221,6 +395,7 @@ impl fmt::Display for Action {
             Self::HttpRequest => "http.request",
             Self::PostgresConnect => "postgres.connect",
             Self::GitHubIssueCreate => "github.issue.create",
+            Self::GitHubIssueRead => "github.issue.read",
             Self::GitHubReleaseCreate => "github.release.create",
         };
         f.write_str(s)
@@ -231,10 +406,22 @@ impl fmt::Display for Action {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Resource {
-    Repository { owner: String, name: String },
-    Database { name: String, role: String },
-    Host { hostname: String },
-    Api { audience: String },
+    Repository {
+        owner: String,
+        name: String,
+    },
+    Database {
+        name: String,
+        role: String,
+    },
+    Host {
+        hostname: String,
+    },
+    /// An API audience. The field is an [`Authority`], not a `String`, so an
+    /// uncanonical audience cannot be constructed (M4 design D5).
+    Api {
+        audience: Authority,
+    },
 }
 
 /// Authorization outcome. Deny is the default; there is no implicit allow
@@ -363,5 +550,154 @@ mod tests {
         let rendered = DomainError::CredentialNotFound(id).to_string();
         assert!(rendered.contains(&id.to_string()));
         assert!(!rendered.contains("secret"));
+    }
+
+    // --- CU-1.1 RED: Authority (design v2 D5) and M4-R9 (D6) -----------------
+
+    /// D5: case and one trailing dot are presentation only. The two spellings
+    /// below are the same authority, so they must produce equal values —
+    /// otherwise an allowlist comparison becomes a spelling contest.
+    #[test]
+    fn authority_treats_case_and_trailing_dot_as_equivalent() {
+        let plain = Authority::canonicalize("api.github.com").expect("valid authority");
+        let shouty = Authority::canonicalize("API.GITHUB.COM").expect("valid authority");
+        let dotted = Authority::canonicalize("api.github.com.").expect("valid authority");
+        assert_eq!(plain, shouty);
+        assert_eq!(plain, dotted);
+        assert_eq!(plain.as_str(), "api.github.com");
+    }
+
+    /// D5 rejection rules. Each input here is a *syntactic* ambiguity or an
+    /// unsupported shape, so it must fail construction. A rejected authority is
+    /// a runtime deny; an authority that does not exist as a type is a compile
+    /// error, and both are the point.
+    ///
+    /// Note what is deliberately **absent**: an unapproved but well-formed host
+    /// like `evil.example`. Canonicalization answers "is this one host
+    /// spelling?"; the audience allowlist (design D6, task 1.2) answers "is
+    /// this host approved?". Collapsing the two layers here would put a
+    /// security decision in a syntax helper.
+    #[test]
+    fn authority_rejects_every_syntactically_ambiguous_shape() {
+        for hostile in [
+            "user@evil.example",     // userinfo: a real-looking prefix, different host
+            "api.github.com..",      // empty label
+            "api%2egithub.com",      // percent-encoding hides the dot
+            "apí.github.com",        // non-ASCII: IDNA is unsupported, not guessed
+            "api.github.com..evil",  // empty label mid-name
+            "api..example",          // empty label
+            "-api.github.com",       // label may not start with a hyphen
+            "api.github-.com",       // label may not end with a hyphen
+            "api_github.com",        // underscore is not a DNS label character
+            "[::1]",                 // IPv6 literal, no DNS resolution to pin
+            "http://api.github.com", // plaintext scheme
+            "api.github.com:443",    // explicit port: the canonical form is bare
+            "api.github.com:8443",   // non-default port
+            "",                      // empty
+            "   ",                   // whitespace only
+            " api.github.com",       // leading whitespace
+            "api.github.com ",       // trailing whitespace
+            ".",                     // root only
+        ] {
+            assert!(
+                Authority::canonicalize(hostile).is_err(),
+                "must reject {hostile:?}"
+            );
+        }
+    }
+
+    /// The other half of the D5/D6 split: a well-formed host that nobody
+    /// approved must canonicalize cleanly, so the *allowlist* is the only place
+    /// that decides whether it is reachable. This test exists to stop a future
+    /// "just also check the allowlist here" shortcut from silently collapsing
+    /// the two layers.
+    #[test]
+    fn a_well_formed_unapproved_host_canonicalizes_and_is_not_special_cased() {
+        let evil = Authority::canonicalize("evil.example").expect("syntactically valid");
+        assert_eq!(evil.as_str(), "evil.example");
+        assert_ne!(
+            evil,
+            Authority::canonicalize("api.github.com").expect("valid"),
+            "canonicalization must not decide approval"
+        );
+    }
+
+    /// A root label cannot be spelled twice, and a suffix trick must not
+    /// canonicalize *into* an approved host. The allowlist compares equality,
+    /// but the canonical form must at least never be a superstring.
+    #[test]
+    fn canonical_form_cannot_acquire_an_approved_suffix() {
+        let lookalike = Authority::canonicalize("api.github.com.evil.example").expect("valid");
+        let approved = Authority::canonicalize("api.github.com").expect("valid");
+        assert_ne!(lookalike, approved);
+        assert!(
+            !approved.as_str().ends_with(lookalike.as_str()),
+            "an approved authority must not share a suffix with a lookalike"
+        );
+    }
+
+    /// D6: the action name is what Cedar matches on, so a mis-spelled action
+    /// silently stops matching anything. Every variant must have a stable,
+    /// non-empty, snake-dotted name — the regression this test exists to pin
+    /// is the catch-all arm that used to collapse non-Git/SSH actions to
+    /// "unsupported".
+    #[test]
+    fn every_action_has_a_stable_non_empty_name() {
+        for action in [
+            Action::GitFetch,
+            Action::GitPush,
+            Action::SshConnect,
+            Action::HttpRequest,
+            Action::PostgresConnect,
+            Action::GitHubIssueCreate,
+            Action::GitHubIssueRead,
+            Action::GitHubReleaseCreate,
+        ] {
+            let name = action.to_string();
+            assert!(!name.is_empty(), "{action:?} has no action name");
+            assert!(
+                !name.contains("unsupported"),
+                "{name:?} is a deny-by-omission"
+            );
+            assert!(
+                name.split('.').count() >= 2,
+                "{name:?} must be a dotted action path"
+            );
+            assert!(
+                name.bytes().all(|b| b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || b == b'.'
+                    || b == b'_'),
+                "{name:?} must be lower-snake, no spaces or capitals"
+            );
+        }
+        assert_eq!(Action::GitHubIssueRead.to_string(), "github.issue.read");
+        assert_eq!(Action::GitHubIssueCreate.to_string(), "github.issue.create");
+    }
+
+    /// M4-R9: an Api resource carries an already-canonical audience, so the
+    /// uncanonical spelling can never be built at all.
+    #[test]
+    fn api_resource_cannot_carry_an_uncanonical_audience() {
+        let audience = Authority::canonicalize("API.GITHUB.COM.").expect("valid");
+        let resource = Resource::Api {
+            audience: audience.clone(),
+        };
+        match &resource {
+            Resource::Api { audience: held } => assert_eq!(held.as_str(), "api.github.com"),
+            other => panic!("expected Api, got {other:?}"),
+        }
+    }
+
+    /// A surrogate is a handle, not a secret-bearing string. Like every other
+    /// identifier it stays a distinct newtype so it cannot be passed where a
+    /// `CredentialId` is expected (P7).
+    #[test]
+    fn surrogate_id_is_distinct_from_credential_id() {
+        let surrogate = SurrogateId::new();
+        let credential = CredentialId::new();
+        assert_ne!(surrogate.to_string(), credential.to_string());
+        let _typed: SurrogateId = surrogate;
+        let _typed: CredentialId = credential;
     }
 }
