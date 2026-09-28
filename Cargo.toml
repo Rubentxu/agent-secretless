@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/domain",
+    "crates/ipc-protocol",
+    "crates/identity",
+    "crates/broker",
+    "crates/cli",
+]
+# M0 deliberately contains no connector crates. docs/15-ROADMAP.md M0 Exit
+# requires the UAT threat harness to run "even though no connector exists yet",
+# so an empty connector surface is the correct shape here, not a missing piece.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/rubentxu/agent-secretless"
+
+[workspace.dependencies]
+asv-domain = { path = "crates/domain" }
+asv-ipc-protocol = { path = "crates/ipc-protocol" }
+asv-identity = { path = "crates/identity" }
+
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+nix = { version = "0.29", features = ["socket", "uio", "user", "fs"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync"] }
+clap = { version = "4", features = ["derive", "env"] }
+secrecy = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+
+# M0 accepts a locked dependency set; versions are pinned after a compatibility
+# and advisory review per docs/17-IMPLEMENTATION-BOOTSTRAP.md section 8, which
+# explicitly declines to hardcode versions in the spec.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

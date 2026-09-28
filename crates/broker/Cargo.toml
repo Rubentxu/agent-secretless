@@ -1,0 +1,26 @@
+[package]
+name = "asv-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ASV broker. Secret-bearing process, isolated by OS identity (ADR-0002)."
+
+[[bin]]
+name = "asv-brokerd"
+path = "src/main.rs"
+
+[dependencies]
+asv-domain.workspace = true
+asv-ipc-protocol.workspace = true
+asv-identity = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { workspace = true }
+nix = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+serde_json = "1"

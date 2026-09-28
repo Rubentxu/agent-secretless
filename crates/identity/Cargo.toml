@@ -1,0 +1,15 @@
+[package]
+name = "asv-identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Workload identity from kernel peer evidence (ADR-0003). Self-declared names are metadata, not authentication."
+
+[dependencies]
+asv-domain.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+nix = { version = "0.29", features = ["socket", "process"] }
+libc = "0.2"

@@ -1,0 +1,21 @@
+[package]
+name = "asv-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The `asv` CLI. Controls sessions and capabilities; never returns a secret (ADR-0001)."
+
+[[bin]]
+name = "asv"
+path = "src/main.rs"
+
+[dependencies]
+asv-domain.workspace = true
+asv-ipc-protocol.workspace = true
+clap = { workspace = true }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1"
+tokio = { workspace = true }

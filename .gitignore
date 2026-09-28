@@ -1,0 +1,12 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# SDDK runtime state and cycle artifacts are machine-owned, not source.
+.sddk/
+*.sqlite
+*.sqlite-journal
+
+# Local scratch
+*.sock
+.DS_Store

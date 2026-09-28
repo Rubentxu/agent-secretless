@@ -1,0 +1,18 @@
+[package]
+name = "asv-domain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ASV domain types. Holds the no-secret-retrieval invariant (ADR-0001)."
+
+[dependencies]
+secrecy.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
+serde = { workspace = true }
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json = "1"
