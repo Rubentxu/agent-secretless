@@ -11,6 +11,10 @@ use asv_ipc_protocol::{ErrorCode, Request, Response, PROTOCOL_VERSION};
 use asv_policy::{AuthorizationRequest, PolicyEngine};
 use std::collections::HashMap;
 
+pub mod surrogate;
+
+pub use surrogate::{now_secs, SurrogateError, SurrogateRegistry};
+
 /// In-memory session table. M1 replaces this with persistent, encrypted state;
 /// M0 only needs it to prove the lifecycle boundary.
 #[derive(Debug, Default)]
@@ -22,6 +26,15 @@ pub struct SessionStore {
 struct SessionRecord {
     workspace: String,
     peer_pid: i32,
+    /// Whether the peer's process could be pinned with a pidfd (M4 D4).
+    ///
+    /// Directed requirement, not a global deny: `main.rs` deliberately makes
+    /// an unpinned peer a log-and-continue case, so refusing here would revert
+    /// a documented M0 decision. What D4 requires is narrower, and this field
+    /// is what makes it enforceable: a surrogate is a credential-shaped token,
+    /// so minting one for a process we can only weakly attribute is the case
+    /// that actually deserves a refusal.
+    pinned: bool,
 }
 
 impl SessionStore {
@@ -37,9 +50,20 @@ impl SessionStore {
             SessionRecord {
                 workspace,
                 peer_pid: peer.credentials.pid,
+                pinned: peer.is_pidfd_pinned(),
             },
         );
         id
+    }
+
+    /// Whether the session's peer was pidfd-pinned when it was opened (M4 D4).
+    ///
+    /// Recorded at creation rather than queried later: pinning is evidence
+    /// about the connection that opened the session, and a later query would
+    /// describe a different moment. A session opened unpinned stays unpinned,
+    /// which is the conservative direction.
+    pub fn is_pinned(&self, id: AgentSessionId) -> bool {
+        self.sessions.get(&id).is_some_and(|record| record.pinned)
     }
 
     /// Returns the workspace a session was opened against.
@@ -85,6 +109,8 @@ pub struct BrokerState {
     pub sessions: SessionStore,
     pub credentials: Vec<CredentialMetadata>,
     pub policy: PolicyEngine,
+    /// M4: the tokens an agent holds instead of credentials (D3).
+    pub surrogates: SurrogateRegistry,
 }
 
 /// Handles one authenticated request.
@@ -125,6 +151,10 @@ pub fn handle(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request
         Request::EndSession { session } => {
             if state.sessions.end(session) {
                 state.policy.revoke_session(session);
+                // The session's surrogates die with it. Leaving them live would
+                // make the session lifetime advisory: an agent could keep
+                // spending a token after the session that authorized it is gone.
+                state.surrogates.revoke_session(session);
                 Response::SessionEnded { session }
             } else {
                 // Fail closed: an unknown session is an error, not a no-op.
@@ -197,6 +227,90 @@ pub fn handle(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request
             Response::Error {
                 code: ErrorCode::Denied,
                 message: "approval must be issued by the human control plane, not by the requesting agent session".into(),
+            }
+        }
+
+        Request::MintSurrogate {
+            session,
+            credential,
+            max_uses,
+            ttl_secs,
+        } => {
+            if !state.sessions.belongs_to(session, peer) {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: "session is not owned by the authenticated peer".into(),
+                };
+            }
+            // D4, directed requirement: the rest of the broker treats an
+            // unpinned peer as a weaker-but-usable connection, but minting a
+            // credential-shaped token for a process we can only weakly
+            // attribute is the case worth refusing.
+            if !state.sessions.is_pinned(session) {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: "surrogate minting requires a pidfd-pinned session".into(),
+                };
+            }
+            if !state.credentials.iter().any(|c| c.id == credential) {
+                // An unknown credential would mint a token that always fails
+                // later. Refusing here reports the real problem instead.
+                return Response::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: format!("no such credential: {credential}"),
+                };
+            }
+
+            match state
+                .surrogates
+                .mint(session, credential, ttl_secs, max_uses, now_secs())
+            {
+                Ok((surrogate, expires_at, granted)) => {
+                    // The token is never logged. Only its budget and its
+                    // lifetime, which are the facts an operator needs.
+                    tracing::info!(
+                        %session,
+                        expires_at,
+                        max_uses = granted,
+                        "surrogate minted"
+                    );
+                    Response::SurrogateMinted {
+                        surrogate,
+                        expires_at,
+                        max_uses: granted,
+                    }
+                }
+                Err(error) => Response::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: error.to_string(),
+                },
+            }
+        }
+
+        Request::RevokeSurrogate { session, surrogate } => {
+            if !state.sessions.belongs_to(session, peer) {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: "session is not owned by the authenticated peer".into(),
+                };
+            }
+            if state.surrogates.revoke(&surrogate, session) {
+                Response::SurrogateRevoked { surrogate }
+            } else {
+                Response::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: "no such surrogate for this session".into(),
+                }
+            }
+        }
+
+        // The three semantic operations belong to CU-2.2: they need the
+        // connector and the secret port. Answering them here with a canned
+        // success would be worse than not answering at all.
+        Request::ReadIssue { .. } | Request::CreateIssue { .. } | Request::CreateRelease { .. } => {
+            Response::Error {
+                code: ErrorCode::UnknownMethod,
+                message: "semantic GitHub operations are not wired to a connector yet".into(),
             }
         }
     }
@@ -509,5 +623,358 @@ mod tests {
             !text.contains(CANARY),
             "canary leaked into response: {text}"
         );
+    }
+}
+
+/// The M4 session-bound surrogate tests. These drive the real `handle` entry
+/// point rather than the registry directly, because the questions that matter
+/// here are about the broker's decisions, not about the registry's internals.
+#[cfg(test)]
+mod surrogate_tests {
+    use super::*;
+    use asv_domain::CredentialKind;
+    use asv_identity::PeerCredentials;
+    use asv_ipc_protocol::MAX_SURROGATE_USES;
+
+    /// A peer whose process is pinned, which is the precondition D4 puts on
+    /// minting. The pin is real: `pin_pidfd` on this very process.
+    fn pinned_peer() -> WorkloadIdentity {
+        let mut peer = WorkloadIdentity::from_peer(PeerCredentials {
+            pid: std::process::id() as i32,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+        });
+        peer.pin_pidfd().expect("pidfd_open on self");
+        assert!(peer.is_pidfd_pinned(), "the fixture must be pinned");
+        peer
+    }
+
+    /// The weaker state: kernel-attested credentials, no pidfd. M0 treats this
+    /// as usable, and D4 keeps that decision.
+    fn unpinned_peer() -> WorkloadIdentity {
+        let peer = WorkloadIdentity::from_peer(PeerCredentials {
+            pid: std::process::id() as i32,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+        });
+        assert!(!peer.is_pidfd_pinned(), "the fixture must be unpinned");
+        peer
+    }
+
+    fn state_with_credential() -> (BrokerState, CredentialId) {
+        let mut state = BrokerState::default();
+        let metadata = CredentialMetadata::new("github-work", CredentialKind::BearerToken);
+        let id = insert_credential(&mut state, metadata);
+        (state, id)
+    }
+
+    fn mint(state: &mut BrokerState, peer: &WorkloadIdentity) -> (AgentSessionId, String) {
+        let session = state.sessions.create("/repo".to_string(), peer);
+        let credential = state.credentials[0].id;
+        match handle(
+            state,
+            peer,
+            Request::MintSurrogate {
+                session,
+                credential,
+                max_uses: 2,
+                ttl_secs: 60,
+            },
+        ) {
+            Response::SurrogateMinted { surrogate, .. } => (session, surrogate),
+            other => panic!("expected a minted surrogate, got {other:?}"),
+        }
+    }
+
+    /// D4's directed requirement: an unpinned session is still usable for
+    /// everything M0 allowed, but it cannot mint a credential-shaped token.
+    /// Without this test, "directed" is indistinguishable from "global deny".
+    #[test]
+    fn an_unpinned_session_can_still_create_and_end_sessions() {
+        let mut state = BrokerState::default();
+        let peer = unpinned_peer();
+        let session = match handle(
+            &mut state,
+            &peer,
+            Request::CreateSession {
+                workspace: "/repo".into(),
+            },
+        ) {
+            Response::SessionCreated { session } => session,
+            other => panic!("expected creation, got {other:?}"),
+        };
+        assert!(
+            !state.sessions.is_pinned(session),
+            "the fixture session is unpinned"
+        );
+        assert_eq!(
+            handle(&mut state, &peer, Request::EndSession { session }),
+            Response::SessionEnded { session },
+            "M0 behaviour must be preserved for an unpinned peer"
+        );
+    }
+
+    /// And the narrow refusal that D4 actually asks for.
+    #[test]
+    fn an_unpinned_peer_cannot_mint_a_surrogate() {
+        let (mut state, credential) = state_with_credential();
+        let peer = unpinned_peer();
+        let session = state.sessions.create("/repo".to_string(), &peer);
+        match handle(
+            &mut state,
+            &peer,
+            Request::MintSurrogate {
+                session,
+                credential,
+                max_uses: 1,
+                ttl_secs: 60,
+            },
+        ) {
+            Response::Error { code, .. } => assert_eq!(code, ErrorCode::Denied),
+            other => panic!("an unpinned peer must be refused, got {other:?}"),
+        }
+        assert!(
+            state.surrogates.is_empty(),
+            "a refused mint must leave no token behind"
+        );
+    }
+
+    /// A pinned peer mints successfully, and the response carries a token that
+    /// is recognisably a surrogate rather than anything credential-shaped.
+    #[test]
+    fn a_pinned_peer_mints_a_bounded_surrogate() {
+        let (mut state, _) = state_with_credential();
+        let peer = pinned_peer();
+        let (session, token) = mint(&mut state, &peer);
+        assert!(token.starts_with("asv1_"), "{token}");
+        assert_eq!(state.surrogates.len(), 1);
+
+        // The session ends, the token dies with it. This is the property that
+        // makes the session a real boundary rather than bookkeeping.
+        assert_eq!(
+            handle(&mut state, &peer, Request::EndSession { session }),
+            Response::SessionEnded { session }
+        );
+        assert_eq!(
+            state.surrogates.len(),
+            0,
+            "ending a session must revoke its surrogates"
+        );
+    }
+
+    /// A session owned by another peer must not mint, even with a valid
+    /// credential id. The session check runs before the credential lookup, so
+    /// the answer is a denial and never "no such credential", which would
+    /// confirm the id exists.
+    #[test]
+    fn a_session_cannot_be_used_by_a_stranger() {
+        let (mut state, credential) = state_with_credential();
+        let owner = pinned_peer();
+        let session = state.sessions.create("/repo".to_string(), &owner);
+
+        // A different PID, so `belongs_to` is false.
+        let stranger = WorkloadIdentity::from_peer(PeerCredentials {
+            pid: std::process::id() as i32 + 1,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+        });
+        match handle(
+            &mut state,
+            &stranger,
+            Request::MintSurrogate {
+                session,
+                credential,
+                max_uses: 1,
+                ttl_secs: 60,
+            },
+        ) {
+            Response::Error { code, .. } => assert_eq!(code, ErrorCode::Denied),
+            other => panic!("a stranger must be refused, got {other:?}"),
+        }
+        assert!(state.surrogates.is_empty());
+    }
+
+    /// Minting against a credential the broker does not hold would produce a
+    /// token that always fails later, which reads as a broker bug rather than
+    /// a client error.
+    #[test]
+    fn an_unknown_credential_is_refused_at_mint_time() {
+        let mut state = BrokerState::default();
+        let peer = pinned_peer();
+        let session = state.sessions.create("/repo".to_string(), &peer);
+        match handle(
+            &mut state,
+            &peer,
+            Request::MintSurrogate {
+                session,
+                credential: CredentialId::new(),
+                max_uses: 1,
+                ttl_secs: 60,
+            },
+        ) {
+            Response::Error { code, .. } => assert_eq!(code, ErrorCode::InvalidRequest),
+            other => panic!("an unknown credential must be refused, got {other:?}"),
+        }
+        assert!(state.surrogates.is_empty());
+    }
+
+    /// A client asking for an absurd budget is clamped, and the clamped value
+    /// is what comes back. The agent can then budget its own calls against the
+    /// real number instead of the one it asked for.
+    #[test]
+    fn a_client_cannot_widen_its_own_surrogate_budget() {
+        let (mut state, credential) = state_with_credential();
+        let peer = pinned_peer();
+        let session = state.sessions.create("/repo".to_string(), &peer);
+        match handle(
+            &mut state,
+            &peer,
+            Request::MintSurrogate {
+                session,
+                credential,
+                max_uses: u32::MAX,
+                ttl_secs: u64::MAX,
+            },
+        ) {
+            Response::SurrogateMinted {
+                max_uses,
+                expires_at,
+                surrogate,
+            } => {
+                assert_eq!(max_uses, MAX_SURROGATE_USES);
+                assert!(surrogate.starts_with("asv1_"));
+                assert!(expires_at > 0);
+            }
+            other => panic!("expected a clamped mint, got {other:?}"),
+        }
+    }
+
+    /// Revoke is session-scoped, and revoking something you do not own reports
+    /// honestly instead of pretending it worked.
+    #[test]
+    fn revoke_is_scoped_to_the_owning_session() {
+        let (mut state, _) = state_with_credential();
+        let peer = pinned_peer();
+        let (session, token) = mint(&mut state, &peer);
+
+        // A stranger's revoke, under their own session, must not touch it.
+        let other_session = state.sessions.create("/other".to_string(), &peer);
+        match handle(
+            &mut state,
+            &peer,
+            Request::RevokeSurrogate {
+                session: other_session,
+                surrogate: token.clone(),
+            },
+        ) {
+            Response::Error { code, .. } => assert_eq!(code, ErrorCode::InvalidRequest),
+            other => panic!("a cross-session revoke must fail, got {other:?}"),
+        }
+        assert_eq!(state.surrogates.len(), 1, "the token is untouched");
+
+        // The owner can.
+        assert_eq!(
+            handle(
+                &mut state,
+                &peer,
+                Request::RevokeSurrogate {
+                    session,
+                    surrogate: token.clone(),
+                }
+            ),
+            Response::SurrogateRevoked { surrogate: token }
+        );
+        assert!(state.surrogates.is_empty());
+    }
+
+    /// The three semantic operations are not wired yet. They must say so
+    /// rather than answering with a plausible-looking success, because a fake
+    /// success here is indistinguishable from a working brokered call.
+    #[test]
+    fn semantic_operations_fail_closed_until_a_connector_exists() {
+        let (mut state, _) = state_with_credential();
+        let peer = pinned_peer();
+        let (session, token) = mint(&mut state, &peer);
+
+        for request in [
+            Request::ReadIssue {
+                session,
+                surrogate: token.clone(),
+                repo: "o/r".into(),
+                number: 1,
+            },
+            Request::CreateIssue {
+                session,
+                surrogate: token.clone(),
+                repo: "o/r".into(),
+                title: "t".into(),
+                body: "b".into(),
+            },
+            Request::CreateRelease {
+                session,
+                surrogate: token.clone(),
+                repo: "o/r".into(),
+                tag: "v1".into(),
+                name: "n".into(),
+                body: "b".into(),
+            },
+        ] {
+            match handle(&mut state, &peer, request) {
+                Response::Error { code, .. } => assert_eq!(
+                    code,
+                    ErrorCode::UnknownMethod,
+                    "an unwired operation must say so"
+                ),
+                other => panic!("an unwired operation must not answer {other:?}"),
+            }
+        }
+        // And crucially, an unattempted call must not have spent the budget.
+        assert_eq!(state.surrogates.len(), 1, "the token is still live");
+    }
+
+    /// A minted token is the only credential-shaped string the broker emits,
+    /// and the response must not also leak the underlying credential id.
+    #[test]
+    fn minting_leaks_no_credential_material() {
+        const CANARY: &str = "ASV-CANARY-9f2c-DO-NOT-LEAK";
+        let mut state = BrokerState::default();
+        let metadata = CredentialMetadata::new(CANARY, CredentialKind::BearerToken);
+        let credential = insert_credential(&mut state, metadata);
+        let peer = pinned_peer();
+        let session = state.sessions.create("/repo".to_string(), &peer);
+
+        let response = handle(
+            &mut state,
+            &peer,
+            Request::MintSurrogate {
+                session,
+                credential,
+                max_uses: 1,
+                ttl_secs: 60,
+            },
+        );
+        let bytes = asv_ipc_protocol::encode_response(&response).expect("encodes");
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(
+            !text.contains(CANARY),
+            "the credential label leaked into the mint response: {text}"
+        );
+        assert!(
+            !text.contains(&credential.as_uuid().to_string()),
+            "the credential id leaked into the mint response: {text}"
+        );
+    }
+
+    /// Teardown leaves nothing live. UAT-030 asserts this, so the invariant is
+    /// pinned where the state actually lives.
+    #[test]
+    fn teardown_leaves_no_surrogate_behind() {
+        let (mut state, _) = state_with_credential();
+        let peer = pinned_peer();
+        let (session, _) = mint(&mut state, &peer);
+        assert_eq!(state.surrogates.len(), 1, "one token is live");
+        handle(&mut state, &peer, Request::EndSession { session });
+        assert!(state.surrogates.is_empty(), "and none after teardown");
+        assert!(state.sessions.is_empty(), "and no session either");
     }
 }

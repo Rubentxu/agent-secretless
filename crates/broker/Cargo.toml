@@ -23,6 +23,10 @@ tokio = { workspace = true }
 nix = { workspace = true }
 libc = "0.2"
 zeroize.workspace = true
+# M4 surrogate tokens: 32 bytes of OS entropy per token, compared in constant
+# time so a rejected guess leaks nothing about the real one.
+rand.workspace = true
+subtle.workspace = true
 
 [dev-dependencies]
 serde_json = "1"

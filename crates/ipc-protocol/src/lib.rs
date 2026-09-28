@@ -23,7 +23,12 @@ use uuid::Uuid;
 
 /// Protocol version. A mismatch is a hard failure, never a downgrade
 /// (`docs/03-ARCHITECTURE.md` §6, version negotiation).
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// v2 adds the M4 semantic surface. The bump is not cosmetic: an agent that
+/// speaks v1 has no way to express a surrogate, and one that speaks v2 but
+/// reaches a v1 broker must fail loudly at the gate rather than discover the
+/// gap when its first brokered call is denied.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Hard ceiling on a single inbound message. Bounded allocation is required for
 /// any IPC that faces an untrusted peer (`docs/17-IMPLEMENTATION-BOOTSTRAP.md` §9).
@@ -60,6 +65,56 @@ pub enum Request {
         request: AuthorizationRequest,
         ttl_secs: u64,
     },
+    /// Mints a short-lived surrogate for an already-authorized session (M4 D3).
+    ///
+    /// The broker returns a bearer-shaped string the agent may present instead
+    /// of a `CredentialId`. Minting is not authorization: it requires a
+    /// pinned session, but the *operation* the surrogate will later stand in
+    /// for is still evaluated by [`Request::Authorize`] at use time.
+    MintSurrogate {
+        session: AgentSessionId,
+        /// The credential the surrogate will stand in for. The agent never
+        /// learns the secret behind this id, and the surrogate is useless
+        /// without it.
+        credential: CredentialId,
+        /// How many operations this surrogate may authorize. Bounded because an
+        /// unbounded surrogate is a permanent credential with extra steps.
+        max_uses: u32,
+        /// Lifetime in seconds, capped by [`MAX_SURROGATE_TTL_SECS`].
+        ttl_secs: u64,
+    },
+    /// Releases a surrogate before its natural expiry.
+    RevokeSurrogate {
+        session: AgentSessionId,
+        surrogate: String,
+    },
+    /// Semantic GitHub issue read (M4-R9). Read-only and provider-shaped, so
+    /// the policy engine evaluates `github.issue.read` rather than a
+    /// catch-all HTTP verb.
+    ReadIssue {
+        session: AgentSessionId,
+        surrogate: String,
+        /// `owner/repo`, validated before any byte leaves the process.
+        repo: String,
+        number: u64,
+    },
+    /// Semantic GitHub issue creation.
+    CreateIssue {
+        session: AgentSessionId,
+        surrogate: String,
+        repo: String,
+        title: String,
+        body: String,
+    },
+    /// Semantic GitHub release creation.
+    CreateRelease {
+        session: AgentSessionId,
+        surrogate: String,
+        repo: String,
+        tag: String,
+        name: String,
+        body: String,
+    },
 }
 
 /// Broker responses. Every variant is safe to return to an agent: none of them
@@ -67,15 +122,77 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
-    Pong { protocol: u16 },
-    SessionCreated { session: AgentSessionId },
-    SessionEnded { session: AgentSessionId },
-    CredentialMetadata { entries: Vec<CredentialMetadataDto> },
-    CredentialDeleted { id: CredentialId },
-    Authorization { explanation: ExplainResult },
-    ApprovalIssued { approval: Approval },
-    Error { code: ErrorCode, message: String },
+    Pong {
+        protocol: u16,
+    },
+    SessionCreated {
+        session: AgentSessionId,
+    },
+    SessionEnded {
+        session: AgentSessionId,
+    },
+    CredentialMetadata {
+        entries: Vec<CredentialMetadataDto>,
+    },
+    CredentialDeleted {
+        id: CredentialId,
+    },
+    Authorization {
+        explanation: ExplainResult,
+    },
+    ApprovalIssued {
+        approval: Approval,
+    },
+    /// A freshly minted surrogate. This is the only response that ever carries
+    /// a credential-shaped string, and it carries a *surrogate*, never a
+    /// secret: the broker keeps the real credential in-process.
+    SurrogateMinted {
+        surrogate: String,
+        /// Absolute expiry, as a UNIX timestamp in seconds. Absolute rather
+        /// than a duration so a client cannot extend a grant by resetting a
+        /// local timer.
+        expires_at: u64,
+        max_uses: u32,
+    },
+    SurrogateRevoked {
+        surrogate: String,
+    },
+    /// The three fields M4-R9 promises for a read, and nothing else. Notably
+    /// absent: the raw provider body, which could carry anything upstream
+    /// chose to add to it.
+    IssueRead {
+        title: String,
+        body: String,
+        state: String,
+    },
+    IssueCreated {
+        number: u64,
+        url: String,
+    },
+    ReleaseCreated {
+        tag: String,
+        url: String,
+    },
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
 }
+
+/// Hard ceiling on a surrogate's lifetime, in seconds (M4 D3).
+///
+/// The agent proposes a TTL and the broker clamps it here. A client that could
+/// choose an unbounded TTL would make the whole expiry mechanism advisory, so
+/// this constant is not a default the broker falls back to, it is a limit the
+/// broker enforces over the client's request.
+pub const MAX_SURROGATE_TTL_SECS: u64 = 900;
+
+/// Hard ceiling on a surrogate's use budget.
+///
+/// One is the common case and two already covers a retry. A larger budget
+/// turns the surrogate into a bearer token with a long tail, which is the
+/// shape ADR-0011 exists to avoid.
+pub const MAX_SURROGATE_USES: u32 = 8;
 
 /// Serializable view of credential metadata.
 ///
@@ -268,9 +385,15 @@ mod tests {
     }
 
     /// Version negotiation is a hard gate with no downgrade path.
+    ///
+    /// The accepted version is `PROTOCOL_VERSION`, not a literal: pinning the
+    /// number here would make every future bump fail this test for a reason
+    /// that has nothing to do with negotiation, and the fix would be to
+    /// rewrite the test rather than the gate.
     #[test]
     fn version_mismatch_is_rejected() {
-        let ok = decode_request(br#"{"method":"ping","protocol":1}"#).expect("v1 ok");
+        let current = format!(r#"{{"method":"ping","protocol":{PROTOCOL_VERSION}}}"#);
+        let ok = decode_request(current.as_bytes()).expect("current version decodes");
         assert!(check_version(&ok).is_ok());
 
         let old = decode_request(br#"{"method":"ping","protocol":0}"#).expect("decodes");
@@ -280,7 +403,7 @@ mod tests {
                 err,
                 ProtocolError::VersionMismatch {
                     client: 0,
-                    broker: 1
+                    broker: PROTOCOL_VERSION
                 }
             ),
             "got {err:?}"
@@ -298,5 +421,130 @@ mod tests {
         assert!(!json.to_lowercase().contains("secret"));
         assert!(!json.to_lowercase().contains("value"));
         assert!(!json.to_lowercase().contains("payload"));
+    }
+
+    /// v1 and v2 must not interoperate. If a v2 client could reach a v1
+    /// broker, the failure would surface as a denied call rather than as a
+    /// version error, and the cause would be misattributed.
+    #[test]
+    fn the_v2_bump_is_a_hard_boundary() {
+        let v1 = decode_request(br#"{"method":"ping","protocol":1}"#).expect("decodes");
+        assert!(
+            check_version(&v1).is_err(),
+            "a v1 client must not be served by a v2 broker"
+        );
+        let v2 = decode_request(br#"{"method":"ping","protocol":2}"#).expect("decodes");
+        assert!(check_version(&v2).is_ok());
+    }
+
+    /// Every M4 method must round-trip with its fields intact. A rename or a
+    /// dropped field here would silently change the wire contract that the
+    /// broker and the agent both compile against.
+    #[test]
+    fn the_m4_methods_round_trip_on_the_wire() {
+        let session = AgentSessionId::new();
+        let credential = CredentialId::new();
+        for request in [
+            Request::MintSurrogate {
+                session,
+                credential,
+                max_uses: 2,
+                ttl_secs: 60,
+            },
+            Request::RevokeSurrogate {
+                session,
+                surrogate: "asv1_abc".into(),
+            },
+            Request::ReadIssue {
+                session,
+                surrogate: "asv1_abc".into(),
+                repo: "owner/repo".into(),
+                number: 7,
+            },
+            Request::CreateIssue {
+                session,
+                surrogate: "asv1_abc".into(),
+                repo: "owner/repo".into(),
+                title: "t".into(),
+                body: "b".into(),
+            },
+            Request::CreateRelease {
+                session,
+                surrogate: "asv1_abc".into(),
+                repo: "owner/repo".into(),
+                tag: "v1".into(),
+                name: "n".into(),
+                body: "b".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&request).expect("serializes");
+            assert!(
+                json.len() <= MAX_MESSAGE_BYTES,
+                "{json} exceeds the message bound"
+            );
+            let decoded: Request = serde_json::from_str(&json).expect("round-trips");
+            assert_eq!(decoded, request);
+        }
+    }
+
+    /// A response must never be able to carry secret material. This walks the
+    /// M4 responses rather than trusting the doc comment on the enum, because
+    /// a doc comment is exactly the kind of claim that rots when a variant is
+    /// added.
+    #[test]
+    fn m4_responses_carry_no_secret_field() {
+        for response in [
+            Response::SurrogateMinted {
+                surrogate: "asv1_abc".into(),
+                expires_at: 1,
+                max_uses: 1,
+            },
+            Response::SurrogateRevoked {
+                surrogate: "asv1_abc".into(),
+            },
+            Response::IssueRead {
+                title: "t".into(),
+                body: "b".into(),
+                state: "open".into(),
+            },
+            Response::IssueCreated {
+                number: 1,
+                url: "u".into(),
+            },
+            Response::ReleaseCreated {
+                tag: "v1".into(),
+                url: "u".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&response).expect("serializes");
+            let lowered = json.to_lowercase();
+            for forbidden in ["secret", "token", "password", "private_key"] {
+                assert!(
+                    !lowered.contains(forbidden),
+                    "{forbidden} leaked into {json}"
+                );
+            }
+        }
+    }
+
+    /// A pinned-in-value test on two constants cannot fail in a useful way: it
+    /// either compiles or it does not, so asserting `TTL > 0` here proves
+    /// nothing an `if` at the mint site would not. The caps are checked where
+    /// they are actually enforced instead, in
+    /// `asv_broker::surrogate` (`a_surrogate_dies_exactly_at_its_expiry` and
+    /// `a_client_cannot_mint_a_surrogate_that_outlives_the_cap`).
+    #[test]
+    fn a_mint_request_always_fits_inside_the_wire_bound() {
+        // What *is* worth asserting here is the shape: every field a client
+        // controls has to be representable without a broker-side truncation
+        // surprise, so a full-size request must still be a normal request.
+        let request = Request::MintSurrogate {
+            session: AgentSessionId::new(),
+            credential: CredentialId::new(),
+            max_uses: MAX_SURROGATE_USES,
+            ttl_secs: MAX_SURROGATE_TTL_SECS,
+        };
+        let json = serde_json::to_string(&request).expect("serializes");
+        assert!(json.len() < MAX_MESSAGE_BYTES / 2, "{json}");
     }
 }

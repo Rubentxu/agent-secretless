@@ -193,6 +193,29 @@ fn print_response(response: &Response) {
         Response::ApprovalIssued { approval } => {
             println!("approval {} issued for {:?}", approval.id, approval.action);
         }
+        Response::SurrogateMinted {
+            surrogate,
+            expires_at,
+            max_uses,
+        } => {
+            // The token itself is the one thing a terminal must not echo into
+            // a scrollback buffer that survives the session. Its budget and
+            // lifetime are safe, and are what an operator actually needs.
+            let _ = surrogate;
+            println!("surrogate minted: {max_uses} use(s), expires at {expires_at}");
+        }
+        Response::SurrogateRevoked { .. } => {
+            println!("surrogate revoked");
+        }
+        Response::IssueRead { title, state, .. } => {
+            println!("issue {title:?} [{state}]");
+        }
+        Response::IssueCreated { number, url } => {
+            println!("issue {number} created: {url}");
+        }
+        Response::ReleaseCreated { tag, url } => {
+            println!("release {tag} created: {url}");
+        }
         Response::Error { code, message } => {
             // `code` is the stable, scriptable part; `message` is for humans.
             eprintln!("{code:?}: {message}");
