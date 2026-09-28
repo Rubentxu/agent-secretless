@@ -22,9 +22,11 @@ not write one" but "one cannot be added without a deliberate act".
 
 - `Request` is a closed enum with no variant able to carry secret material
   (`crates/ipc-protocol/src/lib.rs`).
-- `SecretBytes` omits `Debug`, `Clone`, `Serialize` and `Display`; absence of
-  the derive is the guarantee, because no call site can log or serialize a
-  secret without the code failing to compile.
+- `SecretBytes` has no `Clone`, `Serialize` or `Display`, and its `Debug` impl
+  writes only `SecretBytes(<redacted>)`. The guarantee is not the absence of a
+  derive but the absence of any path to the content: a stray `{:?}` is safe by
+  construction, no call site can clone or serialize the value, and it is
+  zeroized on drop. Verified at `crates/domain/src/secret.rs:64`.
 - `cargo test -p asv-cli no_subcommand_exposes_a_secret` asserts the rendered
   clap surface contains none of `get_secret`, `export_secret`, `show_secret`,
   `reveal`, `password`, `token`.
@@ -63,12 +65,22 @@ This is the requirement that the first harness violated.
 
 - `tests/adversarial/run_harness.py` plants a canary in the vectors a secret
   would occupy and attacks a real `asv-brokerd` and a real `asv` process.
-- Five self-checks plant the canary in the exact vector each probe scans and
+- Six self-checks plant the canary in the exact vector each probe scans and
   require it to be found. A probe that cannot detect its own planted canary
   reports `INVALID`, which fails the run.
 - `tests/adversarial/test_falsifiability.py` injects three real leaks into the
   source, rebuilds, and requires the harness to reject each one before
   restoring the tree.
+
+**What M0 does not claim**
+
+`argv` is readable by every same-uid process, and `ps` and shell history see it
+regardless of what the binary does. A value passed as a CLI flag is therefore
+visible in `/proc/<pid>/cmdline` for the life of the process, and no ASV change
+can prevent it. M0 does not claim an argv boundary. What it does control is
+that the CLI offers no secret-ingestion surface and never echoes a request
+field back; both are checked, and `selfcheck-cmdline` proves the cmdline reader
+works, so the kernel wording is falsifiable rather than asserted.
 
 **Regression that motivated this requirement**
 
@@ -93,7 +105,7 @@ Explicitly not claimed, and not to be read as evidence of working:
 cargo test --workspace                      35 passed, 0 failed
 cargo clippy --workspace --all-targets      0 warnings
 cargo fmt --all -- --check                  clean
-python3 tests/adversarial/run_harness.py    10 passed, 0 leaked, 0 invalid
+python3 tests/adversarial/run_harness.py    11 passed, 0 leaked, 0 invalid
 python3 tests/adversarial/test_falsifiability.py   3/3 leaks detected
 python3 tools/check-gates.py                5 hard defects (tracked, not patched)
 agent-secretless-vault-spec/SHA256SUMS      37/37 unchanged
