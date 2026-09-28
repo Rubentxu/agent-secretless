@@ -1,0 +1,26 @@
+# SDDK permission registry.
+#
+# Default-deny: an agent that is not listed here holds no capabilities. Only the
+# release route is granted, and only the capabilities `sddk release apply
+# --route local` actually performs. Nothing here permits a forge release, a
+# branch push to anywhere but `main`, or a capability deletion.
+#
+# The grant is deliberately narrow. A permissions file that says "allow
+# everything" is indistinguishable from no file at all under a default-deny
+# policy, and this project is about proving boundaries rather than asserting
+# them.
+permissions_registry_version: 1
+agents:
+  sddk-release:
+    phases:
+      - release
+    capabilities:
+      - git.inspect
+      - git.create_branch
+      - git.commit
+      - git.merge
+      - git.tag
+      - git.delete_branch
+      - git.push
+      - sddk:release.local_route
+      - sddk:release.main_branch_release
