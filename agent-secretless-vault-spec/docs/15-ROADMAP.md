@@ -102,7 +102,13 @@ A milestone closes only when its exit UAT is green.
 
 ### Exit UAT
 
-- UAT-001, 002, 004, 005, 014, 016, 028.
+- UAT-001, 002, 004, 014, 016, 028.
+
+### Gate notes
+
+Placeholder replay outside the session is deliberately **not** an M2 gate: it
+requires copying a surrogate outside ASV, and the surrogate registry only
+arrives in M4. It is claimed by M4, the first milestone whose scope provides it.
 
 ### Product checkpoint
 
@@ -150,7 +156,24 @@ At this point ASV has demonstrated its defining property for private keys.
 
 - UAT-005 through 010,
 - UAT-017,
+- UAT-027,
+- UAT-030,
 - fuzz corpus for URL/headers.
+
+### Gate notes
+
+Placeholder replay outside the session is claimed here rather than at M2: it
+needs a surrogate to place outside ASV, and the surrogate registry is M4 scope.
+
+Secret rotation lands here because rotation has to work against a stable
+credential ID that both a live session and a Cedar policy already reference. M4
+is the first milestone where a bearer/API-key secret is issued into a session;
+earlier milestones have no second credential to rotate.
+
+Performance smoke lands here because its 100 brokered read requests need the
+HTTP broker path, and its overhead budget is only meaningful once that path
+exists. The numeric budget is still undefined; it is tracked as an open
+backlog item and is a prerequisite for closing M4.
 
 ---
 
@@ -218,10 +241,19 @@ At this point ASV has demonstrated its defining property for private keys.
 ### Exit UAT
 
 - UAT-003,
-- UAT-013,
-- UAT-021,
 - UAT-023,
 - UAT-024.
+
+### Gate notes
+
+The eBPF wrong-cgroup case is deliberately **not** an M7 gate: it requires
+socket redirection, which is not part of M7. M7's scope stops at cgroup v2
+ownership, Landlock and seccomp; the eBPF redirect path is an M8 research
+decision that only becomes a feature at M9, and M9 claims it.
+
+Isolated worker exfiltration is likewise **not** an M7 gate: it requires the
+registered worker templates and separate-identity workers, which are M10's
+scope. M10 claims it.
 
 ---
 
