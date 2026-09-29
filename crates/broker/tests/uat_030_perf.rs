@@ -352,10 +352,73 @@ fn a_teardown_leaves_no_sessions_no_surrogates_and_no_grants() {
         "the ended session is still pinned"
     );
     assert_eq!(
+        fixture.state.sessions.pin_count(),
+        0,
+        "R3 zero-live-pin violation: {} pinned sessions after teardown",
+        fixture.state.sessions.pin_count()
+    );
+    assert_eq!(
         fixture.state.surrogates.len(),
         0,
         "surrogates leaked after teardown: {}",
         fixture.state.surrogates.len()
+    );
+}
+
+/// R3 ("PID reuse mitigated with pidfd/launch record") requires the broker
+/// to release every pin when the session ends. This test is the property
+/// the previous one only implicitly asserted: after a session is torn down
+/// following N brokered reads, `pin_count` MUST be exactly 0. A pin that
+/// outlives its session is the exact failure mode R3 names.
+///
+/// The number 100 is deliberate: UAT-030's text says "100 brokered read
+/// requests and SSH signatures in the same sentence" (`14-UAT-ADVERSARIAL.md`
+/// line 234). The other half of that — 100 signatures — is exercised by
+/// `one_hundred_ssh_signatures_verify_under_p95_budget`. This test is the
+/// 100-read half's leak-check.
+#[test]
+fn a_hundred_brokered_reads_leave_zero_live_pins_after_teardown() {
+    let mut fixture = Fixture::new(100);
+    for number in 1..=100u64 {
+        fixture.read_issue(number);
+    }
+
+    // The session is live before teardown; this is the precondition for
+    // the post-teardown count to mean anything.
+    assert!(
+        fixture.state.sessions.is_pinned(fixture.session),
+        "the session must be pinned before teardown, or the leak check proves nothing"
+    );
+
+    let ended = handle(
+        &mut fixture.state,
+        &fixture.peer,
+        Request::EndSession {
+            session: fixture.session,
+        },
+    );
+    assert!(
+        matches!(ended, Response::SessionEnded { .. }),
+        "teardown must succeed: {ended:?}"
+    );
+
+    // The structural claim: zero live pins, zero live sessions, zero live
+    // surrogates. Any non-zero value is R3 violation.
+    assert_eq!(
+        fixture.state.sessions.pin_count(),
+        0,
+        "R3 zero-live-pin violation: {} pinned sessions survived teardown",
+        fixture.state.sessions.pin_count()
+    );
+    assert_eq!(
+        fixture.state.sessions.len(),
+        0,
+        "session entry survived teardown"
+    );
+    assert_eq!(
+        fixture.state.surrogates.len(),
+        0,
+        "surrogates leaked after teardown"
     );
 }
 

@@ -110,6 +110,20 @@ impl SessionStore {
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }
+
+    /// Count of live sessions whose peer was pidfd-pinned at creation.
+    ///
+    /// This is the UAT-030 zero-live-pin counter. R3 ("PID reuse mitigated
+    /// with pidfd/launch record") requires that a broker holding a pin for a
+    /// peer cannot outlive the session the pin is bound to: every pin must
+    /// be released when the session ends. `pin_count` is the observable
+    /// surface that makes that property testable from outside the crate.
+    pub fn pin_count(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|record| record.pinned)
+            .count()
+    }
 }
 
 /// Builds the GitHub client for one operation.
