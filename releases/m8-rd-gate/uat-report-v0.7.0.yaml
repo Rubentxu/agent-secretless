@@ -24,12 +24,12 @@ features:
   - scenario_id: S-1
     status: PASS
     executor: automated
-    acceptance: pending
+    acceptance: accepted
     acceptance_required: true
   - scenario_id: S-2
     status: PASS
     executor: automated
-    acceptance: pending
+    acceptance: accepted
     acceptance_required: true
 - id: UAT-M8-R4-AUDIT
   name: asv-ebpfd M8-R4 monotonic audit sequence
