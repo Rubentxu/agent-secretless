@@ -35,6 +35,6 @@
 pub mod verbs;
 
 pub use verbs::{
-    cgroup_attach_skeleton, parse_verb, program_lookup, AttachHandle, HelperError, ProgramId, Verb,
-    VerbError,
+    cgroup_attach_skeleton, format_audit_line, parse_cgroup_id, parse_verb, program_lookup,
+    AttachHandle, AuditCounter, HelperError, ProgramId, Verb, VerbError,
 };
