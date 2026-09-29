@@ -17,8 +17,11 @@ use asv_broker::tls_bridge::{
 use asv_domain::Authority;
 
 fn api_endpoint() -> AuthorityEndpoint {
-    AuthorityEndpoint::new(Authority::canonicalize("api.example.com").expect("host"), 443)
-        .expect("endpoint")
+    AuthorityEndpoint::new(
+        Authority::canonicalize("api.example.com").expect("host"),
+        443,
+    )
+    .expect("endpoint")
 }
 
 #[test]
@@ -44,7 +47,9 @@ fn uat_012_injector_rejects_empty_ca() {
     ca.root_der.clear();
     let tmp = std::env::temp_dir().join("asv-uat012-empty");
     std::fs::create_dir_all(&tmp).expect("mkdir");
-    let err = OpenSslEnvInjector.inject(&ca, &tmp).expect_err("must reject");
+    let err = OpenSslEnvInjector
+        .inject(&ca, &tmp)
+        .expect_err("must reject");
     match err {
         InjectError::EmptyCa(s) => assert_eq!(s, "sess-012-empty"),
         other => panic!("unexpected error: {other:?}"),

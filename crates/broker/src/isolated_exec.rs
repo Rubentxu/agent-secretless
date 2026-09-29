@@ -344,7 +344,9 @@ mod tests {
             name: "kubectl-worker".into(),
             binary: PathBuf::from("/usr/bin/kubectl"),
             arguments: vec!["get".into(), "pods".into()],
-            secret_injection: SecretInjectionPlan::EnvVar { name: "KUBE_TOKEN".into() },
+            secret_injection: SecretInjectionPlan::EnvVar {
+                name: "KUBE_TOKEN".into(),
+            },
             egress_policy: EgressPolicy::Allow(vec![api_endpoint()]),
             landlock_profile: LandlockProfile::default(),
             seccomp_profile: SeccompProfile::ClosedAllowList,

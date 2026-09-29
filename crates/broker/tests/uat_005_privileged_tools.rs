@@ -24,8 +24,7 @@ fn uat_005_install_runs_from_broker_init() {
     // this test asserts the install path itself is sound.
     let cfg = install().expect("install must succeed");
     assert!(
-        cfg.cgroup_v2
-            || !cfg.cgroup_v2,
+        cfg.cgroup_v2 || !cfg.cgroup_v2,
         "HardenConfig struct must be populated"
     );
 }

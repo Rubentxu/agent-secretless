@@ -187,10 +187,7 @@ fn set_dumpable_zero() -> Result<(), HardenError> {
     let ret = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        return Err(HardenError::Prctl(format!(
-            "PR_SET_DUMPABLE: {}",
-            err
-        )));
+        return Err(HardenError::Prctl(format!("PR_SET_DUMPABLE: {}", err)));
     }
     Ok(())
 }
@@ -200,10 +197,7 @@ fn set_no_new_privs() -> Result<(), HardenError> {
     let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        return Err(HardenError::Prctl(format!(
-            "PR_SET_NO_NEW_PRIVS: {}",
-            err
-        )));
+        return Err(HardenError::Prctl(format!("PR_SET_NO_NEW_PRIVS: {}", err)));
     }
     Ok(())
 }
@@ -280,8 +274,7 @@ fn install_landlock() -> bool {
         // ENOSYS = kernel does not implement the syscall.
         // EOPNOTSUPP = kernel was built without CONFIG_SECURITY_LANDLOCK.
         // Both are non-fatal: the broker logs the absence and runs.
-        if err.raw_os_error() == Some(libc::ENOSYS)
-            || err.raw_os_error() == Some(libc::EOPNOTSUPP)
+        if err.raw_os_error() == Some(libc::ENOSYS) || err.raw_os_error() == Some(libc::EOPNOTSUPP)
         {
             eprintln!(
                 "asv-broker: Landlock not supported by this kernel ({err}); \

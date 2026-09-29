@@ -14,8 +14,7 @@
 //! arbitrary BPF load or generic cgroup writes.
 
 use asv_ebpfd::{
-    cgroup_attach_skeleton, parse_verb, program_lookup, AttachHandle, ProgramId, Verb,
-    VerbError,
+    cgroup_attach_skeleton, parse_verb, program_lookup, AttachHandle, ProgramId, Verb, VerbError,
 };
 
 #[test]

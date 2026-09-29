@@ -16,9 +16,12 @@ fn uat_035_replay_round_trip_through_disk_simulation() {
     // Append three records, "flush" to a byte buffer (simulated disk),
     // reload, replay.
     let mut j = RecoveryJournal::new();
-    j.append(JournalKind::CredentialAdded, b"cred-A".to_vec()).unwrap();
-    j.append(JournalKind::CredentialRotated, b"cred-A->cred-B".to_vec()).unwrap();
-    j.append(JournalKind::CredentialRevoked, b"cred-A".to_vec()).unwrap();
+    j.append(JournalKind::CredentialAdded, b"cred-A".to_vec())
+        .unwrap();
+    j.append(JournalKind::CredentialRotated, b"cred-A->cred-B".to_vec())
+        .unwrap();
+    j.append(JournalKind::CredentialRevoked, b"cred-A".to_vec())
+        .unwrap();
 
     let bytes = j.as_bytes().to_vec();
     let j = RecoveryJournal::from_bytes(bytes);
@@ -36,8 +39,10 @@ fn uat_035_torn_write_at_end_truncates_last_record() {
     // Simulate a crash mid-append: the broker wrote the length
     // prefix and part of the body but died before completing.
     let mut j = RecoveryJournal::new();
-    j.append(JournalKind::CredentialAdded, b"cred-A".to_vec()).unwrap();
-    j.append(JournalKind::CredentialRevoked, b"cred-A".to_vec()).unwrap();
+    j.append(JournalKind::CredentialAdded, b"cred-A".to_vec())
+        .unwrap();
+    j.append(JournalKind::CredentialRevoked, b"cred-A".to_vec())
+        .unwrap();
     let mut raw = j.as_bytes().to_vec();
     // Truncate the last 3 bytes — the broker died 3 bytes into the
     // CRC of the second record.
@@ -55,9 +60,12 @@ fn uat_035_corrupted_record_in_middle_stops_replay() {
     // A single byte flip in the middle of a record must stop the
     // replay at the corrupted record; earlier records apply.
     let mut j = RecoveryJournal::new();
-    j.append(JournalKind::CredentialAdded, b"cred-A".to_vec()).unwrap();
-    j.append(JournalKind::CredentialRotated, b"cred-A->cred-B".to_vec()).unwrap();
-    j.append(JournalKind::CredentialRevoked, b"cred-B".to_vec()).unwrap();
+    j.append(JournalKind::CredentialAdded, b"cred-A".to_vec())
+        .unwrap();
+    j.append(JournalKind::CredentialRotated, b"cred-A->cred-B".to_vec())
+        .unwrap();
+    j.append(JournalKind::CredentialRevoked, b"cred-B".to_vec())
+        .unwrap();
     let mut raw = j.as_bytes().to_vec();
     // Flip a bit in the middle of the second record's body. The
     // first record's bytes are 0..(4 + 11) = 0..15. Flip byte 18
@@ -85,10 +93,14 @@ fn uat_035_empty_journal_does_not_advance_state() {
 #[test]
 fn uat_035_full_record_set_with_all_kinds_applies_in_order() {
     let mut j = RecoveryJournal::new();
-    j.append(JournalKind::CredentialAdded, b"cred-A".to_vec()).unwrap();
-    j.append(JournalKind::CredentialRotated, b"cred-A->cred-B".to_vec()).unwrap();
-    j.append(JournalKind::CredentialRevoked, b"cred-A".to_vec()).unwrap();
-    j.append(JournalKind::VaultResealed, b"new-passphrase".to_vec()).unwrap();
+    j.append(JournalKind::CredentialAdded, b"cred-A".to_vec())
+        .unwrap();
+    j.append(JournalKind::CredentialRotated, b"cred-A->cred-B".to_vec())
+        .unwrap();
+    j.append(JournalKind::CredentialRevoked, b"cred-A".to_vec())
+        .unwrap();
+    j.append(JournalKind::VaultResealed, b"new-passphrase".to_vec())
+        .unwrap();
 
     let bytes = j.as_bytes().to_vec();
     let j = RecoveryJournal::from_bytes(bytes);
@@ -114,8 +126,10 @@ fn uat_035_replay_engine_applies_all_records() {
     }
 
     let mut j = RecoveryJournal::new();
-    j.append(JournalKind::CredentialAdded, b"abcdef".to_vec()).unwrap();
-    j.append(JournalKind::CredentialRotated, b"ghi".to_vec()).unwrap();
+    j.append(JournalKind::CredentialAdded, b"abcdef".to_vec())
+        .unwrap();
+    j.append(JournalKind::CredentialRotated, b"ghi".to_vec())
+        .unwrap();
     let mut engine = BodySum(0);
     let _ = j.replay(&mut engine).expect("replay");
     assert_eq!(engine.0, 6 + 3);

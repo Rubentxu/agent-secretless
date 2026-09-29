@@ -12,8 +12,11 @@ use asv_broker::tls_bridge::{authorize_redirect, AuthorityEndpoint, RedirectErro
 use asv_domain::Authority;
 
 fn origin() -> AuthorityEndpoint {
-    AuthorityEndpoint::new(Authority::canonicalize("api.example.com").expect("host"), 443)
-        .expect("endpoint")
+    AuthorityEndpoint::new(
+        Authority::canonicalize("api.example.com").expect("host"),
+        443,
+    )
+    .expect("endpoint")
 }
 
 fn attacker() -> AuthorityEndpoint {
@@ -25,8 +28,11 @@ fn attacker() -> AuthorityEndpoint {
 }
 
 fn same_host_diff_port() -> AuthorityEndpoint {
-    AuthorityEndpoint::new(Authority::canonicalize("api.example.com").expect("host"), 8443)
-        .expect("endpoint")
+    AuthorityEndpoint::new(
+        Authority::canonicalize("api.example.com").expect("host"),
+        8443,
+    )
+    .expect("endpoint")
 }
 
 #[test]

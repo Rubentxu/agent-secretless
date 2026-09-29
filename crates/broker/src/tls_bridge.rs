@@ -262,11 +262,7 @@ pub trait TrustInjector {
     /// Emit the trust binding. Writes the CA material to a session
     /// directory and returns the env var the broker sets when spawning
     /// the agent's process tree.
-    fn inject(
-        &self,
-        ca: &SessionCa,
-        session_dir: &Path,
-    ) -> Result<TrustBinding, InjectError>;
+    fn inject(&self, ca: &SessionCa, session_dir: &Path) -> Result<TrustBinding, InjectError>;
 }
 
 /// Adapter for OpenSSL and the libcurl / Git / Go-runtime stacks that
@@ -284,11 +280,7 @@ impl TrustInjector for OpenSslEnvInjector {
         "openssl"
     }
 
-    fn inject(
-        &self,
-        ca: &SessionCa,
-        session_dir: &Path,
-    ) -> Result<TrustBinding, InjectError> {
+    fn inject(&self, ca: &SessionCa, session_dir: &Path) -> Result<TrustBinding, InjectError> {
         if ca.root_der.is_empty() {
             return Err(InjectError::EmptyCa(ca.session_id.clone()));
         }
@@ -453,15 +445,10 @@ mod tests {
 
     #[test]
     fn openssl_injector_writes_pem_and_returns_binding() {
-        let tmp = std::env::temp_dir().join(format!(
-            "asv-tls-test-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("asv-tls-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).expect("mkdir");
         let ca = SessionCa::new("sess-inject", 7, DEFAULT_SESSION_CA_TTL);
-        let binding = OpenSslEnvInjector
-            .inject(&ca, &tmp)
-            .expect("inject OK");
+        let binding = OpenSslEnvInjector.inject(&ca, &tmp).expect("inject OK");
         assert_eq!(binding.name, "openssl");
         assert_eq!(binding.env_var, "SSL_CERT_FILE");
         assert!(binding.env_value.exists());

@@ -263,9 +263,12 @@ mod tests {
     #[test]
     fn append_then_replay_round_trip_returns_records_in_order() {
         let mut j = RecoveryJournal::new();
-        j.append(JournalKind::CredentialAdded, b"cred-A".to_vec()).unwrap();
-        j.append(JournalKind::CredentialRotated, b"cred-A->cred-B".to_vec()).unwrap();
-        j.append(JournalKind::CredentialRevoked, b"cred-A".to_vec()).unwrap();
+        j.append(JournalKind::CredentialAdded, b"cred-A".to_vec())
+            .unwrap();
+        j.append(JournalKind::CredentialRotated, b"cred-A->cred-B".to_vec())
+            .unwrap();
+        j.append(JournalKind::CredentialRevoked, b"cred-A".to_vec())
+            .unwrap();
 
         let mut e = CollectingReplay::default();
         let n = j.replay(&mut e).expect("replay");
@@ -284,8 +287,7 @@ mod tests {
         j.append(JournalKind::VaultResealed, body.to_vec()).unwrap();
         let bytes = j.as_bytes();
         // First 4 bytes = entry length
-        let entry_len =
-            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let entry_len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
         // Entry = 1 byte kind + N bytes body + 4 bytes CRC
         assert_eq!(entry_len, 1 + body.len() + 4);
         assert_eq!(bytes.len(), 4 + entry_len);
@@ -297,8 +299,10 @@ mod tests {
         // The first record replays; the second fails its torn
         // detection.
         let mut j = RecoveryJournal::new();
-        j.append(JournalKind::CredentialAdded, b"cred-A".to_vec()).unwrap();
-        j.append(JournalKind::CredentialRevoked, b"cred-A".to_vec()).unwrap();
+        j.append(JournalKind::CredentialAdded, b"cred-A".to_vec())
+            .unwrap();
+        j.append(JournalKind::CredentialRevoked, b"cred-A".to_vec())
+            .unwrap();
         let mut bytes = j.as_bytes().to_vec();
         bytes.truncate(bytes.len() - 2);
         let j = RecoveryJournal::from_bytes(bytes);
@@ -313,8 +317,10 @@ mod tests {
     #[test]
     fn replay_detects_torn_body() {
         let mut j = RecoveryJournal::new();
-        j.append(JournalKind::CredentialAdded, b"cred-A".to_vec()).unwrap();
-        j.append(JournalKind::CredentialRevoked, b"cred-A".to_vec()).unwrap();
+        j.append(JournalKind::CredentialAdded, b"cred-A".to_vec())
+            .unwrap();
+        j.append(JournalKind::CredentialRevoked, b"cred-A".to_vec())
+            .unwrap();
         let mut bytes = j.as_bytes().to_vec();
         // Drop the last 4 bytes (the CRC of the second record).
         bytes.truncate(bytes.len() - 4);
@@ -329,7 +335,8 @@ mod tests {
     #[test]
     fn replay_detects_corrupted_body() {
         let mut j = RecoveryJournal::new();
-        j.append(JournalKind::CredentialAdded, b"cred-A".to_vec()).unwrap();
+        j.append(JournalKind::CredentialAdded, b"cred-A".to_vec())
+            .unwrap();
         let mut bytes = j.as_bytes().to_vec();
         // Flip a byte inside the body (after the 4-byte length prefix
         // and the 1-byte kind).
@@ -344,7 +351,8 @@ mod tests {
     #[test]
     fn replay_detects_corrupted_crc() {
         let mut j = RecoveryJournal::new();
-        j.append(JournalKind::CredentialAdded, b"cred-A".to_vec()).unwrap();
+        j.append(JournalKind::CredentialAdded, b"cred-A".to_vec())
+            .unwrap();
         let mut bytes = j.as_bytes().to_vec();
         // Flip a bit in the last byte of the CRC.
         let last = bytes.len() - 1;
@@ -364,7 +372,8 @@ mod tests {
         // CRC over the new (kind || body) tuple. That is exactly
         // what a buggy or malicious writer might produce.
         let mut j = RecoveryJournal::new();
-        j.append(JournalKind::CredentialAdded, b"cred-A".to_vec()).unwrap();
+        j.append(JournalKind::CredentialAdded, b"cred-A".to_vec())
+            .unwrap();
         let mut bytes = j.as_bytes().to_vec();
         // Flip kind byte to a reserved value (0xFE).
         bytes[4] = 0xFE;
@@ -390,7 +399,8 @@ mod tests {
         // This is the safe outcome: the broker stops at the bad
         // record rather than silently accepting a stale CRC.
         let mut j = RecoveryJournal::new();
-        j.append(JournalKind::CredentialAdded, b"cred-A".to_vec()).unwrap();
+        j.append(JournalKind::CredentialAdded, b"cred-A".to_vec())
+            .unwrap();
         let mut bytes = j.as_bytes().to_vec();
         bytes[4] = 0xFE;
         let j = RecoveryJournal::from_bytes(bytes);

@@ -10,7 +10,7 @@
 //! allow-list. UAT-021 is the structural claim that the policy fires
 //! before the worker can open the sink socket.
 
-use asv_broker::isolated_exec::{EgressPolicy, WorkerTemplate, WorkerRegistry};
+use asv_broker::isolated_exec::{EgressPolicy, WorkerRegistry, WorkerTemplate};
 use asv_broker::tls_bridge::AuthorityEndpoint;
 use asv_domain::Authority;
 
@@ -46,8 +46,7 @@ fn uat_021_allow_list_must_be_exact_host_and_port() {
     // denied. This is the structural guarantee that a port-mismatch
     // cannot leak to an unexpected upstream.
     let p = EgressPolicy::Allow(vec![api_endpoint()]);
-    let wrong_port =
-        AuthorityEndpoint::new(auth("api.example.com"), 8443).expect("endpoint");
+    let wrong_port = AuthorityEndpoint::new(auth("api.example.com"), 8443).expect("endpoint");
     assert!(!p.authorises(&wrong_port));
 }
 

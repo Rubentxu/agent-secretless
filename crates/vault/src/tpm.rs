@@ -144,11 +144,7 @@ pub enum TpmError {
 pub trait TpmDevice {
     /// Seal a 32-byte KEK under the device-bound key with the given
     /// PCR policy.
-    fn seal(
-        &self,
-        kek: &[u8; 32],
-        pcr_policy: &PcrPolicy,
-    ) -> Result<TpmSealed, TpmError>;
+    fn seal(&self, kek: &[u8; 32], pcr_policy: &PcrPolicy) -> Result<TpmSealed, TpmError>;
 
     /// Unseal a previously-sealed blob, returning the 32-byte KEK.
     /// The observed PCR digests are checked against the policy; if
@@ -194,11 +190,7 @@ impl SoftwareTpm {
 }
 
 impl TpmDevice for SoftwareTpm {
-    fn seal(
-        &self,
-        kek: &[u8; 32],
-        pcr_policy: &PcrPolicy,
-    ) -> Result<TpmSealed, TpmError> {
+    fn seal(&self, kek: &[u8; 32], pcr_policy: &PcrPolicy) -> Result<TpmSealed, TpmError> {
         // The runtime replaces this body with a TPM2_Unseal /
         // TPM2_Create call. The placeholder uses a deterministic
         // SHA-256-like hash so same-input -> same-blob.

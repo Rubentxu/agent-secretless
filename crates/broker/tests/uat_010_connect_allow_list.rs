@@ -14,8 +14,11 @@ use asv_broker::tls_bridge::{AuthorityEndpoint, Bridge, ConnectError, ConnectPol
 use asv_domain::Authority;
 
 fn api_endpoint() -> AuthorityEndpoint {
-    AuthorityEndpoint::new(Authority::canonicalize("api.example.com").expect("host"), 443)
-        .expect("endpoint")
+    AuthorityEndpoint::new(
+        Authority::canonicalize("api.example.com").expect("host"),
+        443,
+    )
+    .expect("endpoint")
 }
 
 fn attacker_endpoint() -> AuthorityEndpoint {
@@ -27,8 +30,11 @@ fn attacker_endpoint() -> AuthorityEndpoint {
 }
 
 fn same_host_wrong_port() -> AuthorityEndpoint {
-    AuthorityEndpoint::new(Authority::canonicalize("api.example.com").expect("host"), 8443)
-        .expect("endpoint")
+    AuthorityEndpoint::new(
+        Authority::canonicalize("api.example.com").expect("host"),
+        8443,
+    )
+    .expect("endpoint")
 }
 
 #[test]
@@ -100,11 +106,13 @@ fn uat_010_policy_with_multiple_allowed_endpoints() {
     let bridge = Bridge::new(policy);
     assert!(bridge.handle_connect(&api_endpoint()).is_ok());
     assert!(bridge
-        .handle_connect(&AuthorityEndpoint::new(
-            Authority::canonicalize("api.example.com").expect("host"),
-            8443
+        .handle_connect(
+            &AuthorityEndpoint::new(
+                Authority::canonicalize("api.example.com").expect("host"),
+                8443
+            )
+            .expect("endpoint")
         )
-        .expect("endpoint"))
         .is_ok());
     assert_eq!(bridge.allowed_count(), 2);
 }

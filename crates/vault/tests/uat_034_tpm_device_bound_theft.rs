@@ -46,7 +46,9 @@ fn uat_034_drifted_pcr_state_refuses_to_unseal() {
     let unlocker = DeviceBoundUnlocker::new(SoftwareTpm::new("placeholder"));
     // Attacker observes PCR0 with a different digest (boot state drifted).
     let observed = vec![(PcrSlot::Pcr0, digest(99))];
-    let err = unlocker.try_unseal(&sealed, &observed).expect_err("must refuse");
+    let err = unlocker
+        .try_unseal(&sealed, &observed)
+        .expect_err("must refuse");
     assert_eq!(err, TpmError::PcrMismatch);
 }
 
@@ -123,10 +125,7 @@ fn uat_034_software_tpm_is_not_hardware() {
 fn uat_034_pcr_policy_rejects_missing_observed_digest() {
     // An attacker who can present SOME digests but not the full set
     // MUST be refused. The policy is conjunctive across slots.
-    let policy = PcrPolicy::new(vec![
-        (PcrSlot::Pcr0, digest(1)),
-        (PcrSlot::Pcr7, digest(7)),
-    ]);
+    let policy = PcrPolicy::new(vec![(PcrSlot::Pcr0, digest(1)), (PcrSlot::Pcr7, digest(7))]);
     let observed_only_pcr0 = vec![(PcrSlot::Pcr0, digest(1))];
     assert!(!policy.matches(&observed_only_pcr0));
 }
