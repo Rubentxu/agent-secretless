@@ -144,6 +144,28 @@ This is a defect in the SDDK CLI, not in this repository's cycle. It matters
 here because the operator view is the one a human reads to decide whether a
 milestone is done, and it currently says every milestone is.
 
+### F4b — `sddk debt gates` reports PASS on a foreign cycle
+
+`sddk debt gates debt-severity-assigned` prints `PASS: 0 findings checked`.
+That verdict is about `p-52b95ef55999f9de/kernel-cycle-8`, not M4: the debt
+report it consumes carries that cycle id, while `sddk backlog list` shows **7
+live items** for M4, two of them P0.
+
+A green that means "the wrong cycle has no findings" is worse than a red,
+because it is read as a clean bill of health. Both debt gates were therefore
+evaluated as `failed` with the evidence attached, rather than passed. A
+similar one exists as `INC-DEBT-REPORT-FOREIGN-CYCLE`; the gate path is
+affected, not just the report.
+
+### F6 — gate `tests-pass` evidence is unverifiable after the fact
+
+`evaluate-gate` requires `argv`, `exit_code` and `output_digest` in pass
+evidence, which is the right shape. But the digest is over output captured in
+a scratch file that is not retained, so the receipt cannot be re-checked
+against anything a reviewer can see. The gate accepted `sha256:5827c1b4…`
+for a log that no longer exists. The gate proves the evidence was shaped
+rightly, not that the run happened.
+
 ### F5 — backlog item about the M4-R8 fuzz corpus is now satisfied
 
 `bl-bl-01M3N3FKYF000387A6YD7C7G40` (P2) records that the table-driven
@@ -184,8 +206,13 @@ are not on this machine (only a stripped binary at
 the branch hypothesis could not be confirmed here and the previous session
 should not have implied it was resolved by reading behaviour alone.
 
-Root cause, observed: the cycle had a ledger but no restorable snapshot, and
-`cycle rebuild` refused without a lease.
+Root cause, observed: **implicit cycle resolution reads the active lease, not
+the ledger.** The cycle had a ledger, not a lease, and
+`sddk cycle status --cycle <id>` works because the id is given. With no flag,
+the inference layer looks for a lease and finds none.
+
+The first attempt at a fix pointed the wrong way. `sddk cycle rebuild` was
+run (after acquiring a lease, as it demands), and it returned:
 
 ```text
 sddk cycle rebuild --cycle …   → "has no lease; acquire one with `sddk cycle lock acquire`"
@@ -193,23 +220,52 @@ sddk cycle lock acquire --owner jcode --cycle … --root . --scope .
                              → owner=jcode fencing_token=1
 sddk cycle rebuild --cycle … --lease-owner jcode --fencing-token 1
                              → status=OPEN phase=verify sequence=16 restored=false
-sddk cycle status             → cycle_id: p-20a1ee316faf2ba3/m4-http-broker  (now resolves)
-sddk cycle next               → node: Open/Verify, frontier printed          (now resolves)
+sddk cycle status             → resolves
 ```
 
-`restored=false` is the important part: the rebuild did not fabricate a
-snapshot, it re-derived one from the existing events and left the state
-identical (OPEN / verify / sequence 16). The implicit-resolution path started
-working, and the sequence number is unchanged, so nothing was rewound.
+That looked like `rebuild` fixing it. It was not. Releasing the lease made
+the failure come straight back:
 
-The branch divergence is still real and still unexplained — `git branch -a`
-shows only `main` and `origin/main`, the reflog has no checkout, and all 19
-m4 events record `branch=feat/m4-http-broker`. It is just not what was blocking
-resolution, and it is not what the P0 claimed.
+```text
+sddk cycle lock release --owner jcode --cycle … --fencing-token 1  → released: true
+sddk cycle next                                                     → "no active cycle found"
+sddk cycle lock status                                               → "no active cycle found"
+sddk cycle lock acquire --owner jcode --cycle …                     → fencing_token=1
+sddk cycle status                                                    → resolves again
+```
+
+So the only thing that ever mattered is the lease. `restored=false` and the
+unchanged sequence (16) are consistent with that: the rebuild was a no-op on
+state and the resolution change came from the lease being held, not from the
+rebuild.
+
+This is also why the previous session's checks all looked clean — they either
+passed `--cycle <id>` or ran while a lease happened to be held. The failure is
+intermittent from the operator's side and deterministic from the tool's.
 
 The item's conclusion (a) — that the ledger state is correct and must not be
-rebuilt by hand — held. It was rebuilt by the tool, from the ledger, which is
-the sanctioned path.
+rebuilt by hand — held and still holds. The state was never the problem.
+
+## Gate outcomes for `phase.verify.complete`
+
+```text
+tests-pass                    PASSED  argv=cargo test --workspace --no-fail-fast
+                                      exit_code=0, 240 passed / 0 failed, 29 binaries
+policy-compliant              PASSED  argv=python3 tools/check-gates.py
+                                      exit_code=0, 0 hard defects, 0 warnings, 0 orphaned UAT
+debt-severity-assigned        FAILED  gate reads p-52b95ef55999f9de/kernel-cycle-8,
+                                      reports 0 findings; M4 has 7 live items
+debt-priority-assigned        FAILED  same cause
+```
+
+Two passed with real, reproducible evidence. Two were failed deliberately:
+`sddk debt gates` prints PASS for a cycle that is not this one, and passing it
+would have recorded a clean bill of health for debt that has not been looked
+at. See F4b.
+
+`phase.verify.complete` is therefore **not** satisfied, and independently of
+the gates, F0 and F1 say the milestone is not done. The frontier stays at
+Open/Verify.
 
 ## Release recommendation
 
