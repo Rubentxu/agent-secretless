@@ -13,7 +13,10 @@
 //! no verb in the helper's vocabulary that could be repurposed for
 //! arbitrary BPF load or generic cgroup writes.
 
-use asv_ebpfd::{parse_verb, Verb, VerbError};
+use asv_ebpfd::{
+    cgroup_attach_skeleton, parse_verb, program_lookup, AttachHandle, ProgramId, Verb,
+    VerbError,
+};
 
 #[test]
 fn uat_024_closed_verb_set_round_trips() {
@@ -22,6 +25,11 @@ fn uat_024_closed_verb_set_round_trips() {
         Verb::SessionDetach,
         Verb::CgroupRead,
         Verb::SeccompDump,
+        // M8 surface:
+        Verb::CgroupAttach,
+        Verb::CgroupDetach,
+        Verb::ProgramLoad,
+        Verb::ProgramUnload,
     ] {
         assert_eq!(parse_verb(verb.as_str()).unwrap(), verb);
     }
@@ -38,6 +46,9 @@ fn uat_024_arbitrary_bpf_load_is_rejected() {
         "BPF.LOAD",
         "session.attach.bpf_load",
         "bpf",
+        // M8 surface additional:
+        "program.load_arbitrary",
+        "program.attach_arbitrary",
     ] {
         let err = parse_verb(bad).unwrap_err();
         assert_eq!(err, VerbError::Unknown(bad.to_string()));
@@ -62,14 +73,69 @@ fn uat_024_generic_cgroup_write_is_rejected() {
 
 #[test]
 fn uat_024_verb_enum_has_no_load_variant() {
-    // Compile-time check: the Verb enum has exactly four variants
-    // and none of them is named *Load*. The exhaustive match in
-    // parse_verb would fail to compile if a fifth variant were
-    // added without explicit handling.
+    // Compile-time check: the Verb enum has exactly the four M7 +
+    // four M8 variants and none of them is named *Load*. The
+    // exhaustive match in parse_verb would fail to compile if a
+    // ninth variant were added without explicit handling.
     match Verb::SessionAttach {
         Verb::SessionAttach => {}
         Verb::SessionDetach => {}
         Verb::CgroupRead => {}
         Verb::SeccompDump => {}
+        Verb::CgroupAttach => {}
+        Verb::CgroupDetach => {}
+        Verb::ProgramLoad => {}
+        Verb::ProgramUnload => {}
     }
+}
+
+// ---- M8 surface tests ------------------------------------------------
+
+#[test]
+fn uat_024_m8_shipped_program_name_accepted() {
+    // M8-S2: the only shipped program name is connect4-redirect-v1.
+    assert_eq!(
+        program_lookup("connect4-redirect-v1"),
+        Some(ProgramId::Connect4RedirectV1)
+    );
+}
+
+#[test]
+fn uat_024_m8_arbitrary_program_names_rejected() {
+    // M8-S2: any name not in the shipped table returns None. The
+    // helper never accepts a path or arbitrary bytecode.
+    for bad in [
+        "bpf.load_arbitrary",
+        "BPF.LOAD",
+        "arbitrary.o",
+        "/etc/asv/bpf.so",
+        "connect4-redirect-v2",
+        "",
+        "connect4-redirect-v1.elf",
+        "../share/asv/program.o",
+    ] {
+        assert_eq!(
+            program_lookup(bad),
+            None,
+            "program_lookup({bad:?}) must return None"
+        );
+    }
+}
+
+#[test]
+fn uat_024_m8_cgroup_attach_skeleton_returns_ok() {
+    // M8-S5: structural prototype returns Ok(0) without panicking.
+    // The M9 implementation will replace the body with a real
+    // bpf_link_create(BPF_LINK_TYPE_CGROUP) syscall.
+    let handle =
+        cgroup_attach_skeleton(0x1234, ProgramId::Connect4RedirectV1).expect("skeleton ok");
+    assert_eq!(handle, AttachHandle(0));
+}
+
+#[test]
+fn uat_024_m8_cgroup_attach_skeleton_accepts_extreme_values() {
+    // The skeleton must accept the full u64 range and the only
+    // shipped program. It is the surface guarantee for M9.
+    let _ = cgroup_attach_skeleton(0, ProgramId::Connect4RedirectV1).expect("zero");
+    let _ = cgroup_attach_skeleton(u64::MAX, ProgramId::Connect4RedirectV1).expect("max");
 }

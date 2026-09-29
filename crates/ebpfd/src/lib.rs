@@ -1,25 +1,32 @@
 //! ASV privileged helper (`asv-ebpfd`).
 //!
-//! This crate is a **skeleton** (M7 roadmap). Its job is to make the
-//! surface of what a privileged caller can ask for small and
-//! inspectable. The full eBPF redirect path lives in M8 (R&D) and
-//! M9 (ship); this crate only owns the verb set and the
-//! parse-and-reject-the-rest dispatcher.
+//! This crate is the **closed-surface vocabulary** of the privileged helper
+//! the broker talks to over a Unix-domain socket. Its job is to make the
+//! surface of what a privileged caller can ask for small and inspectable.
 //!
-//! # Verb set (M7-R5)
+//! # Verb set (M7-R5 + M8-R1)
 //!
-//! The broker connects to `asv-ebpfd` over a Unix-domain socket and
-//! sends one of four verbs as the first line of each request:
+//! The broker connects to `asv-ebpfd` and sends one of eight verbs:
 //!
 //!  - `session.attach` — bind a session to a cgroup slice
 //!  - `session.detach` — unbind a session from its cgroup slice
 //!  - `cgroup.read`    — read a cgroup file the broker named
 //!  - `seccomp.dump`   — dump the broker's current seccomp filter
+//!  - `cgroup.attach`  — attach a loaded BPF program to a cgroup id
+//!  - `cgroup.detach`  — detach a BPF program from a cgroup id
+//!  - `program.load`   — load a shipped (signed) BPF program by name
+//!  - `program.unload` — unload a previously loaded BPF program
 //!
-//! Anything else returns `Err(VerbError::Unknown)` and the connection
-//! is closed by the helper. There is no verb that accepts arbitrary
-//! BPF bytecode, generic cgroup writes, or any privilege-escalation
-//! primitive.
+//! Anything else returns `Err(VerbError::Unknown)` and the connection is
+//! closed by the helper. There is no verb that accepts arbitrary BPF
+//! bytecode, generic cgroup writes, or any privilege-escalation primitive.
+//!
+//! # Prototype skeleton (M8-S5)
+//!
+//! `cgroup_attach_skeleton` is the documented ABI for the M9 implementation
+//! that performs a real `bpf_link_create(BPF_LINK_TYPE_CGROUP)` syscall.
+//! In M8 the body is a no-op that returns `Ok(AttachHandle(0))`. M9 fills
+//! it in.
 
 #![cfg_attr(
     any(test, feature = "test-support"),
@@ -28,4 +35,7 @@
 
 pub mod verbs;
 
-pub use verbs::{parse_verb, Verb, VerbError};
+pub use verbs::{
+    cgroup_attach_skeleton, parse_verb, program_lookup, AttachHandle, HelperError,
+    ProgramId, Verb, VerbError,
+};
