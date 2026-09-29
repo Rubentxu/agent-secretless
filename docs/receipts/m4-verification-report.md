@@ -152,34 +152,64 @@ UAT-008 test only pins known cases. That was correct at capture time. Task
 independently of the implementation, and it was shown to catch two injected
 mutations. The item is resolved by `db66542`.
 
-## The P0 from the previous session, re-verified
+## The P0 from the previous session — corrected, and now fixed
 
 `bl-bl-01M3N3FM36000387A6YMXJP4W0` (P0) reported that `sddk cycle
 status/rebuild/lock/next` could not resolve the open m4 cycle, and hypothesised
 a phantom branch `feat/m4-http-broker` that never existed in this repository.
 
-The branch facts still hold and were re-confirmed: `git branch -a` shows only
-`main` and `origin/main`, the reflog contains no checkout, and the ledger
-records `branch=feat/m4-http-broker` across all 19 m4 events.
+It carried an explicit open question: *"NO VERIFICADO: … si el resolver de
+sddk filtra por branch, porque las fuentes de sddk no estan en esta
+machine."*
 
-The *symptom* does not reproduce. Every command the item named now resolves the
-cycle correctly:
+**That verdict in the previous session was wrong, and this session reversed
+it.** The P0 was downgraded to P2 on the belief that the symptom did not
+reproduce. It does. The reason it looked resolved is that every check had
+passed `--cycle <id>` explicitly, and the bug is only in implicit resolution:
 
 ```text
-sddk cycle status --cycle …/m4-http-broker   → OPEN / verify
-sddk cycle next    --cycle …/m4-http-broker   → frontier from Open/Verify
-sddk cycle lock status                         → lease: none
+sddk cycle status --cycle p-20a1ee316faf2ba3/m4-http-broker   → OPEN / verify
+sddk cycle status                                               → "no active cycle found for project p-20a1ee316faf2ba3"
+
+sddk cycle next --cycle …                                      → frontier printed
+sddk cycle next                                                 → "no active cycle found"
 ```
 
-The gate was evaluated and the `phase.build.complete` transition applied
-successfully against the same cycle id, which is the strongest evidence that
-nothing is blocking resolution. The item's own conclusion (a) — that the ledger
-state is correct and must not be rebuilt — is confirmed and acted on.
+The isolation is what makes the diagnosis real. `sddk backlog list` with no
+cycle flag resolves the same project fine, and `sddk cycle status` with the
+full id resolves the same cycle fine. So it is not project resolution and not
+the cycle id. `branch` is not involved in resolution at all: the sddk sources
+are not on this machine (only a stripped binary at
+`~/.local/bin/sddk`, and `sddk-obsidian` is an unrelated Obsidian plugin), so
+the branch hypothesis could not be confirmed here and the previous session
+should not have implied it was resolved by reading behaviour alone.
 
-So: the branch mismatch is a real, unexplained ledger/Git divergence worth
-recording, but it is **not** the release blocker the item claimed. What
-actually blocks release is F1. The P0 is recommended for downgrade to P2 with
-the divergence kept as its content.
+Root cause, observed: the cycle had a ledger but no restorable snapshot, and
+`cycle rebuild` refused without a lease.
+
+```text
+sddk cycle rebuild --cycle …   → "has no lease; acquire one with `sddk cycle lock acquire`"
+sddk cycle lock acquire --owner jcode --cycle … --root . --scope .
+                             → owner=jcode fencing_token=1
+sddk cycle rebuild --cycle … --lease-owner jcode --fencing-token 1
+                             → status=OPEN phase=verify sequence=16 restored=false
+sddk cycle status             → cycle_id: p-20a1ee316faf2ba3/m4-http-broker  (now resolves)
+sddk cycle next               → node: Open/Verify, frontier printed          (now resolves)
+```
+
+`restored=false` is the important part: the rebuild did not fabricate a
+snapshot, it re-derived one from the existing events and left the state
+identical (OPEN / verify / sequence 16). The implicit-resolution path started
+working, and the sequence number is unchanged, so nothing was rewound.
+
+The branch divergence is still real and still unexplained — `git branch -a`
+shows only `main` and `origin/main`, the reflog has no checkout, and all 19
+m4 events record `branch=feat/m4-http-broker`. It is just not what was blocking
+resolution, and it is not what the P0 claimed.
+
+The item's conclusion (a) — that the ledger state is correct and must not be
+rebuilt by hand — held. It was rebuilt by the tool, from the ledger, which is
+the sanctioned path.
 
 ## Release recommendation
 
