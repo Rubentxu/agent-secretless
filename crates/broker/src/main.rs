@@ -5,9 +5,13 @@
 //! milestones; nothing here can return a secret even in principle, because the
 //! response enum has no variant that could hold one.
 
-use asv_broker::BrokerState;
+use std::sync::Arc;
+
+use asv_broker::{BrokerState, VaultSecretPort};
 use asv_identity::WorkloadIdentity;
 use asv_ipc_protocol::{decode_request, encode_response, Response};
+use asv_vault::VaultStore;
+use secrecy::SecretString;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use zeroize::Zeroize;
@@ -20,10 +24,71 @@ async fn main() -> std::io::Result<()> {
         )
         .init();
 
-    let socket_path: PathBuf = std::env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/run/user/1000/asv/broker.sock"));
+    // Parse CLI flags. `--vault` and `--passphrase-file` are mutually
+    // dependent: either both are present or neither is, and the bin refuses
+    // to start otherwise. The passphrase is read from a file — never from
+    // argv or env — to keep shell history (`docs/04-SHELL-FIRST-INTEGRATION.md`
+    // §9) from absorbing a secret-shaped argument, and to honour D9 (no
+    // `std::env::var*` in broker/connector production sources). The first
+    // positional argument is the socket path; flags may appear before or
+    // after it. Anything else is rejected.
+    let mut args = std::env::args_os().skip(1);
+    let mut socket_path: PathBuf = PathBuf::from("/run/user/1000/asv/broker.sock");
+    let mut vault_path: Option<PathBuf> = None;
+    let mut passphrase_path: Option<PathBuf> = None;
+    while let Some(arg) = args.next() {
+        let arg = match arg.into_string() {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("asv: arguments must be valid UTF-8");
+                std::process::exit(1);
+            }
+        };
+        match arg.as_str() {
+            "--vault" => {
+                vault_path = args.next().map(PathBuf::from);
+                if vault_path.is_none() {
+                    eprintln!("asv: --vault requires a path argument");
+                    std::process::exit(1);
+                }
+            }
+            "--passphrase-file" => {
+                passphrase_path = args.next().map(PathBuf::from);
+                if passphrase_path.is_none() {
+                    eprintln!("asv: --passphrase-file requires a path argument");
+                    std::process::exit(1);
+                }
+            }
+            "-h" | "--help" => {
+                eprintln!(
+                    "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH]"
+                );
+                std::process::exit(0);
+            }
+            other if other.starts_with("--") || other.starts_with('-') => {
+                eprintln!("asv: unknown flag: {other}");
+                std::process::exit(2);
+            }
+            _ => {
+                // Positional: take it as the socket path if not yet set.
+                socket_path = PathBuf::from(arg);
+            }
+        }
+    }
+    match (&vault_path, &passphrase_path) {
+        (None, None) => {}
+        (Some(v), Some(p)) if v.exists() && p.exists() => {}
+        (Some(_), None) | (None, Some(_)) => {
+            eprintln!(
+                "asv: --vault and --passphrase-file must be passed together; refusing to start"
+            );
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("asv: --vault or --passphrase-file points at a missing path");
+            std::process::exit(1);
+        }
+    }
 
     // Refuse to clobber an existing socket: that would either hijack a running
     // broker or destroy evidence of one. Both are worse than a failed start.
@@ -47,6 +112,27 @@ async fn main() -> std::io::Result<()> {
     tracing::info!(path = %socket_path.display(), protocol = asv_ipc_protocol::PROTOCOL_VERSION, "broker listening");
 
     let mut state = BrokerState::default();
+
+    // Open the vault when one was requested. Failures here are
+    // fail-closed: a broker that cannot read its vault cannot lend any
+    // secret, and pretending otherwise would silently bypass the
+    // deny-by-default property the broker's contract depends on.
+    if let (Some(vault_path), Some(passphrase_path)) = (vault_path, passphrase_path) {
+        let passphrase = read_passphrase(&passphrase_path).unwrap_or_else(|err| {
+            eprintln!("asv: cannot read passphrase file {}: {err}", passphrase_path.display());
+            std::process::exit(1);
+        });
+        let store = VaultStore::open(&vault_path, &passphrase).unwrap_or_else(|err| {
+            eprintln!("asv: cannot open vault {}: {err:?}", vault_path.display());
+            std::process::exit(1);
+        });
+        let key = Arc::new(store.header().unlock(&passphrase).unwrap_or_else(|err| {
+            eprintln!("asv: cannot unlock vault {}: {err:?}", vault_path.display());
+            std::process::exit(1);
+        }));
+        state.secrets = Some(Arc::new(VaultSecretPort::new(Arc::new(store), key)));
+        tracing::info!(vault = %vault_path.display(), "vault opened and unlocked");
+    }
 
     for incoming in listener.incoming() {
         match incoming {
@@ -126,6 +212,23 @@ fn set_socket_mode(path: &std::path::Path) -> std::io::Result<()> {
 fn set_socket_dir_mode(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Reads a passphrase from a file. The bytes are wrapped in `SecretString` so
+/// they share the rest of the vault's handling: zeroized on drop, never
+/// re-formatted by `Debug`, never persisted in a panic message.
+fn read_passphrase(path: &std::path::Path) -> std::io::Result<SecretString> {
+    let mut bytes = std::fs::read(path)?;
+    // Trailing newline: passphrase files are typically created by
+    // `echo secret > passphrase.txt` and the newline is not part of the
+    // secret. Trimming it here is what makes the round-trip
+    // "what the operator typed == what the vault opens" true.
+    while matches!(bytes.last(), Some(b'\n') | Some(b'\r')) {
+        bytes.pop();
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(SecretString::new(text.into_boxed_str()))
 }
 
 use std::io::{Read, Write};

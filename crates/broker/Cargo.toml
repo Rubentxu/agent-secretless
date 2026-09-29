@@ -40,13 +40,13 @@ zeroize.workspace = true
 # time so a rejected guess leaks nothing about the real one.
 rand.workspace = true
 subtle.workspace = true
+# The binary reads the passphrase from a file at startup; `SecretString` is
+# `secrecy`'s, so the dependency lives here, not only under dev-deps.
+secrecy.workspace = true
 
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3"
-# `SecretString` is `secrecy`'s, not ours. The vault takes one to unlock, so a
-# test that opens a real vault needs the same type the production path uses.
-secrecy.workspace = true
 # The end-to-end tests drive the real connector against a local TLS origin.
 # A dev-dependency, not a normal one: the broker binary must not be able to
 # start a test server even if someone asks nicely.
