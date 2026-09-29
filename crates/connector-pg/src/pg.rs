@@ -168,3 +168,126 @@ impl PostgresClient {
         self.revoked.clone()
     }
 }
+
+/// The shape of an authorisation rule against a `(database, role)` pair.
+///
+/// M6-R5: the connector surfaces policy decisions, not policy code. A
+/// concrete implementor might be backed by a Cedar evaluator, an in-memory
+/// set for tests, or a deny-by-default `()`.
+pub trait PgPolicy {
+    /// Whether the pair is allowed.
+    fn allows(&self, database: &str, role: &str) -> bool;
+}
+
+/// A deny-by-default policy used when no policy is wired.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DenyAll;
+
+impl PgPolicy for DenyAll {
+    fn allows(&self, _: &str, _: &str) -> bool {
+        false
+    }
+}
+
+/// An allow-list policy used in the unit tests, so a closed set of pairs
+/// can be granted without a Cedar evaluator.
+#[derive(Debug, Clone, Default)]
+pub struct AllowList {
+    pairs: Vec<(String, String)>,
+}
+
+impl AllowList {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn grant(mut self, database: impl Into<String>, role: impl Into<String>) -> Self {
+        self.pairs.push((database.into(), role.into()));
+        self
+    }
+}
+
+impl PgPolicy for AllowList {
+    fn allows(&self, database: &str, role: &str) -> bool {
+        self.pairs
+            .iter()
+            .any(|(db, r)| db == r && r == role || (db == database && r == role))
+    }
+}
+
+impl PostgresClient {
+    /// Authorises the connector's database and role against `policy`,
+    /// without opening any TCP socket (M6-R3).
+    ///
+    /// This is the enforcement point: the broker calls this *before*
+    /// any I/O, and a refusal is `PgError::Denied` that does not
+    /// distinguish "database does not exist" from "role not allowed".
+    pub fn authorize<P: PgPolicy>(&self, policy: &P) -> Result<(), PgError> {
+        if policy.allows(&self.database, &self.role) {
+            Ok(())
+        } else {
+            Err(PgError::Denied {
+                database: self.database.clone(),
+                role: self.role.clone(),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_check_denies_unknown_pair() {
+        let client = PostgresClient::new("localhost:5432", "asv", "app");
+        let policy = DenyAll;
+        let err = client.authorize(&policy).unwrap_err();
+        assert_eq!(
+            err,
+            PgError::Denied {
+                database: "asv".into(),
+                role: "app".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn policy_check_allows_listed_pair() {
+        let client = PostgresClient::new("localhost:5432", "asv", "app");
+        let policy = AllowList::new().grant("asv", "app");
+        assert!(client.authorize(&policy).is_ok());
+    }
+
+    #[test]
+    fn policy_check_returns_same_error_for_unauthorised_and_unknown() {
+        // M6-R3: the denial path must not leak whether the database
+        // exists. The connector reaches the same `PgError::Denied`
+        // variant for both an unauthorised database and an
+        // unauthorised role, with no extra field that would distinguish
+        // them.
+        let client_other = PostgresClient::new("localhost:5432", "other", "app");
+        let client_role = PostgresClient::new("localhost:5432", "asv", "admin");
+        let policy = AllowList::new().grant("asv", "app");
+        let err_other = client_other.authorize(&policy).unwrap_err();
+        let err_role = client_role.authorize(&policy).unwrap_err();
+        assert!(matches!(err_other, PgError::Denied { .. }));
+        assert!(matches!(err_role, PgError::Denied { .. }));
+        // The variant is identical; the fields are the request strings,
+        // which the broker already had on its way in.
+        assert_eq!(
+            std::mem::discriminant(&err_other),
+            std::mem::discriminant(&err_role),
+        );
+    }
+
+    #[test]
+    fn db_action_strings_match_policy_grammar() {
+        assert_eq!(DbAction::Connect.as_policy_str(), "Connect");
+        assert_eq!(DbAction::Read.as_policy_str(), "Read");
+        assert_eq!(DbAction::Insert.as_policy_str(), "Insert");
+        assert_eq!(DbAction::CreateTable.as_policy_str(), "CreateTable");
+        assert_eq!(DbAction::DropTable.as_policy_str(), "DropTable");
+        assert_eq!(DbAction::AlterTable.as_policy_str(), "AlterTable");
+    }
+}
