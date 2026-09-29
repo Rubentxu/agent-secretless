@@ -340,40 +340,115 @@ verify → release directly). The gate record and the transition packet
 make the scope and the gaps explicit so a future reader can see why M4
 was closable even with F0/F1 open.
 
-## Transition attempt and CLI blocker
+## Transition attempts this cycle — what actually worked, what didn't
 
-After closing F2 and reclassifying F0/F1, M4's exit criteria are met and
-the workflow frontier offers `phase.verify.uat.sync` as the next step.
+The earlier session left the cycle with a "CLI defect" item (`bl-bl-01M3P34Z1W
+000387C6BBE1DPR0`). This session picked it up and found the defect was
+shallower than the diagnosis said:
 
-The gate `uat-activated` is an orchestrator-decision binary per ADR-012.
-It evaluates to `passed` cleanly:
-
-```text
-sddk cycle evaluate-gate --gate uat-activated --transition phase.verify.uat.sync
-  receipt_id: gate-uat-activated-747a33a8134516f7-4
-  plan_hash:  sha256:747a33a8134516f7d20be5a5228afcbb1c9f255a55898b57d1e089c33d84a9e7
-```
-
-The very next command fails:
+### `phase.verify.complete` works, with `--gate-receipt`
 
 ```text
-sddk cycle transition --transition phase.verify.uat.sync --lease-owner jcode --fencing-token 1
-  error[ENGINE_MISSING_GATE_RECEIPT]: transition phase.verify.uat.sync is
-  missing gate receipt for "uat-activated"
+sddk cycle transition --transition phase.verify.complete
+  --lease-owner jcode --fencing-token 1
+  --artifact verification-report=docs/receipts/m4-verification-report.md
+  --gate-receipt gate-tests-pass-5a7f1ad1f7d9982b-6
+  --gate-receipt gate-policy-compliant-5a7f1ad1f7d9982b-4
+  --gate-receipt gate-debt-severity-assigned-5a7f1ad1f7d9982b-3
+  --gate-receipt gate-debt-priority-assigned-5a7f1ad1f7d9982b-3
+
+  cycle_id: p-20a1ee316faf2ba3/m4-http-broker
+  transition_id: phase.verify.complete
+  outcome: failed
+  status: OPEN
+  phase: verify
+  sequence: 21
 ```
 
-Reproduction was attempted four consecutive times against the same
-cycle, with and without `--no-infer`, with the explicit `--cycle` flag
-every time. All four receipts share the same `plan_hash`. The engine
-returns the receipt id from `evaluate-gate` and then reports the receipt
-as missing from `transition`. The receipt is persisted (its id
-increments monotonically: `-1`, `-2`, `-3`, `-4`), but the transition
-side cannot find it.
+Outcome `failed` because two debt gates are `failed` by design (the
+foreign-cycle bug in `sddk debt gates`). The engine applied the
+transition, emitted an event, set `remediation_rounds=1`, and moved the
+cycle to `REMEDIATING/verify`. Two artifacts were added; `artifacts=6`.
 
-This is a CLI defect, not a defect in M4 or in this repository. It blocks
-the workflow independently of any code change, and it cannot be worked
-around from inside the cycle. The blocker is recorded in the backlog as
-`bl-bl-01M3P34Z1W000387C6BBE1DPR0` (P0, triaged).
+The earlier session's diagnosis was wrong: `cycle transition` does not
+look up gate receipts on its own; it requires the caller to pass them
+with `--gate-receipt <id>`. The CLI's recovery hint ("run
+`sddk cycle evaluate-gate`") is misleading — it implies the receipts get
+linked automatically, but they don't. The `requires_met: true` shown in
+`cycle next` is computed from receipt existence in the ledger, not from
+whether the executor can find them at apply time.
+
+This means the original P0 was not a workflow defect; it was a CLI usage
+defect that was fixable from inside the cycle. The fix was one
+`--gate-receipt` flag per gate.
+
+### `phase.verify.uat.sync` is structurally blocked
+
+```text
+sddk cycle transition --transition phase.verify.uat.sync
+  --lease-owner jcode --fencing-token 1
+  --gate-receipt gate-uat-activated-5a65b017a8750592-1
+
+  error[ENGINE_STORAGE]: storage error: database error: CHECK constraint
+  failed: phase IN (
+    'explore', 'specify', 'design', 'plan', 'build',
+    'verify', 'review', 'release', 'archive'
+  )
+```
+
+The workflow declares `phase.verify.uat.sync` (path A-full, verify → uat
+→ review → release → archive), but the storage schema does not include
+`uat` in the phase enum. So `uat` is a valid concept in the workflow
+manifest and a runtime state in `runtime_summary.uat_waiting`, but it is
+not a phase value the cycle can sit on. The transition declares
+`→ UAT_WAITING/uat` and the SQL `CHECK` rejects it.
+
+This is a **real framework defect**, not a usage defect. The `A-full`
+workflow as documented in `/home/rubentxu/.local/share/sddk/framework/2.0.1`
+is structurally broken for this project, because the schema cannot hold
+the `uat` phase the workflow declares. Recorded in
+`bl-bl-01M3P3H2NA000387C70FYNTRC0` (P0).
+
+### What the cycle looks like after this session
+
+```text
+status: OPEN
+phase: verify
+runtime_state: uat-waiting / remediating / remediation_rounds: 1
+artifacts: 6
+```
+
+Both derived flags fire, which is the engine's way of saying "the verify
+transition fired, moved the cycle into remediation, and the workflow
+sidecar still expects uat to exist". The cycle is **not** stuck; it is
+**between remediations** with no action taken, by deliberate choice
+(see "Why no remediation round" below).
+
+## Why no remediation round was applied
+
+`phase.verify.remediate` requires the gate `remediation-complete`. The
+obvious move is to evaluate that gate as `passed` and move on. I did not,
+because:
+
+1. The remediation would be **theatre**, not work. The debt gates are
+   `failed` because `sddk debt gates` reads `p-52b95ef55999f9de/kernel-cycle-8`
+   instead of M4. That is a CLI defect, not a M4 defect. "Remediating"
+   it from inside the cycle means closing a gate that says "yes, the
+   foreign-cycle bug is gone" when it isn't.
+
+2. `phase.verify.complete` with the same debt-gate receipts would
+   *still* fail (same gates, same outcomes), and the next round would be
+   another round of the same non-remediation.
+
+3. The rule is "completado ≠ criterios verificados". A round of
+   remediation that exists only to flip a `passed` flag violates it.
+
+So the cycle sits in `OPEN/verify` with `runtime_state` flags recording
+what happened and `remediation_rounds=1` showing one transition fired.
+The remediation-complete gate has an `evidence` JSON that says, in
+effect, *"we are not remediating; the gate is `failed` by a CLI defect
+the project cannot fix"*, and it is not submitted. That keeps the
+ledger honest.
 
 ## What was actually closed in this cycle
 
@@ -382,20 +457,24 @@ around from inside the cycle. The blocker is recorded in the backlog as
   Commits: `2812cf5` (chore dev-deps), `dbe0628` (test).
 - F0 and F1: reclassified from P0 to P3, with two companion
   "RECLASIFICACION" items so the reasoning is auditable.
-  The gaps remain in the backlog, owned by their proper milestones.
-- F4b (debt gates reading a foreign cycle): not resolved, documented in
-  the report. The 34/0/0 check-gates figure is independent of the SDDK
-  gates and stands on its own.
-- The verification report: walked from initial draft to its current
-  shape across commits `c62877a`, `dc19736`, `71e525c`, `3994fd4`.
+- One verification-report artifact recorded in the cycle ledger.
+- Four gate receipts persisted with `plan_hash` consistency.
+- One transition applied (`phase.verify.complete` outcome=failed,
+  sequence=21, remediation_rounds=1).
+- Two framework defects now in the backlog: the misleading `--gate-receipt`
+  hint (downgraded: not a defect, usage gap), and the schema rejecting
+  `uat` as a phase value (real defect, P0).
 
 ## Recommended next action for the operator
 
-1. Look at the cycle narrative and decide whether the workflow is
-   closable with the CLI defect documented.
-2. If the defect is fixed (or worked around in the CLI),
-   `phase.verify.uat.sync` will pass and the cycle will move into
-   `UAT_WAITING/uat` for human UAT execution.
-3. If the operator decides the defects block a real release, the cycle
-   should be `pause`d rather than left `OPEN/verify` so the lease does
-   not expire silently.
+1. Decide whether to fix the schema CHECK constraint to include `uat`,
+   so the workflow can actually reach the `UAT_WAITING/uat` state it
+   advertises. Without that, `phase.verify.uat.sync` is unreachable for
+   any project on the framework.
+2. Decide whether the debt gates' foreign-cycle read should be fixed at
+   the CLI level (so debt reports carry the correct cycle id) or
+   removed from `phase.verify.complete`'s requirements. Either move
+   lets `phase.verify.complete` return `passed` for M4.
+3. With both fixes, the cycle would close: `phase.verify.complete`
+   would emit `outcome=passed`, the cycle would move to
+   `RELEASE_PENDING/release`, and the human-gated release would follow.
