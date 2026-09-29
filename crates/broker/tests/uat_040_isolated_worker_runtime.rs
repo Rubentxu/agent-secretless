@@ -122,6 +122,81 @@ fn uat_040_deny_worker_sees_only_loopback_and_cannot_reach_out() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn uat_040_pre_exec_isolation_failure_is_classified_and_audited() {
+    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
+    use std::collections::BTreeMap;
+    use std::convert::TryFrom;
+
+    // Make the real unshare syscall fail in the child. Command::spawn
+    // then reports std's actual pre_exec sentinel, not a mocked error.
+    let arch = TargetArch::try_from(std::env::consts::ARCH).expect("supported test arch");
+    let rules = BTreeMap::from([(libc::SYS_unshare, Vec::new())]);
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        arch,
+    )
+    .expect("unshare denial filter");
+    let program = BpfProgram::try_from(filter).expect("compile unshare denial filter");
+    seccompiler::apply_filter(&program).expect("install current-thread filter");
+
+    let registry = WorkerRegistry::new(vec![deny_template("blocked-isolation", "/bin/true", &[])]);
+    let mut audit = AuditLog::new(16);
+    let error = spawn(
+        &registry,
+        "blocked-isolation",
+        SpawnOptions::default(),
+        &mut audit,
+    )
+    .expect_err("a namespace setup failure must prevent exec");
+    assert!(
+        matches!(error, SpawnError::IsolationUnavailable),
+        "{error:?}"
+    );
+    match &audit.query(0)[0].event {
+        asv_ipc_protocol::AuditEventDto::WorkerSpawned { outcome, .. } => {
+            assert_eq!(outcome, "error");
+        }
+        other => panic!("unexpected audit variant: {other:?}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn uat_040_exec_failure_without_hook_marker_remains_io_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = std::env::temp_dir().join(format!(
+        "asv-uat040-invalid-exec-{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    std::fs::write(&path, b"not an executable image\n").expect("write invalid executable");
+    let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&path, permissions).expect("make fixture executable");
+
+    let template = deny_template(
+        "invalid-exec",
+        path.to_str().expect("UTF-8 fixture path"),
+        &[],
+    );
+    let registry = WorkerRegistry::new(vec![template]);
+    let mut audit = AuditLog::new(16);
+    let error = spawn(
+        &registry,
+        "invalid-exec",
+        SpawnOptions::default(),
+        &mut audit,
+    )
+    .expect_err("an invalid executable image must fail exec");
+    assert!(matches!(error, SpawnError::Io(_)), "{error:?}");
+    std::fs::remove_file(path).expect("remove invalid executable fixture");
+}
+
 // ----- M10R-R3: secret injection at spawn only ------------------------------
 
 #[test]
@@ -334,21 +409,27 @@ fn uat_040_seccomp_bite_kills_worker_calling_bpf() {
         eprintln!("SKIPPED: no unprivileged userns on this host");
         return;
     }
-    // `false`-shaped probe: the worker is a shell that calls bpf(2)
-    // through a tiny C-free path — there is none; use the python-free
-    // approach: /usr/bin/env is irrelevant. The honest live bite needs
-    // a binary that issues bpf(2); use the bpftool if present.
-    let bpftool = std::path::Path::new("/usr/bin/bpftool");
-    if !bpftool.exists() {
-        eprintln!("SKIPPED: no /usr/bin/bpftool for the live bpf(2) bite");
-        return;
-    }
-    let t = deny_template("bite-worker", "/usr/bin/bpftool", &["prog", "show"]);
+    // Use libc's syscall binding from Python with the target's compiled
+    // SYS_bpf number. This is a live syscall probe, not a bpftool check.
+    let python = Path::new("/usr/bin/python3");
+    assert!(
+        python.is_file(),
+        "live seccomp bite requires /usr/bin/python3"
+    );
+    let syscall_number = libc::SYS_bpf.to_string();
+    let t = deny_template(
+        "bite-worker",
+        python.to_str().expect("UTF-8 Python path"),
+        &[
+            "-c",
+            "import ctypes,sys; ctypes.CDLL(None).syscall(int(sys.argv[1]),0,0,0)",
+            &syscall_number,
+        ],
+    );
     let r = WorkerRegistry::new(vec![t]);
     let mut audit = AuditLog::new(16);
     let run = spawn(&r, "bite-worker", SpawnOptions::default(), &mut audit).expect("run");
-    // bpftool's first meaningful action is bpf(); the M7 filter must
-    // SIGSYS it before any listing happens.
+    // The worker main thread must die from SIGSYS before bpf(2) returns.
     assert_eq!(
         run.outcome,
         asv_broker::worker::RunOutcome::Signaled,

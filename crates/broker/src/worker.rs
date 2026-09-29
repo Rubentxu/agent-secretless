@@ -16,6 +16,8 @@
 //! redirect bridge is wired — an allow-list we cannot enforce is a
 //! lie, and this broker does not tell those.
 
+use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -173,6 +175,17 @@ pub fn spawn(
         return Err(e);
     }
 
+    // Create the hook-status channel before staging any secret file, so
+    // an OS resource failure cannot leave staged secret material behind.
+    let (mut hook_status_reader, hook_status_writer) = match std::os::unix::net::UnixStream::pair()
+    {
+        Ok(pair) => pair,
+        Err(error) => {
+            audit_worker(audit, name, Some(template), None, "error", None);
+            return Err(error.into());
+        }
+    };
+
     // File-plan staging: written pre-spawn, removed by the guard.
     let mut file_guard: Option<SecretFileGuard> = None;
     let mut secret_bytes: Vec<u8> = Vec::new();
@@ -226,14 +239,29 @@ pub fn spawn(
         cmd.env("ASV_SECRET_FILE", path);
     }
 
+    // std normalizes pre_exec hook failures to InvalidInput/EINVAL,
+    // which is ambiguous with exec-time errors. This close-on-exec
+    // stream carries a marker only when the isolation hook fails.
+    let hook_status_fd = hook_status_writer.as_raw_fd();
+
     // Pre-exec isolation hook: runs in the child after fork, before
-    // exec. Any failure exits the child with 127 — it can never exec
-    // unprotected (M10R-R2/R4 fail-closed).
+    // exec. Any failure aborts before exec (M10R-R2/R4 fail-closed).
     let binary = template.binary.clone();
     let landlock = template.landlock_profile.clone();
     let seccomp = template.seccomp_profile;
     unsafe {
-        cmd.pre_exec(move || child_isolation_hook(&binary, &landlock, seccomp));
+        cmd.pre_exec(
+            move || match child_isolation_hook(&binary, &landlock, seccomp) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    // SAFETY: write(2) is async-signal-safe; this private
+                    // descriptor remains open until exec because it is CLOEXEC.
+                    let marker = [PRE_EXEC_FAILURE_MARKER];
+                    let _ = libc::write(hook_status_fd, marker.as_ptr().cast(), marker.len());
+                    Err(error)
+                }
+            },
+        );
     }
 
     let spawned = cmd.spawn();
@@ -241,16 +269,21 @@ pub fn spawn(
     // heap. Drop it immediately after exec so the secret value is not kept
     // alongside the live worker for its entire lifetime.
     drop(cmd);
+    // Closing the parent's writer makes EOF distinguish an exec error
+    // from the marker emitted by a failed pre_exec hook.
+    drop(hook_status_writer);
     // The secret bytes have been consumed into the child env map /
     // staged file; scrub the staging copy either way.
     zeroize_buf(&mut secret_bytes);
 
     let mut child = match spawned {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-            // pre_exec hook failed inside the child: the child died
-            // with 127 before exec (namespace refused, landlock
-            // failure, filter construction failure). Fail closed.
+        Ok(c) => {
+            drop(hook_status_reader);
+            c
+        }
+        Err(_error) if pre_exec_hook_failed(&mut hook_status_reader) => {
+            // The private marker proves the pre-exec hook failed; no
+            // guess based on std's generic EINVAL is necessary.
             cleanup_guard(file_guard);
             audit_worker(audit, name, Some(template), Some(&plan), "error", None);
             return Err(SpawnError::IsolationUnavailable);
@@ -341,6 +374,13 @@ pub fn spawn(
         stderr_redacted,
         duration,
     })
+}
+
+const PRE_EXEC_FAILURE_MARKER: u8 = 0xA5;
+
+fn pre_exec_hook_failed(reader: &mut std::os::unix::net::UnixStream) -> bool {
+    let mut marker = [0];
+    matches!(reader.read(&mut marker), Ok(1)) && marker[0] == PRE_EXEC_FAILURE_MARKER
 }
 
 // ----- pieces ------------------------------------------------------------
