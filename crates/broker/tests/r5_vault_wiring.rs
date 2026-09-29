@@ -216,7 +216,7 @@ fn broker_with_harden_flag_applies_dumpable_zero_and_still_serves() {
     let pass_path = dir.join("vault.pass");
     std::fs::write(&pass_path, b"harden-test-pass\n").expect("write pass");
     let passphrase = asv_vault_test_support_passphrase();
-    let mut store = asv_vault::VaultStore::create(
+    let store = asv_vault::VaultStore::create(
         &vault_path,
         &passphrase,
         asv_vault::KdfParams::fast_for_tests(),
@@ -224,7 +224,7 @@ fn broker_with_harden_flag_applies_dumpable_zero_and_still_serves() {
     .expect("create vault");
     drop(store);
 
-    let mut broker = BrokerGuard(
+    let broker = BrokerGuard(
         Command::new(cargo_bin("asv-brokerd"))
             .arg(&sock)
             .arg("--vault")
