@@ -17,6 +17,7 @@ use std::sync::Arc;
 pub mod harden;
 pub mod isolated_exec;
 pub mod oauth2;
+pub mod recovery;
 pub mod surrogate;
 pub mod tls_bridge;
 pub mod vault_port;
