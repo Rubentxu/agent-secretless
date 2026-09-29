@@ -11,6 +11,7 @@ members = [
     "crates/policy",
     "crates/connector-http",
     "crates/connector-pg",
+    "crates/ebpfd",
 ]
 # M0 deliberately shipped without a connector, so the UAT threat harness could
 # run with an empty connector surface (docs/15-ROADMAP.md M0 Exit). M4 is the
@@ -32,6 +33,7 @@ asv-ssh-agent = { path = "crates/ssh-agent" }
 asv-policy = { path = "crates/policy" }
 asv-connector-http = { path = "crates/connector-http" }
 asv-connector-pg = { path = "crates/connector-pg" }
+asv-ebpfd = { path = "crates/ebpfd" }
 asv-vault = { path = "crates/vault" }
 
 serde = { version = "1", features = ["derive"] }

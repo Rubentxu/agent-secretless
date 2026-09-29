@@ -1,0 +1,11 @@
+[package]
+name = "asv-ebpfd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ASV privileged helper (skeleton): exposes a closed verb set for the broker to call"
+
+[dependencies]
+thiserror.workspace = true
