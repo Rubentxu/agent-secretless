@@ -1337,4 +1337,180 @@ mod tests {
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
+
+    // -----------------------------------------------------------------------
+    // Migration / upgrade-contract tests (RC gate R2, cycle r2-migration-tests).
+    //
+    // The vault has shipped exactly one envelope version, so "migration tests"
+    // here pin the forward-compatibility contract documented in
+    // docs/manual/OPERATIONS.md: the byte layout future readers must parse, the
+    // loud rejection of any other declared version, reader idempotence across
+    // its own rewrites (the in-place migration path), and versioned KDF params
+    // read from the file rather than from binary defaults.
+    // -----------------------------------------------------------------------
+
+    /// Rewrites the `version` field of a vault file's header JSON, keeping the
+    /// length prefixes consistent so the mutation is *only* the declared
+    /// version. Returns the mutated full file bytes.
+    fn splice_version(bytes: &[u8], version: u16) -> Vec<u8> {
+        let header_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes")) as usize;
+        let mut header: serde_json::Value =
+            serde_json::from_slice(&bytes[16..16 + header_len]).expect("header json");
+        header["version"] = serde_json::Value::from(version);
+        let new_header = serde_json::to_vec(&header).expect("re-serialize");
+        let mut out = Vec::with_capacity(8 + 8 + new_header.len() + bytes.len());
+        out.extend_from_slice(&bytes[..8]);
+        out.extend_from_slice(&(new_header.len() as u64).to_le_bytes());
+        out.extend_from_slice(&new_header);
+        out.extend_from_slice(&bytes[16 + header_len..]);
+        out
+    }
+
+    #[test]
+    fn vault_file_layout_is_pinned() {
+        // R1.1/S1: the on-disk contract a future reader (or migration tool)
+        // depends on. If this test breaks, the envelope changed and a release
+        // shipping that change owes the world an explicit migration tool.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = vault(&dir);
+        let bytes = std::fs::read(store.path()).expect("read");
+
+        assert!(bytes.len() > 8 + 8 + 2 + 8, "file suspiciously short");
+        assert_eq!(&bytes[..8], ENVELOPE_MAGIC, "magic prefix");
+
+        let header_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes")) as usize;
+        let header_end = 16 + header_len;
+        let body_len = u64::from_le_bytes(
+            bytes[header_end..header_end + 8]
+                .try_into()
+                .expect("8 bytes"),
+        ) as usize;
+
+        assert_eq!(
+            bytes.len(),
+            header_end + 8 + body_len,
+            "file must be exactly magic + u64le(header) + header + u64le(body) + body"
+        );
+        assert!(bytes[16] == b'{', "header must be a JSON object");
+
+        // And the pinned reader agrees with the structural parse.
+        assert!(VaultStore::open(store.path(), &pass()).is_ok());
+    }
+
+    #[test]
+    fn open_rejects_a_newer_version_without_touching_the_file() {
+        // R2.1/S2a: a file from the *future* must fail loudly and leave the
+        // bytes exactly as they were (no partial decrypt, no rewrite).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = vault(&dir);
+        let original = std::fs::read(store.path()).expect("read");
+        let mutated = splice_version(&original, ENVELOPE_VERSION + 1);
+        std::fs::write(store.path(), &mutated).expect("write mutated");
+
+        let err = VaultStore::open(store.path(), &pass()).expect_err("future version");
+        assert!(
+            matches!(
+                err,
+                VaultError::Envelope(EnvelopeError::UnsupportedVersion(v)) if v == ENVELOPE_VERSION + 1
+            ),
+            "expected UnsupportedVersion({}), got {err}",
+            ENVELOPE_VERSION + 1
+        );
+
+        let after = std::fs::read(store.path()).expect("read after");
+        assert_eq!(mutated, after, "open must not rewrite the vault file");
+    }
+
+    #[test]
+    fn open_rejects_older_version_zero() {
+        // R2.1/S2b: no v0 ever shipped, but if one ever surfaces it must be
+        // rejected with the same loud error, not best-effort parsed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = vault(&dir);
+        let original = std::fs::read(store.path()).expect("read");
+        let mutated = splice_version(&original, 0);
+        std::fs::write(store.path(), &mutated).expect("write mutated");
+
+        let err = VaultStore::open(store.path(), &pass()).expect_err("version 0");
+        assert!(
+            matches!(
+                err,
+                VaultError::Envelope(EnvelopeError::UnsupportedVersion(0))
+            ),
+            "expected UnsupportedVersion(0), got {err}"
+        );
+    }
+
+    #[test]
+    fn rewrite_round_trip_preserves_records_and_bumps_revision() {
+        // R3.1/S3: the in-place migration path is "open with current reader,
+        // mutate, save". The reader must survive its own rewrites: records
+        // intact, revision advancing by exactly one per persisted mutation.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = vault(&dir);
+        let revision_at_create = store.revision();
+        let key = store.header().unlock(&pass()).expect("unlock");
+        for i in 0..2 {
+            store
+                .insert(
+                    &key,
+                    CredentialMetadata::new(
+                        format!("m{i}"),
+                        format!("label-{i}"),
+                        CredentialKind::Opaque,
+                        "p",
+                        "a",
+                        i as u64,
+                    ),
+                    SecretBytes::new(format!("migration-secret-{i}").into_bytes()),
+                )
+                .expect("insert");
+        }
+        let revision_after_two = store.revision();
+        drop(key);
+
+        let reopened = VaultStore::open(store.path(), &pass()).expect("reopen");
+        assert_eq!(reopened.list().len(), 2);
+        assert_eq!(
+            reopened.revision(),
+            revision_after_two,
+            "reopen must not bump revision"
+        );
+        assert_eq!(
+            revision_after_two - revision_at_create,
+            2,
+            "exactly one revision bump per mutation"
+        );
+
+        let key = reopened.header().unlock(&pass()).expect("unlock");
+        let seen = reopened
+            .with_secret(&key, "m1", |b| b.to_vec())
+            .expect("read");
+        assert_eq!(seen, b"migration-secret-1");
+    }
+
+    #[test]
+    fn custom_kdf_params_round_trip_from_the_file() {
+        // R4.1/S4: KDF parameters are versioned *in the file* so raising them
+        // later cannot invalidate existing vaults. A vault written with valid
+        // non-default params must open by reading its own params.
+        let custom = KdfParams {
+            m_cost_kib: 16 * 1024,
+            t_cost: 2,
+            p_cost: 2,
+            ..KdfParams::fast_for_tests()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("custom.asv");
+        {
+            let store = VaultStore::create(&path, &pass(), custom).expect("create");
+            assert_eq!(store.header().kdf, custom);
+        }
+        let reopened = VaultStore::open(&path, &pass()).expect("reopen");
+        assert_eq!(
+            reopened.header().kdf,
+            custom,
+            "params must come from the file, not binary defaults"
+        );
+    }
 }
