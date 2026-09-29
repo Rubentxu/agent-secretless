@@ -266,9 +266,10 @@ mod tests {
 
     #[test]
     fn program_id_str_round_trips() {
-        for id in [ProgramId::Connect4RedirectV1] {
-            assert_eq!(program_lookup(id.as_str()), Some(id));
-        }
+        assert_eq!(
+            program_lookup(ProgramId::Connect4RedirectV1.as_str()),
+            Some(ProgramId::Connect4RedirectV1)
+        );
     }
 
     #[test]
@@ -281,8 +282,7 @@ mod tests {
 
     #[test]
     fn cgroup_attach_skeleton_accepts_max_cgroup_id() {
-        let handle =
-            cgroup_attach_skeleton(u64::MAX, ProgramId::Connect4RedirectV1).expect("ok");
+        let handle = cgroup_attach_skeleton(u64::MAX, ProgramId::Connect4RedirectV1).expect("ok");
         assert_eq!(handle, AttachHandle(0));
     }
 }

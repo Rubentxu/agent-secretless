@@ -28,14 +28,13 @@
 //! In M8 the body is a no-op that returns `Ok(AttachHandle(0))`. M9 fills
 //! it in.
 
-#![cfg_attr(
-    any(test, feature = "test-support"),
-    allow(dead_code, unused_imports)
-)]
+// NOTE: no `test-support` feature is declared; the allowance below is
+// test-only via `cfg(test)`.
+#![cfg_attr(test, allow(dead_code, unused_imports))]
 
 pub mod verbs;
 
 pub use verbs::{
-    cgroup_attach_skeleton, parse_verb, program_lookup, AttachHandle, HelperError,
-    ProgramId, Verb, VerbError,
+    cgroup_attach_skeleton, parse_verb, program_lookup, AttachHandle, HelperError, ProgramId, Verb,
+    VerbError,
 };

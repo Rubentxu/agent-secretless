@@ -227,7 +227,7 @@ impl Redactor {
         // Sort secrets by length descending so the longest match wins
         // (avoids a prefix-of-longer-secret being replaced first).
         let mut secrets = self.secrets.clone();
-        secrets.sort_by(|a, b| b.len().cmp(&a.len()));
+        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
         let marker: &[u8] = b"[REDACTED]";
         let mut result = Vec::with_capacity(input.len());
         let mut cursor = 0;
