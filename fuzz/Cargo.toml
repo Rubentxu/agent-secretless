@@ -1,0 +1,30 @@
+[package]
+name = "asv-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Own workspace: stable CI never builds this crate.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+asv-ipc-protocol = { path = "../crates/ipc-protocol" }
+
+[[bin]]
+name = "fuzz_ipc_decode_request"
+path = "fuzz_targets/fuzz_ipc_decode_request.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+opt-level = 3
+debug = 1
+debug-assertions = false
+overflow-checks = false
+incremental = false
+codegen-units = 1

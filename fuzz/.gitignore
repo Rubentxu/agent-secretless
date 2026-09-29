@@ -1,0 +1,5 @@
+target/
+crash-*
+coverage/
+artifacts/
+Cargo.lock
