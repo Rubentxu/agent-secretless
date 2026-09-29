@@ -586,6 +586,56 @@ impl VaultStore {
         write_private(&destination, &encoded)
     }
 
+    /// Re-wraps the vault's data-encryption key under a new passphrase,
+    /// persisting the migration atomically.
+    ///
+    /// This is the migration path for the envelope (R2 "migration tests",
+    /// spec §11 "versioned file format"): only the KEK wrapping changes —
+    /// the DEK is never re-generated — so the migration is transparent to
+    /// every backup made under the same live vault key. The persisted
+    /// body is re-encrypted under the same DEK with a fresh nonce by
+    /// `persist` (identical to any other write). See
+    /// [`VaultHeader::rewrap`] for the envelope mechanics.
+    ///
+    /// Ordering guarantees:
+    /// - `current` is proven before anything is mutated: a wrong current
+    ///   passphrase fails at the AEAD tag, exactly like `open`, and the
+    ///   file is untouched;
+    /// - the header is rewrapped in memory first; `persist` then writes
+    ///   the complete new envelope. If the write fails, the in-memory
+    ///   header is rolled back so the store still matches the on-disk
+    ///   file, which still opens with the old passphrase.
+    ///
+    /// An empty `next` is a configuration error, not a migration, and is
+    /// rejected without touching anything.
+    pub fn rekey_passphrase(
+        &mut self,
+        current: &SecretString,
+        next: &SecretString,
+    ) -> Result<(), VaultError> {
+        // Fail closed before touching anything: the caller must prove
+        // possession of the current passphrase, exactly as `open` does.
+        let mut dek = self.header.unlock(current)?;
+
+        // Rewrap in a scratch copy so a rejected rewrap leaves the store
+        // (and the caller's next attempt) untouched.
+        let mut replacement = self.header.clone();
+        replacement.rewrap(&dek, next)?;
+
+        let old_header = std::mem::replace(&mut self.header, replacement);
+        // The body ciphertext is unchanged by a rewrap; re-persist so the
+        // file atomically records the new header (and the revision bump
+        // proves the write happened).
+        let result = self.persist(&dek);
+        if result.is_err() {
+            // Roll the header back so the in-memory store still matches the
+            // on-disk file, which still opens with the old passphrase.
+            self.header = old_header;
+        }
+        dek.wipe();
+        result
+    }
+
     /// Restores a backup into `destination` and verifies it authenticates.
     pub fn restore(
         backup: impl AsRef<Path>,

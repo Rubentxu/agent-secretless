@@ -263,6 +263,48 @@ impl VaultHeader {
         raw.zeroize();
         Ok(key)
     }
+
+    /// Re-wraps the same vault DEK under a new passphrase, in place.
+    ///
+    /// This is the migration primitive for the versioned envelope: moving
+    /// a vault from an old passphrase to a new one only changes how the
+    /// DEK is *wrapped*, never the DEK itself, so a backup taken before
+    /// the migration (which shares the same live DEK) keeps restoring
+    /// (spec §11, "versioned file format"). A fresh salt and wrap nonce
+    /// are drawn, so the on-disk bytes differ even when `next` equals
+    /// the current passphrase (a legitimate KDF-parameter refresh).
+    ///
+    /// The caller must already have unwrapped the DEK with the old
+    /// passphrase — proving possession happens in `unlock`, not here.
+    ///
+    /// `body_nonce` is deliberately left alone: the body ciphertext on
+    /// disk was written under it and stays valid.
+    pub fn rewrap(
+        &mut self,
+        dek: &VaultKey,
+        next: &secrecy::SecretString,
+    ) -> Result<(), EnvelopeError> {
+        if next.expose_secret().is_empty() {
+            return Err(EnvelopeError::MalformedEnvelope);
+        }
+        // Keep the validated KDF parameters; draw a fresh salt and wrap
+        // nonce so the new header is not even structurally equal to the
+        // old one under an equal passphrase.
+        let mut salt = [0u8; SALT_LEN];
+        let mut wrap_nonce = [0u8; 24];
+        fill_random(&mut salt);
+        fill_random(&mut wrap_nonce);
+
+        let kek = derive_kek(next, self.kdf, salt)?;
+        let wrapped = wrap_key(&kek, &wrap_nonce, dek.expose())?;
+
+        self.salt = salt;
+        self.wrap_nonce = wrap_nonce;
+        self.wrapped_vault_key = wrapped;
+        // body_nonce is untouched: the body ciphertext on disk is
+        // unchanged by a rewrap and still pairs with this nonce.
+        Ok(())
+    }
 }
 
 /// The vault data-encryption key, held only while the vault is unlocked.
