@@ -501,8 +501,18 @@ impl VaultStore {
         if !self.body.records.contains_key(id) {
             return Err(VaultError::NotFound(id.to_string()));
         }
-        let nonce = self.header.body_nonce;
-        let mut plaintext = decrypt_body(key, &nonce, &self.ciphertext()?)?;
+        // The nonce and the ciphertext must come from the *same* read of the
+        // file. Taking the nonce from `self.header` while the ciphertext comes
+        // from disk means a store that was opened before another handle wrote
+        // the vault pairs a fresh ciphertext with a stale nonce, and the AEAD
+        // tag check fails with `AuthenticationFailed` — a corruption-shaped
+        // error for what is really just "the file changed under you".
+        //
+        // R7 makes this reachable: rotation is supposed to be observable by a
+        // running broker that was never told about it, and that is exactly a
+        // second handle writing while the first still holds the old header.
+        let (nonce, ciphertext) = self.body_ciphertext_and_nonce()?;
+        let mut plaintext = decrypt_body(key, &nonce, &ciphertext)?;
         let body = VaultBody::from_json(&plaintext);
         // Zeroize the whole decrypted body regardless of whether the parse
         // succeeded: on the error path `plaintext` still holds every secret.
@@ -608,9 +618,19 @@ impl VaultStore {
         ENVELOPE_VERSION
     }
 
-    fn ciphertext(&self) -> Result<Vec<u8>, VaultError> {
+    /// Reads the body's AEAD nonce and ciphertext from a single decode of the
+    /// file on disk.
+    ///
+    /// These two must never come from different sources. The nonce lives in
+    /// the header and the ciphertext is the rest of the envelope, so a store
+    /// that re-read one and cached the other can pair a fresh ciphertext with
+    /// a stale nonce after any write performed by another handle. The tag then
+    /// fails, and the failure is indistinguishable from real corruption — which
+    /// is the worst possible report for a file that is perfectly fine.
+    fn body_ciphertext_and_nonce(&self) -> Result<([u8; 24], Vec<u8>), VaultError> {
         let bytes = std::fs::read(&self.path).map_err(|e| VaultError::io(&self.path, e))?;
-        Ok(VaultFile::decode(&bytes)?.body_ciphertext)
+        let file = VaultFile::decode(&bytes)?;
+        Ok((file.header.body_nonce, file.body_ciphertext))
     }
 }
 
