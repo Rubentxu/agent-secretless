@@ -128,12 +128,23 @@ unavailable or the PCR state has drifted.
 
 ## Audit a run
 
-> **Status: not implemented.** The audit log (brokered request records:
-> id, authority, time, size — never secret bytes) is specified in the
-> security release gates (R9, `agent-secretless-vault-spec/docs/
-> 16-SECURITY-RELEASE-GATES.md`) but no `asv audit` command ships yet.
-> This section will grow the real command reference when the audit
-> milestone lands.
+The broker records one tamper-evident entry per handled request (method,
+peer uid, pinning evidence, outcome, security posture). Records never
+carry request arguments or secret material, and each one's hash covers
+the previous record's hash, so the chain detects any mutation.
+
+```bash
+$ asv audit --since 24h
+```
+
+Retention is configurable via the broker launch flag `--audit-max-records N`
+(default 10000, `0` = unbounded); evicted records are counted and reported
+as `dropped`, never lost silently.
+
+> **Status:** the in-broker chain and this CLI command ship today. Querying
+> is currently restricted to the operator control plane (not yet built),
+> so `asv audit` reports the broker's refusal until that milestone lands.
+> The chain itself is live on every brokered request.
 
 ## Update the broker
 

@@ -375,8 +375,14 @@ def gate_r9(root: Path) -> list[Check]:
         if audit_hits
         else bad("audit event chain (sequence/hash) present", "no sequenced/hashed audit records found in broker")
     )
-    found, ev = grep_crates(root, r"retention")
-    checks.append(ok("retention configurable", ev) if found else bad("retention configurable", "no retention configuration found (R9 requires configurable retention)"))
+    found, ev = grep_crates(root, r"audit_max_records|--audit-max-records|AUDIT_MAX_RECORDS")
+    retention_ev = ev
+    audit_rs = root / "crates" / "broker" / "src" / "audit.rs"
+    chain_rs = audit_rs.is_file() and re.search(r"event_hash|prev_hash", audit_rs.read_text(encoding="utf-8", errors="replace")) is not None
+    if found and chain_rs:
+        checks.append(ok("retention configurable", f"--audit-max-records flag + hash chain in {audit_rs.relative_to(root).as_posix()}"))
+    else:
+        checks.append(bad("retention configurable", "no --audit-max-records config or no hash-chain audit module found (R9 requires configurable retention)"))
     found, ev = grep_crates(root, r"posture|ISOLATED_PROCESS_EXPOSURE")
     checks.append(ok("security posture recorded per operation", ev) if found else bad("security posture recorded per operation", ev))
     return checks
