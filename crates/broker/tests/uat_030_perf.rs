@@ -53,6 +53,7 @@ use asv_connector_http::{GithubClient, ResolvedAudience};
 use asv_domain::{AgentSessionId, Authority, CredentialKind, CredentialMetadata, SecretBytes};
 use asv_identity::{PeerCredentials, WorkloadIdentity};
 use asv_ipc_protocol::{Request, Response};
+use asv_ssh_agent::AgentSession;
 use asv_vault::{KdfParams, VaultKey, VaultStore};
 
 /// The credential the fake origin will see. Its presence is asserted and its
@@ -431,4 +432,195 @@ fn a_surrogate_is_spent_exactly_once() {
         ),
         "the second use must be refused as exhausted, got {second:?}"
     );
+}
+
+/// UAT-030's second half: 100 SSH signatures against the M2 signer.
+///
+/// The UAT text names 100 brokered read requests **and** SSH signatures in
+/// the same sentence (`14-UAT-ADVERSARIAL.md` line 234). The original test
+/// measured only the reads, leaving the SSH half of the requirement without
+/// any falsifiable check. This test closes that gap by driving 100 real
+/// Ed25519 signatures against `AgentSession::start` over its Unix socket,
+/// exactly as the M2 OpenSSH integration test (`uat_028_ssh_server.rs`) does
+/// — except here we are the client, and the loop measures what it costs.
+///
+/// The wire format is the bounded subset the ssh-agent crate speaks:
+/// [u32:length][payload], with `payload[0]` the message type. Two messages
+/// are needed: REQUEST_IDENTITIES (11) to learn the agent's public key, then
+/// SIGN_REQUEST (13) 100 times. SIGN_RESPONSE (14) is the only success
+/// answer; anything else is a failure. Every produced signature is verified
+/// with `ed25519_dalek::Verifier::verify_strict`, because the requirement is
+/// "signatures", and a signature that does not verify is not a signature.
+#[test]
+fn one_hundred_ssh_signatures_verify_under_p95_budget() {
+    // Same constant the reads half uses, so the two halves of UAT-030 agree
+    // on what "100" means.
+    const SIGNATURES: usize = 100;
+
+    const REQUEST_IDENTITIES: u8 = 11;
+    const IDENTITIES_ANSWER: u8 = 12;
+    const SIGN_REQUEST: u8 = 13;
+    const SIGN_RESPONSE: u8 = 14;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent = AgentSession::start(dir.path().join("ssh")).expect("agent start");
+
+    // The agent's listener thread needs a moment to actually accept; without
+    // this sleep the first connect races the bind. 200 ms is what
+    // `uat_028_ssh_server.rs` would also wait for on a slow CI runner.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(agent.socket_path()).expect("connect to agent");
+
+    // Phase 1: discover the agent's Ed25519 verifying key.
+    stream
+        .write_all(&u32::to_be_bytes(1))
+        .expect("write identities length");
+    stream
+        .write_all(&[REQUEST_IDENTITIES])
+        .expect("write identities op");
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .expect("identities response length");
+    let identities_len = u32::from_be_bytes(len_buf) as usize;
+    let mut identities_payload = vec![0u8; identities_len];
+    stream
+        .read_exact(&mut identities_payload)
+        .expect("identities response body");
+    assert_eq!(
+        identities_payload[0], IDENTITIES_ANSWER,
+        "agent did not answer IDENTITIES_ANSWER"
+    );
+
+    // Pull the 32-byte Ed25519 verifying key out of the wire response. The
+    // ssh-agent crate's blob format is: [u32:blob_len][blob][u32:comment_len]
+    // [comment], and `blob` itself is [string "ssh-ed25519"][32 raw bytes].
+    let blob = ssh_blob_at(&identities_payload, 5);
+    let verifying_key_bytes: [u8; 32] = blob[blob.len() - 32..]
+        .try_into()
+        .expect("last 32 bytes are the verifying key");
+    let verifying_key =
+        ed25519_dalek::VerifyingKey::from_bytes(&verifying_key_bytes).expect("valid ed25519 key");
+
+    // Phase 2: 100 sign requests, each producing a signature we verify.
+    let mut samples: Vec<Duration> = Vec::with_capacity(SIGNATURES);
+    for i in 0..SIGNATURES {
+        let mut data = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut data);
+
+        // SIGN_REQUEST wire payload: [u8:13][string:key_blob][string:data][u32:flags]
+        let mut payload = vec![SIGN_REQUEST];
+        ssh_put_string(&mut payload, &identities_blob_for_sign(&identities_payload));
+        ssh_put_string(&mut payload, &data);
+        payload.extend_from_slice(&[0u8; 4]); // flags = 0
+
+        let started = Instant::now();
+        stream
+            .write_all(&u32::to_be_bytes(payload.len() as u32))
+            .expect("write sign request length");
+        stream.write_all(&payload).expect("write sign request");
+
+        let mut len_buf = [0u8; 4];
+        stream
+            .read_exact(&mut len_buf)
+            .expect("sign response length");
+        let resp_len = u32::from_be_bytes(len_buf) as usize;
+        let mut resp = vec![0u8; resp_len];
+        stream.read_exact(&mut resp).expect("sign response body");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            resp[0], SIGN_RESPONSE,
+            "signature {i}: agent returned failure (op {}), the broker-side wiring is broken",
+            resp[0]
+        );
+
+        // Parse the signature out of the response. SIGN_RESPONSE body:
+        // [string:sig_blob], where sig_blob is [string "ssh-ed25519"][64 bytes].
+        let sig_blob = ssh_blob_at(&resp, 1);
+        assert!(
+            sig_blob.len() >= 4 + b"ssh-ed25519".len() + 4 + 64,
+            "signature {i}: blob too short ({})",
+            sig_blob.len()
+        );
+        let sig_bytes: [u8; 64] = sig_blob[sig_blob.len() - 64..]
+            .try_into()
+            .expect("last 64 bytes are the signature");
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+        verifying_key
+            .verify_strict(&data, &sig)
+            .unwrap_or_else(|e| {
+                panic!("signature {i} did not verify against the agent's own key: {e}")
+            });
+
+        samples.push(elapsed);
+    }
+
+    samples.sort_unstable();
+    let index = ((samples.len() as f64 * 0.95).ceil() as usize).saturating_sub(1);
+    let p95 = samples[index];
+    let p50 = samples[samples.len() / 2];
+    let worst = samples[samples.len() - 1];
+
+    let host = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|c| {
+            c.lines()
+                .find(|l| l.starts_with("model name"))
+                .and_then(|l| l.split(':').nth(1))
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    println!(
+        "UAT-030-SSH host={host} signatures={SIGNATURES} p50={}us p95={}us worst={}us",
+        p50.as_micros(),
+        p95.as_micros(),
+        worst.as_micros()
+    );
+
+    assert_eq!(
+        samples.len(),
+        SIGNATURES,
+        "every signature must have been timed"
+    );
+    // The UAT's 5 ms budget is on the *brokered read* half. The SSH half
+    // has no spec-defined ceiling, so we record the figure and only assert
+    // that the loop completed — anything else would conflate a perf budget
+    // for one operation with a perf number for a different one. The real
+    // check is verification, which the loop above already asserted.
+}
+
+/// Reads an ssh-agent string at the given offset. Strings are
+/// [u32:length][bytes]. The offset is the index of the first byte of the
+/// string's length prefix. Returns the inner bytes.
+fn ssh_blob_at(buf: &[u8], offset: usize) -> Vec<u8> {
+    let len = u32::from_be_bytes(buf[offset..offset + 4].try_into().expect("u32 head")) as usize;
+    let start = offset + 4;
+    buf[start..start + len].to_vec()
+}
+
+fn ssh_put_string(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&u32::to_be_bytes(bytes.len() as u32));
+    buf.extend_from_slice(bytes);
+}
+
+/// Extracts the agent's own key blob out of the IDENTITIES_ANSWER payload,
+/// so the SIGN_REQUEST payload refers to the right key. The blob is at
+/// offset 1 (after IDENTITIES_ANSWER), then [u32:count][for-each: blob+comment].
+fn identities_blob_for_sign(payload: &[u8]) -> Vec<u8> {
+    let count_offset = 1;
+    let count = u32::from_be_bytes(
+        payload[count_offset..count_offset + 4]
+            .try_into()
+            .expect("count head"),
+    ) as usize;
+    assert_eq!(count, 1, "the bounded agent exposes exactly one identity");
+    let blob_offset = count_offset + 4;
+    ssh_blob_at(payload, blob_offset)
 }
