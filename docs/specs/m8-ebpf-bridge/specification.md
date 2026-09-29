@@ -53,8 +53,12 @@ return `VerbError::InvalidArgument`.
 
 #### Scenario: cgroup id accepted, path rejected
 
-> `CgroupAttach(0x1234)` returns `Ok(AttachHandle)`. `CgroupAttach(/sys/fs/cgroup/...)`
-> returns `Err(VerbError::InvalidArgument)`.
+> `CgroupAttach` with the wire id `"0x1234"` (or decimal `"4660"`) parses to
+> `Ok(0x1234)`. `CgroupAttach("/sys/fs/cgroup/...")`, `"../escape"`, `""`,
+> `"12x"`, `"0x"` and values above `u64::MAX` return
+> `Err(VerbError::InvalidArgument)`.
+> (Concretely implemented and tested by `parse_cgroup_id` — cycle
+> m8-rd-gate, ebpfd unit tests + `uat_024_m8_parse_cgroup_id_rejects_path_arguments`.)
 
 ### M8-R4 — Audit log emits one line per privileged verb
 
@@ -65,7 +69,10 @@ Every successful `ProgramLoad`, `CgroupAttach`, `CgroupDetach`,
 asv-ebpfd: <verb> <arg> sequence=<N> session=<session-id>
 ```
 
-Where `N` is a monotonically increasing sequence number from the helper.
+Where `N` is a monotonically increasing sequence number from the helper
+(`AuditCounter`, 1-based, one per helper process; implemented in cycle
+m8-rd-gate — `session=<session-id>` remains `session=prototype` until M9
+threads the real session id).
 
 ### M8-R5 — Prototype CgroupAttach syscall surface
 
