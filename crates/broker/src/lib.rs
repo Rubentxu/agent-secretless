@@ -14,6 +14,7 @@ use asv_policy::{AuthorizationRequest, PolicyEngine};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod harden;
 pub mod surrogate;
 pub mod vault_port;
 

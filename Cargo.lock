@@ -123,6 +123,7 @@ dependencies = [
  "asv-connector-http",
  "asv-connector-pg",
  "asv-domain",
+ "asv-ebpfd",
  "asv-identity",
  "asv-ipc-protocol",
  "asv-policy",
@@ -193,6 +194,13 @@ dependencies = [
  "thiserror",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "asv-ebpfd"
+version = "0.4.0"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]

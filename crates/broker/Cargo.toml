@@ -64,3 +64,8 @@ ed25519-dalek = "2"
 # introspect Command configuration. Declared as a dev-dependency to
 # keep the production broker binary free of any test-only import.
 asv-connector-pg = { workspace = true }
+# M7 UAT-024: the broker's integration test exercises the privileged
+# helper's closed verb set from the broker's side. Declared as a
+# dev-dependency so the production binary does not link against the
+# helper until the M8 eBPF redirect is wired.
+asv-ebpfd = { workspace = true }
