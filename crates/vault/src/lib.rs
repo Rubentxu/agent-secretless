@@ -41,6 +41,7 @@ pub mod envelope;
 pub mod ingest;
 pub mod memfd;
 pub mod store;
+pub mod tpm;
 
 pub use envelope::{EnvelopeError, KdfParams, VaultHeader, VaultKey, ENVELOPE_VERSION};
 pub use store::{
