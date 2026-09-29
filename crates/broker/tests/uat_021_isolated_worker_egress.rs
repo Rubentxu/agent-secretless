@@ -65,6 +65,7 @@ fn uat_021_registered_worker_carries_egress_policy() {
         egress_policy: EgressPolicy::Allow(vec![api_endpoint()]),
         landlock_profile: Default::default(),
         seccomp_profile: asv_broker::isolated_exec::SeccompProfile::ClosedAllowList,
+        redactor: asv_broker::isolated_exec::Redactor::empty(),
     };
     let r = WorkerRegistry::new(vec![t]);
     let resolved = r.get("kubectl-worker").expect("registered");
@@ -85,6 +86,7 @@ fn uat_021_unregistered_worker_is_refused() {
         egress_policy: EgressPolicy::Deny,
         landlock_profile: Default::default(),
         seccomp_profile: asv_broker::isolated_exec::SeccompProfile::ClosedAllowList,
+        redactor: asv_broker::isolated_exec::Redactor::empty(),
     }]);
     assert!(r.get("kubectl-worker-evil").is_none());
     assert!(r.get("bash").is_none());
