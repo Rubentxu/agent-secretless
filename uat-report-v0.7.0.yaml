@@ -38,9 +38,8 @@ features:
   - scenario_id: S-1
     status: PASS
     executor: automated
-    acceptance_required: false
+    acceptance_required: true
+    acceptance: accepted
 verdict: READY
 not_ready_blockers: []
-acceptance_blockers:
-- S-1 (machine PASS pero sin acceptance humana)
-- S-2 (machine PASS pero sin acceptance humana)
+acceptance_blockers: []
