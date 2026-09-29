@@ -42,7 +42,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use asv_broker::ConnectorFactory;
-use asv_broker::{BrokerState, VaultSecretPort, handle, insert_credential};
+use asv_broker::{handle, insert_credential, BrokerState, VaultSecretPort};
 use asv_connector_http::fake_origin::{self, Reply};
 use asv_connector_http::{AddressPolicy, GithubClient, ResolvedAudience};
 use asv_domain::{AgentSessionId, Authority, CredentialKind, CredentialMetadata, SecretBytes};
@@ -124,9 +124,8 @@ impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let vault_path = dir.path().join("v.asv");
-        let mut store =
-            VaultStore::create(&vault_path, &passphrase(), KdfParams::fast_for_tests())
-                .expect("create vault");
+        let mut store = VaultStore::create(&vault_path, &passphrase(), KdfParams::fast_for_tests())
+            .expect("create vault");
         let key: VaultKey = store.header().unlock(&passphrase()).expect("unlock");
 
         let mut state = BrokerState::default();
@@ -287,10 +286,7 @@ fn rotation_under_a_live_session_keeps_the_same_surrogate_and_uses_the_new_token
         "the read after rotation must carry the NEW token, through the same surrogate"
     );
     assert!(
-        !after
-            .as_deref()
-            .unwrap_or_default()
-            .contains(OLD_TOKEN),
+        !after.as_deref().unwrap_or_default().contains(OLD_TOKEN),
         "the rotated-out token must not survive anywhere in the new request"
     );
 }
@@ -315,9 +311,7 @@ fn the_credential_id_stays_stable_and_resolvable_across_rotation() {
     // duration of the call — which is the shape R7 depends on.
     let resolved = fixture
         .store
-        .with_secret(&fixture.key, &id_before.to_wire(), |secret| {
-            secret.to_vec()
-        })
+        .with_secret(&fixture.key, &id_before.to_wire(), |secret| secret.to_vec())
         .expect("the original id must still resolve after rotation");
     assert_eq!(
         resolved,
