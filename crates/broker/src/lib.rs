@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod harden;
+pub mod isolated_exec;
 pub mod surrogate;
 pub mod tls_bridge;
 pub mod vault_port;
