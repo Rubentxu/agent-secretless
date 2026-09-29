@@ -17,10 +17,7 @@
 //! it; for now every code path that would set `PGPASSWORD` or
 //! `PGPASSFILE` is forbidden by inspection.
 
-#![cfg_attr(
-    any(test, feature = "test-support"),
-    allow(dead_code, unused_imports)
-)]
+#![cfg_attr(any(test, feature = "test-support"), allow(dead_code, unused_imports))]
 
 /// A local in-process TCP server that speaks the PostgreSQL startup
 /// protocol enough to drive the real connector against a real socket
@@ -45,10 +42,10 @@ pub mod transport;
 pub mod spawn;
 
 pub use pg::{AllowList, DbAction, DenyAll, PgConnection, PgError, PgPolicy, PostgresClient};
+pub use spawn::{spawn_psql_reveal, PsqlSpawn};
 pub use transport::{
     resolve_and_pin, AddressPolicy, PgAudience, PinnedPgClient, PinnedPgError, ResolvedPgAudience,
 };
-pub use spawn::{spawn_psql_reveal, PsqlSpawn};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use fake_pg::FakePg;

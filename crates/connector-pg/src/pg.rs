@@ -272,9 +272,7 @@ impl AllowList {
 
 impl PgPolicy for AllowList {
     fn allows(&self, database: &str, role: &str) -> bool {
-        self.pairs
-            .iter()
-            .any(|(db, r)| db == database && r == role)
+        self.pairs.iter().any(|(db, r)| db == database && r == role)
     }
 }
 
@@ -303,7 +301,11 @@ mod tests {
 
     #[test]
     fn policy_check_denies_unknown_pair() {
-        let client = PostgresClient::new(Authority::canonicalize("asv-pg.test").expect("authority"), "asv", "app");
+        let client = PostgresClient::new(
+            Authority::canonicalize("asv-pg.test").expect("authority"),
+            "asv",
+            "app",
+        );
         let policy = DenyAll;
         let err = client.authorize(&policy).unwrap_err();
         assert_eq!(
@@ -317,7 +319,11 @@ mod tests {
 
     #[test]
     fn policy_check_allows_listed_pair() {
-        let client = PostgresClient::new(Authority::canonicalize("asv-pg.test").expect("authority"), "asv", "app");
+        let client = PostgresClient::new(
+            Authority::canonicalize("asv-pg.test").expect("authority"),
+            "asv",
+            "app",
+        );
         let policy = AllowList::new().grant("asv", "app");
         assert!(client.authorize(&policy).is_ok());
     }
@@ -329,8 +335,16 @@ mod tests {
         // variant for both an unauthorised database and an
         // unauthorised role, with no extra field that would distinguish
         // them.
-        let client_other = PostgresClient::new(Authority::canonicalize("asv-pg.test").expect("authority"), "other", "app");
-        let client_role = PostgresClient::new(Authority::canonicalize("asv-pg.test").expect("authority"), "asv", "admin");
+        let client_other = PostgresClient::new(
+            Authority::canonicalize("asv-pg.test").expect("authority"),
+            "other",
+            "app",
+        );
+        let client_role = PostgresClient::new(
+            Authority::canonicalize("asv-pg.test").expect("authority"),
+            "asv",
+            "admin",
+        );
         let policy = AllowList::new().grant("asv", "app");
         let err_other = client_other.authorize(&policy).unwrap_err();
         let err_role = client_role.authorize(&policy).unwrap_err();
@@ -355,7 +369,11 @@ mod tests {
     #[test]
     fn pg_s4_revoke_teardown_marks_next_query_revoked() {
         // M6-S4: revoking the connection makes the next query fail.
-        let client = PostgresClient::new(Authority::canonicalize("asv-pg.test").expect("authority"), "asv", "app");
+        let client = PostgresClient::new(
+            Authority::canonicalize("asv-pg.test").expect("authority"),
+            "asv",
+            "app",
+        );
         let conn = client.open_connection();
         assert_eq!(conn.query(DbAction::Read).unwrap(), "Read");
         client.revoked.store(true, Ordering::Release);
@@ -368,7 +386,11 @@ mod tests {
         // set even if the broker clears the flag. This is the rule
         // M6-R4: a revoke tears the connection down, and the next
         // call fails regardless of any later broker state.
-        let client = PostgresClient::new(Authority::canonicalize("asv-pg.test").expect("authority"), "asv", "app");
+        let client = PostgresClient::new(
+            Authority::canonicalize("asv-pg.test").expect("authority"),
+            "asv",
+            "app",
+        );
         let conn = client.open_connection();
         client.revoked.store(true, Ordering::Release);
         assert_eq!(conn.query(DbAction::Read).unwrap_err(), PgError::Revoked);
@@ -383,7 +405,11 @@ mod tests {
         // M6-S5: the connector surfaces a `DbAction` whose strings
         // match the policy grammar; the test exercises the strings
         // through a real query to confirm they round-trip.
-        let client = PostgresClient::new(Authority::canonicalize("asv-pg.test").expect("authority"), "asv", "app");
+        let client = PostgresClient::new(
+            Authority::canonicalize("asv-pg.test").expect("authority"),
+            "asv",
+            "app",
+        );
         let conn = client.open_connection();
         assert_eq!(conn.query(DbAction::Read).unwrap(), "Read");
         assert_eq!(conn.query(DbAction::CreateTable).unwrap(), "CreateTable");

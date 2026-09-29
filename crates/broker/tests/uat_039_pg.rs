@@ -28,9 +28,7 @@ use std::sync::Arc;
 use asv_broker::ConnectorFactory;
 use asv_connector_http::{GithubClient, SecretSink};
 use asv_connector_pg::spawn::{spawn_psql_reveal, PsqlSpawn};
-use asv_connector_pg::{
-    AllowList, DbAction, PgError, PgPolicy, PostgresClient,
-};
+use asv_connector_pg::{AllowList, DbAction, PgError, PgPolicy, PostgresClient};
 use asv_domain::Authority;
 
 /// A factory whose `postgres()` routes to a fake origin so the test
@@ -120,10 +118,7 @@ fn uat_039_m6_s4_revoke_teardown_marks_query_revoked() {
     let conn = client.open_connection();
     assert_eq!(conn.query(DbAction::Read).unwrap(), "Read");
     client.revoked_handle().store(true, Ordering::Release);
-    assert_eq!(
-        conn.query(DbAction::Read).unwrap_err(),
-        PgError::Revoked
-    );
+    assert_eq!(conn.query(DbAction::Read).unwrap_err(), PgError::Revoked);
 }
 
 #[test]
@@ -159,10 +154,7 @@ fn uat_039_m6_s2_spawn_psql_helper_clears_password_env() {
     let std_cmd = cmd.as_std();
 
     // Argv: --no-password, --quiet, --, /bin/true
-    let argv: Vec<&str> = std_cmd
-        .get_args()
-        .filter_map(|s| s.to_str())
-        .collect();
+    let argv: Vec<&str> = std_cmd.get_args().filter_map(|s| s.to_str()).collect();
     assert!(argv.contains(&"--no-password"), "argv = {:?}", argv);
     assert!(argv.contains(&"--quiet"), "argv = {:?}", argv);
 
@@ -190,9 +182,7 @@ fn uat_039_m6_s2_spawn_psql_helper_clears_password_env() {
 
 #[test]
 fn uat_039_m6_s5_policy_decision_is_in_db_action_strings() {
-    let policy: AllowList = AllowList::new()
-        .grant("asv", "app")
-        .grant("asv", "admin");
+    let policy: AllowList = AllowList::new().grant("asv", "app").grant("asv", "admin");
 
     assert!(policy.allows("asv", "app"));
     assert!(policy.allows("asv", "admin"));

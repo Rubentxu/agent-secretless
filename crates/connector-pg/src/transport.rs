@@ -95,7 +95,9 @@ impl AddressPolicy {
                 !v6.is_unspecified()
                     && v6.segments()[0] & 0xfe00 != 0xfc00
                     && v6.segments()[0] & 0xffc0 != 0xfe80
-                    && !v6.to_ipv4_mapped().is_some_and(|v4| !self.permits(IpAddr::V4(v4)))
+                    && !v6
+                        .to_ipv4_mapped()
+                        .is_some_and(|v4| !self.permits(IpAddr::V4(v4)))
             }
         }
     }
@@ -111,7 +113,10 @@ impl AddressPolicy {
     }
 
     fn is_documentation_v4(v4: Ipv4Addr) -> bool {
-        matches!(v4.octets(), [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _])
+        matches!(
+            v4.octets(),
+            [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _]
+        )
     }
 }
 
@@ -213,7 +218,9 @@ mod tests {
 
     #[test]
     fn policy_allows_loopback_when_explicit() {
-        let policy = AddressPolicy { allow_loopback: true };
+        let policy = AddressPolicy {
+            allow_loopback: true,
+        };
         assert!(policy.permits(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
     }
 
