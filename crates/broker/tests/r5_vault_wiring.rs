@@ -261,6 +261,35 @@ fn broker_with_harden_flag_applies_dumpable_zero_and_still_serves() {
         "--harden broker must be undumpable (CoreDumping: 0)"
     );
 
+    // M7-R4 through the shipped binary: the seccomp deny-list filter is
+    // ACTIVE in the kernel for the broker process (Seccomp: 2 means
+    // SECCOMP_MODE_FILTER; Seccomp_filters counts installed filters).
+    let seccomp_line = status
+        .lines()
+        .find(|l| l.starts_with("Seccomp:"))
+        .expect("Seccomp line")
+        .split_whitespace()
+        .last()
+        .expect("value")
+        .to_string();
+    assert_eq!(
+        seccomp_line, "2",
+        "--harden broker must run under a seccomp filter (Seccomp: 2)"
+    );
+    let nfilters: u32 = status
+        .lines()
+        .find(|l| l.starts_with("Seccomp_filters:"))
+        .expect("Seccomp_filters line")
+        .split_whitespace()
+        .last()
+        .expect("value")
+        .parse()
+        .expect("filter count");
+    assert!(
+        nfilters >= 1,
+        "--harden broker must have at least one seccomp filter installed"
+    );
+
     // And the IPC surface still works: Ping round-trip (same envelope as
     // the first test in this file: {"result":"pong","protocol":2}).
     let request = serde_json::json!({

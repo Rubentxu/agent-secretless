@@ -118,18 +118,18 @@ fn main() -> std::io::Result<()> {
         });
         let dumpable_zero = asv_broker::harden::dumpable_is_zero();
         let no_new_privs = asv_broker::harden::no_new_privs_is_set();
-        // Honest labels: `landlock_installed` is a real ruleset;
-        // `seccomp_installed` currently only means the kernel ACCEPTS
-        // seccomp filters (a PR_GET_SECCOMP probe in harden.rs), not that
-        // a syscall filter is active. Claiming otherwise would oversell
-        // the profile — see the M7 backlog items.
+        // Honest labels: `landlock_installed` and `seccomp_installed` are
+        // REAL — a live Landlock ruleset (restrict_self succeeded) and a
+        // live seccomp-bpf deny-list (ptrace/process_vm_readv/kexec_load/
+        // bpf/init_module/finit_module/userfaultfd/perf_event_open are
+        // denied with SIGSYS). The closed allow-list profile remains M8.
         tracing::info!(
             dumpable_zero,
             no_new_privs,
             cgroup_v2 = cfg.cgroup_v2,
             landlock = cfg.landlock_installed,
-            seccomp_probe = cfg.seccomp_installed,
-            "M7 harden profile applied (dumpable=0, no-new-privs)"
+            seccomp_filter = cfg.seccomp_installed,
+            "M7 harden profile applied (dumpable=0, no-new-privs, seccomp deny-list)"
         );
         if !cfg.landlock_installed {
             tracing::warn!(
@@ -138,7 +138,7 @@ fn main() -> std::io::Result<()> {
             );
         }
         if !cfg.seccomp_installed {
-            tracing::warn!("kernel lacks seccomp; syscall filtering unavailable");
+            tracing::warn!("kernel rejected seccomp filter; syscall filtering NOT active");
         }
     }
 

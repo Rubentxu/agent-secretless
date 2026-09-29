@@ -43,6 +43,8 @@ subtle.workspace = true
 # The binary reads the passphrase from a file at startup; `SecretString` is
 # `secrecy`'s, so the dependency lives here, not only under dev-deps.
 secrecy.workspace = true
+seccompiler = "0.4"
+landlock = "0.4"
 
 [dev-dependencies]
 serde_json = "1"
