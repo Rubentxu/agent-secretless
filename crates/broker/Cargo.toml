@@ -45,3 +45,10 @@ secrecy.workspace = true
 # A dev-dependency, not a normal one: the broker binary must not be able to
 # start a test server even if someone asks nicely.
 asv-connector-http = { workspace = true, features = ["test-support"] }
+# UAT-030 also exercises 100 SSH signatures against the M2 signer (this
+# milestone's exit criterion), not only 100 HTTP reads. The broker stays
+# unaware of SSH: this dev-dependency exists so the test can drive the
+# signer's deterministic entry point over its real Unix socket and verify
+# the produced signatures with `ed25519_dalek::Verifier`.
+asv-ssh-agent = { workspace = true }
+ed25519-dalek = "2"
