@@ -45,6 +45,13 @@ enum Command {
     },
     /// List credential metadata. Never values.
     Credentials,
+    /// Query the broker's audit log (R9). Denied until the operator control
+    /// plane ships; the command reports that refusal honestly.
+    Audit {
+        /// Only records newer than this duration (e.g. `24h`, `30m`).
+        #[arg(long, value_name = "DURATION")]
+        since: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -69,6 +76,16 @@ async fn main() -> std::io::Result<()> {
         },
         Command::Session { workspace } => Request::CreateSession { workspace },
         Command::Credentials => Request::ListCredentialMetadata,
+        Command::Audit { since } => {
+            let since_secs = match since.as_deref() {
+                None => 0,
+                Some(spec) => parse_duration_secs(spec).unwrap_or_else(|| {
+                    eprintln!("asv: cannot parse duration {spec:?} (try 24h, 30m, 90s)");
+                    std::process::exit(2);
+                }),
+            };
+            Request::AuditQuery { since_secs }
+        }
         Command::Run { .. } => unreachable!("run handled before broker IPC"),
     };
 
@@ -86,6 +103,20 @@ async fn main() -> std::io::Result<()> {
 
 fn default_socket() -> PathBuf {
     PathBuf::from("/run/user/1000/asv/broker.sock")
+}
+
+/// Parses `90s`, `30m`, `24h`, `7d` into seconds. None on garbage.
+fn parse_duration_secs(spec: &str) -> Option<u64> {
+    let spec = spec.trim();
+    let (digits, unit) = spec.split_at(spec.len().checked_sub(1)?);
+    let n: u64 = digits.parse().ok()?;
+    match unit {
+        "s" => Some(n),
+        "m" => Some(n.checked_mul(60)?),
+        "h" => Some(n.checked_mul(3600)?),
+        "d" => Some(n.checked_mul(86400)?),
+        _ => None,
+    }
 }
 
 const QUARANTINED_ENV_NAMES: &[&str] = &[
@@ -215,6 +246,30 @@ fn print_response(response: &Response) {
         }
         Response::ReleaseCreated { tag, url } => {
             println!("release {tag} created: {url}");
+        }
+        Response::AuditRecords {
+            records,
+            chain_head,
+            dropped,
+        } => {
+            if records.is_empty() {
+                println!("no audit records in range");
+            } else {
+                println!("{:<6} {:<12} {:<22} TS", "SEQ", "OUTCOME", "METHOD");
+                for r in records {
+                    let event = match &r.event {
+                        asv_ipc_protocol::AuditEventDto::RequestHandled {
+                            method, outcome, ..
+                        } => format!("{method:<22} {outcome}"),
+                    };
+                    let (method, outcome) = event.split_once(' ').unwrap_or((event.as_str(), ""));
+                    println!("{:<6} {:<12} {:<22} {}", r.seq, outcome, method, r.ts);
+                }
+            }
+            if *dropped > 0 {
+                println!("{dropped} older record(s) evicted by retention");
+            }
+            println!("chain head: {chain_head}");
         }
         Response::Error { code, message } => {
             // `code` is the stable, scriptable part; `message` is for humans.
