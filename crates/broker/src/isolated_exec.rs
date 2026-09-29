@@ -138,6 +138,11 @@ pub struct WorkerTemplate {
     pub landlock_profile: LandlockProfile,
     /// Seccomp profile.
     pub seccomp_profile: SeccompProfile,
+    /// M10R-R5: the defence-in-depth stdout/stderr redactor, seeded by
+    /// the template author with the exact byte sequences this worker
+    /// could leak. Empty = no-op (unchanged output). The runtime routes
+    /// every captured byte through it before returning output.
+    pub redactor: Redactor,
 }
 
 /// The static worker registry. Built at install time.
@@ -350,6 +355,7 @@ mod tests {
             egress_policy: EgressPolicy::Allow(vec![api_endpoint()]),
             landlock_profile: LandlockProfile::default(),
             seccomp_profile: SeccompProfile::ClosedAllowList,
+            redactor: Redactor::empty(),
         };
         let r = WorkerRegistry::new(vec![t]);
         assert!(r.get("kubectl-worker").is_some());
@@ -377,6 +383,7 @@ mod tests {
             egress_policy: EgressPolicy::Deny,
             landlock_profile: LandlockProfile::default(),
             seccomp_profile: SeccompProfile::ClosedAllowList,
+            redactor: Redactor::empty(),
         }]);
         assert!(r.get("kubectl-worker-evil").is_none());
     }
