@@ -17,6 +17,7 @@ use std::sync::Arc;
 pub mod audit;
 pub mod harden;
 pub mod isolated_exec;
+pub mod worker;
 pub mod oauth2;
 pub mod recovery;
 pub mod surrogate;
@@ -809,6 +810,7 @@ mod tests {
             asv_ipc_protocol::AuditEventDto::RequestHandled { outcome, .. } => {
                 assert_eq!(outcome, "INVALID_REQUEST");
             }
+            other => panic!("unexpected audit variant: {other:?}"),
         }
     }
 

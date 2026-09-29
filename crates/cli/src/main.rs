@@ -261,6 +261,11 @@ fn print_response(response: &Response) {
                         asv_ipc_protocol::AuditEventDto::RequestHandled {
                             method, outcome, ..
                         } => format!("{method:<22} {outcome}"),
+                        asv_ipc_protocol::AuditEventDto::WorkerSpawned {
+                            worker,
+                            outcome,
+                            ..
+                        } => format!("worker:{worker:<15} {outcome}"),
                     };
                     let (method, outcome) = event.split_once(' ').unwrap_or((event.as_str(), ""));
                     println!("{:<6} {:<12} {:<22} {}", r.seq, outcome, method, r.ts);

@@ -269,6 +269,25 @@ pub enum AuditEventDto {
         /// Security posture of the handler path.
         posture: String,
     },
+    /// M10R-R6: an isolated worker run reached a terminal state —
+    /// completed, failed, timed out, or was refused before exec.
+    /// Metadata only by construction: every field is a wire name or a
+    /// count; there is no field that could carry secret bytes.
+    WorkerSpawned {
+        /// Registered template name (or the refused name).
+        worker: String,
+        /// EgressPolicy wire name ("deny" | "allow_list").
+        egress: String,
+        /// SecretInjectionPlan wire name ("env_var" | "file" | "none").
+        injection: String,
+        /// Always `ISOLATED_PROCESS_EXPOSURE` for worker runs.
+        posture: String,
+        /// "ok" | "failed" | "timeout" | "refused" | "error".
+        outcome: String,
+        /// Child exit code when the child ran and exited; `None` for
+        /// signals, timeouts and refusals.
+        exit_code: Option<i32>,
+    },
 }
 
 impl Request {
