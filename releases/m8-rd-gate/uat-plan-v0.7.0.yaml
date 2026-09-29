@@ -1,0 +1,71 @@
+schema_version: 1
+release:
+  candidate: v0.7.0
+  project: agent-secretless
+  last_uat_release: v0.6.0
+generated_by: uat-planner
+generated_at: 2026-09-29T15:07:43Z
+features:
+  - id: UAT-M8-R3-PARSE
+    name: "asv-ebpfd M8-R3 cgroup id wire-format parsing"
+    scenarios:
+      - id: S-1
+        title: "Hex and decimal wire ids parse, paths and malformed die as InvalidArgument"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "asv-ebpfd crate compiled"
+        plain_steps:
+          - action: "Run cargo test --release -p asv-ebpfd --lib"
+            copy_hint: false
+            expected: "parse_cgroup_id cases green (11/11)"
+        technical_steps:
+          - "parse_cgroup_id('0x1234') == Ok(0x1234); parse_cgroup_id('/sys/fs/cgroup/x') == Err(InvalidArgument)"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test --release -p asv-ebpfd --lib"
+          status: automated
+        rationale: "M8-R3 is the escalation-primitive guard: path args must never coerce to ids"
+        evidence:
+          required: false
+          kinds: []
+      - id: S-2
+        title: "uat_024 bite rejects path arguments through the broker-facing surface"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "asv-broker tests compiled"
+        plain_steps:
+          - action: "Run cargo test --release -p asv-broker --test uat_024_helper_scope"
+            copy_hint: false
+            expected: "9/9 including uat_024_m8_parse_cgroup_id_rejects_path_arguments"
+        technical_steps:
+          - "integration bite asserts InvalidArgument verb == cgroup.attach"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test --release -p asv-broker --test uat_024_helper_scope"
+          status: automated
+        rationale: "locks the M8-R3 behavior against the consumer crate, not only the library"
+        evidence:
+          required: false
+          kinds: []
+  - id: UAT-M8-R4-AUDIT
+    name: "asv-ebpfd M8-R4 monotonic audit sequence"
+    scenarios:
+      - id: S-1
+        title: "AuditCounter monotonic from 1; audit line carries real N"
+        priority: P1
+        assignee: developer
+        preconditions:
+          - "asv-ebpfd crate compiled"
+        plain_steps:
+          - action: "Run cargo test --release -p asv-ebpfd --lib audit"
+            copy_hint: false
+            expected: "audit_counter_is_monotonic_from_one and audit_line_format green"
+        technical_steps:
+          - "AuditCounter::next() == 1,2,3; format_audit_line ends with sequence=N"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test --release -p asv-ebpfd --lib audit"
+          status: automated
+        rationale: "M8-R4 audit log ingesting depends on a gap-detectable monotonic sequence"
+        evidence:
+          required: false
+          kinds: []

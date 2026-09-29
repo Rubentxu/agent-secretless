@@ -1,0 +1,46 @@
+schema_version: 2
+release: v0.7.0
+plan_ref: v0.7.0
+sessions:
+- auto-S-1-20260929T151831Z
+- auto-S-2-20260929T151841Z
+- auto-S-1-20260929T151846Z
+summary:
+  total_scenarios: 3
+  passed: 3
+  failed: 0
+  blocked: 0
+  partial: 0
+  not_run: 0
+  coverage_pct: 100.0
+  defects: 0
+  ux_issues: 0
+  uat_duration_minutes: 0
+features:
+- id: UAT-M8-R3-PARSE
+  name: asv-ebpfd M8-R3 cgroup id wire-format parsing
+  coverage_pct: 100.0
+  scenarios:
+  - scenario_id: S-1
+    status: PASS
+    executor: automated
+    acceptance: pending
+    acceptance_required: true
+  - scenario_id: S-2
+    status: PASS
+    executor: automated
+    acceptance: pending
+    acceptance_required: true
+- id: UAT-M8-R4-AUDIT
+  name: asv-ebpfd M8-R4 monotonic audit sequence
+  coverage_pct: 100.0
+  scenarios:
+  - scenario_id: S-1
+    status: PASS
+    executor: automated
+    acceptance_required: false
+verdict: READY
+not_ready_blockers: []
+acceptance_blockers:
+- S-1 (machine PASS pero sin acceptance humana)
+- S-2 (machine PASS pero sin acceptance humana)
