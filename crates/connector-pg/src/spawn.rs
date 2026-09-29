@@ -69,7 +69,10 @@ impl PsqlSpawn {
 /// The wrapper script is a no-op on a normal Linux box (`cat` exists);
 /// the helper exists so the test can pick it up and verify the four
 /// forbidden locations are empty.
-#[cfg(any(test, feature = "test-support"))]
+///
+/// Exposed unconditionally (not `#[cfg(test)]`) so the broker's
+/// integration test (UAT-039) can introspect the same `Command`
+/// without re-implementing the env_clear logic.
 pub fn spawn_psql_reveal(spawn: &PsqlSpawn, wrapper: &str) -> Command {
     let mut cmd = spawn.build_command();
     cmd.arg("--");

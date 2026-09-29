@@ -58,3 +58,9 @@ asv-connector-http = { workspace = true, features = ["test-support"] }
 # the produced signatures with `ed25519_dalek::Verifier`.
 asv-ssh-agent = { workspace = true }
 ed25519-dalek = "2"
+# M6 UAT-039: the broker's integration test for the PostgreSQL
+# connector lives here. The broker is already a normal dep, but the
+# test also needs to reach the connector-pg types directly to
+# introspect Command configuration. Declared as a dev-dependency to
+# keep the production broker binary free of any test-only import.
+asv-connector-pg = { workspace = true }

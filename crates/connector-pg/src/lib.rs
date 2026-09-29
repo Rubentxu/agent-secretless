@@ -44,10 +44,11 @@ pub mod transport;
 /// stated and one place where it is implemented.
 pub mod spawn;
 
-pub use pg::{DbAction, PgConnection, PgError, PostgresClient};
+pub use pg::{AllowList, DbAction, DenyAll, PgConnection, PgError, PgPolicy, PostgresClient};
 pub use transport::{
     resolve_and_pin, AddressPolicy, PgAudience, PinnedPgClient, PinnedPgError, ResolvedPgAudience,
 };
+pub use spawn::{spawn_psql_reveal, PsqlSpawn};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use fake_pg::FakePg;
