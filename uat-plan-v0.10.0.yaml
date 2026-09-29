@@ -1,0 +1,68 @@
+schema_version: 1
+release:
+  candidate: v0.10.0
+  project: agent-secretless
+  last_uat_release: v0.9.1
+generated_by: uat-planner
+generated_at: 2026-09-29T18:36:00Z
+features:
+  - id: UAT-AUDIT-DURABLE
+    name: "broker durable audit log (--audit-file) replay, tamper evidence, crash recovery"
+    scenarios:
+      - id: S-AUDIT-1
+        title: "Records survive broker restart with continuous sequence and restored head"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "workspace compiled at 2f7069e"
+        plain_steps:
+          - action: "Run cargo test -p asv-broker --lib replay_restores_window_head_and_sequence"
+            copy_hint: false
+            expected: "PASS"
+        technical_steps:
+          - "open_persistent(max=2) after 5 appends: query window=seqs 3,4; head=record4 hash; next append seq=5 chaining from restored head; verify()=Ok"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p asv-broker --lib replay_restores_window_head_and_sequence"
+          status: automated
+        rationale: "The declared debt: an in-memory ring loses the audit trail on restart"
+        evidence:
+          required: false
+          kinds: []
+      - id: S-AUDIT-2
+        title: "verify_file detects hash and seq tampering, accepts intact log"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "workspace compiled at 2f7069e"
+        plain_steps:
+          - action: "Run cargo test -p asv-broker --lib verify_file"
+            copy_hint: false
+            expected: "3 PASS (intact, hash tamper, seq tamper)"
+        technical_steps:
+          - "verify_file: intact=Ok; flipped hash hex=Chain(...); seq 0->7=DigestMismatch"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p asv-broker --lib verify_file"
+          status: automated
+        rationale: "R9 tamper evidence must extend to the durable file"
+        evidence:
+          required: false
+          kinds: []
+      - id: S-AUDIT-3
+        title: "Crash mid-append recovers: truncated tail discarded, re-anchored, fail-closed mid damage"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "workspace compiled at 2f7069e"
+        plain_steps:
+          - action: "Run cargo test -p asv-broker --lib partial_tail_line mid_history"
+            copy_hint: false
+            expected: "2 PASS"
+        technical_steps:
+          - "half JSON line appended then reopen: trimmed, next seq reuses freed slot, file verifies; 'not json' mid-line = CorruptLine{line:2} fail-closed"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p asv-broker --lib partial_tail_line mid_history"
+          status: automated
+        rationale: "Crash safety of the durable path without corrupting the chain"
+        evidence:
+          required: false
+          kinds: []

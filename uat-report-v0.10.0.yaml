@@ -1,0 +1,44 @@
+schema_version: 2
+release: v0.10.0
+plan_ref: v0.10.0
+sessions:
+- auto-S-AUDIT-1-20260929T183700Z
+- auto-S-AUDIT-2-20260929T183700Z
+- auto-S-AUDIT-3-20260929T183700Z
+summary:
+  total_scenarios: 3
+  passed: 3
+  failed: 0
+  blocked: 0
+  partial: 0
+  not_run: 0
+  coverage_pct: 100.0
+  defects: 0
+  ux_issues: 0
+  uat_duration_minutes: 0
+features:
+- id: UAT-AUDIT-DURABLE
+  name: broker durable audit log (--audit-file) replay, tamper evidence, crash recovery
+  coverage_pct: 100.0
+  scenarios:
+  - scenario_id: S-AUDIT-1
+    status: PASS
+    executor: automated
+    acceptance: pending
+    acceptance_required: true
+  - scenario_id: S-AUDIT-2
+    status: PASS
+    executor: automated
+    acceptance: pending
+    acceptance_required: true
+  - scenario_id: S-AUDIT-3
+    status: PASS
+    executor: automated
+    acceptance: pending
+    acceptance_required: true
+verdict: READY
+not_ready_blockers: []
+acceptance_blockers:
+- S-AUDIT-1 (machine PASS pero sin acceptance humana)
+- S-AUDIT-2 (machine PASS pero sin acceptance humana)
+- S-AUDIT-3 (machine PASS pero sin acceptance humana)
