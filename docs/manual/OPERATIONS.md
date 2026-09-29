@@ -12,6 +12,22 @@ credential to a single request, runs the request through a hardened
 subprocess, and hands the response back. The agent has no API to
 read the secret.
 
+## Building from source
+
+The workspace builds with a stable Rust toolchain (edition 2021):
+
+```bash
+cargo build --workspace --release     # all crates, release profile
+cargo test --workspace --release      # full acceptance suite (~430 tests)
+```
+
+Release profile notes:
+
+- `Cargo.lock` is committed; builds are reproducible for a given toolchain.
+- The privileged helper (`asv-ebpfd`) and the broker (`asv-brokerd`) are the
+  only binaries meant for production paths; fuzz/ and tools/ never ship.
+- An SBOM can be emitted with `cargo audit` tooling (`target/sbom.json`).
+
 ## First-use — create a vault
 
 ```bash
@@ -112,13 +128,12 @@ unavailable or the PCR state has drifted.
 
 ## Audit a run
 
-```bash
-$ asv audit --vault ./vault.bin --since 24h
-```
-
-The audit log records every brokered request (id, authority, time,
-size). It does NOT record secret bytes — by construction the secret
-never enters the broker's logging path.
+> **Status: not implemented.** The audit log (brokered request records:
+> id, authority, time, size — never secret bytes) is specified in the
+> security release gates (R9, `agent-secretless-vault-spec/docs/
+> 16-SECURITY-RELEASE-GATES.md`) but no `asv audit` command ships yet.
+> This section will grow the real command reference when the audit
+> milestone lands.
 
 ## Update the broker
 
