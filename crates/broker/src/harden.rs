@@ -342,7 +342,35 @@ fn install_landlock() -> bool {
 // slice bounded and testable.
 #[cfg(target_os = "linux")]
 fn install_seccomp() -> bool {
-    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
+    let program = match worker_deny_list_filter() {
+        Some(p) => p,
+        None => return false,
+    };
+
+    // TSYNC: apply the filter to ALL threads in the process, not just
+    // the calling one. In production the broker installs from the single
+    // main thread (sync main), so both calls are equivalent there; TSYNC
+    // also makes /proc/<pid>/status (which reports the main thread's
+    // state) reflect the filter regardless of the calling thread, and
+    // covers any thread that may already exist.
+    match seccompiler::apply_filter_all_threads(&program) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("asv-broker: seccomp filter install rejected: {e:?}; NOT active");
+            false
+        }
+    }
+}
+
+/// The M7-R4 deny-list BPF program, shared by the broker's own startup
+/// (`install_seccomp`) and the isolated-worker pre-exec hook (M10R-R4).
+/// One source of truth: worker and broker can never drift apart on which
+/// syscalls are denied. `None` means the program could not be built for
+/// this arch — callers treat that as "filter NOT active" and (in the
+/// worker path) fail closed.
+#[cfg(target_os = "linux")]
+pub(crate) fn worker_deny_list_filter() -> Option<seccompiler::BpfProgram> {
+    use seccompiler::{SeccompAction, SeccompFilter, TargetArch};
     use std::collections::BTreeMap;
     use std::convert::TryFrom;
 
@@ -354,7 +382,7 @@ fn install_seccomp() -> bool {
                  syscall filtering NOT active",
                 std::env::consts::ARCH
             );
-            return false;
+            return None;
         }
     };
 
@@ -381,7 +409,7 @@ fn install_seccomp() -> bool {
     }
     if rules.is_empty() {
         eprintln!("asv-broker: seccomp deny-list resolved to zero syscalls; NOT active");
-        return false;
+        return None;
     }
 
     let filter = match SeccompFilter::new(
@@ -393,28 +421,14 @@ fn install_seccomp() -> bool {
         Ok(f) => f,
         Err(e) => {
             eprintln!("asv-broker: seccomp filter construction failed: {e:?}; NOT active");
-            return false;
+            return None;
         }
     };
-    let program = match BpfProgram::try_from(filter) {
-        Ok(p) => p,
+    match seccompiler::BpfProgram::try_from(filter) {
+        Ok(p) => Some(p),
         Err(e) => {
             eprintln!("asv-broker: seccomp BPF compilation failed: {e:?}; NOT active");
-            return false;
-        }
-    };
-
-    // TSYNC: apply the filter to ALL threads in the process, not just
-    // the calling one. In production the broker installs from the single
-    // main thread (sync main), so both calls are equivalent there; TSYNC
-    // also makes /proc/<pid>/status (which reports the main thread's
-    // state) reflect the filter regardless of the calling thread, and
-    // covers any thread that may already exist.
-    match seccompiler::apply_filter_all_threads(&program) {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!("asv-broker: seccomp filter install rejected: {e:?}; NOT active");
-            false
+            None
         }
     }
 }
