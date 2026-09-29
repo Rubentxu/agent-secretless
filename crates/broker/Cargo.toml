@@ -22,6 +22,12 @@ asv-policy.workspace = true
 # `asv-connector-http` does not depend on the vault, and adding one would make
 # D2's one-way dependency a comment instead of a fact.
 asv-connector-http.workspace = true
+# M6: the broker also depends on the PostgreSQL connector for the same
+# reason it depends on the HTTP one: the connector factory in
+# `ConnectorFactory` returns clients for both protocols. The same
+# one-way dependency rule (D2) applies: asv-connector-pg does not
+# depend on the vault.
+asv-connector-pg.workspace = true
 asv-vault.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

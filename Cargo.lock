@@ -121,6 +121,7 @@ name = "asv-broker"
 version = "0.4.0"
 dependencies = [
  "asv-connector-http",
+ "asv-connector-pg",
  "asv-domain",
  "asv-identity",
  "asv-ipc-protocol",

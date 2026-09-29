@@ -6,6 +6,7 @@
 //! state. Vault access and connectors are M1 and M4.
 
 use asv_connector_http::{validate_repo, AddressPolicy, GithubClient, GithubError, SecretPort};
+use asv_connector_pg::{PgError, PostgresClient};
 use asv_domain::{AgentSessionId, Authority, CredentialId, CredentialMetadata};
 use asv_identity::WorkloadIdentity;
 use asv_ipc_protocol::{ErrorCode, Request, Response, PROTOCOL_VERSION};
@@ -122,6 +123,24 @@ pub trait ConnectorFactory {
         audience: Authority,
         secrets: Arc<dyn SecretPort>,
     ) -> Result<GithubClient, GithubError>;
+
+    /// Builds a PostgreSQL client for the requested audience, database,
+    /// and role. The factory does not authorise the (database, role)
+    /// pair; the connector does, before any I/O (M6-R3).
+    ///
+    /// The default implementation refuses every audience, because the
+    /// production `LiveConnectorFactory` does not have a real PostgreSQL
+    /// transport wired; tests override it with a factory that routes
+    /// to a `fake_pg` origin.
+    fn postgres(
+        &self,
+        _audience: Authority,
+        _database: String,
+        _role: String,
+        _secrets: Arc<dyn SecretPort>,
+    ) -> Result<PostgresClient, PgError> {
+        Err(PgError::UnsupportedInThisBuild)
+    }
 }
 
 /// The production factory: real DNS, real TLS, public addresses only.
@@ -142,6 +161,16 @@ impl ConnectorFactory for LiveConnectorFactory {
             AddressPolicy::default(),
             secrets,
         ))
+    }
+
+    fn postgres(
+        &self,
+        _audience: Authority,
+        _database: String,
+        _role: String,
+        _secrets: Arc<dyn SecretPort>,
+    ) -> Result<PostgresClient, PgError> {
+        Err(PgError::UnsupportedInThisBuild)
     }
 }
 
@@ -1347,6 +1376,20 @@ mod e2e {
                 secrets,
             )
             .trusting(vec![self.root.clone()]))
+        }
+
+        // M6-T7: test factory does not route to a fake_pg; production
+        // shape is enough for the existing HTTP tests. Any test that
+        // exercises the broker-side PostgreSQL flow installs a
+        // factory whose postgres routes to fake_pg explicitly.
+        fn postgres(
+            &self,
+            audience: Authority,
+            database: String,
+            role: String,
+            _secrets: Arc<dyn SecretPort>,
+        ) -> Result<PostgresClient, PgError> {
+            Ok(PostgresClient::new(audience, database, role))
         }
     }
 

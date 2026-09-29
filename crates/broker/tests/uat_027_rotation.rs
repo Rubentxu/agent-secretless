@@ -45,6 +45,7 @@ use asv_broker::ConnectorFactory;
 use asv_broker::{handle, insert_credential, BrokerState, VaultSecretPort};
 use asv_connector_http::fake_origin::{self, Reply};
 use asv_connector_http::{AddressPolicy, GithubClient, ResolvedAudience};
+use asv_connector_pg::{PgError, PostgresClient};
 use asv_domain::{AgentSessionId, Authority, CredentialKind, CredentialMetadata, SecretBytes};
 use asv_identity::{PeerCredentials, WorkloadIdentity};
 use asv_ipc_protocol::{Request, Response};
@@ -100,6 +101,16 @@ impl ConnectorFactory for LocalFactory {
             secrets,
         )
         .trusting(vec![self.root.clone()]))
+    }
+
+    fn postgres(
+        &self,
+        audience: Authority,
+        database: String,
+        role: String,
+        _secrets: Arc<dyn asv_connector_http::SecretPort>,
+    ) -> Result<PostgresClient, PgError> {
+        Ok(PostgresClient::new(audience, database, role))
     }
 }
 
