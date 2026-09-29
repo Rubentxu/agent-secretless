@@ -46,8 +46,10 @@ fn cargo_bin(name: &str) -> PathBuf {
             return candidate;
         }
     }
-    let candidate = PathBuf::from("target").join(profile).join(name);
-    candidate
+    if let Ok(target) = std::env::var("CARGO_TARGET_DIR") {
+        return PathBuf::from(target).join(profile).join(name);
+    }
+    PathBuf::from("target").join(profile).join(name)
 }
 
 fn unique_socket(tag: &str) -> PathBuf {

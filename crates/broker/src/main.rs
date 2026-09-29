@@ -18,6 +18,13 @@ use zeroize::Zeroize;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    // R2 (16-SECURITY-RELEASE-GATES): "broker core dumps disabled". A core
+    // dump of a broker holding unlocked vault keys would write that key
+    // material to a file any log collector could read. This runs before
+    // anything else: disabling dumps after the first secret exists would
+    // leave a crash window in which the keys were already dumpable.
+    disable_core_dumps();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -60,9 +67,7 @@ async fn main() -> std::io::Result<()> {
                 }
             }
             "-h" | "--help" => {
-                eprintln!(
-                    "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH]"
-                );
+                eprintln!("usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH]");
                 std::process::exit(0);
             }
             other if other.starts_with("--") || other.starts_with('-') => {
@@ -119,7 +124,10 @@ async fn main() -> std::io::Result<()> {
     // deny-by-default property the broker's contract depends on.
     if let (Some(vault_path), Some(passphrase_path)) = (vault_path, passphrase_path) {
         let passphrase = read_passphrase(&passphrase_path).unwrap_or_else(|err| {
-            eprintln!("asv: cannot read passphrase file {}: {err}", passphrase_path.display());
+            eprintln!(
+                "asv: cannot read passphrase file {}: {err}",
+                passphrase_path.display()
+            );
             std::process::exit(1);
         });
         let store = VaultStore::open(&vault_path, &passphrase).unwrap_or_else(|err| {
@@ -232,3 +240,64 @@ fn read_passphrase(path: &std::path::Path) -> std::io::Result<SecretString> {
 }
 
 use std::io::{Read, Write};
+
+/// Sets RLIMIT_CORE to (0, 0) so the kernel refuses to write a core dump
+/// of this process, ever.
+///
+/// R2 (16-SECURITY-RELEASE-GATES): "broker core dumps disabled". A core of
+/// a broker holding unlocked vault keys is a plain-text key file written
+/// wherever `kernel.core_pattern` points — often world-readable, often
+/// shipped by a crash collector. The rlimit is inherited by every child,
+/// so a crash in any tokio worker is covered too.
+///
+/// Not a hard error: an seccomp/apparmor profile that denies setrlimit
+/// must not stop the broker from serving, but the skip is loudly logged
+/// so a hardened deployment (M7) can alert on it.
+#[cfg(unix)]
+fn disable_core_dumps() {
+    let rlimit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &rlimit) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(
+            error = %err,
+            "could not disable core dumps; a crash may write key material to the core pattern path"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn disable_core_dumps() {
+    // Non-unix builds have no vault unlock path in this binary today; the
+    // no-op keeps the call site total without pretending protection exists.
+}
+
+#[cfg(test)]
+mod core_dump_tests {
+    /// The R2 claim "broker core dumps disabled" must be observable: after
+    /// `disable_core_dumps`, this process's own RLIMIT_CORE soft limit is 0,
+    /// which is exactly what the kernel checks before writing a core.
+    #[test]
+    #[cfg(unix)]
+    fn disable_core_dumps_sets_rlimit_core_to_zero() {
+        super::disable_core_dumps();
+        let mut limit = libc::rlimit {
+            rlim_cur: 1,
+            rlim_max: 1,
+        };
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) };
+        assert_eq!(
+            rc,
+            0,
+            "getrlimit failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            limit.rlim_cur, 0,
+            "RLIMIT_CORE soft limit must be 0 after disable_core_dumps"
+        );
+    }
+}
