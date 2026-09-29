@@ -43,6 +43,10 @@ fn main() -> std::io::Result<()> {
     let mut vault_path: Option<PathBuf> = None;
     let mut passphrase_path: Option<PathBuf> = None;
     let mut harden = false;
+    // R9 audit retention. A flag, not an environment variable: the broker's
+    // env-quarantine invariant (uat_017) scans for env reads in production
+    // sources, and operator configuration belongs in the launch contract.
+    let mut audit_max_records: Option<u64> = None;
     while let Some(arg) = args.next() {
         let arg = match arg.into_string() {
             Ok(s) => s,
@@ -72,9 +76,19 @@ fn main() -> std::io::Result<()> {
                 // the broker; a packaged install (M7) passes it by default.
                 harden = true;
             }
+            "--audit-max-records" => {
+                let value = args.next().and_then(|v| v.into_string().ok());
+                match value.and_then(|v| v.trim().parse::<u64>().ok()) {
+                    Some(n) => audit_max_records = Some(n),
+                    None => {
+                        eprintln!("asv: --audit-max-records requires a number (0 = unbounded)");
+                        std::process::exit(1);
+                    }
+                }
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH] [--harden]"
+                    "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH] [--audit-max-records N] [--harden]"
                 );
                 std::process::exit(0);
             }
@@ -170,6 +184,12 @@ fn main() -> std::io::Result<()> {
     tracing::info!(path = %socket_path.display(), protocol = asv_ipc_protocol::PROTOCOL_VERSION, "broker listening");
 
     let mut state = BrokerState::default();
+    if let Some(max) = audit_max_records {
+        // Operator-configured retention (R9). 0 = unbounded. Logged so the
+        // launch contract is visible in the broker's own output.
+        state.audit = asv_broker::audit::AuditLog::new(max);
+        tracing::info!(max_records = max, "audit retention configured");
+    }
 
     // Open the vault when one was requested. Failures here are
     // fail-closed: a broker that cannot read its vault cannot lend any

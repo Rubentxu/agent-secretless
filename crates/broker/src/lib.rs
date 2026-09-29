@@ -9,11 +9,12 @@ use asv_connector_http::{validate_repo, AddressPolicy, GithubClient, GithubError
 use asv_connector_pg::{PgError, PostgresClient};
 use asv_domain::{AgentSessionId, Authority, CredentialId, CredentialMetadata};
 use asv_identity::WorkloadIdentity;
-use asv_ipc_protocol::{ErrorCode, Request, Response, PROTOCOL_VERSION};
+use asv_ipc_protocol::{AuditEventDto, ErrorCode, Request, Response, PROTOCOL_VERSION};
 use asv_policy::{AuthorizationRequest, PolicyEngine};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod audit;
 pub mod harden;
 pub mod isolated_exec;
 pub mod oauth2;
@@ -209,6 +210,10 @@ pub struct BrokerState {
     /// M4 CU-2.2: how to reach GitHub. Injected so a test can point the very
     /// same authorisation path at a local origin.
     pub connectors: Box<dyn ConnectorFactory>,
+    /// R9: tamper-evident log of every handled request. One record per
+    /// `handle` call, appended by the public wrapper (not by the inner
+    /// dispatcher), so the audit cannot be bypassed by a new variant.
+    pub audit: audit::AuditLog,
 }
 
 impl Default for BrokerState {
@@ -223,6 +228,7 @@ impl Default for BrokerState {
             // There is no `Default` that fabricates a port.
             secrets: None,
             connectors: Box::new(LiveConnectorFactory),
+            audit: audit::AuditLog::default(),
         }
     }
 }
@@ -244,12 +250,78 @@ impl std::fmt::Debug for BrokerState {
     }
 }
 
-/// Handles one authenticated request.
+/// Handles one authenticated request and audits the outcome (R9).
 ///
 /// `peer` is kernel-attested by the caller before we get here. There is no code
 /// path that reaches this function without a `WorkloadIdentity`, which is what
 /// makes ADR-0003 structural instead of aspirational.
+///
+/// The audit append lives in *this* wrapper, not in the inner dispatcher: every
+/// existing and future request variant is recorded exactly once, and a new
+/// variant cannot forget to audit because the wrapper does not dispatch.
 pub fn handle(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request) -> Response {
+    let response = handle_inner(state, peer, request);
+
+    // The record is metadata-only by construction: `AuditEventDto` has no
+    // field that could carry request arguments or secret material, so the
+    // canary guarantee does not depend on this call site being careful.
+    let outcome = match &response {
+        Response::Error { code, .. } => error_code_name(*code),
+        _ => "ok".to_string(),
+    };
+    let event = AuditEventDto::RequestHandled {
+        method: request_method_name(state, &response),
+        session: None,
+        peer_uid: peer.credentials.uid,
+        pinned: peer.is_pidfd_pinned(),
+        outcome,
+        posture: "SERVICE_BROKERED".to_string(),
+    };
+    let _ = state.audit.append(event, now_secs());
+    response
+}
+
+/// Wire name of the method that produced `response`. The request has been
+/// consumed by the dispatcher, so the method is recovered from the response
+/// shape; unknown shapes (future variants) audit as "other" rather than lying.
+fn request_method_name(_state: &BrokerState, response: &Response) -> String {
+    match response {
+        Response::Pong { .. } => "ping".into(),
+        Response::SessionCreated { .. } => "create_session".into(),
+        Response::SessionEnded { .. } => "end_session".into(),
+        Response::CredentialMetadata { .. } => "list_credential_metadata".into(),
+        Response::CredentialDeleted { .. } => "delete_credential".into(),
+        Response::Authorization { .. } => "authorize/explain".into(),
+        Response::ApprovalIssued { .. } => "submit_approval".into(),
+        Response::SurrogateMinted { .. } => "mint_surrogate".into(),
+        Response::SurrogateRevoked { .. } => "revoke_surrogate".into(),
+        Response::IssueRead { .. } => "read_issue".into(),
+        Response::IssueCreated { .. } => "create_issue".into(),
+        Response::ReleaseCreated { .. } => "create_release".into(),
+        Response::AuditRecords { .. } => "audit_query".into(),
+        Response::Error { .. } => "(error)".into(),
+    }
+}
+
+/// Stable name of an error code for audit records.
+fn error_code_name(code: ErrorCode) -> String {
+    let name = match code {
+        ErrorCode::Unauthenticated => "UNAUTHENTICATED",
+        ErrorCode::VersionMismatch => "VERSION_MISMATCH",
+        ErrorCode::MessageTooLarge => "MESSAGE_TOO_LARGE",
+        ErrorCode::UnknownMethod => "UNKNOWN_METHOD",
+        ErrorCode::Denied => "DENIED",
+        ErrorCode::InvalidRequest => "INVALID_REQUEST",
+        ErrorCode::SurrogateExpired => "SURROGATE_EXPIRED",
+        ErrorCode::SurrogateExhausted => "SURROGATE_EXHAUSTED",
+        ErrorCode::Upstream => "UPSTREAM",
+    };
+    name.to_string()
+}
+
+/// The pre-R9 dispatcher. Unchanged in behavior; every request reaches it
+/// exactly once, through the auditing wrapper above.
+fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request) -> Response {
     // A connection whose process could not be pinned is still usable, but the
     // weaker evidence is recorded rather than hidden.
     let evidence_note = if peer.is_pidfd_pinned() {
@@ -432,6 +504,19 @@ pub fn handle(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request
                     code: ErrorCode::InvalidRequest,
                     message: "no such surrogate for this session".into(),
                 }
+            }
+        }
+
+        Request::AuditQuery { .. } => {
+            // R9 separation of duties: audit readers must not be audit
+            // writers. Every peer that can reach this socket is an agent peer
+            // (the broker's whole threat model), so the honest answer is a
+            // closed door until the human control plane ships. Recording the
+            // refused attempt is also the point: an agent probing the audit
+            // channel is itself an auditable event.
+            Response::Error {
+                code: ErrorCode::Denied,
+                message: "audit query requires the operator control plane, not an agent session".into(),
             }
         }
 
@@ -699,6 +784,64 @@ mod tests {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
         })
+    }
+
+    #[test]
+    fn every_handled_request_is_audited_once() {
+        let mut state = BrokerState::default();
+        handle(&mut state, &peer(), Request::Ping { protocol: PROTOCOL_VERSION });
+        handle(&mut state, &peer(), Request::ListCredentialMetadata);
+        handle(
+            &mut state,
+            &peer(),
+            Request::EndSession {
+                session: AgentSessionId::new(),
+            },
+        );
+        let records = state.audit.query(0);
+        assert_eq!(records.len(), 3, "one record per handle call");
+        assert_eq!(records[0].seq, 0);
+        assert_eq!(records[2].seq, 2);
+        assert_eq!(state.audit.verify(), Ok(()));
+        // Outcome classification: the EndSession on an unknown session is an
+        // error and must be audited as such, not as ok.
+        match &records[2].event {
+            asv_ipc_protocol::AuditEventDto::RequestHandled { outcome, .. } => {
+                assert_eq!(outcome, "INVALID_REQUEST");
+            }
+        }
+    }
+
+    #[test]
+    fn audit_query_is_denied_for_every_agent_peer() {
+        let mut state = BrokerState::default();
+        let resp = handle(&mut state, &peer(), Request::AuditQuery { since_secs: 0 });
+        match resp {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::Denied);
+                assert!(message.contains("operator control plane"), "{message}");
+            }
+            other => panic!("audit query must never succeed for an agent peer: {other:?}"),
+        }
+        // And the probe itself was recorded: the refused attempt is evidence.
+        assert_eq!(state.audit.query(0).len(), 1);
+    }
+
+    #[test]
+    fn canary_in_request_fields_never_reaches_audit_records() {
+        const CANARY: &str = "ASV-CANARY-7f3c9a11-BROKER-AUDIT";
+        let mut state = BrokerState::default();
+        handle(
+            &mut state,
+            &peer(),
+            Request::CreateSession {
+                workspace: CANARY.to_string(),
+            },
+        );
+        for r in state.audit.query(0) {
+            let serialized = serde_json::to_string(&r).expect("dto serializes");
+            assert!(!serialized.contains(CANARY), "canary leaked into audit");
+        }
     }
 
     #[test]

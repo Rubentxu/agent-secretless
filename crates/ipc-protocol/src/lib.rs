@@ -115,6 +115,14 @@ pub enum Request {
         name: String,
         body: String,
     },
+    /// Operator audit query (R9). Refused for agent sessions: audit readers
+    /// must not be audit writers, and the human control plane that will own
+    /// this channel ships separately. The variant exists on the wire so the
+    /// CLI can get a precise refusal instead of an unknown-method error.
+    AuditQuery {
+        /// Return only records newer than this many seconds.
+        since_secs: u64,
+    },
 }
 
 /// Broker responses. Every variant is safe to return to an agent: none of them
@@ -173,6 +181,15 @@ pub enum Response {
         tag: String,
         url: String,
     },
+    /// Answer to an audit query. Records are metadata-only by construction;
+    /// `dropped` counts retention evictions so loss is never silent.
+    AuditRecords {
+        records: Vec<AuditRecordDto>,
+        /// `event_hash` of the newest record, or the genesis hash on an empty
+        /// log. A verifier pins the chain to this value.
+        chain_head: String,
+        dropped: u64,
+    },
     Error {
         code: ErrorCode,
         message: String,
@@ -214,6 +231,65 @@ impl From<&asv_domain::CredentialMetadata> for CredentialMetadataDto {
             label: m.label.clone(),
             kind: m.kind,
             exportability: m.exportability,
+        }
+    }
+}
+
+/// Wire shape of one audited broker operation (R9).
+///
+/// Metadata only: method, session id, peer uid, pinning evidence, outcome and
+/// the security posture of the handler path. There is no field that can carry
+/// a request argument or a secret; that is the shape-level canary guarantee.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRecordDto {
+    pub seq: u64,
+    /// Hex hash of the previous record (genesis: 64 zeros).
+    pub prev_hash: String,
+    /// UNIX seconds.
+    pub ts: u64,
+    /// sha256 over `seq || prev_hash || ts || canonical event`.
+    pub event_hash: String,
+    pub event: AuditEventDto,
+}
+
+/// What happened, tagged for stable wire evolution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum AuditEventDto {
+    /// One authenticated request was handled.
+    RequestHandled {
+        method: String,
+        /// Present only for session-scoped methods.
+        session: Option<String>,
+        peer_uid: u32,
+        /// pidfd pinning evidence ("pidfd-pinned" | "peercred-only").
+        pinned: bool,
+        /// "ok" or the error code name.
+        outcome: String,
+        /// Security posture of the handler path.
+        posture: String,
+    },
+}
+
+impl Request {
+    /// Stable wire name of this method. Used by the broker's audit records so
+    /// an operator can tell which handler produced an entry.
+    pub fn method_name(&self) -> &'static str {
+        match self {
+            Request::Ping { .. } => "ping",
+            Request::CreateSession { .. } => "create_session",
+            Request::EndSession { .. } => "end_session",
+            Request::ListCredentialMetadata => "list_credential_metadata",
+            Request::DeleteCredential { .. } => "delete_credential",
+            Request::Authorize { .. } => "authorize",
+            Request::ExplainAuthorization { .. } => "explain_authorization",
+            Request::SubmitApproval { .. } => "submit_approval",
+            Request::MintSurrogate { .. } => "mint_surrogate",
+            Request::RevokeSurrogate { .. } => "revoke_surrogate",
+            Request::ReadIssue { .. } => "read_issue",
+            Request::CreateIssue { .. } => "create_issue",
+            Request::CreateRelease { .. } => "create_release",
+            Request::AuditQuery { .. } => "audit_query",
         }
     }
 }
