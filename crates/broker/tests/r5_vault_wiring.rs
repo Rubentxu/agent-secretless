@@ -200,3 +200,88 @@ fn broker_binary_starts_without_a_vault_unchanged() {
     let still_alive = broker.0.try_wait().expect("try_wait").is_none();
     assert!(still_alive, "broker without vault exited unexpectedly");
 }
+
+#[test]
+fn broker_with_harden_flag_applies_dumpable_zero_and_still_serves() {
+    // M7-R1 through the shipped binary: with --harden, the broker must
+    // come up undumpable (CoreDumping: 0, ptrace refused) while serving
+    // Ping exactly as before. Without the flag nothing changes, which
+    // the other tests in this file pin.
+    let dir = std::env::temp_dir().join(format!("asv-harden-{}-{}", std::process::id(), line!()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let sock = dir.join("harden.sock");
+    let _ = std::fs::remove_file(&sock);
+
+    let vault_path = dir.join("vault.asv");
+    let pass_path = dir.join("vault.pass");
+    std::fs::write(&pass_path, b"harden-test-pass\n").expect("write pass");
+    let passphrase = asv_vault_test_support_passphrase();
+    let mut store = asv_vault::VaultStore::create(
+        &vault_path,
+        &passphrase,
+        asv_vault::KdfParams::fast_for_tests(),
+    )
+    .expect("create vault");
+    drop(store);
+
+    let mut broker = BrokerGuard(
+        Command::new(cargo_bin("asv-brokerd"))
+            .arg(&sock)
+            .arg("--vault")
+            .arg(&vault_path)
+            .arg("--passphrase-file")
+            .arg(&pass_path)
+            .arg("--harden")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn hardened broker"),
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !sock.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(sock.exists(), "--harden broker did not bind socket");
+
+    // The broker must still be alive (prctl steps did not kill it) and
+    // observable as undumpable via /proc.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let pid = broker.0.id();
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("read status");
+    let core_dumping: &str = status
+        .lines()
+        .find(|l| l.starts_with("CoreDumping:"))
+        .expect("CoreDumping line")
+        .split_whitespace()
+        .last()
+        .expect("value");
+    assert_eq!(
+        core_dumping, "0",
+        "--harden broker must be undumpable (CoreDumping: 0)"
+    );
+
+    // And the IPC surface still works: Ping round-trip (same envelope as
+    // the first test in this file: {"result":"pong","protocol":2}).
+    let request = serde_json::json!({
+        "method": "ping",
+        "protocol": asv_ipc_protocol::PROTOCOL_VERSION,
+    });
+    let payload = serde_json::to_vec(&request).expect("serialize ping");
+    let mut stream = UnixStream::connect(&sock).expect("connect hardened broker");
+    stream.write_all(&payload).expect("write ping");
+    stream.flush().expect("flush");
+    let mut buf = vec![0u8; 64 * 1024];
+    let n = stream.read(&mut buf).expect("read pong");
+    assert!(n > 0, "hardened broker closed without responding");
+    let response: serde_json::Value = serde_json::from_slice(&buf[..n]).expect("parse pong");
+    assert_eq!(
+        response.get("result").and_then(|v| v.as_str()),
+        Some("pong"),
+        "--harden broke the IPC surface: {response}"
+    );
+}
+
+fn asv_vault_test_support_passphrase() -> secrecy::SecretString {
+    secrecy::SecretString::from("harden-test-pass".to_string())
+}

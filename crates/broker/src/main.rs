@@ -16,8 +16,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use zeroize::Zeroize;
 
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<()> {
     // R2 (16-SECURITY-RELEASE-GATES): "broker core dumps disabled". A core
     // dump of a broker holding unlocked vault keys would write that key
     // material to a file any log collector could read. This runs before
@@ -43,6 +42,7 @@ async fn main() -> std::io::Result<()> {
     let mut socket_path: PathBuf = PathBuf::from("/run/user/1000/asv/broker.sock");
     let mut vault_path: Option<PathBuf> = None;
     let mut passphrase_path: Option<PathBuf> = None;
+    let mut harden = false;
     while let Some(arg) = args.next() {
         let arg = match arg.into_string() {
             Ok(s) => s,
@@ -66,8 +66,16 @@ async fn main() -> std::io::Result<()> {
                     std::process::exit(1);
                 }
             }
+            "--harden" => {
+                // M7 hardening profile: dumpable=0, no-new-privs, Landlock,
+                // seccomp. Opt-in so a dev box or an old kernel can still run
+                // the broker; a packaged install (M7) passes it by default.
+                harden = true;
+            }
             "-h" | "--help" => {
-                eprintln!("usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH]");
+                eprintln!(
+                    "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH] [--harden]"
+                );
                 std::process::exit(0);
             }
             other if other.starts_with("--") || other.starts_with('-') => {
@@ -92,6 +100,45 @@ async fn main() -> std::io::Result<()> {
         _ => {
             eprintln!("asv: --vault or --passphrase-file points at a missing path");
             std::process::exit(1);
+        }
+    }
+
+    // M7-R1/R3/R4: when --harden is passed, install the hardening profile
+    // BEFORE the socket bind and any vault open. The ordering is normative:
+    // the spec requires the Landlock ruleset to be in place before
+    // `VaultStore::open`, and dumpable=0 to hold before any secret can
+    // exist in memory. prctl failures are fail-closed (they are the core
+    // of M7-R1); missing kernel features (Landlock on < 5.13, seccomp
+    // denied by the sandbox) degrade loudly to a warning instead of
+    // killing a broker the operator explicitly asked to harden.
+    if harden {
+        let cfg = asv_broker::harden::install().unwrap_or_else(|err| {
+            eprintln!("asv: --harden failed on a mandatory step: {err}");
+            std::process::exit(1);
+        });
+        let dumpable_zero = asv_broker::harden::dumpable_is_zero();
+        let no_new_privs = asv_broker::harden::no_new_privs_is_set();
+        // Honest labels: `landlock_installed` is a real ruleset;
+        // `seccomp_installed` currently only means the kernel ACCEPTS
+        // seccomp filters (a PR_GET_SECCOMP probe in harden.rs), not that
+        // a syscall filter is active. Claiming otherwise would oversell
+        // the profile — see the M7 backlog items.
+        tracing::info!(
+            dumpable_zero,
+            no_new_privs,
+            cgroup_v2 = cfg.cgroup_v2,
+            landlock = cfg.landlock_installed,
+            seccomp_probe = cfg.seccomp_installed,
+            "M7 harden profile applied (dumpable=0, no-new-privs)"
+        );
+        if !cfg.landlock_installed {
+            tracing::warn!(
+                landlock = cfg.landlock_installed,
+                "kernel lacks Landlock (< 5.13); file sandbox NOT active"
+            );
+        }
+        if !cfg.seccomp_installed {
+            tracing::warn!("kernel lacks seccomp; syscall filtering unavailable");
         }
     }
 
