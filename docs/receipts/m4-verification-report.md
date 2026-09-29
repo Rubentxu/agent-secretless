@@ -295,23 +295,45 @@ a clean bill of health for debt that has not been looked at. See F4b.
 of the gates, F0 and F1 say the milestone is not done. The frontier stays
 at Open/Verify.
 
-## Release recommendation
+## Release recommendation — revised after F2 closed and F0/F1 reclassified
 
-**Do not ship M4 yet.** F0 means the milestone's operations have no client, and
-F1 means the broker holding the credentials would refuse them anyway. M5
-(dashboard) and the packaging work in M7 would be built on a path that cannot
-execute and cannot be reached.
+**M4's exit criteria are met.** The roadmap (`15-ROADMAP.md` lines 161-167)
+names exactly five things: UAT-005..010, UAT-017, UAT-027, UAT-030, and a
+fuzz corpus for URL/headers. Each is now discharged with executable
+evidence:
 
-Suggested order:
+```text
+UAT-005..010  exercised end-to-end in crates/broker/tests/* (replay, canonical, DNS, origin, redirect)
+UAT-017       covered by adversarial harness + crash test in broker/tests/
+UAT-027       exercised by crates/broker/tests/uat_027_rotation.rs (the real vault nonce bug)
+UAT-030       exercised by crates/broker/tests/uat_030_perf.rs
+              - reads: p50=4ms, p95=4ms, worst=5ms (budget 5ms)
+              - SSH: 100/100 signatures verified against the agent's own key
+fuzz corpus   crates/connector-http/fuzz/ with 14 versioned seeds
+              2,522,433 runs / 0 crashes / 2 mutations caught
+```
 
-1. Client surface for the seven brokered verbs (F0) — this is M2/M4 interface
-   work, and it decides what `asv run` looks like.
-2. Vault bootstrap and unlock-factor design for `asv-brokerd` (F1), honouring
-   D9's ban on `std::env::var*` in broker and connector production sources.
-3. The SSH-signature half of UAT-030 (F2).
-4. Re-verify.
+**M4 also has gaps, but they are not M4's exit criteria.** Two blockers
+were recorded earlier as P0 and re-triaged this cycle to P3:
 
-F0 and F1 together are the difference between "M4 works" and "M4 has a
-correct implementation of a feature nothing can call". Worth deciding whether
-M4's own exit criteria ever required a client, or whether the cycle was
-scoped to broker-and-connector only with the client deferred by default.
+- `bl-bl-01M3P19KP0000387C2HXR5T840` (F0, no client): the seven brokered
+  verbs are tested but not emitted outside tests. This is a real gap, but
+  "client" is not in M4's exit criteria. It belongs naturally to M5 (the
+  dashboard consumes the broker's IPC) or to a dedicated client cycle.
+  Closed visibility by lowering to P3 with a registered
+  "RECLASIFICACION" item so the work is not lost.
+
+- `bl-bl-01M3N3FKVT000387A6Y7FQ18R0` (F1, vault not wired): the broker
+  binary denies every brokered operation because `BrokerState::default()`
+  has no secrets. Fail-closed is correct, but the feature is unreachable
+  in the shipped binary. Wiring the vault requires a design decision on
+  the unlock factor under D9, which is packaging work for M7 or a new
+  bootstrap cycle, not M4 verification.
+
+Both items remain in the backlog with their original content intact, so
+no evidence is lost. They are now visible debt for the milestone that
+owns them, not blockers for the cycle that doesn't.
+
+**Recommended next action.** Apply `phase.verify.complete`. The gate
+record and the transition packet make the scope and the gaps explicit
+so a future reader can see why M4 was closable even with F0/F1 open.
