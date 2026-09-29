@@ -105,11 +105,17 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(1);
     }
     if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-        // Restrictive permissions are the first isolation layer: a socket the
-        // agent's own uid can open is still gated by SO_PEERCRED + policy, but
-        // world-writable would hand every local user a connection attempt.
-        set_socket_dir_mode(parent)?;
+        // A bare filename like `broker.sock` has an empty-string parent:
+        // there is no directory to create or restrict, and `chmod("")`
+        // would fail with ENOENT. Only touch the filesystem for a real
+        // parent directory.
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+            // Restrictive permissions are the first isolation layer: a socket the
+            // agent's own uid can open is still gated by SO_PEERCRED + policy, but
+            // world-writable would hand every local user a connection attempt.
+            set_socket_dir_mode(parent)?;
+        }
     }
 
     let listener = UnixListener::bind(&socket_path)?;
