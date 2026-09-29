@@ -47,6 +47,9 @@ fn main() -> std::io::Result<()> {
     // env-quarantine invariant (uat_017) scans for env reads in production
     // sources, and operator configuration belongs in the launch contract.
     let mut audit_max_records: Option<u64> = None;
+    // Durable audit log. Same flag-not-env rule: the file survives broker
+    // restarts, so the query window and chain head restore across runs.
+    let mut audit_file: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         let arg = match arg.into_string() {
             Ok(s) => s,
@@ -86,9 +89,16 @@ fn main() -> std::io::Result<()> {
                     }
                 }
             }
+            "--audit-file" => {
+                audit_file = args.next().map(PathBuf::from);
+                if audit_file.is_none() {
+                    eprintln!("asv: --audit-file requires a path argument");
+                    std::process::exit(1);
+                }
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH] [--audit-max-records N] [--harden]"
+                    "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH] [--audit-max-records N] [--audit-file PATH] [--harden]"
                 );
                 std::process::exit(0);
             }
@@ -184,7 +194,18 @@ fn main() -> std::io::Result<()> {
     tracing::info!(path = %socket_path.display(), protocol = asv_ipc_protocol::PROTOCOL_VERSION, "broker listening");
 
     let mut state = BrokerState::default();
-    if let Some(max) = audit_max_records {
+    if let Some(path) = audit_file.as_deref() {
+        // Durable audit (R9 follow-up). Fail-closed: a chain that does not
+        // verify on disk is not extended; a broken durable log must be
+        // investigated, not silently re-based.
+        let max = audit_max_records.unwrap_or(asv_broker::audit::DEFAULT_MAX_RECORDS);
+        let log = asv_broker::audit::AuditLog::open_persistent(max, path).unwrap_or_else(|err| {
+            eprintln!("asv: refusing to start with a broken audit log at {}: {err:?}", path.display());
+            std::process::exit(1);
+        });
+        tracing::info!(path = %path.display(), restored = log.query(0).len(), dropped = log.dropped(), "durable audit log opened");
+        state.audit = log;
+    } else if let Some(max) = audit_max_records {
         // Operator-configured retention (R9). 0 = unbounded. Logged so the
         // launch contract is visible in the broker's own output.
         state.audit = asv_broker::audit::AuditLog::new(max);
