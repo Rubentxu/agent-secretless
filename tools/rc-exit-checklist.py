@@ -79,6 +79,31 @@ def file_mentions(root: Path, rel: str, needles: list[str]) -> tuple[bool, str]:
     return False, f"{rel} exists but none of {needles} found"
 
 
+def find_migration_test(root: Path) -> tuple[bool, str]:
+    """Integration-test evidence for R2 (vault migration tests).
+
+    Searches crates/*/tests/*.rs (real, executable integration-test
+    files) for migration-related content. Passing requires the physical
+    test file: a comment in a non-test source never satisfies this gate,
+    and the old `"test" in evidence` heuristic could never succeed by
+    construction because grep_crates strips test content before returning.
+    """
+    rx = re.compile(r"migrat(e|ion)", re.I)
+    hits: list[str] = []
+    tests_root = root / "crates"
+    if tests_root.is_dir():
+        for p in sorted(tests_root.glob("*/tests/*.rs")):
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if rx.search(text):
+                hits.append(p.relative_to(root).as_posix())
+    if hits:
+        return True, "found migration tests: " + ", ".join(hits[:3])
+    return False, "no integration test file under crates/*/tests/ matches 'migration'"
+
+
 def grep_crates(root: Path, pattern: str) -> tuple[bool, str]:
     """Search non-test rust sources under crates/ for a regex. Returns
     (found, evidence)."""
@@ -224,12 +249,11 @@ def gate_r2(root: Path) -> list[Check]:
         if has_crypto_tests
         else bad("authenticated encryption + wrong-key/tamper tests", "no tamper/wrong-key test found in crates/vault")
     )
-    found, ev = grep_crates(root, r"migrat(e|ion)")
-    has_migration_tests = "tests" in ev or "test" in ev
+    found, ev = find_migration_test(root)
     checks.append(
         ok("migration tests present", ev)
-        if has_migration_tests
-        else bad("migration tests present", "no version-to-version migration test found (M13 honest gap: upgrade/migration tests deferred to a follow-up cycle)")
+        if found
+        else bad("migration tests present", "no version-to-version migration test found under crates/*/tests/ (M13 honest gap: upgrade/migration tests are absent)")
     )
     has_zeroize = False
     for p in (root / "crates").rglob("Cargo.toml"):

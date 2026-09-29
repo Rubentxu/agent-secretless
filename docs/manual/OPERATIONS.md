@@ -141,6 +141,14 @@ Retention is configurable via the broker launch flag `--audit-max-records N`
 (default 10000, `0` = unbounded); evicted records are counted and reported
 as `dropped`, never lost silently.
 
+Since v0.10.0 the chain can also be made durable with `--audit-file PATH`:
+the broker appends one JSON line per record and replays the file at startup,
+restoring the query window, the sequence counter and the chain head across
+restarts. The persisted file is self-verifying (`verify_file`): a chain that
+fails validation aborts startup fail-closed, and a line truncated by a crash
+mid-write is discarded and re-anchored. Without the flag the log stays
+in-memory and dies with the process, as before.
+
 > **Status:** the in-broker chain and this CLI command ship today. Querying
 > is currently restricted to the operator control plane (not yet built),
 > so `asv audit` reports the broker's refusal until that milestone lands.
