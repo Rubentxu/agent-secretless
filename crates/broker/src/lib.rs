@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 pub mod harden;
 pub mod surrogate;
+pub mod tls_bridge;
 pub mod vault_port;
 
 pub use surrogate::{now_secs, SurrogateError, SurrogateRegistry};
