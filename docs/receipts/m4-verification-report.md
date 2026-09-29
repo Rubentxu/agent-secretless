@@ -33,6 +33,44 @@ cargo +nightly fuzz run authority_canonicalization
 
 ## Findings
 
+### F0 — BLOCKER: no client can issue any brokered request
+
+The M4 brokered verbs — `ReadIssue`, `CreateIssue`, `CreateRelease`,
+`MintSurrogate`, `RevokeSurrogate`, `Authorize`, `SubmitApproval` — exist in
+the IPC protocol and the broker matches and handles every one of them
+(`crates/broker/src/lib.rs:316-490`). But nothing outside the test suite ever
+*constructs* one.
+
+Counted across every non-test source file in `crates/`:
+
+```text
+ReadIssue        0 emitters      RevokeSurrogate  0 emitters
+CreateIssue      0 emitters      Authorize        0 emitters
+CreateRelease    0 emitters      SubmitApproval   0 emitters
+MintSurrogate    0 emitters
+```
+
+The `asv` client (`crates/cli/src/main.rs:30-48`) exposes exactly four
+subcommands: `Status`, `Session`, `Run`, `Credentials`. It maps those to
+`Ping`, `CreateSession` and `ListCredentialMetadata`, and handles
+`Command::Run` locally by spawning a child process. It can print
+`Response::IssueRead` and `Response::ReleaseCreated` (`main.rs:210-216`), but
+there is no subcommand that produces those requests in the first place — the
+response arms are unreachable from the CLI.
+
+So M4 built a working, tested, fail-closed implementation of seven operations
+that no shipped binary can invoke. The `asv run` path (M2's strict session with
+a broker-owned SSH signer) is the closest thing to a client, and it does not go
+through these requests either.
+
+This is larger than the CLI-wiring item already in the backlog, and it is
+disjoint from F1: even with a vault open (proven below), there is no way to
+ask the broker to do the thing. F1 alone would leave a broker that refuses;
+F0 plus F1 means a broker that is correct and unreachable.
+
+Scope: this is the client surface for M4, which M2's `asv run` was supposed
+to grow. It is a milestone-level gap, not a bug to patch inside verify.
+
 ### F1 — BLOCKER: the brokered HTTP path is unreachable in the shipped binary
 
 `crates/broker/src/main.rs:49` constructs `BrokerState::default()`, whose
@@ -54,6 +92,15 @@ This was already known in the backlog as P1
 says "the CLI"; the real location is the broker daemon, which is more precise
 and more serious: the CLI is only an IPC client and never builds a
 `BrokerState` at all.
+
+Falsified, not just read: the finding was probed by actually wiring a vault
+into the startup path (`VaultStore::create` → `header().unlock` →
+`state.secrets = Some(VaultSecretPort::new(...))`), building the binary and
+starting it. It reports `PROBE: vault wired, secrets.is_some()=true` and
+listens normally. The three pieces compose exactly as the tests assume, so
+F1 is a genuine missing startup step and not a symptom of some second defect
+lurking behind the refusal. The probe was reverted; the tree carries no probe
+code.
 
 Scope call: wiring the vault means deciding where the vault path comes from,
 how the unlock factor reaches the broker without an environment variable (D9
@@ -136,9 +183,21 @@ the divergence kept as its content.
 
 ## Release recommendation
 
-**Do not ship M4 yet.** F1 means the milestone's function is absent from the
-binary. M5 (dashboard) and the packaging work in M7 would be built on a path
-that cannot execute.
+**Do not ship M4 yet.** F0 means the milestone's operations have no client, and
+F1 means the broker holding the credentials would refuse them anyway. M5
+(dashboard) and the packaging work in M7 would be built on a path that cannot
+execute and cannot be reached.
 
-Suggested order: decide the vault bootstrap and unlock-factor question (F1),
-then add the SSH-signature half of UAT-030 (F2), then re-verify.
+Suggested order:
+
+1. Client surface for the seven brokered verbs (F0) — this is M2/M4 interface
+   work, and it decides what `asv run` looks like.
+2. Vault bootstrap and unlock-factor design for `asv-brokerd` (F1), honouring
+   D9's ban on `std::env::var*` in broker and connector production sources.
+3. The SSH-signature half of UAT-030 (F2).
+4. Re-verify.
+
+F0 and F1 together are the difference between "M4 works" and "M4 has a
+correct implementation of a feature nothing can call". Worth deciding whether
+M4's own exit criteria ever required a client, or whether the cycle was
+scoped to broker-and-connector only with the client deferred by default.
