@@ -14,24 +14,28 @@ agent ──(surrogate / socket)──▶ broker ──(real credential)──�
         no secret material                the only holder
 ```
 
-> **Status: M0. Foundations only.**
+> **Status: pre-1.0 RC preparation (M13 + gates R2/R3/R5/R6 done).**
 >
-> This repository contains the compiling workspace, the enforced boundaries and
-> the adversarial test harness. **There is no vault yet**, so there is no secret
-> to protect and nothing here should be treated as a working credential store.
-> The vault, SSH signing, HTTP brokering and the Tauri dashboard are later
-> milestones. `agent-secretless-vault-spec/docs/15-ROADMAP.md` is the planning
-> authority.
->
-> What M0 does prove is that the *boundaries* hold, and that the checks
-> enforcing them can actually fail. See
-> [Honest verification](#honest-verification) for what is and is not verified.
+> The workspace compiles with **424 tests green** (`--release`, canonical flakes
+> excluded). The vault, SSH signing, HTTP/PostgreSQL brokering, policy, OAuth2
+> framework, TPM sealing and crash recovery exist and are tested. Remaining
+> before a 1.0 that the maintainer has not yet approved: signed reproducible
+> artifacts (R0), full certification pass (R11), and the M5 operator dashboard.
+> `agent-secretless-vault-spec/docs/15-ROADMAP.md` is the planning authority.
+
+## Why this exists
+
+If you give an AI agent shell access, every credential on the machine is one
+`env`, one `~/.git-credentials` or one shell-history read away. ASV removes
+that class of leak: the agent asks the broker to perform the sensitive
+operation, the broker holds the credential, the agent gets the result — never
+the material.
 
 ## The invariant
 
 **The agent-facing API has no way to read a secret.** Not `getSecret`, not
 `exportSecret`, not any alias that recreates one (ADR-0001). This is not a
-convention that a future contributor could quietly break; it is enforced by the
+convention a future contributor could quietly break; it is enforced by the
 type system:
 
 | Enforcement | Where | How it is proven |
@@ -39,48 +43,97 @@ type system:
 | `SecretBytes` has no `Clone` or `Serialize`, and its `Debug` prints only `SecretBytes(<redacted>)` | `crates/domain/src/secret.rs` | no call site can clone or serialize a secret, and a stray `{:?}` in a log line is safe by construction |
 | IPC requests are a closed enum with no secret-carrying variant | `crates/ipc-protocol/src/lib.rs` | every forbidden method name fails at the decoder, before a handler sees it |
 | Identity comes from the kernel, never from the peer | `crates/identity/src/lib.rs` | a client that lies about its own uid is still reported truthfully by `SO_PEERCRED` |
+| Production broker/connector sources never call `std::env::var*` | `crates/broker/tests/uat_017_env_scan.rs` | a source scanner fails the build if a credential-shaped environment read reappears (the D9 rule) |
 
-The first row is stronger than a missing `Debug` impl. If `Debug` simply did not
-exist, the first person to add a log line would get a compile error and could
-"fix" it by deriving it. Here the content is unreachable through every trait
-the type implements, and the value is zeroized on drop.
+## What it does today
 
-The identity row is the interesting one. An agent process is assumed hostile
-and untrusted, so the broker never asks it who it is: it asks the kernel, via
-`SO_PEERCRED` and `pidfd_open` (ADR-0003).
+- **Encrypted local vault** — Argon2id + XChaCha20-Poly1305 envelope, versioned
+  format, authenticated headers, owner-only files. Backup/restore under a
+  *separate* recovery passphrase. Passphrase **rekey** that re-wraps the same
+  data key, so pre-rotation backups keep working (`crates/vault`).
+- **Broker daemon** (`asv-brokerd`) — Unix-socket IPC (protocol v2), `SO_PEERCRED`
+  identity, Cedar policy with **deny-by-default**, fail-closed startup: it opens
+  `--vault`/`--passphrase-file` at boot or refuses every brokered operation.
+  Core dumps are disabled via `RLIMIT_CORE=0` before any secret exists.
+- **Connectors** — GitHub (HTTP, semantic authority), PostgreSQL (full decision
+  logic; live transport pending), SSH (the agent requests *signatures*, never
+  the private key).
+- **OAuth2 client-credentials framework** for short-lived surrogate issuance
+  (prototype, M11).
+- **TPM sealing prototype** — PCR policy binding and an offline recovery blob
+  (M12; `SoftwareTpm` is a placeholder, no real hardware path yet).
+- **Crash recovery** — append-only journal with length prefixes and CRC32;
+  a torn write is detected and replayed or discarded, never half-applied (M13).
+- **Environment quarantine** — `asv run` scrubs credential-bearing variables
+  from the agent's environment before the workload starts.
+
+## What it does *not* do (yet)
+
+Stated plainly, because a security project that oversells itself is worthless:
+
+- **No operator dashboard.** The Tauri 2 UI is M5, not started.
+- **PostgreSQL has no live transport.** The connector's decision logic is
+  complete and tested; `LiveConnectorFactory::postgres` returns
+  `UnsupportedInThisBuild` until `tokio-postgres` is wired.
+- **`harden::install` is not wired into the binary.** The M7 hardening profile
+  (PR_SET_DUMPABLE, Landlock, seccomp) exists with tests but is opt-in by
+  design; the broker ships with `RLIMIT_CORE=0` only for now.
+- **No signed artifacts yet (R0).** Reproducible-build and signing tooling
+  (cosign/sigstore) is the next gate.
+- **TPM support is a prototype.** `SoftwareTpm` stands in for hardware; do not
+  trust it as hardware-bound.
+- **Same-uid memory reads succeed.** A process running as you can read the
+  broker's memory, because the broker runs as you. Only a dedicated broker uid
+  (M7) makes denial unconditional.
+- **1.0 has not been declared.** The maintainer gates it explicitly; iteration
+  continues below 1.0.
 
 ## Quick start
 
 ```bash
-cargo build --workspace
-cargo test --workspace
+cargo build --release -p asv-broker
+cargo test --workspace --release -- --test-threads=1 \
+    --skip uat_028 --skip one_hundred_brokered_reads
+# expected: passed=424 failed=0 ignored=1
 ```
 
-Try it:
+Try the broker with a vault:
 
 ```bash
 SOCK="$HOME/.asv/broker.sock"
-asv-brokerd "$SOCK" &
+PASS=/tmp/vault.pass   # passphrase file; keep it out of shell history
+
+# create a vault (head -c reads /dev/urandom: no secret in shell history)
+head -c 24 /dev/urandom | base64 | tr -d '\n' > "$PASS"
+asv-vault-tool create --vault /tmp/vault.asv --passphrase "$(cat "$PASS")" --fast
+
+# start the broker: configuration by argv, passphrase by file (rule D9:
+# broker/connector production code never reads the environment for secrets)
+asv-brokerd "$SOCK" --vault /tmp/vault.asv --passphrase-file "$PASS" &
+
 asv --socket "$SOCK" status
-asv --socket "$SOCK" session --workspace "$PWD"
-asv --socket "$SOCK" credentials
 ```
 
 The broker binds its socket `0600` inside a `0700` directory and **refuses to
 start if the socket already exists**, so it cannot hijack or clobber a running
-instance.
+instance. If only one of `--vault` / `--passphrase-file` is given, it exits
+rather than starting half-configured.
 
 ## Workspace layout
 
 ```text
 crates/
-  domain/         core types and the secret wrapper
-  ipc-protocol/   versioned, length-bounded request/response
+  domain/         core types, SecretBytes, Authority canonicalization
+  ipc-protocol/   versioned, length-bounded request/response (protocol v2)
   identity/       SO_PEERCRED + pidfd workload identity
-  broker/         request handling and the asv-brokerd daemon
+  vault/          encrypted envelope, backup/restore, rekey, TPM prototype
+  policy/         Cedar integration, deny-by-default decisions
+  broker/         request handling, sessions, recovery, asv-brokerd daemon
   cli/            the asv binary: a control plane, never a secret reader
-tests/
-  adversarial/    the threat harness and its falsification test
+  connector-http/ GitHub connector with semantic authority binding
+  connector-pg/   PostgreSQL connector (decision logic complete)
+  ssh-agent/      signature service: the key never leaves the broker
+  ebpfd/          eBPF / privilege separation research (M8/M9)
 tools/
   check-gates.py  audits the UAT -> milestone gate map in the spec pack
 ```
@@ -92,61 +145,48 @@ confidence it has not earned. This repository is built around that idea.
 
 **The harness is proven able to fail.** `tests/adversarial/test_falsifiability.py`
 injects three real leaks into the source, rebuilds, and requires the harness to
-reject each one:
+reject each one. Every probe carries a self-check that plants a canary in the
+exact vector it scans and requires the probe to find it; a probe that cannot
+detect its own canary reports `INVALID` instead of passing vacuously.
 
-| Injected leak | Detected as |
-|---|---|
-| raw request bytes written to the broker log | `broker-isolation` |
-| request field reflected into the IPC response | `broker-isolation` |
-| request field echoed to the CLI's stderr | `cli-argv` |
+**Structural invariants are scanned, not trusted.** UAT-017 walks the broker and
+connector sources and fails the build on any credential-shaped `env::var*` —
+it caught exactly that regression during the R5 vault wiring, and the fix
+(argv flags instead of environment variables) is the shipped design.
 
-Each one fails through a different probe. If the harness were broken in the way
-it was once broken, this script would report it.
-
-**It was broken that way.** The harness in the first M0 commit reported 5/5
-green while planting its canary nowhere. It was structurally incapable of
-reporting FAIL, so its result was evidence of nothing at all.
-`test_falsifiability.py` exists as the regression test for exactly that.
+**Migration tests exist because the format says so.** The R2 gate lists
+"migration tests"; `crates/vault/tests/uat_036_rekey_migration.rs` pins the
+passphrase-rekey contract: old passphrase dies, new one opens, pre-rotation
+backups still restore, a wrong current passphrase writes zero bytes.
 
 Run everything:
 
 ```bash
 cargo clippy --workspace --all-targets
+cargo test --workspace --release -- --test-threads=1
 python3 tests/adversarial/run_harness.py            # 11 probes + self-checks
 python3 tests/adversarial/test_falsifiability.py    # the harness can fail
 python3 tools/check-gates.py                        # spec gate-map audit
 ```
 
-Every probe carries a self-check that plants a canary in the exact vector the
-probe scans and requires the probe to find it. A probe that cannot detect its
-own planted canary reports `INVALID` and fails the run, rather than passing
-vacuously.
-
 **This is checked on CI, not just locally.** Putting the same gates in GitHub
-Actions immediately found two defects that every local run had missed: a
-workflow that never built the binaries it attacked, and a build that passed
-locally while failing under CI's `-D warnings`. The harness reported both
-loudly instead of going green. A security project that only its author's
-machine can break is not verified.
+Actions immediately found two defects that every local run had missed. A
+security project that only its author's machine can break is not verified.
 
-## What is *not* protected yet
+## Recent milestone history
 
-Stated plainly, because a security project that oversells itself is worthless:
+| Milestone | Scope | Evidence |
+|---|---|---|
+| M11 ✅ | OAuth2 client-credentials framework prototype | tag `m11-oauth2-framework` |
+| M12 ✅ | TPM sealing + recovery blob prototype | tag `m12-tpm-vault` |
+| M13 ✅ | Crash/recovery journal, audit baseline, SBOM, ops manual | tag `m13-rc-stabilization` |
+| R3 ✅ | Zero-live-pin session leak check (UAT-030) | `3e5c42c` |
+| R5 ✅ | Vault wired into the broker binary, fail-closed | `e2a6f65` |
+| R6/R11 ✅ | Fuzz evidence: 2×30s runs, ~460k execs, 0 crashes | `8d3a7b5` |
+| R2 ✅ | Passphrase rekey + migration tests, core dumps disabled | `dba2e73`, `82e08fd` |
 
-- **There is no vault.** No secret is stored, encrypted or retrieved. M0
-  verifies boundary *properties*, not protection of secret material.
-- **Same-uid memory reads succeed.** A process running as you can read the
-  broker's memory, because the broker runs as you. Only a dedicated broker uid
-  (M7) makes denial unconditional. The harness reports the kernel's actual
-  verdict rather than claiming a boundary the OS does not offer.
-- **`argv` is readable by your uid.** Anything you pass as a CLI flag is
-  visible to every process you own, via `ps` and shell history. No software can
-  change that. The design response is never to put a secret in `argv`; the M0
-  CLI satisfies this by having no credential-ingestion command at all, and M1
-  adds the no-echo TTY channel the threat model requires.
-- **Five defects remain in the spec pack.** The signed pack is normative and is
-  imported byte-for-byte. Defects found in it are recorded as tracked backlog
-  items, not silently patched. `tools/check-gates.py` reports them.
+Remaining toward a (maintainer-approved) 1.0: **R0** signed reproducible
+artifacts, **R11** final certification, M5 dashboard, live PostgreSQL transport.
 
 ## Security posture is stated, never implied
 
@@ -158,19 +198,8 @@ to signing or proxying, because that is how "secretless" quietly becomes a lie.
 ## Specification
 
 `agent-secretless-vault-spec/` holds the full pack: 20 documents, 15 ADRs, and a
-`SHA256SUMS` manifest (37 files, verified intact). It is imported verbatim and
-is not edited in place.
-
-## Roadmap
-
-| Milestone | Scope |
-|---|---|
-| **M0** ✅ | Compiling workspace, enforced boundaries, adversarial harness |
-| M1 | Encrypted vault, no-echo credential ingestion |
-| M2 | `asv run`: isolated agent execution |
-| M4 | SSH signing via the agent socket |
-| M7 | Dedicated broker uid, hardening profile |
-| M9–M10 | eBPF redirection, isolated exec |
+`SHA256SUMS` manifest (verified intact). It is imported verbatim and is not
+edited in place.
 
 ## Security
 
@@ -184,3 +213,7 @@ MIT. See [LICENSE](LICENSE).
 
 The specification pack under `agent-secretless-vault-spec/` is included under
 the same terms.
+
+---
+
+📚 **Readme in Spanish / Leerlo en español:** [README-es.md](README-es.md)
