@@ -1,0 +1,34 @@
+[package]
+name = "asv-connector-http-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# This package is intentionally NOT a workspace member. cargo-fuzz builds each
+# target with `#![no_main]` and a sanitizer, so it must not be picked up by
+# `cargo test --workspace` or `cargo build --workspace` for ordinary
+# development. Keeping it outside the members list is what stops a fuzz target
+# from breaking a normal build for someone who only came here to fix a bug.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.asv-domain]
+path = "../../domain"
+
+[dependencies.asv-connector-http]
+path = ".."
+
+[dependencies.url]
+version = "2"
+
+[[bin]]
+name = "authority_canonicalization"
+path = "fuzz_targets/authority_canonicalization.rs"
+test = false
+doc = false
+bench = false

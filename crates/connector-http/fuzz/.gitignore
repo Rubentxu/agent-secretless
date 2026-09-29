@@ -1,0 +1,15 @@
+# Fuzz build output. cargo-fuzz builds here with sanitizers enabled, so it is
+# never a build artifact worth keeping.
+target/
+
+# Fuzzer-discovered inputs. These are reproducible from `corpus_seeds/` by
+# running the target, and a run adds thousands of them, so they are working
+# state rather than source. A crash *file* is never stored here — it lands in
+# `artifacts/`, which is deliberately NOT ignored: a committed crash is a
+# reproducible failure, and hiding one behind an ignore rule would make the
+# next run silently green against a known bug. Triaged by hand, never by
+# `git clean`.
+corpus/
+
+# Crash inputs and leaks are *findings*, not build output. See above.
+# artifacts/
