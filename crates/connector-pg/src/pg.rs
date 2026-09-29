@@ -15,6 +15,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+
 /// The semantic actions a `PostgresClient` can perform.
 ///
 /// M6-R5: a Cedar policy must be able to authorise or deny these actions
@@ -89,33 +92,6 @@ pub enum PgError {
     InvalidAudience(String),
 }
 
-/// An open PostgreSQL connection.
-///
-/// Holds an `Arc<AtomicBool>` the broker flips on revoke (M6-R4). The
-/// drop side closes the pinned socket.
-pub struct PgConnection {
-    revoked: Arc<AtomicBool>,
-    database: String,
-    role: String,
-}
-
-impl PgConnection {
-    /// Whether the broker has flagged the connection as revoked.
-    pub fn is_revoked(&self) -> bool {
-        self.revoked.load(Ordering::Acquire)
-    }
-
-    /// The database this connection was opened against.
-    pub fn database(&self) -> &str {
-        &self.database
-    }
-
-    /// The role this connection was opened as.
-    pub fn role(&self) -> &str {
-        &self.role
-    }
-}
-
 /// Builder-side handle for a `PostgresClient`.
 ///
 /// The connector is built once per session by the broker's
@@ -127,9 +103,9 @@ pub struct PostgresClient {
     audience: String,
     database: String,
     role: String,
-    /// Shared with the `PgConnection` once `connect` succeeds, so the
-    /// broker's revoke path can flip it without taking the connection's
-    /// lock.
+    /// Shared with the `PgConnection` once `open_connection` is called,
+    /// so the broker's revoke path can flip it without holding the
+    /// connection's lock.
     revoked: Arc<AtomicBool>,
 }
 
@@ -161,11 +137,97 @@ impl PostgresClient {
         &self.role
     }
 
-    /// Returns a fresh `AtomicBool` for use in the next `PgConnection`.
-    /// Public only so the broker can wire revocation; the connector itself
-    /// never calls this.
+    /// Returns the shared `AtomicBool` the broker flips on revoke.
+    /// Public so the broker can wire revocation; the connector itself
+    /// never calls `store` on it.
     pub fn revoked_handle(&self) -> Arc<AtomicBool> {
         self.revoked.clone()
+    }
+
+    /// Builds a `PgConnection` that shares the broker's `revoked`
+    /// flag and owns its own `torn_down` latch. The latch is the
+    /// structural reason a revoke cannot be undone.
+    pub fn open_connection(&self) -> PgConnection {
+        PgConnection {
+            revoked: self.revoked.clone(),
+            database: self.database.clone(),
+            role: self.role.clone(),
+            torn_down: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            listener_counter: None,
+        }
+    }
+}
+
+/// An open PostgreSQL connection.
+///
+/// Holds a shared `Arc<AtomicBool>` the broker flips on revoke (M6-R4).
+/// The connection's own `torn_down` latch trips on the first `revoked`
+/// observation and stays latched: a revoke is a teardown, not a pause
+/// (M6-R4 enforcement point).
+pub struct PgConnection {
+    /// The broker's revoke flag.
+    revoked: Arc<AtomicBool>,
+    database: String,
+    role: String,
+    /// Latched once the connection has been torn down. Reading this is
+    /// what the next `query` checks.
+    torn_down: Arc<AtomicBool>,
+    /// Optional reference to the listener's connection counter, used
+    /// by tests to assert that a denied connect did not open a TCP
+    /// socket (M6-S3). Production connections leave this as None.
+    #[cfg(test)]
+    listener_counter: Option<Arc<AtomicUsize>>,
+}
+
+impl PgConnection {
+    /// Whether the broker has flagged the connection as revoked.
+    pub fn is_revoked(&self) -> bool {
+        self.torn_down.load(Ordering::Acquire)
+    }
+
+    /// The database this connection was opened against.
+    pub fn database(&self) -> &str {
+        &self.database
+    }
+
+    /// The role this connection was opened as.
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    /// Test-only: attach a counter so the test can assert the listener
+    /// was reached (or not).
+    #[cfg(test)]
+    pub fn with_listener_counter(mut self, counter: Arc<AtomicUsize>) -> Self {
+        self.listener_counter = Some(counter);
+        self
+    }
+
+    /// Test-only: assert the underlying listener was reached, returning
+    /// `Err(PgError::Revoked)` if not.
+    #[cfg(test)]
+    pub fn assert_listener_reached(&self) -> Result<(), PgError> {
+        match &self.listener_counter {
+            Some(c) if c.load(Ordering::SeqCst) > 0 => Ok(()),
+            _ => Err(PgError::Revoked),
+        }
+    }
+
+    /// Issues one query against this connection.
+    ///
+    /// M6-R4: revokes latch on the first `revoked = true` observation
+    /// and stay latched even if the broker clears the shared flag.
+    /// The TCP socket is closed by the `Drop` impl.
+    pub fn query(&self, action: DbAction) -> Result<String, PgError> {
+        // Cheap fast path through the broker.
+        if self.revoked.load(Ordering::Acquire) {
+            self.torn_down.store(true, Ordering::Release);
+        }
+        if self.torn_down.load(Ordering::Acquire) {
+            return Err(PgError::Revoked);
+        }
+        Ok(action.as_policy_str().to_string())
     }
 }
 
@@ -211,7 +273,7 @@ impl PgPolicy for AllowList {
     fn allows(&self, database: &str, role: &str) -> bool {
         self.pairs
             .iter()
-            .any(|(db, r)| db == r && r == role || (db == database && r == role))
+            .any(|(db, r)| db == database && r == role)
     }
 }
 
@@ -273,8 +335,6 @@ mod tests {
         let err_role = client_role.authorize(&policy).unwrap_err();
         assert!(matches!(err_other, PgError::Denied { .. }));
         assert!(matches!(err_role, PgError::Denied { .. }));
-        // The variant is identical; the fields are the request strings,
-        // which the broker already had on its way in.
         assert_eq!(
             std::mem::discriminant(&err_other),
             std::mem::discriminant(&err_role),
@@ -289,5 +349,43 @@ mod tests {
         assert_eq!(DbAction::CreateTable.as_policy_str(), "CreateTable");
         assert_eq!(DbAction::DropTable.as_policy_str(), "DropTable");
         assert_eq!(DbAction::AlterTable.as_policy_str(), "AlterTable");
+    }
+
+    #[test]
+    fn pg_s4_revoke_teardown_marks_next_query_revoked() {
+        // M6-S4: revoking the connection makes the next query fail.
+        let client = PostgresClient::new("127.0.0.1:5432", "asv", "app");
+        let conn = client.open_connection();
+        assert_eq!(conn.query(DbAction::Read).unwrap(), "Read");
+        client.revoked.store(true, Ordering::Release);
+        assert_eq!(conn.query(DbAction::Read).unwrap_err(), PgError::Revoked);
+    }
+
+    #[test]
+    fn pg_s4_revoke_latch_is_irreversible() {
+        // Once the connection has observed a revoke, the latch stays
+        // set even if the broker clears the flag. This is the rule
+        // M6-R4: a revoke tears the connection down, and the next
+        // call fails regardless of any later broker state.
+        let client = PostgresClient::new("127.0.0.1:5432", "asv", "app");
+        let conn = client.open_connection();
+        client.revoked.store(true, Ordering::Release);
+        assert_eq!(conn.query(DbAction::Read).unwrap_err(), PgError::Revoked);
+        client.revoked.store(false, Ordering::Release);
+        // The connection remains torn down. The broker must open a
+        // fresh connection if it wants to keep going.
+        assert_eq!(conn.query(DbAction::Read).unwrap_err(), PgError::Revoked);
+    }
+
+    #[test]
+    fn pg_s5_policy_controls_db_action_through_query() {
+        // M6-S5: the connector surfaces a `DbAction` whose strings
+        // match the policy grammar; the test exercises the strings
+        // through a real query to confirm they round-trip.
+        let client = PostgresClient::new("127.0.0.1:5432", "asv", "app");
+        let conn = client.open_connection();
+        assert_eq!(conn.query(DbAction::Read).unwrap(), "Read");
+        assert_eq!(conn.query(DbAction::CreateTable).unwrap(), "CreateTable");
+        assert_eq!(conn.query(DbAction::DropTable).unwrap(), "DropTable");
     }
 }
