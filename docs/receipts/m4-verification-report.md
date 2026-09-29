@@ -334,6 +334,68 @@ Both items remain in the backlog with their original content intact, so
 no evidence is lost. They are now visible debt for the milestone that
 owns them, not blockers for the cycle that doesn't.
 
-**Recommended next action.** Apply `phase.verify.complete`. The gate
-record and the transition packet make the scope and the gaps explicit
-so a future reader can see why M4 was closable even with F0/F1 open.
+**Recommended next action.** Apply `phase.verify.uat.sync` (the
+`A-full` path is verify → uat → review → release → archive, not
+verify → release directly). The gate record and the transition packet
+make the scope and the gaps explicit so a future reader can see why M4
+was closable even with F0/F1 open.
+
+## Transition attempt and CLI blocker
+
+After closing F2 and reclassifying F0/F1, M4's exit criteria are met and
+the workflow frontier offers `phase.verify.uat.sync` as the next step.
+
+The gate `uat-activated` is an orchestrator-decision binary per ADR-012.
+It evaluates to `passed` cleanly:
+
+```text
+sddk cycle evaluate-gate --gate uat-activated --transition phase.verify.uat.sync
+  receipt_id: gate-uat-activated-747a33a8134516f7-4
+  plan_hash:  sha256:747a33a8134516f7d20be5a5228afcbb1c9f255a55898b57d1e089c33d84a9e7
+```
+
+The very next command fails:
+
+```text
+sddk cycle transition --transition phase.verify.uat.sync --lease-owner jcode --fencing-token 1
+  error[ENGINE_MISSING_GATE_RECEIPT]: transition phase.verify.uat.sync is
+  missing gate receipt for "uat-activated"
+```
+
+Reproduction was attempted four consecutive times against the same
+cycle, with and without `--no-infer`, with the explicit `--cycle` flag
+every time. All four receipts share the same `plan_hash`. The engine
+returns the receipt id from `evaluate-gate` and then reports the receipt
+as missing from `transition`. The receipt is persisted (its id
+increments monotonically: `-1`, `-2`, `-3`, `-4`), but the transition
+side cannot find it.
+
+This is a CLI defect, not a defect in M4 or in this repository. It blocks
+the workflow independently of any code change, and it cannot be worked
+around from inside the cycle. The blocker is recorded in the backlog as
+`bl-bl-01M3P34Z1W000387C6BBE1DPR0` (P0, triaged).
+
+## What was actually closed in this cycle
+
+- F2 (UAT-030 SSH half): 100 real signatures over the M2 ssh-agent's
+  Unix socket, all verified against the agent's own public key.
+  Commits: `2812cf5` (chore dev-deps), `dbe0628` (test).
+- F0 and F1: reclassified from P0 to P3, with two companion
+  "RECLASIFICACION" items so the reasoning is auditable.
+  The gaps remain in the backlog, owned by their proper milestones.
+- F4b (debt gates reading a foreign cycle): not resolved, documented in
+  the report. The 34/0/0 check-gates figure is independent of the SDDK
+  gates and stands on its own.
+- The verification report: walked from initial draft to its current
+  shape across commits `c62877a`, `dc19736`, `71e525c`, `3994fd4`.
+
+## Recommended next action for the operator
+
+1. Look at the cycle narrative and decide whether the workflow is
+   closable with the CLI defect documented.
+2. If the defect is fixed (or worked around in the CLI),
+   `phase.verify.uat.sync` will pass and the cycle will move into
+   `UAT_WAITING/uat` for human UAT execution.
+3. If the operator decides the defects block a real release, the cycle
+   should be `pause`d rather than left `OPEN/verify` so the lease does
+   not expire silently.
