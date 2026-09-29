@@ -14,7 +14,8 @@
 //! arbitrary BPF load or generic cgroup writes.
 
 use asv_ebpfd::{
-    cgroup_attach_skeleton, parse_verb, program_lookup, AttachHandle, ProgramId, Verb, VerbError,
+    cgroup_attach_skeleton, parse_cgroup_id, parse_verb, program_lookup, AttachHandle, ProgramId,
+    Verb, VerbError,
 };
 
 #[test]
@@ -127,7 +128,7 @@ fn uat_024_m8_cgroup_attach_skeleton_returns_ok() {
     // The M9 implementation will replace the body with a real
     // bpf_link_create(BPF_LINK_TYPE_CGROUP) syscall.
     let handle =
-        cgroup_attach_skeleton(0x1234, ProgramId::Connect4RedirectV1).expect("skeleton ok");
+        cgroup_attach_skeleton(0x1234, ProgramId::Connect4RedirectV1, 1).expect("skeleton ok");
     assert_eq!(handle, AttachHandle(0));
 }
 
@@ -135,6 +136,29 @@ fn uat_024_m8_cgroup_attach_skeleton_returns_ok() {
 fn uat_024_m8_cgroup_attach_skeleton_accepts_extreme_values() {
     // The skeleton must accept the full u64 range and the only
     // shipped program. It is the surface guarantee for M9.
-    let _ = cgroup_attach_skeleton(0, ProgramId::Connect4RedirectV1).expect("zero");
-    let _ = cgroup_attach_skeleton(u64::MAX, ProgramId::Connect4RedirectV1).expect("max");
+    let _ = cgroup_attach_skeleton(0, ProgramId::Connect4RedirectV1, 1).expect("zero");
+    let _ = cgroup_attach_skeleton(u64::MAX, ProgramId::Connect4RedirectV1, 1).expect("max");
+}
+
+#[test]
+fn uat_024_m8_parse_cgroup_id_rejects_path_arguments() {
+    // M8-R3 bite: a path-based argument (the escalation primitive the
+    // spec forbids) is InvalidArgument, never silently coerced to an id.
+    for path_like in [
+        "/sys/fs/cgroup/asv.slice",
+        "../escape",
+        "cgroup.controllers",
+    ] {
+        match parse_cgroup_id(path_like) {
+            Err(VerbError::InvalidArgument { verb, .. }) => {
+                assert_eq!(verb, "cgroup.attach");
+            }
+            other => {
+                panic!("parse_cgroup_id({path_like:?}) must be InvalidArgument, got {other:?}")
+            }
+        }
+    }
+    // And the honest numeric forms still parse.
+    assert_eq!(parse_cgroup_id("0x1234"), Ok(0x1234));
+    assert_eq!(parse_cgroup_id("4660"), Ok(0x1234));
 }
