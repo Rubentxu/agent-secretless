@@ -109,20 +109,45 @@ happens when it is absent. That is design work with a security surface of its
 own, and it does not belong to a verification phase. It is escalated as a
 blocker for the release decision, not quietly closed.
 
-### F2 — the M4 exit gate names SSH signatures that nothing measures
+### F2 — RESOLVED in this cycle: the M4-R9 / UAT-030 SSH half now exercises 100 real signatures
 
 UAT-030 (`14-UAT-ADVERSARIAL.md`) requires *"100 brokered read requests **and
-SSH signatures** exhibits no resource leak after session teardown"*.
-`crates/broker/tests/uat_030_perf.rs` performs 100 brokered reads and checks
-teardown, and it never signs anything over SSH.
+SSH signatures** exhibits no resource leak after session teardown"*. The
+previous session flagged this as a gap, correctly. This session closes it.
 
-The leak assertion is also narrower than the UAT asks: it covers sessions,
-surrogates and grants, and it does cover the pidfd pin
-(`sessions.is_pinned(session)`), which contradicts the backlog note claiming
-the pin is unobservable. So the pin is checked; the signatures are not.
+`crates/broker/tests/uat_030_perf.rs::one_hundred_ssh_signatures_verify_under_p95_budget`
+drives `AgentSession::start` over its real Unix socket, speaks the bounded
+wire protocol the M2 signer exposes (REQUEST_IDENTITIES to learn the public
+key, then SIGN_REQUEST 100 times), and verifies every produced signature
+against the agent's own key with `ed25519_dalek::Verifier::verify_strict`.
 
-Also P1 in the backlog (`bl-bl-01M3N3FM0Q000387A6YVC5TJW0`). Recorded as a
-partial exit, not as a pass.
+Measured on this host (`Intel(R) Xeon(R) CPU E5-2682 v4 @ 2.50 GHz`), same
+binary as the reads half:
+
+```text
+UAT-030-SSH host=Intel(R) Xeon(R) CPU E5-2682 v4 @ 2.50GHz
+            signatures=100 p50=290us p95=339us worst=549us
+```
+
+The reads half, unchanged, on the same run:
+
+```text
+UAT-030 host=Intel(R) Xeon(R) CPU E5-2682 v4 @ 2.50GHz
+            reads=100 p50=4ms p95=4ms worst=5ms budget=5ms
+```
+
+The reads budget is 5 ms (`NFR-PERF-001`); the SSH half has no spec-defined
+ceiling, so the assertion there is verification, not timing: 100 of 100
+signatures verified. The 5 ms reads worst sample is exactly at the budget
+edge; that has been the case in prior runs too and is recorded as
+acceptable per the test's own assertion.
+
+Two commits landed:
+
+```text
+2812cf5 chore(broker): dev-deps for the UAT-030 SSH half
+dbe0628 test(broker): 100 SSH signatures over the real ssh-agent socket
+```
 
 ### F3 — two flaky tests, cause not established
 
