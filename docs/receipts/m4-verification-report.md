@@ -274,23 +274,26 @@ rebuilt by hand — held and still holds. The state was never the problem.
 ## Gate outcomes for `phase.verify.complete`
 
 ```text
-tests-pass                    PASSED  argv=cargo test --workspace --no-fail-fast
-                                      exit_code=0, 240 passed / 0 failed, 29 binaries
-policy-compliant              PASSED  argv=python3 tools/check-gates.py
-                                      exit_code=0, 0 hard defects, 0 warnings, 0 orphaned UAT
-debt-severity-assigned        FAILED  gate reads p-52b95ef55999f9de/kernel-cycle-8,
-                                      reports 0 findings; M4 has 7 live items
-debt-priority-assigned        FAILED  same cause
+tests-pass                    PASSED (v2)  argv=cargo test --workspace --no-fail-fast
+                                          exit_code=0, 241 passed / 0 failed, 29 binaries
+                                          (F2 added one_hundred_ssh_signatures_verify_under_p95_budget;
+                                          241 vs prior 240)
+policy-compliant              PASSED (v2)  argv=python3 tools/check-gates.py
+                                          exit_code=0, 0 hard defects, 0 warnings, 0 orphaned UAT
+debt-severity-assigned        FAILED (v2)  gate reads p-52b95ef55999f9de/kernel-cycle-8,
+                                          reports 0 findings; M4 has 8 live items
+debt-priority-assigned        FAILED (v2)  same cause
 ```
 
-Two passed with real, reproducible evidence. Two were failed deliberately:
-`sddk debt gates` prints PASS for a cycle that is not this one, and passing it
-would have recorded a clean bill of health for debt that has not been looked
-at. See F4b.
+Two passed with real, reproducible evidence; the test count is now 241
+because the SSH half of UAT-030 is in its own test. Both debt gates were
+failed deliberately for the same reason as v1: `sddk debt gates` prints
+PASS for a cycle that is not this one, and passing it would have recorded
+a clean bill of health for debt that has not been looked at. See F4b.
 
-`phase.verify.complete` is therefore **not** satisfied, and independently of
-the gates, F0 and F1 say the milestone is not done. The frontier stays at
-Open/Verify.
+`phase.verify.complete` is therefore **not** satisfied, and independently
+of the gates, F0 and F1 say the milestone is not done. The frontier stays
+at Open/Verify.
 
 ## Release recommendation
 
