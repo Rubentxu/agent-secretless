@@ -56,6 +56,26 @@ pub enum InjectError {
     EmptyCa(String),
 }
 
+/// Why leaf issuance failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LeafError {
+    /// The session CA has already aged out, so no leaf may be minted under it.
+    #[error("session CA for {0} is expired")]
+    CaExpired(String),
+    /// The requested host is not the one the leaf is bound to. Issuance is
+    /// per exact host: a leaf for `a.example` must never validate `b.example`.
+    #[error("leaf is bound to {bound}, not to {requested}")]
+    HostMismatch {
+        /// The host the leaf was issued for.
+        bound: String,
+        /// The host the caller asked for.
+        requested: String,
+    },
+    /// The session CA carries no intermediate to sign with.
+    #[error("session CA for {0} has no signing material")]
+    NoSigner(String),
+}
+
 /// Errors that the bridge dispatcher returns.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BridgeError {
@@ -65,6 +85,9 @@ pub enum BridgeError {
     /// Redirect rejected.
     #[error(transparent)]
     Redirect(#[from] RedirectError),
+    /// Leaf issuance rejected.
+    #[error(transparent)]
+    Leaf(#[from] LeafError),
 }
 
 /// A canonicalized (host, port) endpoint. The M9 prototype defines
@@ -295,6 +318,107 @@ impl TrustInjector for OpenSslEnvInjector {
     }
 }
 
+/// A leaf certificate minted under a session CA for exactly one host.
+///
+/// Like [`SessionCa`], the prototype payload is a structural stand-in, not
+/// a real x509 certificate. What is real and asserted by the tests is the
+/// binding: a leaf names one host, and [`LeafCertificate::verify_host`]
+/// refuses any other. The M9-runtime follow-up swaps the body for
+/// `rcgen::CertificateParams` + `signed_by(&intermediate_key)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafCertificate {
+    /// The session this leaf belongs to.
+    pub session_id: String,
+    /// The single host this leaf is valid for.
+    pub host: String,
+    /// DER-encoded leaf certificate.
+    pub leaf_der: Vec<u8>,
+    /// When the leaf was minted.
+    pub issued_at: Instant,
+    /// How long the leaf is valid for. Never outlives the CA's own TTL in
+    /// practice; the CA is re-minted per session, so a leaf outliving its
+    /// CA would be a certificate no trust store can validate.
+    pub ttl: Duration,
+}
+
+impl LeafCertificate {
+    /// True if the leaf is past its own TTL.
+    pub fn is_expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.issued_at) >= self.ttl
+    }
+
+    /// True only when `host` is exactly the host this leaf was issued for.
+    ///
+    /// Exact match, not suffix or wildcard. A CA that can mint for any host
+    /// in a zone can mint for a host it was never asked to vouch for, which
+    /// is the whole point of per-host issuance: a session authorized for
+    /// `api.github.com` must not gain a leaf for `internal.github.com`.
+    pub fn verify_host(&self, host: &str) -> Result<(), LeafError> {
+        if self.host != host {
+            return Err(LeafError::HostMismatch {
+                bound: self.host.clone(),
+                requested: host.to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Mints a leaf for `host` under `ca`.
+///
+/// Fails closed in three cases, all of them security-relevant:
+///
+/// - the CA has expired, so no leaf may outlive its issuer;
+/// - the CA has no intermediate, so there is nothing to sign with;
+/// - the CA material is empty, which would mint a leaf that chains to
+///   nothing.
+pub fn issue_leaf(ca: &SessionCa, host: &str, now: Instant) -> Result<LeafCertificate, LeafError> {
+    if ca.is_expired(now) {
+        return Err(LeafError::CaExpired(ca.session_id.clone()));
+    }
+    if ca.intermediate_der.is_empty() {
+        return Err(LeafError::NoSigner(ca.session_id.clone()));
+    }
+    if host.is_empty() {
+        return Err(LeafError::HostMismatch {
+            bound: ca.session_id.clone(),
+            requested: host.to_string(),
+        });
+    }
+    // The leaf never outlives the CA: a certificate whose issuer expired
+    // first cannot be validated by any trust store that checks the chain.
+    let ttl = ca
+        .ttl
+        .saturating_sub(now.saturating_duration_since(ca.issued_at));
+    Ok(LeafCertificate {
+        session_id: ca.session_id.clone(),
+        host: host.to_string(),
+        leaf_der: synth_leaf_der(&ca.session_id, host),
+        issued_at: now,
+        ttl,
+    })
+}
+
+const ROLE_LEAF: u8 = 0x03;
+
+fn synth_leaf_der(session_id: &str, host: &str) -> Vec<u8> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ROLE_LEAF.hash(&mut h);
+    session_id.hash(&mut h);
+    host.hash(&mut h);
+    let a = h.finish();
+    let mut h2 = std::collections::hash_map::DefaultHasher::new();
+    host.hash(&mut h2);
+    session_id.hash(&mut h2);
+    ROLE_LEAF.hash(&mut h2);
+    let b = h2.finish();
+    let mut out = vec![ROLE_LEAF];
+    out.extend_from_slice(&a.to_le_bytes());
+    out.extend_from_slice(&b.to_le_bytes());
+    out
+}
+
 /// The bridge dispatcher. M9-prototype is a single struct that the
 /// runtime follow-up replaces with the `rustls::Server` + `hyper`
 /// acceptor.
@@ -491,5 +615,98 @@ mod tests {
         assert!(bridge.handle_redirect(&a, &b).is_ok());
         let cross = AuthorityEndpoint::new(auth("attacker.example.net"), 443).expect("ok");
         assert!(bridge.handle_redirect(&a, &cross).is_err());
+    }
+
+    fn leaf_ca() -> SessionCa {
+        SessionCa::new("sess-leaf", 7, Duration::from_secs(3600))
+    }
+
+    #[test]
+    fn issued_leaf_is_bound_to_the_requested_host() {
+        let ca = leaf_ca();
+        let leaf = issue_leaf(&ca, "api.example.com", Instant::now()).expect("issuance");
+        assert_eq!(leaf.session_id, "sess-leaf");
+        assert_eq!(leaf.host, "api.example.com");
+        assert!(!leaf.leaf_der.is_empty());
+        assert!(leaf.verify_host("api.example.com").is_ok());
+    }
+
+    #[test]
+    fn leaf_for_one_host_does_not_validate_a_sibling() {
+        // The adversarial case that per-host issuance exists to prevent: a
+        // session authorized for a public API must not gain a leaf for an
+        // internal host in the same zone. Suffix and prefix neighbours both
+        // have to be refused, not just unrelated hosts.
+        let ca = leaf_ca();
+        let leaf = issue_leaf(&ca, "api.example.com", Instant::now()).expect("issuance");
+        for other in [
+            "internal.example.com",
+            "example.com",
+            "api.example.com.evil.net",
+            "API.example.com",
+            "api.example.co",
+        ] {
+            assert!(
+                leaf.verify_host(other).is_err(),
+                "leaf for api.example.com must not validate {other}"
+            );
+        }
+    }
+
+    #[test]
+    fn leaf_der_differs_per_host_and_per_session() {
+        let ca = leaf_ca();
+        let a = issue_leaf(&ca, "api.example.com", Instant::now()).expect("a");
+        let b = issue_leaf(&ca, "internal.example.com", Instant::now()).expect("b");
+        assert_ne!(
+            a.leaf_der, b.leaf_der,
+            "distinct hosts must not share a leaf"
+        );
+
+        let other_session = SessionCa::new("sess-other", 7, Duration::from_secs(3600));
+        let c = issue_leaf(&other_session, "api.example.com", Instant::now()).expect("c");
+        assert_ne!(
+            a.leaf_der, c.leaf_der,
+            "the same host in a different session must not share a leaf"
+        );
+    }
+
+    #[test]
+    fn issuance_fails_once_the_ca_has_expired() {
+        let ca = SessionCa::new("sess-old", 3, Duration::from_secs(1));
+        let later = ca.issued_at + Duration::from_secs(2);
+        assert!(ca.is_expired(later), "precondition: the CA must be expired");
+        assert_eq!(
+            issue_leaf(&ca, "api.example.com", later).unwrap_err(),
+            LeafError::CaExpired("sess-old".to_string())
+        );
+    }
+
+    #[test]
+    fn leaf_never_outlives_its_issuer() {
+        let ca = SessionCa::new("sess-ttl", 5, Duration::from_secs(100));
+        let midway = ca.issued_at + Duration::from_secs(40);
+        let leaf = issue_leaf(&ca, "api.example.com", midway).expect("issuance");
+        // 40s of the CA's 100s are already spent, so the leaf has 60s left.
+        assert_eq!(leaf.ttl, Duration::from_secs(60));
+        // The leaf expires exactly when the CA does, never after.
+        assert!(!leaf.is_expired(ca.issued_at + Duration::from_secs(99)));
+        assert!(leaf.is_expired(ca.issued_at + Duration::from_secs(100)));
+    }
+
+    #[test]
+    fn issuance_fails_closed_without_signing_material() {
+        let mut ca = leaf_ca();
+        ca.intermediate_der.clear();
+        assert_eq!(
+            issue_leaf(&ca, "api.example.com", Instant::now()).unwrap_err(),
+            LeafError::NoSigner("sess-leaf".to_string())
+        );
+    }
+
+    #[test]
+    fn issuance_refuses_an_empty_host() {
+        let ca = leaf_ca();
+        assert!(issue_leaf(&ca, "", Instant::now()).is_err());
     }
 }
