@@ -22,16 +22,21 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 const HOST: &str = "api.example.com";
 
 /// A session CA plus a leaf for `HOST`, as the acceptor consumes it.
-fn material_for(host: &str) -> (LeafMaterial, SessionCa) {
+///
+/// The leaf DER is returned alongside so a test can assert the chain holds
+/// the leaf that was actually minted, rather than comparing the chain
+/// against itself.
+fn material_for(host: &str) -> (LeafMaterial, SessionCa, Vec<u8>) {
     let ca = SessionCa::new("acceptor-test", 7, std::time::Duration::from_secs(3600));
     let leaf = issue_leaf(&ca, host, std::time::Instant::now()).expect("mint a leaf");
+    let leaf_der = leaf.leaf_der.clone();
     let material = LeafMaterial::new(
         ca.root_der.clone(),
         vec![leaf.leaf_der.clone(), ca.intermediate_der.clone()],
         leaf.leaf_key.serialize_der(),
     )
     .expect("material");
-    (material, ca)
+    (material, ca, leaf_der)
 }
 
 /// A client that trusts exactly the session root and nothing else.
@@ -75,7 +80,7 @@ fn connect(
 
 #[test]
 fn a_client_trusting_only_the_session_root_completes_the_handshake() {
-    let (material, ca) = material_for(HOST);
+    let (material, ca, _leaf) = material_for(HOST);
     let acceptor = Acceptor::bind(&material, 0).expect("bind");
     let client = client_trusting(&ca.root_der);
 
@@ -97,18 +102,43 @@ fn a_client_trusting_only_the_session_root_completes_the_handshake() {
 
 #[test]
 fn the_chain_presented_is_leaf_then_intermediate() {
-    let (material, _ca) = material_for(HOST);
+    let (material, ca, leaf_der) = material_for(HOST);
     let chain = material.leaf_chain_der();
     assert_eq!(chain.len(), 2, "leaf plus one intermediate");
-    // The first element must be the end-entity certificate. Presenting them
-    // the other way round produces a certificate some clients build a path
-    // from and others reject, which is worse than either order being wrong.
-    assert_eq!(chain[0], material.leaf_chain_der()[0], "end-entity first");
+
+    // Compare against the CA's intermediate, not against the chain itself.
+    //
+    // The first version of this test read
+    //
+    //     assert_eq!(chain[0], material.leaf_chain_der()[0])
+    //
+    // which compares a value with itself. It is true for any chain of length
+    // one or more, and it would have stayed green if the acceptor presented
+    // the intermediate first or presented the root instead of the leaf. The
+    // comment above it claimed to pin the order, so the test asserted
+    // something and the comment claimed something else, and only the comment
+    // was wrong until the chain was mutated.
+    assert_eq!(
+        chain[0], leaf_der,
+        "the end-entity certificate must be presented first"
+    );
+    assert_ne!(
+        chain[0], ca.intermediate_der,
+        "the end-entity certificate must not be the intermediate"
+    );
+    assert_eq!(
+        chain[1], ca.intermediate_der,
+        "the intermediate follows the leaf"
+    );
+    assert_ne!(
+        chain[0], ca.root_der,
+        "the root is a trust anchor and is not presented in the chain"
+    );
 }
 
 #[test]
 fn a_client_asking_for_another_hostname_is_refused() {
-    let (material, ca) = material_for(HOST);
+    let (material, ca, _leaf) = material_for(HOST);
     let acceptor = Acceptor::bind(&material, 0).expect("bind");
     // This client trusts the session root correctly. It is refused because
     // the leaf does not name the host it asked for, not because of trust.
@@ -123,11 +153,11 @@ fn a_client_asking_for_another_hostname_is_refused() {
 
 #[test]
 fn a_client_trusting_an_unrelated_root_is_refused() {
-    let (material, _ca) = material_for(HOST);
+    let (material, _ca, _leaf) = material_for(HOST);
     let acceptor = Acceptor::bind(&material, 0).expect("bind");
     // A different session's root: the acceptor is right, the client is not
     // told to trust it.
-    let (_other_material, other_ca) = material_for("other.example.com");
+    let (_other_material, other_ca, _other_leaf) = material_for("other.example.com");
     let client = client_trusting(&other_ca.root_der);
 
     let result = connect(acceptor.local_addr(), client, HOST);
