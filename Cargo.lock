@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "asv-broker"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "asv-connector-http",
  "asv-connector-pg",
@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "asv-cli"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "asv-domain",
  "asv-ipc-protocol",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "asv-connector-http"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "asv-domain",
  "rcgen",
@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "asv-connector-pg"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "asv-domain",
  "base64 0.22.1",
@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "asv-domain"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "secrecy",
  "serde",
@@ -213,14 +213,14 @@ dependencies = [
 
 [[package]]
 name = "asv-ebpfd"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "asv-identity"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "asv-domain",
  "libc",
@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "asv-ipc-protocol"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "asv-domain",
  "asv-policy",
@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "asv-policy"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "asv-domain",
  "cedar-policy",
@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "asv-ssh-agent"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "ed25519-dalek",
  "libc",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "asv-vault"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "argon2",
  "asv-domain",
