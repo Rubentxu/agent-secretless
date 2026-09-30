@@ -154,6 +154,10 @@ pub struct WorkerRegistry {
 
 impl WorkerRegistry {
     /// Construct a registry from a template list.
+    ///
+    /// No template is validated here: a `PassThrough` seccomp profile is
+    /// accepted at registration and refused later by `worker::spawn`, before
+    /// any child process exists. Registration is not a trust boundary.
     pub fn new(templates: Vec<WorkerTemplate>) -> Self {
         Self { templates }
     }

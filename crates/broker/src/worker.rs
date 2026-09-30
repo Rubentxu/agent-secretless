@@ -406,7 +406,9 @@ fn pre_exec_hook_failed(reader: &mut std::os::unix::net::UnixStream) -> bool {
 /// carries a `seccomp_profile`, but PassThrough is debug-only and must not
 /// weaken the worker sandbox, so the profile is not a runtime input here.
 /// Branching on it would let a template opt out of M7's deny-list, which is a
-/// security regression. The profile is checked when a template is registered.
+/// security regression. The profile is instead checked in `spawn`, before any
+/// child exists; it is NOT validated at registration, because
+/// `WorkerRegistry::new` accepts a template list as-is.
 #[cfg(target_os = "linux")]
 fn child_isolation_hook(
     binary: &Path,
