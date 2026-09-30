@@ -464,6 +464,35 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
         }
 
         Request::EndSession { session } => {
+            // Ending a session is not the requesting peer's decision alone.
+            // `EndSession` revokes the session's policy grants and kills its
+            // surrogates, so a peer that could end any session id could deny
+            // another agent its access — and, because the session is the unit
+            // of authority, strip a grant it never held. Every other
+            // session-scoped verb here (Authorize, MintSurrogate,
+            // RevokeSurrogate, the GitHub trio) checks ownership for exactly
+            // that reason; this arm was the outlier.
+            //
+            // Existence is checked BEFORE ownership, on purpose. The two
+            // refusals mean different things and an operator has to be able
+            // to tell them apart: "no such session" is a client error and
+            // keeps UAT-014's revoke-observability, while "not owned" is a
+            // denial. Checking ownership first would answer "not owned" to an
+            // owner who simply revoked twice, which is both wrong and a
+            // misleading thing to audit.
+            let Some(owner_pid) = state.sessions.peer_pid_of(session) else {
+                // Fail closed: an unknown session is an error, not a no-op.
+                return Response::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: format!("no such session: {session}"),
+                };
+            };
+            if owner_pid != peer.credentials.pid {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: "session is not owned by the authenticated peer".into(),
+                };
+            }
             if state.sessions.end(session) {
                 state.policy.revoke_session(session);
                 // The session's surrogates die with it. Leaving them live would
@@ -472,8 +501,8 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                 state.surrogates.revoke_session(session);
                 Response::SessionEnded { session }
             } else {
-                // Fail closed: an unknown session is an error, not a no-op.
-                // UAT-014 requires revoke to be observable.
+                // Unreachable while the session is known to exist, kept so a
+                // future change to the store cannot make this a silent no-op.
                 Response::Error {
                     code: ErrorCode::InvalidRequest,
                     message: format!("no such session: {session}"),
@@ -485,16 +514,32 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             entries: state.credentials.iter().map(Into::into).collect(),
         },
 
-        Request::DeleteCredential { id } => {
-            let before = state.credentials.len();
-            state.credentials.retain(|c| c.id != id);
-            if state.credentials.len() == before {
-                Response::Error {
-                    code: ErrorCode::InvalidRequest,
-                    message: format!("no such credential: {}", id),
-                }
-            } else {
-                Response::CredentialDeleted { id }
+        Request::DeleteCredential { .. } => {
+            // A credential is not session-scoped, so there is no ownership
+            // relation to check: every peer reaching this socket is an agent
+            // peer, and every one of them runs as the operator's own uid. A
+            // uid check would therefore pass for the agent as readily as for
+            // the human, which is the opposite of a guard.
+            //
+            // Deleting a credential is also not a decision an agent may make:
+            // it is the operator giving up access. Until the human control
+            // plane ships there is no authorized caller, so the honest answer
+            // is a closed door — the same one SubmitApproval and AuditQuery
+            // already answer with, and for the same reason.
+            //
+            // Two further reasons this cannot be quietly allowed. The
+            // in-memory list is not the vault: a delete here never reached
+            // the encrypted store, so it would look like a revocation and
+            // then be un-done by the next broker restart. And a peer able to
+            // destroy every credential in the running broker holds a
+            // denial-of-service over the operator's entire working setup,
+            // which is exactly the capability a secretless product must not
+            // hand to the thing it exists to constrain.
+            Response::Error {
+                code: ErrorCode::Denied,
+                message: "credential deletion requires the operator control plane, \
+                          not an agent session"
+                    .into(),
             }
         }
 
@@ -1361,6 +1406,48 @@ mod tests {
         }
     }
 
+    /// A peer cannot end another peer's session.
+    ///
+    /// `EndSession` revokes the session's policy grants and kills its
+    /// surrogates, so an unguarded arm let any process on the socket strip
+    /// another agent's authority. The two refusals stay distinguishable:
+    /// this one is a denial because the session exists and belongs to
+    /// somebody else, which is not the same answer as "no such session".
+    #[test]
+    fn ending_another_peers_session_is_denied_and_leaves_it_alive() {
+        let mut state = BrokerState::default();
+        let owner = peer();
+        let intruder = WorkloadIdentity::from_peer(PeerCredentials {
+            pid: owner.credentials.pid + 1,
+            uid: owner.credentials.uid,
+            gid: owner.credentials.gid,
+        });
+        let session = state.sessions.create("/repo".into(), &owner);
+
+        match handle(&mut state, &intruder, Request::EndSession { session }) {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::Denied, "{message}");
+                assert!(
+                    message.contains("not owned"),
+                    "the refusal must name the ownership rule: {message}"
+                );
+            }
+            other => panic!("a foreign peer ended the session: {other:?}"),
+        }
+
+        // The denial must not have half-applied: the session is still live,
+        // so its grants and surrogates still work.
+        assert_eq!(state.sessions.len(), 1, "the session survived the denial");
+        assert!(state.sessions.belongs_to(session, &owner));
+
+        // And the rightful owner can still end it.
+        assert_eq!(
+            handle(&mut state, &owner, Request::EndSession { session }),
+            Response::SessionEnded { session }
+        );
+        assert!(state.sessions.is_empty());
+    }
+
     #[test]
     fn protected_push_requires_exact_single_use_approval() {
         let mut state = BrokerState::default();
@@ -1550,13 +1637,56 @@ mod tests {
         assert!(!json.to_lowercase().contains("secret"));
     }
 
+    /// Credential deletion is a closed door for agent peers, and it is a
+    /// closed door that answers the same way whether or not the id exists.
+    ///
+    /// The previous behaviour answered `InvalidRequest` for an unknown id and
+    /// `CredentialDeleted` for a known one, which made deletion an existence
+    /// oracle: an agent could enumerate the operator's credentials by
+    /// watching which ids came back deleted. One unconditional refusal closes
+    /// that and the denial-of-service with it.
     #[test]
-    fn deleting_an_unknown_credential_fails_closed() {
+    fn credential_deletion_is_refused_and_does_not_confirm_existence() {
         let mut state = BrokerState::default();
+        let known = insert_credential(
+            &mut state,
+            CredentialMetadata::new("github-work", asv_domain::CredentialKind::BearerToken),
+        );
         let ghost = CredentialId::new();
-        match handle(&mut state, &peer(), Request::DeleteCredential { id: ghost }) {
-            Response::Error { code, .. } => assert_eq!(code, ErrorCode::InvalidRequest),
-            other => panic!("expected failure, got {other:?}"),
+
+        // Identical refusal for an id that exists and one that does not. If
+        // these ever differ again, the difference is an oracle.
+        for (label, id) in [("known", known), ("ghost", ghost)] {
+            match handle(&mut state, &peer(), Request::DeleteCredential { id }) {
+                Response::Error { code, message } => {
+                    assert_eq!(code, ErrorCode::Denied, "{label}");
+                    assert!(
+                        message.contains("operator control plane"),
+                        "{label}: the refusal must name who may delete: {message}"
+                    );
+                }
+                other => panic!("{label}: expected a refusal, got {other:?}"),
+            }
+        }
+
+        // The refusal did not touch the store: the credential is still there,
+        // so a denied delete cannot be mistaken for a revocation.
+        assert!(
+            state.credentials.iter().any(|c| c.id == known),
+            "a refused deletion must leave the credential in place"
+        );
+
+        // And the attempt itself is auditable: an agent probing this verb is
+        // exactly the event an operator needs to see.
+        let records = state.audit.query(0);
+        assert_eq!(records.len(), 2, "both refusals are recorded");
+        for record in &records {
+            match &record.event {
+                asv_ipc_protocol::AuditEventDto::RequestHandled { outcome, .. } => {
+                    assert_eq!(outcome, "DENIED");
+                }
+                other => panic!("unexpected audit variant: {other:?}"),
+            }
         }
     }
 
