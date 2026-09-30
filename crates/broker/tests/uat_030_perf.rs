@@ -104,6 +104,16 @@ const READS: usize = 100;
 /// millisecond.
 const P95_BUDGET_US: u128 = 8_000;
 
+/// How far `P95_BUDGET_US` may sit above the p95 a run actually measured,
+/// before the test treats the gap as a deleted gate rather than as
+/// headroom.
+///
+/// 8 ms against an observed 4.7-5.0 ms p95 is 1.6-1.7x. 4x leaves room for
+/// a slower host without letting the constant drift into irrelevance. It
+/// is checked against THIS run's measurement rather than a fixed absolute,
+/// so it does not go stale when the host changes.
+const MAX_BUDGET_MULTIPLE: f64 = 4.0;
+
 /// A connector factory pointing at the local fake origin.
 struct LocalFactory {
     resolved: ResolvedAudience,
@@ -345,6 +355,28 @@ fn one_hundred_brokered_reads_stay_under_the_p95_budget() {
         P95_BUDGET_US,
         p50.as_micros(),
         worst.as_micros()
+    );
+
+    // The budget must stay a BOUND, not a formality. Without this, raising
+    // P95_BUDGET_US is the easiest way to make this test pass and nothing
+    // observes it: verified by falsification, setting the budget to 8000x
+    // its value left the whole file green. CI runs the test but no job
+    // compares the constant against anything.
+    //
+    // The measured p95 here is 4.7-5.0 ms. A budget above 4x that is not a
+    // measured decision, it is a deleted gate. `MAX_BUDGET_MULTIPLE` is the
+    // multiple of THIS RUN's observed p95 that the budget may not exceed,
+    // so the check travels with the host instead of hardcoding a number
+    // that would go stale on faster or slower machines.
+    let multiple = P95_BUDGET_US as f64 / p95.as_micros() as f64;
+    assert!(
+        multiple <= MAX_BUDGET_MULTIPLE,
+        "P95_BUDGET_US is {}us but this run measured p95 {}us, a multiple of \
+         {multiple:.1}x. The limit is {MAX_BUDGET_MULTIPLE}x. If the budget \
+         really must move, change it together with the NFR and say why here; \
+         a larger number with no measured justification deletes the gate.",
+        P95_BUDGET_US,
+        p95.as_micros(),
     );
 }
 
