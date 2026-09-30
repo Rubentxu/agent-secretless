@@ -1,0 +1,27 @@
+[package]
+name = "asv-tls-acceptor"
+version = "0.14.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "M9: presents a per-session x509 leaf over a real TLS handshake."
+
+[dependencies]
+# The provider feature has to match every other rustls in the workspace.
+# `rustls-tls` resolves to reqwest's `__rustls-ring`, and a mismatch leaves
+# rustls unable to pick a CryptoProvider: it panics at handshake time with a
+# message that does not name the mismatched crate. Copied verbatim from
+# crates/connector-http/Cargo.toml for that reason, not by preference.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+# The integration tests need a real `SessionCa` to mint a real leaf, and that
+# type lives in the broker. It is a dev-dependency on purpose: the published
+# library's graph must not reach the vault, and REQ-3 is checked with
+# `cargo tree --edges normal`, which does not include this line.
+asv-broker.workspace = true
+# The tests are a real rustls client, not `openssl s_client`, so the client
+# side needs the same features.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

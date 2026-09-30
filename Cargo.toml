@@ -12,6 +12,7 @@ members = [
     "crates/connector-http",
     "crates/connector-pg",
     "crates/ebpfd",
+    "crates/tls-acceptor",
 ]
 # M0 deliberately shipped without a connector, so the UAT threat harness could
 # run with an empty connector surface (docs/15-ROADMAP.md M0 Exit). M4 is the
@@ -35,6 +36,11 @@ asv-connector-http = { path = "crates/connector-http" }
 asv-connector-pg = { path = "crates/connector-pg" }
 asv-ebpfd = { path = "crates/ebpfd" }
 asv-vault = { path = "crates/vault" }
+# M9: the tls-acceptor integration tests need a real `SessionCa` to mint a real
+# leaf, and that type lives in the broker. Declared here so the acceptor crate
+# can name it as a path dependency; it is a dev-dependency there, so the
+# published library's graph still does not reach the vault.
+asv-broker = { path = "crates/broker" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

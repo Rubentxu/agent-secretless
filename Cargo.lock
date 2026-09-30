@@ -261,6 +261,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "asv-tls-acceptor"
+version = "0.14.0"
+dependencies = [
+ "asv-broker",
+ "rustls",
+ "thiserror",
+]
+
+[[package]]
 name = "asv-vault"
 version = "0.14.0"
 dependencies = [
