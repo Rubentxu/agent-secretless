@@ -41,7 +41,16 @@ pub mod transport;
 /// stated and one place where it is implemented.
 pub mod spawn;
 
+/// SCRAM-SHA-256, the authentication a modern PostgreSQL server requires.
+///
+/// Separate from the wire protocol because it is the one part of the
+/// transport with a published test vector: RFC 7677 gives a full exchange
+/// with expected output, so the implementation can be pinned to something
+/// outside this repository instead of to itself.
+pub mod scram;
+
 pub use pg::{AllowList, DbAction, DenyAll, PgConnection, PgError, PgPolicy, PostgresClient};
+pub use scram::{normalise_password, NormalisedPassword, Scram, ScramError};
 pub use spawn::{spawn_psql_reveal, PsqlSpawn};
 pub use transport::{
     resolve_and_pin, AddressPolicy, PgAudience, PinnedPgClient, PinnedPgError, ResolvedPgAudience,

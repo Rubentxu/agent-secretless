@@ -17,10 +17,26 @@ test-support = []
 [dependencies]
 asv-domain.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["process", "io-util", "sync", "net", "rt", "rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["process", "io-util", "sync", "net", "rt", "rt-multi-thread", "macros", "time", "io-std"] }
 zeroize.workspace = true
 tracing.workspace = true
 url.workspace = true
+# M6 live transport. A modern PostgreSQL server with
+# `password_encryption = scram-sha-256` refuses MD5 and cleartext outright, so
+# the connector speaks SCRAM-SHA-256 directly rather than shelling out to
+# libpq. `hmac`/`sha2` implement RFC 7677, `base64` carries the salt, proof and
+# signature, `subtle` does the constant-time signature compare, and `rustls`
+# gives the TLS session the transport refuses to skip.
+hmac.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+base64 = "0.22"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = "1"
+webpki-roots = "0.26"
+# The client nonce that makes a recorded SCRAM exchange unreplayable. `rand`
+# was already in the lock via the vault.
+rand.workspace = true
 
 [dev-dependencies]
 # The fake server is only ever linked into tests; it is gated behind
