@@ -80,6 +80,36 @@ opaque_id!(
     CredentialId
 );
 
+impl CredentialId {
+    /// Rehydrates a credential id only from its canonical wire spelling.
+    ///
+    /// The vault keys credentials by a `String` (`asv_vault::CredentialMetadata`
+    /// `id`), while this type is a `Uuid`, so something has to stand between
+    /// them. Doing it here rather than in the broker keeps `uuid` out of every
+    /// consumer's dependency list and keeps the decision about what a valid
+    /// credential id looks like next to the type that defines one. Uppercase,
+    /// compact, braced, and other alternate UUID spellings are rejected.
+    ///
+    /// Only [`CredentialId`] gets this. The other ids in this module are minted
+    /// by the broker and never parsed from caller-supplied text, and leaving
+    /// them without a parse is the point: an id that cannot be reconstructed
+    /// from bytes is an id that cannot be guessed either.
+    pub fn from_wire(text: &str) -> Result<Self, CredentialIdParseError> {
+        let uuid = uuid::Uuid::parse_str(text).map_err(|_| CredentialIdParseError)?;
+        let id = Self(uuid);
+        if id.to_wire() != text {
+            return Err(CredentialIdParseError);
+        }
+        Ok(id)
+    }
+}
+
+/// A credential ID must use its exact canonical wire spelling. The error is
+/// intentionally input-free so malformed text cannot leak through diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("credential id must be a canonical lowercase hyphenated UUID")]
+pub struct CredentialIdParseError;
+
 opaque_id!(
     /// Handle for one `asv run` session.
     AgentSessionId
@@ -532,6 +562,36 @@ mod tests {
         // collapses them to a bare Uuid, this file stops compiling.
         let _typed: CredentialId = cred;
         let _typed: AgentSessionId = session;
+    }
+
+    #[test]
+    fn credential_id_wire_form_is_canonical_and_round_trips() {
+        const CANONICAL: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let id = CredentialId::from_wire(CANONICAL).expect("canonical UUID is accepted");
+        assert_eq!(id.to_wire(), CANONICAL);
+
+        let uppercase = CANONICAL.to_ascii_uppercase();
+        let compact = CANONICAL.replace('-', "");
+        let braced = format!("{{{CANONICAL}}}");
+        let malformed = "not-a-uuid".to_string();
+        for (label, candidate) in [
+            ("uppercase", uppercase),
+            ("compact", compact),
+            ("braced", braced),
+            ("malformed", malformed),
+        ] {
+            let parsed = CredentialId::from_wire(&candidate);
+            assert!(
+                parsed.is_err(),
+                "accepted noncanonical UUID spelling ({label})"
+            );
+            if let Err(error) = parsed {
+                assert!(
+                    !error.to_string().contains(&candidate),
+                    "parse diagnostics must not echo candidate text ({label})"
+                );
+            }
+        }
     }
 
     /// ADR-0014: posture ordering must keep degraded modes strictly below
