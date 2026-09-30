@@ -37,6 +37,21 @@ permit (
                 Action::"github_release_create"],
     resource is Api
 );
+
+// M6-R5 database verbs. Only the gateway verb and the read verb are permitted
+// here, and the omission is the point: `postgres_insert`,
+// `postgres_create_table`, `postgres_drop_table` and `postgres_alter_table` are
+// absent, so they are denied by default and an operator who wants them adds a
+// rule. A default policy that permitted every verb would make the five Cedar
+// actions decorative, which is the failure M6-R5 exists to prevent.
+//
+// `postgres_connect` is the gateway: it opens the socket and lends the
+// credential, and it was permitted before the query path consulted the policy
+// at all, so leaving it out would have been a behaviour change nobody asked
+// for. `postgres_read` is what makes the transport usable without making it
+// writable.
+permit (principal, action == Action::"postgres_connect", resource is Database);
+permit (principal, action == Action::"postgres_read", resource is Database);
 "#;
 
 /// Audiences a semantic HTTP action may ever target (D6; the design v2 open

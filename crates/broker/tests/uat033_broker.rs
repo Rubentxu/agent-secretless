@@ -401,3 +401,283 @@ with_substrate!(
         );
     }
 );
+
+/// A short, unique, legal SQL identifier suffix.
+///
+/// The tables these tests create must not collide between tests, and the
+/// session id is a UUID whose hyphens are legal in an identifier but which
+/// reads badly in a failure message.
+fn unique_suffix() -> String {
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}_{}", std::process::id(), n)
+}
+
+// M6-R5, the scenario the spec spells out: a policy that allows `connect` and
+// `select 1` but denies `create table`, against a real server.
+//
+// The claim under test is not "the classifier knows that CREATE TABLE is a
+// different verb from SELECT". That is a unit test in `pg_policy`, and it was
+// passing while the broker never asked the policy anything. The claim here is
+// that a statement the policy denies does not reach the server. So the test
+// connects for real, runs a read the policy allows, and then runs a write the
+// policy forbids, and the write must be refused while the read still works.
+with_substrate!(
+    a_policy_allows_select_and_denies_create_table,
+    |substrate: Substrate| {
+        let (mut state, peer, session, _dir) = brokered(&substrate);
+        // The M6-R5 policy, verbatim in intent: read is permitted, creating a
+        // table is not. No other database verb is permitted either, so this
+        // policy is the narrow one the spec describes.
+        state.policy = asv_policy::PolicyEngine::from_policy_text(
+            r#"
+            permit (principal, action == Action::"postgres_connect", resource is Database);
+            permit (principal, action == Action::"postgres_read", resource is Database);
+            "#,
+        )
+        .expect("the M6-R5 policy parses and validates against the schema");
+
+        let connected = handle(
+            &mut state,
+            &peer,
+            Request::PostgresConnect {
+                session,
+                host: substrate.name.clone(),
+                host_addr: substrate.address.to_string(),
+                port: substrate.port,
+                database: substrate.database.clone(),
+                role: substrate.role.clone(),
+            },
+        );
+        assert!(
+            matches!(connected, Response::PostgresConnected { .. }),
+            "the gateway verb is permitted, so the connect must succeed: {connected:?}"
+        );
+
+        // The allowed half. If this fails, the gate is not selective, it is
+        // just broken, and the denial below would prove nothing.
+        let read = handle(
+            &mut state,
+            &peer,
+            Request::PostgresQuery {
+                session,
+                sql: "select 1".into(),
+            },
+        );
+        match &read {
+            Response::PostgresResult { rows, row_count } => {
+                assert_eq!(*row_count, 1, "select 1 returns one row: {read:?}");
+                assert_eq!(rows, &vec![render_row(&["1".to_string()])]);
+            }
+            other => panic!("a policy-allowed read was refused: {other:?}"),
+        }
+
+        // The denied half. This is the scenario: the policy does not mention
+        // create_table, so the table is never created.
+        let table = format!("m6_r5_denied_{}", unique_suffix());
+        let create = handle(
+            &mut state,
+            &peer,
+            Request::PostgresQuery {
+                session,
+                sql: format!("create table {table} (id int)"),
+            },
+        );
+        assert!(
+            matches!(
+                create,
+                Response::Error {
+                    code: ErrorCode::Denied,
+                    ..
+                }
+            ),
+            "a policy that does not permit create_table must deny it, got {create:?}"
+        );
+
+        // And the server must agree, rather than the broker merely reporting
+        // a denial it invented. Asking through the allowed verb is the only
+        // way left to ask.
+        let probe = handle(
+            &mut state,
+            &peer,
+            Request::PostgresQuery {
+                session,
+                sql: format!(
+                    "select count(*) from information_schema.tables where table_name = '{table}'"
+                ),
+            },
+        );
+        let count = match &probe {
+            Response::PostgresResult { rows, .. } => rows.first().cloned().unwrap_or_default(),
+            other => panic!("the probe must be a permitted read: {other:?}"),
+        };
+        assert_eq!(
+            count, "0",
+            "the table must not exist on the server; a denial that still created it would be a lie"
+        );
+    }
+);
+
+// The fail-closed half, end to end. `GRANT` is a statement the classifier does
+// not place, so it is denied before the policy is consulted at all. This is the
+// property that makes the classifier safe to be a recogniser rather than a
+// parser: what it cannot understand, it does not run.
+with_substrate!(
+    policy_denies_a_statement_the_classifier_cannot_place,
+    |substrate: Substrate| {
+        let (mut state, peer, session, _dir) = brokered(&substrate);
+        // A policy that permits everything the classifier *can* place, so the
+        // only thing that can refuse `grant` is the classifier itself.
+        state.policy = asv_policy::PolicyEngine::from_policy_text(
+            r#"
+            permit (principal, action == Action::"postgres_connect", resource is Database);
+            permit (principal, action == Action::"postgres_read", resource is Database);
+            permit (principal, action == Action::"postgres_insert", resource is Database);
+            permit (principal, action == Action::"postgres_create_table", resource is Database);
+            permit (principal, action == Action::"postgres_drop_table", resource is Database);
+            permit (principal, action == Action::"postgres_alter_table", resource is Database);
+            "#,
+        )
+        .expect("the permissive policy parses");
+        assert!(
+            matches!(
+                handle(
+                    &mut state,
+                    &peer,
+                    Request::PostgresConnect {
+                        session,
+                        host: substrate.name.clone(),
+                        host_addr: substrate.address.to_string(),
+                        port: substrate.port,
+                        database: substrate.database.clone(),
+                        role: substrate.role.clone(),
+                    },
+                ),
+                Response::PostgresConnected { .. }
+            ),
+            "connect first, so the statement below has a live session to be denied on"
+        );
+
+        for sql in [
+            "grant all on everything to public",
+            "copy (select 1) to program 'id'",
+            "vacuum",
+        ] {
+            let response = handle(
+                &mut state,
+                &peer,
+                Request::PostgresQuery {
+                    session,
+                    sql: sql.to_string(),
+                },
+            );
+            assert!(
+                matches!(
+                    response,
+                    Response::Error {
+                        code: ErrorCode::Denied,
+                        ..
+                    }
+                ),
+                "an unclassified statement must be denied, and `{sql}` is one. Got {response:?}"
+            );
+        }
+    }
+);
+
+// The second M6-R5 scenario: changing the policy needs no connector change.
+// The same running session, the same statement, one new policy decision.
+with_substrate!(
+    a_policy_change_applies_without_a_connector_change,
+    |substrate: Substrate| {
+        let (mut state, peer, session, _dir) = brokered(&substrate);
+        state.policy = asv_policy::PolicyEngine::from_policy_text(
+            r#"
+            permit (principal, action == Action::"postgres_connect", resource is Database);
+            permit (principal, action == Action::"postgres_read", resource is Database);
+            permit (principal, action == Action::"postgres_create_table", resource is Database);
+            "#,
+        )
+        .expect("the permitting policy parses");
+        assert!(
+            matches!(
+                handle(
+                    &mut state,
+                    &peer,
+                    Request::PostgresConnect {
+                        session,
+                        host: substrate.name.clone(),
+                        host_addr: substrate.address.to_string(),
+                        port: substrate.port,
+                        database: substrate.database.clone(),
+                        role: substrate.role.clone(),
+                    },
+                ),
+                Response::PostgresConnected { .. }
+            ),
+            "connect first"
+        );
+
+        let table = format!("m6_r5_then_{}", unique_suffix());
+        // Permitted by the first policy.
+        assert!(
+            matches!(
+                handle(
+                    &mut state,
+                    &peer,
+                    Request::PostgresQuery {
+                        session,
+                        sql: format!("create table {table} (id int)"),
+                    },
+                ),
+                Response::PostgresResult { .. }
+            ),
+            "the first policy permits create_table"
+        );
+
+        // The policy now forbids it. Nothing about the connector, the
+        // session, or the socket changes; only the policy text does.
+        state.policy = asv_policy::PolicyEngine::from_policy_text(
+            r#"
+            permit (principal, action == Action::"postgres_connect", resource is Database);
+            permit (principal, action == Action::"postgres_read", resource is Database);
+            "#,
+        )
+        .expect("the tightened policy parses");
+
+        let second = format!("{table}_two");
+        assert!(
+            matches!(
+                handle(
+                    &mut state,
+                    &peer,
+                    Request::PostgresQuery {
+                        session,
+                        sql: format!("create table {second} (id int)"),
+                    },
+                ),
+                Response::Error {
+                    code: ErrorCode::Denied,
+                    ..
+                }
+            ),
+            "the tightened policy must deny create_table with no code change"
+        );
+        // And the read the tightened policy still permits keeps working, so
+        // the gate is selective rather than closed.
+        assert!(
+            matches!(
+                handle(
+                    &mut state,
+                    &peer,
+                    Request::PostgresQuery {
+                        session,
+                        sql: "select 1".into(),
+                    },
+                ),
+                Response::PostgresResult { .. }
+            ),
+            "a permitted read still runs after the policy tightened"
+        );
+    }
+);

@@ -7,10 +7,10 @@
 
 use asv_connector_http::{validate_repo, AddressPolicy, GithubClient, GithubError, SecretPort};
 use asv_connector_pg::{LiveConnectorConfig, PgError, PostgresClient, TlsRoots};
-use asv_domain::{AgentSessionId, Authority, CredentialId, CredentialMetadata};
+use asv_domain::{AgentSessionId, Authority, CredentialId, CredentialMetadata, Decision, Resource};
 use asv_identity::WorkloadIdentity;
 use asv_ipc_protocol::{AuditEventDto, ErrorCode, Request, Response, PROTOCOL_VERSION};
-use asv_policy::{AuthorizationRequest, PolicyEngine};
+use asv_policy::{AuthorizationRequest, PolicyContext, PolicyEngine};
 // The row renderer is imported from the session module rather than redefined so
 // the wire separator is defined in exactly one place and a client-side renderer
 // cannot drift from it.
@@ -23,6 +23,7 @@ pub mod audit;
 pub mod harden;
 pub mod isolated_exec;
 pub mod oauth2;
+pub mod pg_policy;
 pub mod pg_session;
 pub mod recovery;
 pub mod surrogate;
@@ -737,7 +738,13 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             if let Err(denial) = state.authorize_postgres(session, peer) {
                 return *denial;
             }
-            state.postgres_query(session, &sql)
+            // M6-R5: the statement's action is decided before the statement
+            // reaches the socket, not after. A gate that runs once the server
+            // has already executed is not a gate.
+            match state.authorize_postgres_statement(session, peer, &sql) {
+                Ok(()) => state.postgres_query(session, &sql),
+                Err(denial) => *denial,
+            }
         }
         Request::PostgresRevoke { session } => {
             // Revoke of a session that was never opened is a no-op, not an
@@ -915,6 +922,96 @@ impl BrokerState {
                 role,
             },
             Err(error) => pg_failure(error),
+        }
+    }
+
+    /// Decides one SQL statement against the policy, before it is sent.
+    ///
+    /// M6-R5 requires a Cedar policy to authorise or deny PostgreSQL actions
+    /// without a connector change, and to keep doing so after the policy
+    /// changes. Both need this to exist: the policy vocabulary has the five
+    /// database verbs, and nothing consulted them. Without this call the verbs
+    /// were decoration, and the scenario "a policy allowing `connect` but not
+    /// `create_table`" was satisfied by no test and by no code.
+    ///
+    /// The order is deliberate. Ownership and the vault come first, in
+    /// [`Self::authorize_postgres`], because a peer that does not own the
+    /// session must not learn anything about the policy. Then the statement
+    /// is classified, and a statement that cannot be placed is denied without
+    /// consulting the policy at all: there is no action to evaluate, so there
+    /// is no decision to report.
+    ///
+    /// The refusal for an unplaceable statement is [`ErrorCode::Denied`],
+    /// not `InvalidRequest`. The request was well-formed; what is missing is
+    /// the authority to run it, and reporting it as a bad request would tell
+    /// the agent to rephrase a statement that no phrasing can be allowed.
+    fn authorize_postgres_statement(
+        &self,
+        session: AgentSessionId,
+        peer: &WorkloadIdentity,
+        sql: &str,
+    ) -> Result<(), Box<Response>> {
+        let Some(action) = pg_policy::classify(sql).action() else {
+            return Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: format!(
+                    "this statement is not one the broker will classify, so it is denied: {sql}"
+                ),
+            }));
+        };
+        let workspace = self
+            .sessions
+            .workspace_of(session)
+            .unwrap_or_default()
+            .to_string();
+        let request = AuthorizationRequest {
+            session,
+            action: action.as_policy_action(),
+            resource: self.database_resource(session, peer),
+            context: PolicyContext {
+                workspace,
+                protected_ref: None,
+                request_digest: None,
+                peer_uid: peer.credentials.uid,
+            },
+        };
+        match self.policy.authorize(&request, None, None).decision {
+            Decision::Allow => Ok(()),
+            Decision::Deny { reason } => Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                // The reason is Cedar's, not the broker's. Rewriting it would
+                // hide which policy clause fired, and a policy author
+                // debugging a denial needs exactly that.
+                message: format!("policy denied {}: {reason}", action.as_policy_str()),
+            })),
+            Decision::RequireApproval { approval } => Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: format!(
+                    "policy requires approval {approval} for {}",
+                    action.as_policy_str()
+                ),
+            })),
+        }
+    }
+
+    /// The `(database, role)` this session is connected to, as a policy
+    /// resource.
+    ///
+    /// `None` when the session has no recorded connection, which is the
+    /// state a `PostgresQuery` on a closed session finds. Cedar then sees a
+    /// resource no policy matches, and a default-deny policy denies it, so an
+    /// unknown session is refused by the policy rather than by a special
+    /// case here.
+    fn database_resource(&self, session: AgentSessionId, _peer: &WorkloadIdentity) -> Resource {
+        match self.postgres.connected(session) {
+            Some((database, role)) => Resource::Database {
+                name: database,
+                role,
+            },
+            None => Resource::Database {
+                name: String::new(),
+                role: String::new(),
+            },
         }
     }
 

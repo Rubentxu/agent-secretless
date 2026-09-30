@@ -102,6 +102,17 @@ enum Command {
 #[derive(Default)]
 pub struct PgSessionMap {
     sessions: Mutex<HashMap<AgentSessionId, mpsc::Sender<Command>>>,
+    /// The `(database, role)` each open session is connected to.
+    ///
+    /// A separate map rather than a field on the sender, because the policy
+    /// gate needs to name the resource a statement acts on and the sender is
+    /// not a place to hang metadata. It is written in the same critical
+    /// section as the sender, so a session is never visible as connected
+    /// before its socket is, or after its socket is gone.
+    ///
+    /// Nothing secret is here: a database name and a role name are identifiers
+    /// the agent already sent and already sees in the connect reply.
+    connected: Mutex<HashMap<AgentSessionId, (String, String)>>,
 }
 
 use tokio::sync::mpsc;
@@ -128,10 +139,30 @@ impl PgSessionMap {
     /// observe from `Terminate`; the only difference is whether the broker
     /// waited to see it.
     pub fn forget(&self, session: AgentSessionId) -> bool {
-        self.sessions
+        let removed = self
+            .sessions
             .lock()
             .map(|mut s| s.remove(&session).is_some())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if removed {
+            if let Ok(mut connected) = self.connected.lock() {
+                connected.remove(&session);
+            }
+        }
+        removed
+    }
+
+    /// The `(database, role)` this session is connected to.
+    ///
+    /// Read by the policy gate to build the `Resource` a statement acts on.
+    /// `None` for a session that was never connected, was revoked, or was
+    /// forgotten, which is the state that must not be authorisable: a policy
+    /// that matched on an empty resource would be matching on nothing.
+    pub fn connected(&self, session: AgentSessionId) -> Option<(String, String)> {
+        self.connected
+            .lock()
+            .ok()
+            .and_then(|connected| connected.get(&session).cloned())
     }
 
     /// Runs `sql` on `session`, if it is open.
@@ -190,11 +221,18 @@ impl PgSessionMap {
     /// is exactly the shape that lets two callers both believe they own the
     /// session. One acquisition, one owner.
     fn take(&self, session: AgentSessionId) -> Result<mpsc::Sender<Command>, PgSessionError> {
-        self.sessions
+        let sender = self
+            .sessions
             .lock()
             .map_err(|_| poisoned())?
             .remove(&session)
-            .ok_or(PgSessionError::NoSuchSession)
+            .ok_or(PgSessionError::NoSuchSession)?;
+        // The connection record goes with the sender, so a session is never
+        // authorisable as connected once its socket is gone.
+        if let Ok(mut connected) = self.connected.lock() {
+            connected.remove(&session);
+        }
+        Ok(sender)
     }
 }
 
@@ -278,9 +316,16 @@ impl PgSessionMap {
         // The socket is opened *here*, after the caller has authorised the
         // session and the pair. A refused request never gets this far, so it
         // never reaches a server.
-        let connected = connect_with_password(config, password).await?;
+        let connected_socket = connect_with_password(config, password).await?;
         let (tx, rx) = mpsc::channel(8);
-        runtime.0.spawn(drive(connected, rx));
+        runtime.0.spawn(drive(connected_socket, rx));
+        // The record goes in before the sender, so a policy gate that can see
+        // the session can also see what it is connected to. The reverse order
+        // would open a window where a statement is authorisable against an
+        // empty resource.
+        if let Ok(mut connected) = self.connected.lock() {
+            connected.insert(session, (config.database.clone(), config.role.clone()));
+        }
         self.sessions
             .lock()
             .map_err(|_| poisoned())?
