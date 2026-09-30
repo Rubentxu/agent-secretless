@@ -585,6 +585,114 @@ with_substrate!(
     }
 );
 
+// The M6-R5 scenario, played by the two statements that defeat it. The policy
+// below is the read-only one the milestone names: it permits connect and read,
+// and says nothing about create_table. A classifier that reads only the leading
+// keyword calls `select ... into` a read and `explain analyze delete` a read, so
+// both run, and the denial the operator wrote is the one the agent walks past.
+with_substrate!(
+    a_write_disguised_as_a_read_is_denied_by_a_read_only_policy,
+    |substrate: Substrate| {
+        let (mut state, peer, session, _dir) = brokered(&substrate);
+        state.policy = asv_policy::PolicyEngine::from_policy_text(
+            r#"
+            permit (principal, action == Action::"postgres_connect", resource is Database);
+            permit (principal, action == Action::"postgres_read", resource is Database);
+            "#,
+        )
+        .expect("the read-only policy parses and validates against the schema");
+
+        assert!(
+            matches!(
+                handle(
+                    &mut state,
+                    &peer,
+                    Request::PostgresConnect {
+                        session,
+                        host: substrate.name.clone(),
+                        host_addr: substrate.address.to_string(),
+                        port: substrate.port,
+                        database: substrate.database.clone(),
+                        role: substrate.role.clone(),
+                    },
+                ),
+                Response::PostgresConnected { .. }
+            ),
+            "connect first, so each statement below has a live session to be denied on"
+        );
+
+        // The allowed half, again. If this fails the gate is not selective but
+        // broken, and the denials below would prove nothing.
+        assert!(
+            matches!(
+                handle(
+                    &mut state,
+                    &peer,
+                    Request::PostgresQuery {
+                        session,
+                        sql: "select 1".into(),
+                    },
+                ),
+                Response::PostgresResult { .. }
+            ),
+            "a policy-allowed read must still succeed"
+        );
+
+        // One prefix, used by the statements and by the probe below, so the
+        // probe searches for a name something actually tried to create.
+        let prefix = format!("m6_r5_disguised_{}_", unique_suffix());
+        for sql in [
+            format!("select 1 into {prefix}a"),
+            // `EXPLAIN ANALYZE` executes what it plans, so the wrapper is a
+            // write even though its first word is not one.
+            format!("explain analyze create table {prefix}b (id int)"),
+        ] {
+            let response = handle(
+                &mut state,
+                &peer,
+                Request::PostgresQuery {
+                    session,
+                    sql: sql.clone(),
+                },
+            );
+            assert!(
+                matches!(
+                    response,
+                    Response::Error {
+                        code: ErrorCode::Denied,
+                        ..
+                    }
+                ),
+                "a write that opens with a read keyword must be denied by a \
+                 read-only policy. `{sql}` is one. Got {response:?}"
+            );
+        }
+
+        // The server must agree. A denial that still created the table would be
+        // a lie, and asking through the permitted verb is the only way left to
+        // ask.
+        let probe = handle(
+            &mut state,
+            &peer,
+            Request::PostgresQuery {
+                session,
+                sql: format!(
+                    "select count(*) from information_schema.tables where table_name like '{prefix}%'"
+                ),
+            },
+        );
+        let count = match &probe {
+            Response::PostgresResult { rows, .. } => rows.first().cloned().unwrap_or_default(),
+            other => panic!("the probe must be a permitted read: {other:?}"),
+        };
+        assert_eq!(
+            count, "0",
+            "neither statement may have reached the server; a denial that still \
+             created the table would be a lie"
+        );
+    }
+);
+
 // The second M6-R5 scenario: changing the policy needs no connector change.
 // The same running session, the same statement, one new policy decision.
 with_substrate!(

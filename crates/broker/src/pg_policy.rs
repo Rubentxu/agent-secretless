@@ -22,6 +22,22 @@
 //! the leading token, skips leading comments and whitespace, and refuses
 //! anything it cannot place.
 //!
+//! # A write is never identified by its first word alone
+//!
+//! Three statement forms change state while opening with a word that also
+//! opens a read, and each was a live authorization bypass until this module
+//! learned it:
+//!
+//! - `SELECT ... INTO newtable` is `CREATE TABLE AS`.
+//! - `EXPLAIN ANALYZE <write>` executes the write it plans.
+//! - `WITH ... INSERT` is a data-modifying CTE.
+//!
+//! What all three defeat is the same policy: the read-only one M6-R5 writes. So
+//! the invariant this module exists to hold is narrow and absolute — **a
+//! statement that changes state is never classified as a read.** A classifier
+//! that cannot honour that is not a useful gate, because the denial it exists
+//! to express is the one an agent walks straight through.
+//!
 //! This is a deliberate limitation with a known failure mode: a statement
 //! this module refuses but a database would have accepted is denied rather
 //! than executed. That is the correct direction for a gate. The alternative
@@ -111,16 +127,58 @@ impl DbAction {
 /// in the broker suite is the end-to-end proof that the refusal is enforced
 /// rather than merely returned.
 pub fn classify(sql: &str) -> Classified {
+    classify_at(sql, 0)
+}
+
+/// How deep `EXPLAIN` nesting is followed before a statement is refused.
+///
+/// `EXPLAIN` is the only recognised verb that can contain another statement,
+/// so it is the only source of recursion. The cap is not about a real nesting
+/// depth PostgreSQL supports — it supports one — it is about a hostile string
+/// like `explain explain explain ...` repeating to the 64 KiB protocol limit,
+/// which would otherwise recurse thousands of levels deep. Refusing is the
+/// answer a gate gives to a statement no database would run.
+const MAX_EXPLAIN_DEPTH: u32 = 4;
+
+/// [`classify`], carrying the `EXPLAIN` nesting depth.
+fn classify_at(sql: &str, depth: u32) -> Classified {
     let Some(leading) = leading_token(sql) else {
         return Classified::RefuseEmpty;
     };
     let upper = leading.to_ascii_uppercase();
     let body = sql.to_ascii_uppercase();
 
+    // `EXPLAIN ANALYZE <write>` runs the write. Treating the wrapper as a
+    // read because the first word is `EXPLAIN` is the same bug as `SELECT
+    // INTO`: the policy is asked about a read and the database changes state.
+    // The payload is classified instead, so a read stays a read and a write
+    // carries the weight of what it actually does.
+    if upper == "EXPLAIN" {
+        if depth >= MAX_EXPLAIN_DEPTH {
+            return Classified::RefuseUnknown {
+                leading: "EXPLAIN".into(),
+            };
+        }
+        let Some(payload) = explain_payload(sql) else {
+            return Classified::RefuseUnknown {
+                leading: "EXPLAIN".into(),
+            };
+        };
+        return classify_at(&payload, depth + 1);
+    }
+
     let action = match upper.as_str() {
-        // A read is a read. `SELECT` and the statement forms that return
-        // rows without changing state.
-        "SELECT" | "TABLE" | "VALUES" | "SHOW" | "EXPLAIN" | "WITH" => DbAction::Read,
+        // A read is a read, except when it is not. `SELECT ... INTO newtable`
+        // is `CREATE TABLE AS`: it returns rows *and* creates a table, so it
+        // carries the create-table weight even though it is a `SELECT`.
+        "SELECT" => {
+            if has_select_into(&body) {
+                DbAction::CreateTable
+            } else {
+                DbAction::Read
+            }
+        }
+        "TABLE" | "VALUES" | "SHOW" | "WITH" => DbAction::Read,
         // `WITH ... INSERT` is an insert. The classifier reads the leading
         // keyword, so a CTE would otherwise be mistaken for a read and a
         // data-modifying CTE would slip through as one. When the statement
@@ -186,6 +244,16 @@ pub fn classify(sql: &str) -> Classified {
 /// Returns `None` when the statement holds nothing but whitespace and
 /// comments, which is the case that becomes [`Classified::RefuseEmpty`].
 fn leading_token(sql: &str) -> Option<String> {
+    let (start, end) = leading_token_span(sql)?;
+    Some(sql[start..end].to_string())
+}
+
+/// The byte span of the first SQL token, as `(start, end)`.
+///
+/// Shared with [`explain_payload`], which needs the position just past the
+/// token rather than its text. Both offsets come from one scan so the two
+/// callers cannot disagree about where the token is.
+fn leading_token_span(sql: &str) -> Option<(usize, usize)> {
     let bytes = sql.as_bytes();
     let mut index = 0usize;
     loop {
@@ -214,7 +282,7 @@ fn leading_token(sql: &str) -> Option<String> {
     while index < bytes.len() && !bytes[index].is_ascii_whitespace() && bytes[index] != b';' {
         index += 1;
     }
-    Some(sql[start..index].to_string())
+    Some((start, index))
 }
 
 /// Whether the statement mentions `TABLE` as a word.
@@ -251,6 +319,134 @@ fn mentions_data_modifying_cte(body: &str) -> bool {
             at > 0 && matches!(body.as_bytes()[at - 1], b' ' | b'\t' | b'\n' | b'\r' | b'(')
         })
     })
+}
+
+/// Whether a `SELECT` carries an `INTO` that creates a table.
+///
+/// `SELECT ... INTO newtable FROM t` is `CREATE TABLE AS` with a different
+/// spelling. A gate that reads only the leading keyword calls it a read, and a
+/// policy written "read only" then authorises a table creation — which is the
+/// exact denial M6-R5 exists to produce.
+///
+/// The false-positive direction still matters, so this is not a substring
+/// search. Two things would make a bare `body.contains(" INTO ")` wrong:
+///
+/// - a literal: `SELECT 'into' AS note FROM t` is a read, and the needle
+///   matches inside the quotes;
+/// - a longer identifier: a column named `into_table` is not the keyword.
+///
+/// So the text outside single-quoted literals is scanned, and the match must
+/// sit on a token boundary. Anything else — `SELECT INTO FROM t`, where `INTO`
+/// is a column name — stays a read, which is correct: PostgreSQL reads that as
+/// selecting a column.
+fn has_select_into(body: &str) -> bool {
+    let stripped = strip_single_quoted(body);
+    stripped.match_indices("INTO").any(|(at, _)| {
+        let bytes = stripped.as_bytes();
+        let before_ok =
+            at > 0 && matches!(bytes[at - 1], b' ' | b'\t' | b'\n' | b'\r' | b'(' | b',');
+        let after = at + "INTO".len();
+        let after_ok =
+            after >= bytes.len() || !bytes[after].is_ascii_alphanumeric() && bytes[after] != b'_';
+        before_ok && after_ok
+    })
+}
+
+/// `text` with the contents of every single-quoted literal removed.
+///
+/// Doubled quotes (`'it''s'`) are the escape SQL uses, so a literal ends at
+/// the first quote that is not itself doubled. Backslash escapes are not
+/// handled, which is safe here for the same reason the rest of this module is
+/// a recogniser and not a parser: an unterminated literal blanks the remainder
+/// of the statement, which can only cost an `INTO` that was never a keyword.
+fn strip_single_quoted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_literal = false;
+    while let Some(c) = chars.next() {
+        if !in_literal {
+            if c == '\'' {
+                in_literal = true;
+                out.push(' ');
+            } else {
+                out.push(c);
+            }
+        } else if c == '\'' {
+            // A doubled quote is a literal quote; a single one closes it.
+            if chars.peek() == Some(&'\'') {
+                chars.next();
+            } else {
+                in_literal = false;
+                out.push(' ');
+            }
+        } else {
+            out.push(' ');
+        }
+    }
+    out
+}
+
+/// The statement an `EXPLAIN` wraps, or `None` when there is none.
+///
+/// `EXPLAIN` takes options before its payload (`ANALYZE`, `VERBOSE`, `COSTS`,
+/// …) either bare or in a parenthesised list, and the payload is what actually
+/// determines the action. Everything up to the payload is skipped, and a
+/// statement that is only options is refused rather than called a read: it
+/// names no work, and the gate has no action to evaluate.
+fn explain_payload(sql: &str) -> Option<String> {
+    // Skip whatever precedes the leading `EXPLAIN` — whitespace and comments —
+    // and the word itself, so the scan starts on the options.
+    let (_, after_word) = leading_token_span(sql)?;
+    let mut rest = &sql[after_word..];
+
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        if rest.is_empty() {
+            return None;
+        }
+        // A parenthesised option list: `EXPLAIN (ANALYZE, VERBOSE) SELECT`.
+        if rest.starts_with('(') {
+            let end = rest.find(')')?;
+            rest = &rest[end + 1..];
+            continue;
+        }
+        // A bare option word. `ANALYZE` is the one that executes the payload,
+        // and the rest are plan-shaping only, so they are all skipped together.
+        let word_end = rest
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
+        let word = &rest[..word_end];
+        if word.is_empty() {
+            return None;
+        }
+        if is_explain_option(&word.to_ascii_uppercase()) {
+            rest = &rest[word_end..];
+            continue;
+        }
+        return Some(rest.to_string());
+    }
+}
+
+/// Whether `word` is an `EXPLAIN` option rather than the start of a statement.
+///
+/// The list is the documented option set. A word that is not on it is treated
+/// as the beginning of the payload, which means an option this build has
+/// never heard of ends the scan and gets classified — and an unknown statement
+/// is refused, so a future option fails closed instead of open.
+fn is_explain_option(word: &str) -> bool {
+    matches!(
+        word,
+        "ANALYZE"
+            | "ANALYSE"
+            | "VERBOSE"
+            | "COSTS"
+            | "BUFFERS"
+            | "TIMING"
+            | "SUMMARY"
+            | "SETTINGS"
+            | "WAL"
+            | "GENERIC_PLAN"
+    )
 }
 
 #[cfg(test)]
@@ -385,6 +581,135 @@ mod tests {
                 "{sql} must not be allowed through, got {classified:?}"
             );
         }
+    }
+
+    #[test]
+    fn select_into_creates_a_table_and_is_not_a_read() {
+        // The bypass this pins down. `SELECT ... INTO newtable` is
+        // PostgreSQL's `CREATE TABLE AS`: it creates a table and returns rows.
+        // The module doc names `INTO` as one of the two words that decide the
+        // verbs where the distinction matters, and the implementation read
+        // only `TABLE`, so a read-only policy was asked about a read, said yes,
+        // and the statement created a table anyway.
+        for sql in [
+            "select * into evil from t",
+            "select 1 into evil",
+            "select a, b into evil from t where a > 0",
+            "select * into temp evil from t",
+        ] {
+            assert_eq!(
+                action_of(sql),
+                Some(DbAction::CreateTable),
+                "{sql} creates a table and must not classify as a read"
+            );
+        }
+    }
+
+    #[test]
+    fn a_select_that_merely_says_into_in_a_literal_is_still_a_read() {
+        // The other direction. `INTO` is a keyword, not a substring: a read
+        // whose projection happens to contain the word is still a read, and
+        // refusing it would cost a legitimate statement for nothing.
+        assert_eq!(
+            action_of("select 'into' as note from t"),
+            Some(DbAction::Read)
+        );
+        assert_eq!(
+            action_of("select 'x into y' as note from t"),
+            Some(DbAction::Read)
+        );
+        // A doubled quote is an escaped quote, so the literal continues and
+        // the `into` after it is still inside the string.
+        assert_eq!(
+            action_of("select 'it''s into t' as note from t"),
+            Some(DbAction::Read)
+        );
+        // A column whose name merely starts with the keyword.
+        assert_eq!(action_of("select into_table from t"), Some(DbAction::Read));
+        // `SELECT INTO FROM t` is a degenerate input whose reading depends on
+        // how the server resolves a bare `INTO`. This module does not claim to
+        // settle that, and it does not have to: the choice between the two
+        // readings is settled by the direction of the error. Calling it a
+        // create costs one odd statement; calling it a read would let a
+        // read-only policy through a form that may well create a table.
+        assert_eq!(
+            action_of("select into from t"),
+            Some(DbAction::CreateTable),
+            "an ambiguous bare INTO must take the conservative side"
+        );
+    }
+
+    #[test]
+    fn explain_analyze_runs_the_write_it_plans() {
+        // The second vector. `EXPLAIN ANALYZE` executes the statement it
+        // explains, so calling the wrapper a read because the first word is
+        // `EXPLAIN` hands a read-only policy the authority to write.
+        for sql in [
+            "explain analyze insert into t values (1)",
+            "explain analyze delete from t",
+            "explain analyze update t set a = 1",
+            "explain (analyze) delete from t",
+        ] {
+            assert_eq!(
+                action_of(sql),
+                Some(DbAction::Insert),
+                "{sql} writes and must not classify as a read"
+            );
+        }
+        // The DDL verbs keep their own weight through the wrapper too.
+        assert_eq!(
+            action_of("explain (analyze, verbose) drop table t"),
+            Some(DbAction::DropTable)
+        );
+        assert_eq!(
+            action_of("explain analyze create table t (id int)"),
+            Some(DbAction::CreateTable)
+        );
+        assert_eq!(
+            action_of("explain select * into evil from t"),
+            Some(DbAction::CreateTable)
+        );
+        // A plan-only `EXPLAIN` of a read is still a read, and the plan-only
+        // form of a write is still the write: the gate should not depend on
+        // whether the agent asked for a plan or for the run.
+        assert_eq!(action_of("explain select 1"), Some(DbAction::Read));
+        assert_eq!(action_of("explain delete from t"), Some(DbAction::Insert));
+        assert_eq!(action_of("explain analyze select 1"), Some(DbAction::Read));
+        assert_eq!(
+            action_of("explain analyze create table t (id int)"),
+            Some(DbAction::CreateTable)
+        );
+    }
+
+    #[test]
+    fn an_explain_with_nothing_to_explain_is_refused() {
+        // No payload means no action to evaluate, so there is no decision to
+        // report. Guessing "read" here would let a malformed statement past a
+        // gate that has nothing to base a decision on.
+        for sql in [
+            "explain",
+            "explain analyze",
+            "explain (analyze)",
+            "explain ()",
+        ] {
+            assert!(
+                !classify(sql).is_allowed_shape(),
+                "{sql} names no statement and must not be allowed, got {:?}",
+                classify(sql)
+            );
+        }
+    }
+
+    #[test]
+    fn explain_nesting_is_bounded_rather_than_recursing_to_the_message_limit() {
+        // A hostile string repeats `explain` to the 64 KiB protocol limit.
+        // Unbounded recursion would exhaust the stack, so the depth is capped
+        // and the statement is refused. No database would run it either.
+        let nested = "explain analyze ".repeat(64) + "select 1";
+        assert!(
+            !classify(&nested).is_allowed_shape(),
+            "a pathological nesting must be refused, not recursed"
+        );
     }
 
     #[test]
