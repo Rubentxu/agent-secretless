@@ -20,10 +20,47 @@ use asv_broker::isolated_exec::{
     EgressPolicy, LandlockProfile, Redactor, SeccompProfile, SecretInjectionPlan, WorkerRegistry,
     WorkerTemplate,
 };
-use asv_broker::worker::{spawn, SpawnError, SpawnOptions};
+use asv_broker::worker::{spawn, SecretProvider, SpawnError, SpawnOptions};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 // ----- helpers -----------------------------------------------------------
+
+/// The budget a test gives a worker it expects to COMPLETE.
+///
+/// This is deliberately not the production default. `DEFAULT_WORKER_TIMEOUT`
+/// (10s) is the lifetime cap of a real worker — spec §7 "short lifetime" —
+/// and it is the right number for `uat_040_runaway_worker_is_killed_at_timeout`,
+/// whose subject IS that cap. But a test that asserts "the worker ran and
+/// produced this output" is not testing the lifetime cap; it is a bystander
+/// to it. Under a full parallel `cargo test --workspace`, interpreter
+/// startup (`python3`, `sh`) competes with dozens of binaries forking and
+/// exec-ing at once, and the observed failure ran exactly that arithmetic:
+/// the failing binary finished in 11.02s — 10s budget + 1s TERM grace — on
+/// the one test that spawns the heaviest child.
+///
+/// A completion test that dies at the production budget reports a timeout
+/// where the property under test never got a chance to run. 60s keeps the
+/// assertion honest (a hung worker still fails, just later) and takes the
+/// CI scheduler out of the result. The runaway test keeps its own short
+/// timeout on purpose: there the budget is the thing being measured.
+const COMPLETION_BUDGET: Duration = Duration::from_secs(60);
+
+/// Spawn options for a worker the test expects to complete normally.
+fn completion_opts() -> SpawnOptions {
+    SpawnOptions {
+        secret: None,
+        timeout: Some(COMPLETION_BUDGET),
+    }
+}
+
+/// The two-site form for completion tests that also inject a secret.
+fn completion_opts_with_secret(secret: SecretProvider) -> SpawnOptions {
+    SpawnOptions {
+        secret: Some(secret),
+        timeout: Some(COMPLETION_BUDGET),
+    }
+}
 
 fn userns_available() -> bool {
     // The same kernel feature the runtime hook needs. Probe it the way
@@ -109,7 +146,7 @@ fn uat_040_deny_worker_sees_only_loopback_and_cannot_reach_out() {
     );
     let r = WorkerRegistry::new(vec![t]);
     let mut audit = AuditLog::new(16);
-    let run = spawn(&r, "net-probe", SpawnOptions::default(), &mut audit).expect("run");
+    let run = spawn(&r, "net-probe", completion_opts(), &mut audit).expect("run");
     let out = String::from_utf8_lossy(&run.stdout_redacted);
     assert_eq!(run.exit_code, Some(0));
     // In the fresh netns the only interface is the downed lo.
@@ -219,10 +256,7 @@ fn uat_040_env_injection_reaches_child_only() {
     let run = spawn(
         &r,
         "env-worker",
-        SpawnOptions {
-            secret: Some(Box::new(|| b"sekrit".to_vec())),
-            timeout: None,
-        },
+        completion_opts_with_secret(Box::new(|| b"sekrit".to_vec())),
         &mut audit,
     )
     .expect("run");
@@ -272,10 +306,7 @@ fn uat_040_file_injection_is_0600_and_cleaned_up() {
     let run = spawn(
         &r,
         "file-worker",
-        SpawnOptions {
-            secret: Some(Box::new(|| b"file-secret".to_vec())),
-            timeout: None,
-        },
+        completion_opts_with_secret(Box::new(|| b"file-secret".to_vec())),
         &mut audit,
     )
     .expect("run");
@@ -319,7 +350,7 @@ fn uat_040_landlock_profile_denies_unlisted_paths() {
     };
     let r = WorkerRegistry::new(vec![t]);
     let mut audit = AuditLog::new(16);
-    let run = spawn(&r, "ll-worker", SpawnOptions::default(), &mut audit).expect("run");
+    let run = spawn(&r, "ll-worker", completion_opts(), &mut audit).expect("run");
     let out = String::from_utf8_lossy(&run.stdout_redacted);
     let err = String::from_utf8_lossy(&run.stderr_redacted);
     assert_eq!(run.exit_code, Some(0), "{out} | stderr: {err}");
@@ -359,7 +390,7 @@ fn uat_040_read_allow_does_not_grant_execute() {
     };
     let r = WorkerRegistry::new(vec![t]);
     let mut audit = AuditLog::new(16);
-    let run = spawn(&r, "read-only-worker", SpawnOptions::default(), &mut audit)
+    let run = spawn(&r, "read-only-worker", completion_opts(), &mut audit)
         .expect("run under read-only profile");
     let out = String::from_utf8_lossy(&run.stdout_redacted);
     assert_eq!(run.exit_code, Some(0), "{out}");
@@ -394,7 +425,7 @@ fn uat_040_large_stdout_and_stderr_are_drained_concurrently() {
     );
     let r = WorkerRegistry::new(vec![t]);
     let mut audit = AuditLog::new(16);
-    let run = spawn(&r, "chatty-worker", SpawnOptions::default(), &mut audit)
+    let run = spawn(&r, "chatty-worker", completion_opts(), &mut audit)
         .expect("large output must not deadlock");
     assert_eq!(run.exit_code, Some(0));
     assert_eq!(run.stdout_redacted.len(), 131072);
@@ -428,7 +459,7 @@ fn uat_040_seccomp_bite_kills_worker_calling_bpf() {
     );
     let r = WorkerRegistry::new(vec![t]);
     let mut audit = AuditLog::new(16);
-    let run = spawn(&r, "bite-worker", SpawnOptions::default(), &mut audit).expect("run");
+    let run = spawn(&r, "bite-worker", completion_opts(), &mut audit).expect("run");
     // The worker main thread must die from SIGSYS before bpf(2) returns.
     assert_eq!(
         run.outcome,
@@ -498,10 +529,7 @@ fn uat_040_secret_in_stdout_is_redacted_transformed_is_not() {
     let run = spawn(
         &r,
         "leaky",
-        SpawnOptions {
-            secret: Some(Box::new(|| b"topsecret".to_vec())),
-            timeout: None,
-        },
+        completion_opts_with_secret(Box::new(|| b"topsecret".to_vec())),
         &mut audit,
     )
     .expect("run");
@@ -540,7 +568,7 @@ fn uat_040_completed_run_is_audited_with_metadata_only() {
     let t = deny_template("ok-worker", "/bin/true", &[]);
     let r = WorkerRegistry::new(vec![t]);
     let mut audit = AuditLog::new(16);
-    let run = spawn(&r, "ok-worker", SpawnOptions::default(), &mut audit).expect("run");
+    let run = spawn(&r, "ok-worker", completion_opts(), &mut audit).expect("run");
     assert_eq!(run.exit_code, Some(0));
     assert!(run.duration < std::time::Duration::from_secs(10));
     let recs = audit.query(0);
