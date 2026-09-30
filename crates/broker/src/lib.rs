@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 pub mod audit;
 pub mod harden;
+pub mod inventory;
 pub mod isolated_exec;
 pub mod oauth2;
 pub mod pg_policy;
