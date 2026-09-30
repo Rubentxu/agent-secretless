@@ -17,12 +17,12 @@ use std::sync::Arc;
 pub mod audit;
 pub mod harden;
 pub mod isolated_exec;
-pub mod worker;
 pub mod oauth2;
 pub mod recovery;
 pub mod surrogate;
 pub mod tls_bridge;
 pub mod vault_port;
+pub mod worker;
 
 pub use surrogate::{now_secs, SurrogateError, SurrogateRegistry};
 pub use vault_port::VaultSecretPort;
@@ -517,7 +517,8 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             // channel is itself an auditable event.
             Response::Error {
                 code: ErrorCode::Denied,
-                message: "audit query requires the operator control plane, not an agent session".into(),
+                message: "audit query requires the operator control plane, not an agent session"
+                    .into(),
             }
         }
 
@@ -790,7 +791,13 @@ mod tests {
     #[test]
     fn every_handled_request_is_audited_once() {
         let mut state = BrokerState::default();
-        handle(&mut state, &peer(), Request::Ping { protocol: PROTOCOL_VERSION });
+        handle(
+            &mut state,
+            &peer(),
+            Request::Ping {
+                protocol: PROTOCOL_VERSION,
+            },
+        );
         handle(&mut state, &peer(), Request::ListCredentialMetadata);
         handle(
             &mut state,

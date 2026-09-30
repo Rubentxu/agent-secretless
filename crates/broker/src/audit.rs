@@ -77,7 +77,9 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 /// 64 lowercase hex chars: the shape any legal previous-hash anchor has.
 fn is_hex_64(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Why the chain stopped verifying.
@@ -113,7 +115,9 @@ pub enum AuditOpenError {
 pub enum AuditFileError {
     Io(std::io::Error),
     /// A line that is not valid JSON (or not a record).
-    MalformedLine { line: usize },
+    MalformedLine {
+        line: usize,
+    },
     Chain(ChainBreak),
 }
 
@@ -138,7 +142,10 @@ fn validate_link(prev: Option<&AuditRecordDto>, record: &AuditRecordDto) -> Resu
     match prev {
         Some(p) => {
             if record.prev_hash != p.event_hash {
-                return Err(ChainBreak { seq: record.seq, reason: ChainBreakReason::LinkMismatch });
+                return Err(ChainBreak {
+                    seq: record.seq,
+                    reason: ChainBreakReason::LinkMismatch,
+                });
             }
         }
         None => {
@@ -148,13 +155,24 @@ fn validate_link(prev: Option<&AuditRecordDto>, record: &AuditRecordDto) -> Resu
                 is_hex_64(&record.prev_hash)
             };
             if !anchored {
-                return Err(ChainBreak { seq: record.seq, reason: ChainBreakReason::LinkMismatch });
+                return Err(ChainBreak {
+                    seq: record.seq,
+                    reason: ChainBreakReason::LinkMismatch,
+                });
             }
         }
     }
-    let computed = sha256_hex(&frame_bytes(record.seq, &record.prev_hash, record.ts, &record.event));
+    let computed = sha256_hex(&frame_bytes(
+        record.seq,
+        &record.prev_hash,
+        record.ts,
+        &record.event,
+    ));
     if computed != record.event_hash {
-        return Err(ChainBreak { seq: record.seq, reason: ChainBreakReason::DigestMismatch });
+        return Err(ChainBreak {
+            seq: record.seq,
+            reason: ChainBreakReason::DigestMismatch,
+        });
     }
     Ok(())
 }
@@ -239,10 +257,15 @@ impl AuditLog {
             std::fs::write(path, &text.as_bytes()[..valid_len]).map_err(AuditOpenError::Io)?;
         }
         let total = records.len();
-        let window = if max == 0 { total } else { (max as usize).min(total) };
+        let window = if max == 0 {
+            total
+        } else {
+            (max as usize).min(total)
+        };
         let dropped = (total - window) as u64;
         let mut log = Self::new(max);
-        log.records.extend(records[total - window..].iter().cloned());
+        log.records
+            .extend(records[total - window..].iter().cloned());
         log.dropped = dropped;
         if let Some(last) = records.last() {
             log.next_seq = last.seq + 1;
@@ -353,8 +376,12 @@ impl AuditLog {
                     }
                 }
             }
-            let computed =
-                sha256_hex(&frame_bytes(record.seq, &record.prev_hash, record.ts, &record.event));
+            let computed = sha256_hex(&frame_bytes(
+                record.seq,
+                &record.prev_hash,
+                record.ts,
+                &record.event,
+            ));
             if computed != record.event_hash {
                 return Err(ChainBreak {
                     seq: record.seq,
@@ -497,11 +524,8 @@ mod tests {
     // ---- Durable audit log (persistence follow-up) ----
 
     fn temp_audit_path(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "asv-audit-test-{}-{}",
-            std::process::id(),
-            name
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("asv-audit-test-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir.join("audit.jsonl")
@@ -520,8 +544,12 @@ mod tests {
         assert_eq!(lines.len(), 2, "one JSON line per record");
         for line in &lines {
             let record: AuditRecordDto = serde_json::from_str(line).expect("line parses");
-            let recomputed =
-                sha256_hex(&frame_bytes(record.seq, &record.prev_hash, record.ts, &record.event));
+            let recomputed = sha256_hex(&frame_bytes(
+                record.seq,
+                &record.prev_hash,
+                record.ts,
+                &record.event,
+            ));
             assert_eq!(recomputed, record.event_hash, "line binds its own hash");
         }
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -546,7 +574,10 @@ mod tests {
         let mut log = log;
         let next = log.append(event("ping"), 99);
         assert_eq!(next.seq, 5, "sequence continues after restart");
-        assert_eq!(next.prev_hash, kept[1].event_hash, "chains from restored head");
+        assert_eq!(
+            next.prev_hash, kept[1].event_hash,
+            "chains from restored head"
+        );
         assert_eq!(log.verify(), Ok(()));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -603,7 +634,10 @@ mod tests {
         let tampered = text.replace("\"seq\":0", "\"seq\":7");
         std::fs::write(&path, tampered).expect("rewrite");
         match verify_file(&path) {
-            Err(AuditFileError::Chain(ChainBreak { reason: ChainBreakReason::DigestMismatch, .. })) => {}
+            Err(AuditFileError::Chain(ChainBreak {
+                reason: ChainBreakReason::DigestMismatch,
+                ..
+            })) => {}
             other => panic!("expected digest mismatch, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

@@ -200,7 +200,10 @@ fn main() -> std::io::Result<()> {
         // investigated, not silently re-based.
         let max = audit_max_records.unwrap_or(asv_broker::audit::DEFAULT_MAX_RECORDS);
         let log = asv_broker::audit::AuditLog::open_persistent(max, path).unwrap_or_else(|err| {
-            eprintln!("asv: refusing to start with a broken audit log at {}: {err:?}", path.display());
+            eprintln!(
+                "asv: refusing to start with a broken audit log at {}: {err:?}",
+                path.display()
+            );
             std::process::exit(1);
         });
         tracing::info!(path = %path.display(), restored = log.query(0).len(), dropped = log.dropped(), "durable audit log opened");

@@ -20,7 +20,7 @@ use asv_broker::isolated_exec::{
     EgressPolicy, LandlockProfile, Redactor, SeccompProfile, SecretInjectionPlan, WorkerRegistry,
     WorkerTemplate,
 };
-use asv_broker::worker::{SpawnError, SpawnOptions, spawn};
+use asv_broker::worker::{spawn, SpawnError, SpawnOptions};
 use std::path::{Path, PathBuf};
 
 // ----- helpers -----------------------------------------------------------
