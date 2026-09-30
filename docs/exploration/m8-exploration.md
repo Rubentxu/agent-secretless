@@ -178,8 +178,49 @@ of `06-TRANSPARENT-BRIDGE-EBPF.md`).
 
 ## 11. Verdict
 
-**Recorded verdict: PASS.** All three criteria below were re-verified by
-execution on 2026-09-30 at `7e6a352`, not inferred from the code reading:
+**Local criteria: PASS. Normative M8 exit: DELEGATED, 8 PASS / 0 FAIL /
+3 UNVERIFIABLE-IN-REPO.**
+
+`15-ROADMAP.md` states that M8 owns no acceptance set of its own: it
+"re-runs their acceptance set rather than owning any of its own" and is
+therefore DELEGATED to `16-SECURITY-RELEASE-GATES`. `tools/check-gates.py`
+confirms this mechanically: it reports `M8 Go criteria [] DELEGATED`.
+
+So there are two distinct claims, and conflating them would be a false
+verdict:
+
+| Scope | Status | Basis |
+|---|---|---|
+| The three conditions written in this section | **PASS** | re-verified by execution, table below |
+| R0-R11 in `16-SECURITY-RELEASE-GATES` | **8 PASS / 0 FAIL / 3 UNVERIFIABLE-IN-REPO** | `python3 tools/rc-exit-checklist.py` |
+
+The delegated set was executed, not assumed. On 2026-09-30 at `7e6a352`:
+
+```text
+R1  Secret API invariant        PASS
+R2  Vault                       PASS
+R3  Identity/session            PASS
+R4  Policy                      PASS
+R5  Connector security          PASS
+R6  Agent leak harness          PASS
+R7  eBPF/privilege separation   PASS
+R9  Audit                       PASS
+R10 Compatibility truthfulness  PASS
+R0  Build and provenance        UNVERIFIABLE-IN-REPO  (only: release-artifact signing)
+R8  Tauri                       UNVERIFIABLE-IN-REPO  (no Tauri app yet; M5 scope)
+R11 Full certification          UNVERIFIABLE-IN-REPO
+summary: 9 PASS / 0 FAIL / 3 UNVERIFIABLE-IN-REPO
+```
+
+R0 is UNVERIFIABLE on only one of its five bullets. The other four pass,
+including `SBOM generated: target/sbom.json exists`. The three
+UNVERIFIABLE items are things a repository cannot attest for itself:
+signing on release infrastructure, a UI that does not exist yet, and full
+certification that presupposes each milestone's own UAT set. None of them
+is a defect; all three are outside this repo's reach by construction.
+
+The three local conditions were re-verified by execution on 2026-09-30 at
+`7e6a352`, not inferred from reading the code:
 
 | Criterion | Evidence | Result |
 |---|---|---|
@@ -193,9 +234,19 @@ cargo test -p asv-ebpfd --lib -- closed_set_round_trips unknown_verb_is_rejected
 test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out
 ```
 
-M9 is therefore unblocked. The verdict was previously stated as a
-condition without being recorded as met, which left the cycle open on a
-question the code had already answered.
+The closed-set rejection was falsified before being trusted: widening the
+real `parse_verb` match to accept `cgroup.freeze` turned
+`unknown_verb_is_rejected` red at `crates/ebpfd/src/verbs.rs:306`, and the
+change was reverted (`git diff` clean, 11/11 green after restore). An
+earlier falsification attempt that only moved an entry inside the test's own
+input list stayed green and proved nothing; it was discarded.
+
+M9 is unblocked by the local criteria, and the delegated R0-R11 set
+reports no FAIL. It does not mean M8 is fully certified: three gates are
+UNVERIFIABLE-IN-REPO by construction, and R11 full certification remains
+open until every milestone's own UAT set is green. Claiming M8 "fully
+certified" would overstate what was observed; claiming nothing would
+understate the 9 gates that pass.
 
 The criteria as written:
 
