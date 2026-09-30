@@ -118,3 +118,25 @@ Before final release:
   5 ms, or 6 ms for the end-to-end brokered read in either build profile,
   evidenced by UAT-030 with the measured host recorded. A performance claim
   without a recorded host and percentile is not a pass.
+
+## Gate status as of 2026-09-30
+
+`15-ROADMAP.md` delegates M11 and M13 completion to this document rather
+than to a fixed UAT set. That delegation is only meaningful if the current
+state is stated, so it is stated here. Source: `docs/exploration/m11-m13-convergence.md`.
+
+| Gate | Status | Evidence |
+|---|---|---|
+| R11 dependency audit | pass | `cargo audit`: 0 advisories, 335 deps |
+| R11 full suite | pass | 486 passed / 0 failed / 1 ignored |
+| R11 clippy `-D warnings` | pass | clean |
+| R11 formatting | pass | `cargo fmt --all -- --check` clean |
+| R11 `NFR-PERF-001` | pass | UAT-030, 6 ms budget, both profiles, host recorded |
+| M12 hardware-backed vault | **NOT MET** | no TPM on this host (`/dev/tpm*` absent, `/sys/class/tpm` empty, no TPM CPU flag). UAT-034 exercises the structural shape against `SoftwareTpm`, a content-addressed placeholder. No hardware-backed guarantee is claimed. |
+| M11 live OAuth2 provider | **NOT MET** | `StaticClientCredentialsIssuer` only; no AS interaction, no PKCE. The framework and its 6 tests are real. |
+| M11-M13 semver | **NOT MET** | tagged `m11-*`/`m12-*`/`m13-*` with no cycle receipt and no version. `v0.11.0` stays on `9bd86dd` and must not be moved to cover them. |
+| R10 compatibility truthfulness | partial | the `ISOLATED_PROCESS_EXPOSURE` posture label exists; the per-integration catalog required by M11 has no live provider to populate yet. |
+
+Two of these cannot be closed by writing code on this machine: M12 needs a
+host with a TPM, and M11 needs a real provider to point the framework at.
+Recording them as open is the correct outcome, not a blocker to route around.
