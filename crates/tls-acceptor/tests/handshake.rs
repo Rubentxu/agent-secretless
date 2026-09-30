@@ -10,6 +10,7 @@
 //! disables verification proves nothing about whether a real peer would
 //! accept the certificate.
 
+use std::io::Read;
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
@@ -187,5 +188,42 @@ fn presenting_the_leaf_without_the_intermediate_fails() {
     assert!(
         result.is_err(),
         "a leaf with no intermediate verified against the root alone"
+    );
+}
+
+/// REQ-6: a port with no acceptor must fail promptly rather than hang.
+///
+/// A liveness requirement, so there is no mutation that would break it and
+/// no assertion on silence. What there is instead is a bound: the connect
+/// carries a timeout, and the elapsed time is asserted, so a slow regression
+/// is visible rather than merely present.
+///
+/// It cannot go through `connect`, which expects a live acceptor and would
+/// panic on the very failure this requirement is about.
+#[test]
+fn connecting_to_a_port_with_no_acceptor_fails_promptly() {
+    // Bind and immediately drop, so the port is known to be free. Port reuse
+    // is a theoretical race and irrelevant here: either nothing answers, or
+    // something that is not a TLS acceptor answers, and both must fail.
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+    let addr = probe.local_addr().expect("a loopback address");
+    drop(probe);
+
+    let started = std::time::Instant::now();
+    let outcome =
+        TcpStream::connect_timeout(&addr, Duration::from_secs(5)).and_then(|mut stream| {
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut buf = [0u8; 1];
+            stream.read(&mut buf)
+        });
+    let elapsed = started.elapsed();
+
+    assert!(
+        outcome.is_err(),
+        "a dead port returned {outcome:?} after {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the failure took {elapsed:?}; the requirement is prompt failure, not a hang"
     );
 }
