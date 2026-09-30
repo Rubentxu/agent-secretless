@@ -44,24 +44,45 @@ die() { echo "asv-uat033-substrate: $*" >&2; exit 1; }
 step() { echo "==> $*" >&2; }
 
 # ---------------------------------------------------------------- binaries ---
-# `pg_ctl` is not on PATH on Debian/Ubuntu unless postgresql-client-common is
-# installed, and on Fedora the server binaries live under a versioned prefix.
-# Guessing wrong here is the single most common way this script fails on a
-# machine that does have PostgreSQL, so probe the known locations.
+# `pg_ctl` is not on PATH everywhere, and where it is, `initdb` — the binary
+# this script actually needs — frequently is not beside it. Debian and Ubuntu
+# put the server binaries under a versioned prefix, Fedora under another, and
+# a source or Homebrew install under a third. Guessing wrong here is the most
+# common way this script fails on a machine that does have PostgreSQL, so probe
+# in order of authority and check the result rather than trusting a glob.
+#
+# `pg_config --bindir` is the authoritative answer when it exists; the globs
+# are the fallback for images that ship the binaries without it.
 find_bindir() {
-  if [[ -n "${ASV_UAT033_PG_BINDIR:-}" ]]; then
-    echo "$ASV_UAT033_PG_BINDIR"; return
-  fi
-  if command -v pg_ctl >/dev/null 2>&1 && command -v initdb >/dev/null 2>&1; then
-    dirname "$(command -v pg_ctl)"; return
-  fi
   local candidate
-  for candidate in /usr/lib/postgresql/*/bin /usr/pgsql-*/bin /opt/homebrew/opt/postgresql*/bin /usr/local/pgsql/bin; do
-    if [[ -x "$candidate/pg_ctl" && -x "$candidate/initdb" ]]; then
-      echo "$candidate"; return
+  if [[ -n "${ASV_UAT033_PG_BINDIR:-}" ]]; then
+    if has_pg_binaries "$ASV_UAT033_PG_BINDIR"; then
+      echo "$ASV_UAT033_PG_BINDIR"; return
     fi
+    die "ASV_UAT033_PG_BINDIR=${ASV_UAT033_PG_BINDIR} has no pg_ctl and initdb"
+  fi
+  if command -v pg_config >/dev/null 2>&1; then
+    candidate="$(pg_config --bindir 2>/dev/null || true)"
+    if has_pg_binaries "$candidate"; then echo "$candidate"; return; fi
+  fi
+  if command -v pg_ctl >/dev/null 2>&1; then
+    candidate="$(dirname "$(command -v pg_ctl)")"
+    if has_pg_binaries "$candidate"; then echo "$candidate"; return; fi
+  fi
+  for candidate in /usr/lib/postgresql/*/bin /usr/pgsql-*/bin \
+                   /opt/homebrew/opt/postgresql*/bin /usr/local/pgsql/bin \
+                   /usr/bin /usr/local/bin; do
+    if has_pg_binaries "$candidate"; then echo "$candidate"; return; fi
   done
-  die "no PostgreSQL server binaries found. Install postgresql, or set ASV_UAT033_PG_BINDIR."
+  die "no PostgreSQL server binaries found (need both pg_ctl and initdb). \
+Install the postgresql server package, or set ASV_UAT033_PG_BINDIR."
+}
+
+# A bindir is only usable if it has BOTH binaries. `initdb` in particular is
+# server-side and is the one most often missing from a client-only install,
+# and a bindir with only pg_ctl fails later with a much less obvious error.
+has_pg_binaries() {
+  [[ -n "${1:-}" && -x "$1/pg_ctl" && -x "$1/initdb" ]]
 }
 
 # ------------------------------------------------------------------- certs ---
@@ -294,6 +315,11 @@ case "${1:-up}" in
   run)    cmd_run ;;
   down)   cmd_down ;;
   status) cmd_status ;;
-  -h|--help|help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
+  # Not a user command: it makes the binary discovery testable on its own. CI
+  # depends on this resolving on an image whose layout differs from the
+  # developer's, and that difference is exactly what is awkward to reproduce
+  # by hand, so it is exposed rather than buried.
+  print-bindir) find_bindir ;;
+  -h|--help|help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command '${1}'. Try: up, env, run, down, status" ;;
 esac
