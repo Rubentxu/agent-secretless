@@ -414,5 +414,13 @@ mod tests {
             !rendered.contains("ASV-CANARY"),
             "Debug leaked the credential: {rendered}"
         );
+        // The contrast that gives the assertion above teeth: a String holding
+        // the same bytes does print them, so this is a real redaction rather
+        // than a canary the Debug format could never have matched.
+        let plain = String::from("ASV-CANARY-sink-DO-NOT-LEAK");
+        assert!(
+            format!("{plain:?}").contains("ASV-CANARY"),
+            "a String prints its contents, so the check above has teeth"
+        );
     }
 }
