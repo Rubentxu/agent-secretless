@@ -46,6 +46,29 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+  postgres-substrate:
+    name: UAT-033 against a real PostgreSQL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL
+        # The runner ships the client but not always the server binaries the
+        # script needs for `initdb` and `pg_ctl`. Installing explicitly pins
+        # the version rather than depending on the runner image.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql postgresql-contrib
+
+      - name: Run the UAT-033 suites against a real server
+        # Without a substrate these 18 tests print a skip and report `ok`.
+        # That is how `pg_policy::classify` called `SELECT ... INTO` a read
+        # for a release cycle and a half while the suite stayed green: the
+        # tests that would have caught it were skips. The script sets
+        # ASV_UAT033_REQUIRE=1, so here a substrate that fails to come up is
+        # a job failure instead of a silent pass.
+        run: scripts/uat033-pg-substrate.sh run
+
   adversarial:
     name: adversarial harness
     runs-on: ubuntu-latest
