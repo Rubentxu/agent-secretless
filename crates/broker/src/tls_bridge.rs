@@ -383,11 +383,12 @@ impl TrustInjector for OpenSslEnvInjector {
 ///
 /// Real x509: the intermediate signs it, it carries the host as its only
 /// SAN, it is `CA:FALSE`, and its validity ends no later than the CA's. The
-/// per-host binding is enforced twice, on purpose: [`verify_host`] refuses
-/// any other host, and the certificate itself does not name any other host,
-/// so a TLS peer doing its own hostname check agrees with us. A leaf whose
-/// SAN list was merely a superset of the requested host would pass the first
-/// check and defeat the second.
+/// per-host binding is enforced twice, on purpose:
+/// [`LeafCertificate::verify_host_at`] refuses any other host, and the
+/// certificate itself does not name any other host, so a TLS peer doing its
+/// own hostname check agrees with us. A leaf whose SAN list was merely a
+/// superset of the requested host would pass the first check and defeat the
+/// second.
 #[derive(Debug)]
 pub struct LeafCertificate {
     /// The session this leaf belongs to.
@@ -412,26 +413,23 @@ impl LeafCertificate {
         now.saturating_duration_since(self.issued_at) >= self.ttl
     }
 
-    /// True only when `host` is exactly the host this leaf was issued for.
+    /// Exact host binding, checked against `now`.
     ///
     /// Exact match, not suffix or wildcard. A CA that can mint for any host
     /// in a zone can mint for a host it was never asked to vouch for, which
     /// is the whole point of per-host issuance: a session authorized for
     /// `api.github.com` must not gain a leaf for `internal.github.com`.
     ///
-    /// This checks the name binding only. It does **not** check expiry: the
-    /// leaf is compared structurally, with no clock. Use
-    /// [`LeafCertificate::verify_host_at`] whenever the decision depends on
-    /// time, which is every real TLS handshake.
-    pub fn verify_host(&self, host: &str) -> Result<(), LeafError> {
-        self.verify_host_at(host, self.issued_at)
-    }
-
-    /// Exact host binding, plus an expiry check against `now`.
-    ///
-    /// This is the form callers should use. A binding check alone would
-    /// accept an expired leaf, which is a certificate that can no longer
-    /// chain to a live CA but whose name still matches perfectly.
+    /// The time is a parameter on purpose, and this is the only verifier.
+    /// An earlier design also offered a clock-free `verify_host` that
+    /// checked the binding against `self.issued_at`, and nothing in the
+    /// type system stopped a caller from picking it for a decision that
+    /// depends on time — which is every real verification. An expired leaf
+    /// still binds its host perfectly; only the clock reveals that it must
+    /// not be accepted. Passing `self.issued_at` gives the old structural
+    /// comparison to a caller that genuinely wants it, but makes the choice
+    /// of instant visible at the call site instead of hidden in a second
+    /// method.
     pub fn verify_host_at(&self, host: &str, now: Instant) -> Result<(), LeafError> {
         if self.is_expired(now) {
             return Err(LeafError::LeafExpired(self.host.clone()));
@@ -725,7 +723,9 @@ mod tests {
         assert_eq!(leaf.session_id, "sess-leaf");
         assert_eq!(leaf.host, "api.example.com");
         assert!(!leaf.leaf_der.is_empty());
-        assert!(leaf.verify_host("api.example.com").is_ok());
+        assert!(leaf
+            .verify_host_at("api.example.com", leaf.issued_at)
+            .is_ok());
     }
 
     #[test]
@@ -744,7 +744,7 @@ mod tests {
             "api.example.co",
         ] {
             assert!(
-                leaf.verify_host(other).is_err(),
+                leaf.verify_host_at(other, leaf.issued_at).is_err(),
                 "leaf for api.example.com must not validate {other}"
             );
         }
@@ -874,15 +874,22 @@ mod tests {
         // allowlist never named. The check is therefore on the SAN, not the
         // bytes, and `leaf_for_one_host_does_not_validate_a_sibling` covers
         // the refusal direction.
-        assert!(upper.verify_host(lower.host.as_str()).is_ok());
-        assert!(lower.verify_host(upper.host.as_str()).is_ok());
+        assert!(upper
+            .verify_host_at(lower.host.as_str(), upper.issued_at)
+            .is_ok());
+        assert!(lower
+            .verify_host_at(upper.host.as_str(), lower.issued_at)
+            .is_ok());
     }
 
     #[test]
     fn host_mismatch_reports_a_host_not_a_session_id() {
         let ca = leaf_ca();
         let leaf = issue_leaf(&ca, "api.example.com", Instant::now()).expect("issuance");
-        match leaf.verify_host("internal.example.com").unwrap_err() {
+        match leaf
+            .verify_host_at("internal.example.com", leaf.issued_at)
+            .unwrap_err()
+        {
             LeafError::HostMismatch { bound, .. } => assert_ne!(
                 bound, ca.session_id,
                 "HostMismatch.bound is documented as a host, not a session id"
