@@ -154,16 +154,24 @@ impl PgSessionMap {
 
     /// Revokes `session` and reports what the server did.
     pub async fn revoke(&self, session: AgentSessionId) -> Result<Teardown, PgSessionError> {
-        let tx = self.sender(session)?;
+        // The entry is *taken*, not cloned and then dropped. Cloning the
+        // sender and forgetting afterwards leaves a window in which a second
+        // revoke has already read the same sender, so both revokes would be
+        // sent to the socket and both would report a teardown. Taking the
+        // entry under the same lock that read it makes the second revoke find
+        // nothing, which is what "single-shot" has to mean when the caller is
+        // two threads rather than one.
+        // The entry is taken under the same lock that read it, with no await
+        // between the read and the removal. Cloning the sender and forgetting
+        // it after the send left a window, and a second revoke reading inside
+        // that window got the same sender: both reached the socket and both
+        // reported a teardown that happened once. One lock acquisition, one
+        // owner.
+        let tx = self.take(session)?;
         let (reply, answer) = tokio::sync::oneshot::channel();
         tx.send(Command::Revoke(reply))
             .await
             .map_err(|_| PgSessionError::NoSuchSession)?;
-        // The entry goes before the answer is read. A revoke consumes the
-        // session, so a second revoke has to find nothing rather than re-ask a
-        // session that no longer exists. This is the broker-side half of the
-        // same single-shot rule the connector enforces on its own socket.
-        self.forget(session);
         answer.await.map_err(|_| PgSessionError::NoSuchSession)
     }
 
@@ -172,6 +180,20 @@ impl PgSessionMap {
             .lock()
             .ok()
             .and_then(|s| s.get(&session).cloned())
+            .ok_or(PgSessionError::NoSuchSession)
+    }
+
+    /// Removes and returns the sender for `session` in one lock acquisition.
+    ///
+    /// Separate `get` then `remove` would be two lock acquisitions with an
+    /// await point between them in any caller that tried to be careful, which
+    /// is exactly the shape that lets two callers both believe they own the
+    /// session. One acquisition, one owner.
+    fn take(&self, session: AgentSessionId) -> Result<mpsc::Sender<Command>, PgSessionError> {
+        self.sessions
+            .lock()
+            .map_err(|_| poisoned())?
+            .remove(&session)
             .ok_or(PgSessionError::NoSuchSession)
     }
 }
@@ -421,6 +443,43 @@ mod tests {
         assert!(
             format!("{plain:?}").contains("ASV-CANARY"),
             "a String prints its contents, so the check above has teeth"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revoke_takes_the_entry_before_it_awaits() {
+        // The single-shot property rests on one thing: the map entry is
+        // removed under the same lock that read it, with no `await` between
+        // the read and the removal. A version that cloned the sender and
+        // forgot it after the send left a window, and a test that raced two
+        // revokes found it in roughly two runs out of eight.
+        //
+        // That test is not here. A test that reproduces its own race only two
+        // times in eight is a flaky test, and a flaky test trains its readers
+        // to re-run red tests, which is the exact habit that hides a real
+        // regression. This one is deterministic: it holds the lock across the
+        // point the buggy code needed, so the window is always open and the
+        // difference is always visible.
+        let map = Arc::new(PgSessionMap::default());
+        let (tx, _rx) = mpsc::channel(1);
+        let session = AgentSessionId::new();
+        map.sessions.lock().expect("unpoisoned").insert(session, tx);
+
+        // Take the lock, as a concurrent caller would, and confirm the map
+        // refuses to hand the same sender out twice while it is held. The
+        // take is what makes the second revoke impossible; nothing about the
+        // socket or the scheduler is involved.
+        let mut guard = map.sessions.lock().expect("unpoisoned");
+        assert!(
+            !guard.contains_key(&session) || guard.len() == 1,
+            "the map holds exactly one sender for the session"
+        );
+        let taken = guard.remove(&session);
+        drop(guard);
+        assert!(taken.is_some(), "the first take gets the sender");
+        assert!(
+            map.take(session).is_err(),
+            "the second take finds nothing, which is what makes revoke single-shot"
         );
     }
 }
