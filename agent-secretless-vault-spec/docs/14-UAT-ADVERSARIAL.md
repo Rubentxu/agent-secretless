@@ -240,12 +240,15 @@ human approval and upstream provider latency. This UAT is the falsifiable
 check for that NFR; the two documents were previously written without
 referencing each other, which left the milestone gate unfalsifiable.
 
-The measured p95 sits within 0.3-0.6 ms of 5 ms on the development host, with
-2-5 of 100 reads per run at or above 5 ms, so the end-to-end assertion uses
-8 ms. UAT-030 asserts the 8 ms end-to-end bound and records the measured host,
-the p50, the p95 and the worst sample, so a regression can be told apart from a
-slower machine. See `NFR-PERF-001` for the full distribution and the split
-between local authorization (~195 µs) and the loopback round trip.
+The measured debug p95 sits within 0.1-0.3 ms of 5 ms on the development host,
+with 2-5 of 100 reads per run at or above 5 ms, so the end-to-end assertion
+uses 6 ms. Release builds run about 3x faster than debug here, so the 6 ms
+bound is set by the slower profile and the same constant gates both; UAT-030
+additionally fails if the budget exceeds 6x the p95 that the same run
+measured. UAT-030 asserts the bound and records the measured host, the p50,
+the p95 and the worst sample, so a regression can be told apart from a slower
+machine. See `NFR-PERF-001` for the full distribution and the split between
+local authorization (~195 µs) and the loopback round trip.
 
 "Normal workstation" is not numerically defined by any spec document. Until it
 is, treat the threshold as applying to a developer-grade local Linux host and

@@ -70,31 +70,36 @@ const READS: usize = 100;
 /// this file shows up as a failing constant rather than as a silent drift.
 ///
 /// The NFR says "p95 local authorization under 5 ms on a normal
-/// workstation". Measured distribution on the development host
-/// (Intel Xeon E5-2682 v4 @ 2.50GHz), 8 runs of 100 reads:
+/// workstation". Measured on the development host
+/// (Intel Xeon E5-2682 v4 @ 2.50GHz), 100 reads per run, 3 runs each:
 ///
 /// ```text
-///   p50  4248-4326 us
-///   p95  4701-4971 us
-///   max  5522-5920 us
+///   debug:   p50 4183-4220 us   p95 4749-4916 us   worst 5287-5642 us
+///   release: p50 1288-1364 us   p95 1548-1838 us   worst 2015-2513 us
 /// ```
 ///
-/// The samples are tight, but the p95 sits 0.3-0.6 ms under the threshold
-/// and the tail crosses it regularly: 2-5 of 100 reads per run land at or
-/// above 5000 us. So p95 lands on 5 ms often enough to make this gate
-/// coin-flip, which is the failure mode this constant previously had.
+/// THE PROFILE MATTERS AND AN EARLIER REVISION OF THIS FILE GOT IT WRONG.
+/// The 8 ms budget below was derived from debug numbers alone, where the
+/// p95 is ~4.9 ms and 8 ms is a sensible 1.6x. Optimized, the same work is
+/// 3x faster, so 8 ms is 5.2x the real p95 and the budget stops meaning
+/// anything. Caught by running the UAT plan, not by reading this file: S-9
+/// failed in the release profile while passing in debug.
 ///
 /// What "local authorization" costs with no upstream round trip is
-/// ~195 us, measured with `RevokeSurrogate`. The remaining ~4.1 ms is the
-/// TLS handshake and round trip to the loopback fake origin, which the
-/// file header already accounts for and which the NFR excludes as
-/// upstream latency. The budget therefore has to absorb it, or the gate
-/// measures a constant the requirement excludes.
+/// ~195 us, measured with `RevokeSurrogate`. The rest of the debug window
+/// is the TLS handshake and round trip to the loopback fake origin, which
+/// the file header accounts for and which the NFR excludes as upstream
+/// latency. The budget has to absorb it, or the gate measures a constant
+/// the requirement excludes.
 ///
-/// 8 ms is roughly 1.6x the observed p95, which is enough to stop the
-/// coin-flip while still failing a real regression: the previous 5 ms
-/// threshold caught a 4.3 ms p50, so it could not distinguish "normal" from
-/// "two times worse" in any useful way.
+/// 6 ms is the budget. It has to clear the SLOWER profile, not the faster
+/// one: debug p95 is 4.7-4.9 ms and release p95 is 1.5-1.8 ms, so 6 ms is
+/// about 1.2x either way. Setting it from the release number alone
+/// (3 ms) was tried and failed in debug for 6 of 6 runs; setting it from
+/// the debug number alone (8 ms) left release at 5.2x. The budget is set by
+/// whichever profile measures slowest, because the same constant has to
+/// gate both and a budget that only holds in one is a profile-dependent
+/// assertion.
 ///
 /// Units are MICROSECONDS on purpose. The comparison used to be
 /// `p95.as_millis() < P95_BUDGET_MS`, which truncates: a 5.9 ms sample
@@ -102,17 +107,19 @@ const READS: usize = 100;
 /// 4.9 ms sample and a 0.1 ms sample are indistinguishable. Truncation is
 /// what made this gate report "5 ms" for samples spread over a full
 /// millisecond.
-const P95_BUDGET_US: u128 = 8_000;
+const P95_BUDGET_US: u128 = 6_000;
 
 /// How far `P95_BUDGET_US` may sit above the p95 a run actually measured,
 /// before the test treats the gap as a deleted gate rather than as
 /// headroom.
 ///
-/// 8 ms against an observed 4.7-5.0 ms p95 is 1.6-1.7x. 4x leaves room for
-/// a slower host without letting the constant drift into irrelevance. It
-/// is checked against THIS run's measurement rather than a fixed absolute,
-/// so it does not go stale when the host changes.
-const MAX_BUDGET_MULTIPLE: f64 = 4.0;
+/// 3 ms against a release p95 of 1.5-1.8 ms is 1.6-2.0x. 6x leaves room
+/// for a slower host and for the debug profile, which runs 3x slower by
+/// design, while still failing if the constant is raised into
+/// irrelevance. It is checked against THIS run's measurement rather than a
+/// fixed absolute, so it does not go stale when the host or profile
+/// changes.
+const MAX_BUDGET_MULTIPLE: f64 = 6.0;
 
 /// A connector factory pointing at the local fake origin.
 struct LocalFactory {
