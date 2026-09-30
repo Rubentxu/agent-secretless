@@ -206,12 +206,19 @@ impl std::fmt::Debug for Scram {
 impl Scram {
     /// Starts an exchange for `role`, given a client nonce.
     ///
-    /// The role lands in the `n=` attribute of `client-first-bare`, and that
-    /// is not decoration: `AuthMessage` is the concatenation of the bare
-    /// messages, so a client that sent `n=,r=...` would derive a proof over
-    /// a string the server never saw and the exchange would fail at the
-    /// signature check. For PostgreSQL the SASL username is the role being
-    /// authenticated, which is the same string the startup message carried.
+    /// The message built here is `n=<role>,r=<nonce>`, which is the
+    /// *client-first-bare* and not what goes on the wire. The wire form
+    /// prepends the gs2 header, giving `n,,n=<role>,r=<nonce>`: the bare
+    /// attribute is where the SCRAM username lives, and the server parses
+    /// the whole thing as a comma-separated attribute list. Sending the bare
+    /// form alone is what PostgreSQL rejects with `expected a comma, found
+    /// '='`, because it reads the leading `n=` as the gs2 header's `n`
+    /// channel-binding flag and then finds `=` where it wants a comma.
+    ///
+    /// Keeping the two apart matters for a second reason: `AuthMessage` is
+    /// built from the *bare* form, so a client that sent the header-prefixed
+    /// string into the signature would derive a proof over a string the
+    /// server never saw.
     pub fn new(role: &str, password: NormalisedPassword, nonce: &str) -> Self {
         let client_first_bare = format!("n={role},r={nonce}");
         Self {
@@ -245,11 +252,16 @@ impl Scram {
         base64::engine::general_purpose::STANDARD.encode(raw)
     }
 
-    /// The SASL initial response, prefixed with the mechanism name.
-    pub fn initial_response(&self) -> Vec<u8> {
+    /// The client-first message as it goes on the wire: the gs2 header
+    /// followed by the bare message.
+    ///
+    /// `n,,` says "no channel binding, not a GSSAPI exchange". The bare
+    /// attribute is mandatory, not decorative: the server computes its
+    /// signature over a message that includes it, so a client that omitted it
+    /// would derive a signature the server never matches.
+    pub fn client_first(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(MECHANISM);
-        out.push(0);
+        out.extend_from_slice(GS2_HEADER);
         out.extend_from_slice(self.client_first_bare.as_bytes());
         out
     }
@@ -691,19 +703,41 @@ mod tests {
     }
 
     #[test]
-    fn the_initial_response_carries_the_mechanism_and_bare_message() {
+    fn the_client_first_carries_the_gs2_header_and_the_bare_message() {
         let scram = exchange();
-        let response = scram.initial_response();
-        assert_eq!(&response[..MECHANISM.len()], MECHANISM);
         assert_eq!(
-            response[MECHANISM.len()],
-            0,
-            "a NUL separates mechanism from data"
+            String::from_utf8(scram.client_first()).expect("ascii"),
+            format!("n,,n={RFC_ROLE},r={RFC_CLIENT_NONCE}"),
+            "the wire form is the gs2 header plus the bare message, and the RFC \
+             7677 vector is the case that proves the bare `n=` must be present"
         );
-        assert_eq!(
-            String::from_utf8(response[MECHANISM.len() + 1..].to_vec()).expect("ascii"),
-            format!("n={RFC_ROLE},r={RFC_CLIENT_NONCE}"),
-            "the SCRAM username is the role, and the RFC vector requires it present"
+    }
+
+    #[test]
+    fn the_auth_message_is_bare_client_first_and_an_unproven_client_final() {
+        let mut scram = exchange();
+        scram.client_final(RFC_SERVER_FIRST).expect("well formed");
+        let message = String::from_utf8(scram.auth_message.expect("set").to_vec()).expect("ascii");
+        // The auth message is the input to the proof, so it cannot contain the
+        // proof, and it must be built from the *bare* client-first. A client
+        // that signed the gs2-prefixed wire form would derive a proof the
+        // server never matches, and the only symptom would be a signature
+        // mismatch with nothing to name it. Those two properties are what the
+        // live server actually distinguishes; the rest of the string is the
+        // server-first, verbatim, which `parse_server_first` already pins.
+        let components: Vec<&str> = message.split(',').collect();
+        assert!(
+            !message.starts_with("n,,"),
+            "the auth message must not carry the gs2 header: {message}"
+        );
+        assert_eq!(components[0], format!("n={RFC_ROLE}"), "the username leads the bare client-first");
+        assert!(
+            !message.contains(",p="),
+            "the auth message is the proof's input and cannot contain the proof"
+        );
+        assert!(
+            message.contains(RFC_SERVER_FIRST),
+            "the server-first is included verbatim, since its attributes went into the proof"
         );
     }
 

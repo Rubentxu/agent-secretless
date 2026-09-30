@@ -49,6 +49,18 @@ pub mod spawn;
 /// outside this repository instead of to itself.
 pub mod scram;
 
+/// The PostgreSQL v3 wire protocol: framing, the startup handshake, and the
+/// two query paths. Separate from `live` so the codec can be driven against
+/// a scripted peer without a TLS stack in the way.
+pub mod wire;
+
+/// The live connection: TCP, TLS, SCRAM, and the teardown observation
+/// M6-R4 requires.
+pub mod live;
+
+pub use live::{connect, LivePgSession, Teardown, TlsRoots};
+pub use wire::{QueryResult, WireError};
+
 pub use pg::{AllowList, DbAction, DenyAll, PgConnection, PgError, PgPolicy, PostgresClient};
 pub use scram::{normalise_password, NormalisedPassword, Scram, ScramError};
 pub use spawn::{spawn_psql_reveal, PsqlSpawn};
