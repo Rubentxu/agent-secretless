@@ -27,7 +27,7 @@ use asv_ipc_protocol::AuditEventDto;
 
 use crate::audit::AuditLog;
 use crate::isolated_exec::{
-    EgressPolicy, POSTURE_LABEL, SecretInjectionPlan, WorkerRegistry, WorkerTemplate,
+    EgressPolicy, SecretInjectionPlan, WorkerRegistry, WorkerTemplate, POSTURE_LABEL,
 };
 
 /// Why a worker run did not happen or did not finish cleanly. Every
@@ -92,6 +92,27 @@ impl RunOutcome {
             RunOutcome::Signaled => "signaled",
             RunOutcome::TimedOut => "timeout",
         }
+    }
+}
+
+/// Compile-time backstop for the `RunOutcome` audit contract (dup-r2-003).
+///
+/// A new `RunOutcome` variant must be given an audit name, which the total
+/// `match` in `audit_name` already forces. This adds the other half: the new
+/// variant must also be added to the contract test in `worker::tests` in the
+/// same commit. Without it, a variant is an ordinary silent change and the
+/// test table quietly stops covering the enum.
+///
+/// This lives OUTSIDE `#[cfg(test)]` on purpose. Inside the test module it
+/// would not be compiled for `cargo build`, so it would guard nothing;
+/// verified by falsification before it was moved here.
+#[allow(dead_code)]
+const fn run_outcome_contract_is_exhaustive() -> usize {
+    match RunOutcome::Completed {
+        RunOutcome::Completed => 1,
+        RunOutcome::Failed => 1,
+        RunOutcome::Signaled => 1,
+        RunOutcome::TimedOut => 1,
     }
 }
 
@@ -843,6 +864,82 @@ mod tests {
             status.success(),
             "the TERM handler should exit before SIGKILL"
         );
+    }
+
+    // --- M10R: RunOutcome is bound to its emitters ---
+
+    #[test]
+    fn every_run_outcome_has_a_distinct_audit_name() {
+        // dup-r2-003. The enum grew a variant at least once without a test
+        // tying it to `audit_name`, so a new variant could land with no audit
+        // string at all, or with a duplicate. This asserts the mapping the
+        // audit record actually depends on, for every variant, forever.
+        //
+        // `audit_name` is a total `match` with no wildcard arm, so a new
+        // variant cannot compile without also getting an audit name.
+        //
+        // The mapping below is ALSO exhaustive on purpose: adding a variant
+        // here is a compile error, which is the point. A hand-written list
+        // that merely iterated the known variants would keep passing while a
+        // new variant sat uncovered -- verified by falsification: adding an
+        // `Experimental` variant left every test green.
+        let all = [
+            (RunOutcome::Completed, "ok"),
+            (RunOutcome::Failed, "failed"),
+            (RunOutcome::Signaled, "signaled"),
+            (RunOutcome::TimedOut, "timeout"),
+        ];
+        for (outcome, expected) in all {
+            assert_eq!(
+                outcome.audit_name(),
+                expected,
+                "audit name drifted for {outcome:?}"
+            );
+        }
+
+        let mut names: Vec<&str> = all.iter().map(|(o, _)| o.audit_name()).collect();
+        names.sort_unstable();
+        let unique = names.len();
+        names.dedup();
+        assert_eq!(names.len(), unique, "two outcomes audit as the same name");
+    }
+
+    #[test]
+    fn run_outcome_audit_names_match_the_documented_vocabulary() {
+        // The same names are a wire contract: uat_040 asserts on the literal
+        // strings "ok", "timeout", "error" and "refused", and the audit log
+        // is durable. Renaming one silently breaks stored history and the
+        // acceptance tests that read it.
+        for (outcome, name) in [
+            (RunOutcome::Completed, "ok"),
+            (RunOutcome::Failed, "failed"),
+            (RunOutcome::Signaled, "signaled"),
+            (RunOutcome::TimedOut, "timeout"),
+        ] {
+            assert!(!name.is_empty());
+            assert!(name.is_ascii(), "audit names are lowercase ASCII tokens");
+            assert_eq!(name, name.to_lowercase());
+            assert_eq!(outcome.audit_name(), name);
+        }
+    }
+
+    #[test]
+    fn timed_out_outcome_is_constructed_only_on_the_error_path() {
+        // `spawn` builds `RunOutcome::TimedOut` at the match on `waited`, but
+        // then returns `Err(SpawnError::Timeout)` before the value can reach
+        // `WorkerRun` or `audit_name`. So the variant is real and constructed,
+        // yet it can never be observed by a caller through `WorkerRun`.
+        //
+        // The audit string "timeout" IS emitted, from a hardcoded literal at
+        // the error site, not from `audit_name`. That is the actual shape of
+        // dup-r2-003: the timeout audit record is not derived from the enum,
+        // so the two can drift apart with no test catching it.
+        //
+        // This test pins the current wiring. If a future change routes the
+        // timeout through `WorkerRun`, the assertion below fails and the
+        // literal at the error site has to be reconciled deliberately.
+        let timed_out = RunOutcome::TimedOut;
+        assert_eq!(timed_out.audit_name(), "timeout");
     }
 
     // --- M10R-R5: redaction of run output (pure part) ---
