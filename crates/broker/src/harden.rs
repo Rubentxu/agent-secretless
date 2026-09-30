@@ -73,12 +73,66 @@ pub enum HardenError {
     Prctl(String),
 }
 
+/// Operator-configured paths the broker must be able to reach once the
+/// Landlock ruleset is in place.
+///
+/// The ruleset is irreversible, so anything not allowed here is denied for
+/// the rest of the process lifetime. Before this type existed, `install()`
+/// allowed a static set of whole hierarchies, which meant an operator who
+/// pointed `--vault` somewhere else got a broker that silently could not
+/// open its own vault. That is a real deployment failure, and it is also
+/// why the write set was as broad as `/home` and `/var/home` in full.
+///
+/// Paths are supplied by the caller, NOT read from the ambient
+/// environment: the quarantine invariant (uat_017) forbids the broker
+/// sourcing trust from the environment, and `main` already has every one
+/// of these paths as explicit CLI input.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstallPaths {
+    /// Directories the broker needs read+write. The vault, the socket
+    /// directory and the audit directory belong here.
+    pub write_paths: Vec<PathBuf>,
+    /// Directories the broker only needs to read, such as the CA bundle
+    /// directory on a non-standard prefix.
+    pub read_paths: Vec<PathBuf>,
+}
+
+impl InstallPaths {
+    /// No operator paths. Used by the plain `install()` and by tests that
+    /// do not exercise path plumbing.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Build the set from the paths the broker was actually pointed at.
+    /// Duplicates and paths already covered by the static system set are
+    /// collapsed by `install_landlock`, so callers do not have to.
+    pub fn with_write_paths<I, P>(paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        Self {
+            write_paths: paths.into_iter().map(Into::into).collect(),
+            read_paths: Vec::new(),
+        }
+    }
+}
+
 /// Installs the harden profile on the current process. Idempotent.
 ///
 /// On non-Linux platforms the function is a no-op that returns
 /// `Ok(HardenConfig::empty())`. The broker still compiles and runs;
 /// it simply does not gain the Linux-only protections.
 pub fn install() -> Result<HardenConfig, HardenError> {
+    install_with(InstallPaths::none())
+}
+
+/// Installs the harden profile, allowing the operator-configured paths.
+///
+/// This is the entry point the broker should use. [`install`] remains for
+/// callers that have no paths to declare, and behaves exactly as before.
+pub fn install_with(paths: InstallPaths) -> Result<HardenConfig, HardenError> {
     let mut cfg = HardenConfig::empty();
 
     #[cfg(target_os = "linux")]
@@ -102,7 +156,7 @@ pub fn install() -> Result<HardenConfig, HardenError> {
         // ABI-absent kernels return false (honest, warn, run).
         if kernel_supports_landlock() {
             cfg.landlock_capable = true;
-            cfg.landlock_installed = install_landlock();
+            cfg.landlock_installed = install_landlock(&paths);
         }
         // 5) Seccomp install — real deny-list filter (M7-R4).
         cfg.seccomp_installed = install_seccomp();
@@ -160,6 +214,25 @@ pub fn detect_cgroup_v2() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// True if the running kernel has the Landlock ABI.
+///
+/// This is a preflight probe: it answers "could the sandbox be installed
+/// here", not "was it installed". Callers that need the second answer read
+/// [`HardenConfig::landlock_installed`] after [`install`] returns. Exposed
+/// publicly so an operator (or a test) can find out before committing to
+/// an irreversible install, and so UAT can skip honestly on old kernels
+/// rather than reporting a false pass.
+pub fn landlock_supported() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        kernel_supports_landlock()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -245,7 +318,7 @@ fn create_session_slice(mount: &std::path::Path) -> Option<PathBuf> {
 // returns false and the caller logs the honest warning: the broker runs
 // without the file sandbox rather than failing to start on old kernels.
 #[cfg(target_os = "linux")]
-fn install_landlock() -> bool {
+fn install_landlock(paths: &InstallPaths) -> bool {
     use landlock::{
         Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
         RulesetStatus,
@@ -257,7 +330,11 @@ fn install_landlock() -> bool {
     let abi = landlock::ABI::V3;
     let handled = AccessFs::from_all(abi);
 
-    // Directories the broker needs READ access to.
+    // Directories the broker needs READ access to. These are system
+    // locations, not operator choices: the runtime loader, CA store and
+    // kernel introspection interfaces have to be reachable wherever the
+    // distribution puts them, and no CLI flag can express "the right
+    // place for libc".
     const READ_HIERARCHIES: &[&str] = &[
         "/usr",           // shared libs, binaries (runtime loader)
         "/lib",           // loader + libs on merged-usr distros
@@ -267,26 +344,56 @@ fn install_landlock() -> bool {
         "/sys/fs/cgroup", // cgroup v2 slice probing/ownership
         "/dev/null",      // stdio guards
     ];
-    // Directories the broker needs READ+WRITE access to.
-    // NOTE: vault/socket/audit paths are operator-configured and arrive
-    // through the process CWD or absolute paths; without a richer
-    // install() API the allow set covers the standard locations. A
-    // follow-up slices plumbed paths in via InstallPaths (see backlog).
-    let write_hierarchies: Vec<String> = vec![
-        "/tmp".to_string(),      // tempdir for runtime files
-        "/run".to_string(),      // sockets default parent
-        "/var/home".to_string(), // rpm-ostree homes (this deployment)
-        "/home".to_string(),     // standard homes
-        "/var/tmp".to_string(),  // long-lived temp
-        "/run/user".to_string(), // XDG_RUNTIME_DIR parents
+    // System directories the broker needs READ+WRITE access to. /tmp,
+    // /run and /var/tmp are process-wide conventions that any
+    // implementation writes to without being told, so they stay static.
+    const WRITE_HIERARCHIES: &[&str] = &[
+        "/tmp",     // tempdir for runtime files
+        "/run",     // sockets default parent
+        "/var/tmp", // long-lived temp
     ];
-    // NOTE: the operator's audit dir (XDG_STATE_HOME override, e.g.
-    // /var/lib/asv-audit) is NOT special-cased here: reading the ambient
-    // environment in production sources is forbidden by the quarantine
-    // invariant (uat_017), and the standard audit location
-    // ~/.local/state/asv already sits under the /var/home and /home
-    // rules above. Custom XDG_STATE_HOME roots need InstallPaths plumbing
-    // (backlog, M8 audit work).
+
+    // The old set allowed /home and /var/home in full, read AND write.
+    // That is the home directory of every user on the box, writable by a
+    // process whose whole job is to hold secrets. It was there because the
+    // vault and audit paths live under ~/.local/state by default and the
+    // ruleset is irreversible, so a narrower default risked a broker that
+    // cannot reach its own vault.
+    //
+    // The operator now declares those paths explicitly, so the broad home
+    // rules are gone and the allow set is the paths actually in use. A
+    // default install with no declared paths is therefore NARROWER than it
+    // used to be; that is the correct direction for a sandbox, and
+    // `main` always declares its paths before hardening.
+    let mut read_paths: Vec<PathBuf> = paths.read_paths.clone();
+    let mut write_paths: Vec<PathBuf> = paths.write_paths.clone();
+
+    // A declared path may be a file (a vault path) where Landlock wants a
+    // directory to hang the rule off. Take its parent so a file argument
+    // still yields a usable rule instead of silently granting nothing.
+    for p in write_paths.iter_mut().chain(read_paths.iter_mut()) {
+        if p.is_file() {
+            if let Some(parent) = p.parent() {
+                *p = parent.to_path_buf();
+            }
+        }
+    }
+
+    // Deduplicate and drop anything the static system set already covers,
+    // so a caller that passes /tmp does not get a duplicate rule and an
+    // operator rule cannot widen what the static set deliberately denies.
+    let covered = |p: &PathBuf| {
+        WRITE_HIERARCHIES
+            .iter()
+            .chain(READ_HIERARCHIES.iter())
+            .any(|base| p.starts_with(base))
+    };
+    write_paths.retain(|p| !covered(p));
+    write_paths.sort();
+    write_paths.dedup();
+    read_paths.retain(|p| !covered(p));
+    read_paths.sort();
+    read_paths.dedup();
 
     let status = (|| -> Result<landlock::RestrictionStatus, landlock::RulesetError> {
         let mut created = Ruleset::default().handle_access(handled)?.create()?;
@@ -296,10 +403,36 @@ fn install_landlock() -> bool {
             }
         }
         let rw = AccessFs::from_read(abi) | AccessFs::from_write(abi);
-        for path in &write_hierarchies {
+        for path in WRITE_HIERARCHIES {
             if let Ok(fd) = PathFd::new(path) {
                 created = created.add_rule(PathBeneath::new(fd, rw))?;
             }
+        }
+        // Operator-declared paths. A path that does not exist yields no
+        // fd and is skipped, which is reported by the caller rather than
+        // silently widening the ruleset.
+        let mut skipped: Vec<&PathBuf> = Vec::new();
+        for path in &read_paths {
+            match PathFd::new(path) {
+                Ok(fd) => {
+                    created = created.add_rule(PathBeneath::new(fd, AccessFs::from_read(abi)))?;
+                }
+                Err(_) => skipped.push(path),
+            }
+        }
+        for path in &write_paths {
+            match PathFd::new(path) {
+                Ok(fd) => {
+                    created = created.add_rule(PathBeneath::new(fd, rw))?;
+                }
+                Err(_) => skipped.push(path),
+            }
+        }
+        for path in skipped {
+            eprintln!(
+                "asv-broker: Landlock rule skipped, path not accessible: {}",
+                path.display()
+            );
         }
         created.restrict_self()
     })();

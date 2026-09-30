@@ -136,7 +136,30 @@ fn main() -> std::io::Result<()> {
     // denied by the sandbox) degrade loudly to a warning instead of
     // killing a broker the operator explicitly asked to harden.
     if harden {
-        let cfg = asv_broker::harden::install().unwrap_or_else(|err| {
+        // The Landlock ruleset is irreversible, so the paths the broker is
+        // actually pointed at have to be allowed BEFORE it installs, or the
+        // broker would sandbox itself out of its own vault. All three come
+        // from explicit CLI input; none is read from the environment, which
+        // the quarantine invariant forbids.
+        let mut install_paths = asv_broker::harden::InstallPaths::with_write_paths([socket_path
+            .parent()
+            .unwrap_or(std::path::Path::new("/run"))
+            .to_path_buf()]);
+        if let Some(v) = &vault_path {
+            // --vault names a FILE. The parent directory is the unit
+            // Landlock can grant, so allow the directory and not the file.
+            let dir = v.parent().filter(|p| !p.as_os_str().is_empty());
+            if let Some(dir) = dir {
+                install_paths.write_paths.push(dir.to_path_buf());
+            }
+        }
+        if let Some(a) = &audit_file {
+            let dir = a.parent().filter(|p| !p.as_os_str().is_empty());
+            if let Some(dir) = dir {
+                install_paths.write_paths.push(dir.to_path_buf());
+            }
+        }
+        let cfg = asv_broker::harden::install_with(install_paths).unwrap_or_else(|err| {
             eprintln!("asv: --harden failed on a mandatory step: {err}");
             std::process::exit(1);
         });
