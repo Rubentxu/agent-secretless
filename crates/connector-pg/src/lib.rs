@@ -58,8 +58,55 @@ pub mod wire;
 /// M6-R4 requires.
 pub mod live;
 
+/// How the broker reaches a PostgreSQL server.
+///
+/// Separated from [`LiveConnectorFactory`] in the broker so this crate states
+/// what a connection needs and the broker decides what it is willing to supply.
+/// The password is a borrowed slice rather than a field: this struct is `Debug`
+/// and `Clone`, and a password that could be printed is a password that will be.
+#[derive(Debug, Clone)]
+pub struct LiveConnectorConfig {
+    /// The address the broker pinned and the policy already allowed.
+    pub address: std::net::IpAddr,
+    /// The port, pinned alongside the address.
+    pub port: u16,
+    /// The name the server certificate must match. Never derived from the
+    /// address: a certificate carries names, and a client that checks an IP
+    /// string is not verifying anything.
+    pub server_name: String,
+    /// Roots to trust in addition to the platform store.
+    pub roots: TlsRoots,
+    /// The database the broker authorised for this session.
+    pub database: String,
+    /// The role the broker authorised for this session.
+    pub role: String,
+}
+
+impl LiveConnectorConfig {
+    /// Builds a config for a `host:port` the caller has already authorised.
+    pub fn new(
+        address: std::net::IpAddr,
+        port: u16,
+        server_name: impl Into<String>,
+        roots: TlsRoots,
+        database: impl Into<String>,
+        role: impl Into<String>,
+    ) -> Self {
+        Self {
+            address,
+            port,
+            server_name: server_name.into(),
+            roots,
+            database: database.into(),
+            role: role.into(),
+        }
+    }
+}
+
 pub use live::{connect, LivePgSession, Teardown, TlsRoots};
 pub use wire::{QueryResult, WireError};
+
+pub use LiveConnectorConfig as ConnectorConfig;
 
 pub use pg::{AllowList, DbAction, DenyAll, PgConnection, PgError, PgPolicy, PostgresClient};
 pub use scram::{normalise_password, NormalisedPassword, Scram, ScramError};

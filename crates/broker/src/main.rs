@@ -262,6 +262,26 @@ fn main() -> std::io::Result<()> {
         tracing::info!(vault = %vault_path.display(), "vault opened and unlocked");
     }
 
+    // M6: the runtime the live PostgreSQL transport runs on. Built here, in the
+    // process that owns it, rather than inside the broker, so the threads that
+    // hold database sockets have the same lifetime as the process. A broker
+    // without one refuses every PostgreSQL request, which is the honest answer:
+    // it cannot have a session it cannot serve.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap_or_else(|err| {
+            eprintln!("asv: cannot start the async runtime: {err}");
+            std::process::exit(1);
+        });
+    state.runtime = Some(asv_broker::PgRuntime::from_handle(runtime.handle().clone()));
+    // The handle is kept alive for the whole loop below. Dropping the runtime
+    // while a session task still holds a socket would close that socket without
+    // the broker having observed a teardown, which is the one outcome M6-R4
+    // exists to prevent.
+    let _runtime = runtime;
+
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {

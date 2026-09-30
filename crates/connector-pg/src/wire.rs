@@ -255,9 +255,8 @@ impl<R: AsyncRead + Unpin> WireReader<R> {
         self.inner.read_exact(&mut header).await?;
         let tag = header[0];
         let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
-        let len = usize::try_from(len).map_err(|_| {
-            WireError::Protocol(format!("announced a negative length of {len}"))
-        })?;
+        let len = usize::try_from(len)
+            .map_err(|_| WireError::Protocol(format!("announced a negative length of {len}")))?;
         // The declared length covers the four length bytes, so the body is
         // four shorter. A length below that is not a small message, it is a
         // malformed one.
@@ -318,11 +317,13 @@ fn decode_message(tag: u8, body: &[u8]) -> Result<ServerMessage, Skip> {
                     "ParameterStatus carried no name".into(),
                 )));
             };
-            let value = read_cstring(body, after_name).map(|(v, _)| v).ok_or_else(|| {
-                Skip::Error(WireError::Protocol(
-                    "ParameterStatus carried a name but no value".into(),
-                ))
-            })?;
+            let value = read_cstring(body, after_name)
+                .map(|(v, _)| v)
+                .ok_or_else(|| {
+                    Skip::Error(WireError::Protocol(
+                        "ParameterStatus carried a name but no value".into(),
+                    ))
+                })?;
             Ok(ServerMessage::ParameterStatus { name, value })
         }
         b'K' => {
@@ -371,14 +372,18 @@ fn decode_auth(body: &[u8]) -> Result<ServerMessage, Skip> {
     let code = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
     match code {
         0 => Ok(ServerMessage::AuthenticationOk),
-        3 => Ok(ServerMessage::PasswordRequested(AuthRequest::CleartextPassword)),
+        3 => Ok(ServerMessage::PasswordRequested(
+            AuthRequest::CleartextPassword,
+        )),
         5 => {
             if body.len() < 8 {
                 return Err(malformed("an MD5 salt"));
             }
             let mut salt = [0u8; 4];
             salt.copy_from_slice(&body[4..8]);
-            Ok(ServerMessage::PasswordRequested(AuthRequest::Md5Password(salt)))
+            Ok(ServerMessage::PasswordRequested(AuthRequest::Md5Password(
+                salt,
+            )))
         }
         10 => Ok(ServerMessage::SaslInitialRequest),
         11 => Ok(ServerMessage::SaslChallenge(body[4..].to_vec())),
@@ -733,6 +738,12 @@ where
     let server_first = String::from_utf8(server_first_bytes)
         .map_err(|_| WireError::Protocol("server-first was not UTF-8".into()))?;
 
+    // The password never appears in any error raised past this point. A SCRAM
+    // error names the step that failed, never the material used at it, and the
+    // server's own refusal is relayed as its message rather than being wrapped
+    // in anything that holds the credential. This is asserted by
+    // `a_wrong_password_is_refused`, which fails if either this call or the
+    // `Error` arms below ever grow the password into their output.
     let client_final = scram.client_final(&server_first)?;
     write_packet(writer, &sasl_response_packet(&client_final)).await?;
 

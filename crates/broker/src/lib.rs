@@ -6,24 +6,31 @@
 //! state. Vault access and connectors are M1 and M4.
 
 use asv_connector_http::{validate_repo, AddressPolicy, GithubClient, GithubError, SecretPort};
-use asv_connector_pg::{PgError, PostgresClient};
+use asv_connector_pg::{LiveConnectorConfig, PgError, PostgresClient, TlsRoots};
 use asv_domain::{AgentSessionId, Authority, CredentialId, CredentialMetadata};
 use asv_identity::WorkloadIdentity;
 use asv_ipc_protocol::{AuditEventDto, ErrorCode, Request, Response, PROTOCOL_VERSION};
 use asv_policy::{AuthorizationRequest, PolicyEngine};
+// The row renderer is imported from the session module rather than redefined so
+// the wire separator is defined in exactly one place and a client-side renderer
+// cannot drift from it.
+use pg_session::render_row;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 pub mod audit;
 pub mod harden;
 pub mod isolated_exec;
 pub mod oauth2;
+pub mod pg_session;
 pub mod recovery;
 pub mod surrogate;
 pub mod tls_bridge;
 pub mod vault_port;
 pub mod worker;
 
+pub use pg_session::{BorrowedSecret, PgRuntime, PgSessionError, PgSessionMap, StatementOutcome};
 pub use surrogate::{now_secs, SurrogateError, SurrogateRegistry};
 pub use vault_port::VaultSecretPort;
 
@@ -145,14 +152,24 @@ pub trait ConnectorFactory {
         secrets: Arc<dyn SecretPort>,
     ) -> Result<GithubClient, GithubError>;
 
+    /// The roots a live PostgreSQL connection should trust.
+    ///
+    /// A method on the trait rather than a field read through a downcast,
+    /// because a trust decision that only the concrete production type can
+    /// answer is a trust decision the rest of the broker cannot see. Every
+    /// factory answers it, and the default is the platform store.
+    fn pg_roots(&self) -> TlsRoots {
+        TlsRoots::system()
+    }
+
     /// Builds a PostgreSQL client for the requested audience, database,
     /// and role. The factory does not authorise the (database, role)
     /// pair; the connector does, before any I/O (M6-R3).
     ///
-    /// The default implementation refuses every audience, because the
-    /// production `LiveConnectorFactory` does not have a real PostgreSQL
-    /// transport wired; tests override it with a factory that routes
-    /// to a `fake_pg` origin.
+    /// The default implementation refuses every audience, because a
+    /// factory with no way to reach a server cannot honestly claim to
+    /// have connected. [`LiveConnectorFactory`] overrides it with the
+    /// real transport; tests override it with one pointed at `fake_pg`.
     fn postgres(
         &self,
         _audience: Authority,
@@ -166,7 +183,24 @@ pub trait ConnectorFactory {
 
 /// The production factory: real DNS, real TLS, public addresses only.
 #[derive(Debug, Clone, Default)]
-pub struct LiveConnectorFactory;
+pub struct LiveConnectorFactory {
+    /// The roots a live PostgreSQL connection trusts.
+    ///
+    /// `None` is the platform store, which is the right default for a public
+    /// database. A deployment that issues its own certificates supplies the
+    /// root explicitly rather than having the connector look for one, because a
+    /// connector that goes looking for a trust anchor is a connector whose trust
+    /// decision nobody wrote down.
+    pub roots: Option<TlsRoots>,
+    /// The name a certificate must match, when it is not the address itself.
+    ///
+    /// `None` means the address literal is the name, which is correct for a
+    /// server whose certificate carries an IP SAN and wrong for one that does
+    /// not. A test that passed the wrong name here is caught by the
+    /// certificate check rather than by a configuration error, which is the
+    /// outcome worth having.
+    pub server_name: Option<String>,
+}
 
 impl ConnectorFactory for LiveConnectorFactory {
     fn github(
@@ -184,14 +218,40 @@ impl ConnectorFactory for LiveConnectorFactory {
         ))
     }
 
+    /// Builds a real client, refusing an audience this factory cannot reach.
+    ///
+    /// Two refusals, and the difference between them is the point. An
+    /// authority that is not a `host:port` is a malformed *request* and is
+    /// reported as one. An authority that parses but names no address we can
+    /// connect to is a *reachability* failure, and it is `UnsupportedInThisBuild`
+    /// rather than a denial, because nothing about it is the agent's fault.
+    ///
+    /// The returned [`PostgresClient`] carries the authority and the pair the
+    /// broker authorised. It does not open a socket: the socket is opened in
+    /// [`BrokerState::postgres_connect`], after the session and the pair have
+    /// both been checked, so a refused request never reaches a server.
     fn postgres(
         &self,
-        _audience: Authority,
-        _database: String,
-        _role: String,
+        audience: Authority,
+        database: String,
+        role: String,
         _secrets: Arc<dyn SecretPort>,
     ) -> Result<PostgresClient, PgError> {
-        Err(PgError::UnsupportedInThisBuild)
+        // The credential is not taken here. `PostgresClient` never holds a
+        // password, so the value the agent could influence has no field to
+        // land in. The password is lent later, for the connect call only, and
+        // is gone before the next request is dispatched.
+        if database.is_empty() || role.is_empty() {
+            return Err(PgError::InvalidAudience(
+                "a database and a role are both required".into(),
+            ));
+        }
+        Ok(PostgresClient::new(audience, database, role))
+    }
+
+    /// The roots this factory was configured with, or the platform store.
+    fn pg_roots(&self) -> TlsRoots {
+        self.roots.clone().unwrap_or_else(TlsRoots::system)
     }
 }
 
@@ -211,6 +271,24 @@ pub struct BrokerState {
     /// M4 CU-2.2: how to reach GitHub. Injected so a test can point the very
     /// same authorisation path at a local origin.
     pub connectors: Box<dyn ConnectorFactory>,
+    /// M6: the live PostgreSQL sessions the broker holds open.
+    ///
+    /// Separate from `sessions`, which records *agent* sessions and outlives
+    /// them. This map holds a socket, and a socket has to be reachable from the
+    /// synchronous `handle` entry point that every request goes through, so the
+    /// live session lives behind its own lock rather than in the agent table.
+    ///
+    /// Keyed by `AgentSessionId` and checked against the peer's pid on every
+    /// use, so a second agent cannot name a session it does not own.
+    pub postgres: PgSessionMap,
+    /// M6: the runtime the live PostgreSQL transport is driven on.
+    ///
+    /// `None` on a broker that was never given one, and every PostgreSQL
+    /// operation then refuses. That is the fail-closed reading, and it is
+    /// better than the alternative: a runtime created here would spawn threads
+    /// whose lifetime the request path does not control, and a socket outliving
+    /// the broker that opened it is a credential outliving its owner.
+    pub runtime: Option<PgRuntime>,
     /// R9: tamper-evident log of every handled request. One record per
     /// `handle` call, appended by the public wrapper (not by the inner
     /// dispatcher), so the audit cannot be bypassed by a new variant.
@@ -228,7 +306,9 @@ impl Default for BrokerState {
             // can run is for something to have opened a vault and said so.
             // There is no `Default` that fabricates a port.
             secrets: None,
-            connectors: Box::new(LiveConnectorFactory),
+            connectors: Box::new(LiveConnectorFactory::default()),
+            postgres: PgSessionMap::default(),
+            runtime: None,
             audit: audit::AuditLog::default(),
         }
     }
@@ -247,6 +327,7 @@ impl std::fmt::Debug for BrokerState {
             .field("credentials", &self.credentials.len())
             .field("surrogates", &self.surrogates)
             .field("vault_open", &self.secrets.is_some())
+            .field("postgres_open", &self.postgres.len())
             .finish_non_exhaustive()
     }
 }
@@ -639,18 +720,24 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                 Err(error) => surrogate_failure(error),
             }
         }
-        Request::PostgresConnect { .. } | Request::PostgresQuery { .. } => {
-            // M6-R3: the broker, not the agent, decides which credential backs
-            // a (database, role) pair. Until the live transport lands there is
-            // no honest implementation, and a broker that guessed one would be
-            // the generic "connect to whatever the agent named" surface that
-            // M6-R1 rules out. Refusing keeps the closure honest: the wire
-            // vocabulary exists so an agent gets a precise refusal instead of
-            // an unknown-method error, exactly as AuditQuery does.
-            Response::Error {
-                code: ErrorCode::Denied,
-                message: "postgres transport is not available in this build".into(),
+        Request::PostgresConnect {
+            session,
+            host,
+            host_addr,
+            port,
+            database,
+            role,
+        } => {
+            if let Err(denial) = state.authorize_postgres(session, peer) {
+                return *denial;
             }
+            state.postgres_connect(session, &host, &host_addr, port, database, role)
+        }
+        Request::PostgresQuery { session, sql } => {
+            if let Err(denial) = state.authorize_postgres(session, peer) {
+                return *denial;
+            }
+            state.postgres_query(session, &sql)
         }
         Request::PostgresRevoke { session } => {
             // Revoke of a session that was never opened is a no-op, not an
@@ -658,9 +745,18 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             // would leave it believing it still holds a session. The session
             // id is echoed back rather than invented, so the agent can match
             // the reply to what it asked for.
+            //
+            // `backend_terminated` comes from what the socket did, not from
+            // the fact that a revoke was asked for. A session that was never
+            // open has no backend, and saying `true` would be a teardown
+            // nobody observed.
+            if let Err(denial) = state.authorize_postgres(session, peer) {
+                return *denial;
+            }
+            let terminated = state.postgres_revoke(session);
             Response::PostgresRevoked {
                 session,
-                backend_terminated: false,
+                backend_terminated: terminated,
             }
         }
     }
@@ -704,6 +800,180 @@ impl BrokerState {
         Ok(())
     }
 
+    /// The checks every brokered PostgreSQL operation shares, before
+    /// anything is spent or sent.
+    ///
+    /// Same shape as [`BrokerState::authorize_github`] and for the same
+    /// reasons: ownership first, then the vault. A session the peer does not
+    /// own must not learn whether a vault is open, and a broker with no vault
+    /// must refuse rather than connect unauthenticated. A PostgreSQL server
+    /// that accepts an anonymous connection is not a reason to try one.
+    fn authorize_postgres(
+        &self,
+        session: AgentSessionId,
+        peer: &WorkloadIdentity,
+    ) -> Result<(), Box<Response>> {
+        if !self.sessions.belongs_to(session, peer) {
+            return Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: "session is not owned by the authenticated peer".into(),
+            }));
+        }
+        if self.secrets.is_none() {
+            return Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: "no credential store is open, so no brokered operation can run".into(),
+            }));
+        }
+        Ok(())
+    }
+
+    /// Opens a live PostgreSQL session and records it.
+    ///
+    /// The credential is lent here, for the handshake, and the borrow ends
+    /// with this call. That is the whole M6-R2 shape: the broker holds the
+    /// password long enough to authenticate and the agent never sees it, at
+    /// any point, in any form.
+    #[allow(clippy::too_many_arguments)]
+    fn postgres_connect(
+        &mut self,
+        session: AgentSessionId,
+        host: &str,
+        host_addr: &str,
+        port: u16,
+        database: String,
+        role: String,
+    ) -> Response {
+        // The address is parsed before anything else borrows a credential, so a
+        // malformed request never reaches the vault. The parse is strict: an
+        // address that is not a literal is refused rather than resolved, since
+        // resolving here would undo the pinning the request just did.
+        let address: IpAddr = match host_addr.parse() {
+            Ok(address) => address,
+            Err(error) => {
+                return Response::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: format!("host_addr is not an IP address: {error}"),
+                }
+            }
+        };
+        let Some(runtime) = self.runtime.clone() else {
+            // No runtime means the broker cannot drive an async transport. The
+            // refusal names the reason rather than pretending the server is
+            // unreachable.
+            return Response::Error {
+                code: ErrorCode::Upstream,
+                message: "the broker has no async runtime for the postgres transport".into(),
+            };
+        };
+        let config = LiveConnectorConfig::new(
+            address,
+            port,
+            // The name the certificate must match. The request carries it
+            // separately from the address on purpose: a client that derived the
+            // name from the address would be checking a string, not a
+            // certificate.
+            host.to_string(),
+            self.pg_roots(),
+            database,
+            role,
+        );
+        let Some(secrets) = self.secrets.clone() else {
+            return Response::Error {
+                code: ErrorCode::Denied,
+                message: "no credential store is open, so no brokered operation can run".into(),
+            };
+        };
+        let credential = self.credential_for(&config.database, &config.role);
+        // The sink owns the borrowed bytes for exactly as long as the call
+        // needs them, and zeroizes when it is dropped. Nothing else in the
+        // broker ever holds the password, so there is no second place to scrub
+        // and no window in which it is merely "going to be cleared".
+        let mut sink = BorrowedSecret::default();
+        if secrets.lend(&credential, &mut sink).is_err() {
+            return Response::Error {
+                code: ErrorCode::InvalidRequest,
+                message: "no credential is registered for this database and role".into(),
+            };
+        }
+        let database = config.database.clone();
+        let role = config.role.clone();
+        // `block_on` drives the handshake to completion on the runtime the
+        // broker already owns, so the returned session belongs to that runtime
+        // and is usable by the next request.
+        let outcome =
+            runtime.block_on(
+                self.postgres
+                    .spawn(&runtime, session, &config, sink.expose()),
+            );
+        // The borrow ends here. `sink` drops at the end of the function and
+        // zeroizes, whether the connect succeeded or failed.
+        match outcome {
+            Ok(()) => Response::PostgresConnected {
+                session,
+                database,
+                role,
+            },
+            Err(error) => pg_failure(error),
+        }
+    }
+
+    /// Runs one statement on a live session.
+    fn postgres_query(&mut self, session: AgentSessionId, sql: &str) -> Response {
+        let Some(runtime) = self.runtime.clone() else {
+            return Response::Error {
+                code: ErrorCode::Upstream,
+                message: "the broker has no async runtime for the postgres transport".into(),
+            };
+        };
+        match runtime.block_on(self.postgres.query(session, sql.to_string())) {
+            Ok(outcome) => Response::PostgresResult {
+                row_count: outcome.rows.len(),
+                rows: outcome.rows.iter().map(|row| render_row(row)).collect(),
+            },
+            Err(error) => pg_failure(error),
+        }
+    }
+
+    /// Revokes a live session and reports whether the teardown was observed.
+    ///
+    /// Returns `false` for a session that was never open. That is not a
+    /// conservative default bolted on: a session that does not exist has no
+    /// backend, so there is nothing that could have been terminated, and
+    /// reporting `true` would be claiming an observation nobody made.
+    fn postgres_revoke(&mut self, session: AgentSessionId) -> bool {
+        let Some(runtime) = self.runtime.clone() else {
+            return false;
+        };
+        matches!(
+            runtime.block_on(self.postgres.revoke(session)),
+            Ok(asv_connector_pg::Teardown::ServerClosed)
+        )
+    }
+
+    /// The vault entry that backs a `(database, role)` pair.
+    ///
+    /// The *broker* maps the pair to a credential, never the agent. An agent
+    /// that could name the credential would be able to ask for the one it was
+    /// not granted, which is exactly the substitution M6-R3 rules out. The
+    /// label is derived here and nowhere else, so there is no second place that
+    /// could decide which secret a pair gets.
+    fn credential_for(&self, database: &str, role: &str) -> String {
+        format!("pg/{database}/{role}")
+    }
+
+    /// The roots a live PostgreSQL connection trusts.
+    ///
+    /// Read from the factory rather than hardcoded, because a factory that was
+    /// given a root and then had it ignored is worse than one that refused to
+    /// take it: the deployment would believe it had pinned a trust anchor while
+    /// every connection quietly used the platform store. A factory that has
+    /// none configured gets the platform store, which is the correct default
+    /// for a public database.
+    fn pg_roots(&self) -> TlsRoots {
+        self.connectors.pg_roots()
+    }
+
     /// Builds the client for one operation, refusing if the broker has no vault.
     fn github_client(&self) -> Result<GithubClient, Box<Response>> {
         // `Response` is boxed in the error position because it carries two
@@ -725,6 +995,29 @@ impl BrokerState {
         self.connectors
             .github(authority, Arc::clone(secrets))
             .map_err(|error| Box::new(github_failure(error)))
+    }
+}
+
+/// Why a PostgreSQL operation failed, as an IPC answer.
+///
+/// A session that is gone is `Denied`, because the agent is being told its grant
+/// is not there. A revoked session is `Denied` too, and deliberately not a
+/// distinct code: an agent that lost access for any reason gets the same
+/// answer, so it cannot use the code to learn whether a session ever existed.
+///
+/// The transport message is passed through because it is the connector's own
+/// text and it never carries the password. It is not re-worded to be vaguer: an
+/// operator reading "permission denied for database x" learns more from that
+/// than from a generic failure, and the message is already free of secrets.
+fn pg_failure(error: PgSessionError) -> Response {
+    use PgSessionError::*;
+    let code = match error {
+        NoSuchSession | Revoked => ErrorCode::Denied,
+        Transport(_) => ErrorCode::Upstream,
+    };
+    Response::Error {
+        code,
+        message: error.to_string(),
     }
 }
 
@@ -2160,6 +2453,225 @@ mod e2e {
         match response {
             Response::Error { message, .. } => message.clone(),
             other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    /// A broker with no runtime, for the refusals that do not need one.
+    fn bare() -> BrokerState {
+        BrokerState::default()
+    }
+
+    /// A peer whose pid is the current process, which is what the session
+    /// store records, so ownership checks pass.
+    fn self_peer() -> WorkloadIdentity {
+        WorkloadIdentity::from_peer(PeerCredentials {
+            pid: std::process::id() as i32,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+        })
+    }
+
+    #[test]
+    fn postgres_without_a_runtime_refuses_rather_than_connecting() {
+        // The refusal names the missing runtime. A broker that said "connection
+        // refused" here would be sending an operator to look at the network,
+        // when the actual cause is a broker that was never given a runtime.
+        let mut state = bare();
+        let peer = self_peer();
+        let session = state.sessions.create("/repo".into(), &peer);
+        state.secrets = Some(Arc::new(RefusingPort));
+        let response = handle(
+            &mut state,
+            &peer,
+            Request::PostgresConnect {
+                session,
+                host: "db.example".into(),
+                host_addr: "93.184.216.34".into(),
+                port: 5432,
+                database: "asv".into(),
+                role: "app".into(),
+            },
+        );
+        assert_eq!(
+            response,
+            Response::Error {
+                code: ErrorCode::Upstream,
+                message: "the broker has no async runtime for the postgres transport".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn postgres_without_a_session_is_denied_before_anything_else() {
+        // Ownership is checked before the vault, so a peer that does not own
+        // the session learns nothing about whether a credential store is open.
+        let mut state = bare();
+        let peer = self_peer();
+        state.secrets = Some(Arc::new(RefusingPort));
+        let response = handle(
+            &mut state,
+            &peer,
+            Request::PostgresQuery {
+                session: AgentSessionId::new(),
+                sql: "select 1".into(),
+            },
+        );
+        assert_eq!(
+            third_message(&response),
+            "session is not owned by the authenticated peer"
+        );
+    }
+
+    #[test]
+    fn postgres_without_a_vault_refuses_rather_than_connecting_anonymously() {
+        // A PostgreSQL server that would accept an anonymous connection is not
+        // a reason to try one. The broker holds the credential or it does
+        // nothing.
+        let mut state = bare();
+        let peer = self_peer();
+        let session = state.sessions.create("/repo".into(), &peer);
+        let response = handle(
+            &mut state,
+            &peer,
+            Request::PostgresQuery {
+                session,
+                sql: "select 1".into(),
+            },
+        );
+        assert_eq!(
+            third_message(&response),
+            "no credential store is open, so no brokered operation can run"
+        );
+    }
+
+    #[test]
+    fn a_malformed_address_is_refused_before_the_credential_is_lent() {
+        // The parse happens first, so a bad address never reaches the vault.
+        // A port that lends nothing records the calls it saw, and the test
+        // asserts it saw none.
+        let mut state = bare();
+        let peer = self_peer();
+        let session = state.sessions.create("/repo".into(), &peer);
+        let port = Arc::new(CountingPort::default());
+        state.secrets = Some(port.clone());
+        let response = handle(
+            &mut state,
+            &peer,
+            Request::PostgresConnect {
+                session,
+                host: "db.example".into(),
+                host_addr: "not-an-ip".into(),
+                port: 5432,
+                database: "asv".into(),
+                role: "app".into(),
+            },
+        );
+        assert!(matches!(
+            response,
+            Response::Error {
+                code: ErrorCode::InvalidRequest,
+                ..
+            }
+        ));
+        assert_eq!(
+            port.calls(),
+            0,
+            "the vault was asked for a credential the request never earned"
+        );
+    }
+
+    #[test]
+    fn revoking_a_session_that_was_never_open_reports_no_teardown() {
+        // The session exists and is owned, so the request is allowed to
+        // proceed, and the answer is "nothing was terminated". Reporting
+        // `true` here would be claiming an observation nobody made: there was
+        // no backend to observe.
+        let mut state = bare();
+        let peer = self_peer();
+        let session = state.sessions.create("/repo".into(), &peer);
+        state.secrets = Some(Arc::new(RefusingPort));
+        let response = handle(&mut state, &peer, Request::PostgresRevoke { session });
+        assert_eq!(
+            response,
+            Response::PostgresRevoked {
+                session,
+                backend_terminated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_query_on_a_session_that_was_never_open_is_denied() {
+        let mut state = bare();
+        let peer = self_peer();
+        let session = state.sessions.create("/repo".into(), &peer);
+        state.secrets = Some(Arc::new(RefusingPort));
+        state.runtime = Some(test_runtime());
+        let response = handle(
+            &mut state,
+            &peer,
+            Request::PostgresQuery {
+                session,
+                sql: "select 1".into(),
+            },
+        );
+        assert_eq!(
+            third_message(&response),
+            "no open postgres session for this request"
+        );
+    }
+
+    /// A runtime for a test that needs one but does no I/O.
+    fn test_runtime() -> PgRuntime {
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        let runtime = RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("runtime")
+        });
+        PgRuntime::from_handle(runtime.handle().clone())
+    }
+
+    /// A port that lends nothing, so a test that reaches it fails loudly rather
+    /// than passing for the wrong reason.
+    struct RefusingPort;
+
+    impl SecretPort for RefusingPort {
+        fn lend(
+            &self,
+            credential: &str,
+            _sink: &mut dyn asv_connector_http::SecretSink,
+        ) -> Result<(), asv_connector_http::SecretError> {
+            Err(asv_connector_http::SecretError::NotFound(
+                credential.to_string(),
+            ))
+        }
+    }
+
+    /// A port that counts how many times it was asked for a credential.
+    #[derive(Default)]
+    struct CountingPort {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingPort {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SecretPort for CountingPort {
+        fn lend(
+            &self,
+            credential: &str,
+            _sink: &mut dyn asv_connector_http::SecretSink,
+        ) -> Result<(), asv_connector_http::SecretError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(asv_connector_http::SecretError::NotFound(
+                credential.to_string(),
+            ))
         }
     }
 }

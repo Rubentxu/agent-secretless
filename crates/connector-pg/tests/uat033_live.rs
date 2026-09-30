@@ -22,12 +22,16 @@
 //! | `ASV_UAT033_PG_NAME`   | the name in the certificate's SAN, usually `127.0.0.1` |
 //! | `ASV_UAT033_PG_ROLE`   | a non-superuser role, `app` |
 //! | `ASV_UAT033_PG_DB`     | a database `app` may connect to, `asvdb` |
-//! | `ASV_UAT033_PG_PASSWORD` | that role's password |
+//! | `ASV_UAT033_PG_PASSWORD_FILE` | a file holding that role's password |
 //!
-//! The password is read from the environment on the *test* side, which is
-//! the one place UAT-033 does not look: the assertion is that the broker's
-//! own process never hands it to the agent, and the test harness is not the
-//! agent.
+//! The password is read from a *file*, not from an environment variable, and
+//! the reason is the broker's suite. Both suites describe the same substrate
+//! and both assert the password never reaches an agent, so they must agree on
+//! one variable name. The broker's suite additionally asserts the password is
+//! absent from its own `/proc/<pid>/environ`, and a suite that read the
+//! password from the environment would have planted it there itself, making its
+//! own assertion vacuous. Reading a file keeps one substrate definition that
+//! both suites can share honestly.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -35,14 +39,13 @@ use std::path::PathBuf;
 use asv_connector_pg::live::{self, TlsRoots};
 use asv_connector_pg::Teardown;
 
-/// The canary. If this string appears anywhere the agent can read, the UAT
-/// fails. It is deliberately distinctive so a grep cannot hit it by accident.
-///
-/// The value is also the substrate password, so the test has something real to
-/// hunt for: a canary nobody ever actually uses proves nothing.
-const CANARY: &str = "uat033-canary-4f2a9c";
-
 /// Where the substrate is, or why there isn't one.
+///
+/// `password` doubles as the leak canary: every check reads it rather than a
+/// constant duplicated here. A copy can drift from the file the substrate
+/// actually uses, and then the assertions would be hunting for a string the
+/// system has never seen, which passes without proving anything. The value is
+/// deliberately distinctive so an incidental grep cannot hit it.
 struct Substrate {
     address: IpAddr,
     port: u16,
@@ -60,7 +63,8 @@ fn substrate() -> Option<Substrate> {
     let name = std::env::var("ASV_UAT033_PG_NAME").ok()?;
     let role = std::env::var("ASV_UAT033_PG_ROLE").ok()?;
     let database = std::env::var("ASV_UAT033_PG_DB").ok()?;
-    let password = std::env::var("ASV_UAT033_PG_PASSWORD").ok()?;
+    let password = std::env::var("ASV_UAT033_PG_PASSWORD_FILE").ok()?;
+    let password = std::fs::read_to_string(password).ok()?;
     Some(Substrate {
         address: address.parse().ok()?,
         port,
@@ -68,7 +72,7 @@ fn substrate() -> Option<Substrate> {
         name,
         role,
         database,
-        password,
+        password: password.trim_end_matches(['\n', '\r']).to_string(),
     })
 }
 
@@ -162,79 +166,94 @@ async fn open(substrate: &Substrate) -> asv_connector_pg::LivePgSession {
     .unwrap_or_else(|error| panic!("connect to the substrate failed: {error}"))
 }
 
-with_substrate!(connects_and_answers_a_statement, |substrate: Substrate| async move {
-    let mut session = open(&substrate).await;
+with_substrate!(
+    connects_and_answers_a_statement,
+    |substrate: Substrate| async move {
+        let mut session = open(&substrate).await;
 
-    // The handshake reporting a real server version is what separates
-    // "connected to PostgreSQL" from "connected to something that speaks the
-    // framing". A connector that ignored ParameterStatus could not tell.
-    let version = session
-        .parameter("server_version")
-        .expect("the server must report server_version");
-    assert!(
-        version.starts_with(|c: char| c.is_ascii_digit()),
-        "server_version {version:?} does not look like a PostgreSQL version"
-    );
+        // The handshake reporting a real server version is what separates
+        // "connected to PostgreSQL" from "connected to something that speaks the
+        // framing". A connector that ignored ParameterStatus could not tell.
+        let version = session
+            .parameter("server_version")
+            .expect("the server must report server_version");
+        assert!(
+            version.starts_with(|c: char| c.is_ascii_digit()),
+            "server_version {version:?} does not look like a PostgreSQL version"
+        );
 
-    let result = session.query("select 1 as one").await.expect("select 1");
-    assert_eq!(result.row_count(), 1, "select 1 returns exactly one row");
-    assert_eq!(result.rows[0], vec!["1".to_string()]);
-    assert!(
-        result.tag.starts_with("SELECT"),
-        "expected a SELECT tag, got {:?}",
-        result.tag
-    );
+        let result = session.query("select 1 as one").await.expect("select 1");
+        assert_eq!(result.row_count(), 1, "select 1 returns exactly one row");
+        assert_eq!(result.rows[0], vec!["1".to_string()]);
+        assert!(
+            result.tag.starts_with("SELECT"),
+            "expected a SELECT tag, got {:?}",
+            result.tag
+        );
 
-    // A real backend pid is M6-R4's handle on the server side.
-    let pid = session
-        .backend_pid()
-        .filter(|pid| *pid > 0)
-        .expect("the server must send BackendKeyData");
-    assert!(pid > 0);
-});
+        // A real backend pid is M6-R4's handle on the server side.
+        let pid = session
+            .backend_pid()
+            .filter(|pid| *pid > 0)
+            .expect("the server must send BackendKeyData");
+        assert!(pid > 0);
+    }
+);
 
-with_substrate!(a_null_column_is_not_the_string_null, |substrate: Substrate| async move {
-    let mut session = open(&substrate).await;
-    // SQL NULL and the four-character string 'NULL' are different values.
-    // Rendering both as "NULL" would make a caller unable to tell an absent
-    // value from a present one, which matters for any policy that filters
-    // on a column.
-    let result = session
-        .query("select null::text as a, 'NULL'::text as b")
+with_substrate!(
+    a_null_column_is_not_the_string_null,
+    |substrate: Substrate| async move {
+        let mut session = open(&substrate).await;
+        // SQL NULL and the four-character string 'NULL' are different values.
+        // Rendering both as "NULL" would make a caller unable to tell an absent
+        // value from a present one, which matters for any policy that filters
+        // on a column.
+        let result = session
+            .query("select null::text as a, 'NULL'::text as b")
+            .await
+            .expect("select with a null");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0][0], "",
+            "a NULL renders as empty, not as a literal"
+        );
+        assert_eq!(
+            result.rows[0][1], "NULL",
+            "the string 'NULL' is preserved verbatim"
+        );
+    }
+);
+
+with_substrate!(
+    a_wrong_password_is_refused,
+    |substrate: Substrate| async move {
+        let roots = roots(&substrate);
+        let error = live::connect(
+            substrate.address,
+            substrate.port,
+            &substrate.name,
+            &roots,
+            &substrate.database,
+            &substrate.role,
+            "definitely-not-the-password",
+        )
         .await
-        .expect("select with a null");
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0][0], "", "a NULL renders as empty, not as a literal");
-    assert_eq!(result.rows[0][1], "NULL", "the string 'NULL' is preserved verbatim");
-});
+        .expect_err("a wrong password must not authenticate");
 
-with_substrate!(a_wrong_password_is_refused, |substrate: Substrate| async move {
-    let roots = roots(&substrate);
-    let error = live::connect(
-        substrate.address,
-        substrate.port,
-        &substrate.name,
-        &roots,
-        &substrate.database,
-        &substrate.role,
-        "definitely-not-the-password",
-    )
-    .await
-    .expect_err("a wrong password must not authenticate");
-
-    // The refusal must not leak the password, nor echo the server's message
-    // verbatim if that message would contain credential material. This
-    // checks the first; the second is a property of the server, not of us.
-    let rendered = error.to_string();
-    assert!(
-        !rendered.contains("definitely-not-the-password"),
-        "the error leaked the password: {rendered}"
-    );
-    assert!(
-        !rendered.contains(CANARY),
-        "the error leaked another password: {rendered}"
-    );
-});
+        // The refusal must not leak the password, nor echo the server's message
+        // verbatim if that message would contain credential material. This
+        // checks the first; the second is a property of the server, not of us.
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("definitely-not-the-password"),
+            "the error leaked the password: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&substrate.password),
+            "the error leaked another password: {rendered}"
+        );
+    }
+);
 
 with_substrate!(
     an_untrusted_root_cannot_connect,
@@ -407,109 +426,133 @@ fn cmdline_of(pid: u32) -> Option<Vec<String>> {
 // a macro invocation, and a `///` there is not attached to anything, which the
 // compiler says so out loud. The reasoning it carries is about the assertions
 // below, so it is worth keeping either way.
-with_substrate!(psql_authenticates_without_the_password_in_proc, |substrate: Substrate| async move {
-    // The password reaches the client through `PGPASSFILE`, a file it reads
-    // and does not put in its arguments or environment. That is the *shape*
-    // of the claim being tested: a secret handed to a child must arrive
-    // through a channel the child reads, not through one a reader of `/proc`
-    // can see. Nothing here is mocked. `psql` is the real client, the
-    // substrate is a real server, and the assertions read the kernel's view of
-    // a real process.
-    let passfile = std::env::temp_dir().join(format!("asv-uat033-{}.pgpass", std::process::id()));
-    // `chmod 0600`: libpq refuses a world-readable password file, so this is
-    // what makes the client accept it at all, not a hygiene step.
-    std::fs::write(
-        &passfile,
-        format!("{}:{}:{}:{}:{}\n", substrate.address, substrate.port, substrate.database, substrate.role, CANARY),
-    )
-    .expect("write the passfile");
-    restrict_to_owner(&passfile);
-
-    let host = substrate.name.clone();
-    let port = substrate.port.to_string();
-    let database = substrate.database.clone();
-    let role = substrate.role.clone();
-    let passfile = passfile.clone();
-
-    // Resolve `psql` to an absolute path *before* clearing the environment.
-    // With an empty `PATH` the exec succeeds on argv[0] alone, and then psql
-    // fails with `could not find own program executable`, because it re-execs
-    // itself to find its share directory. This is a real failure the live run
-    // surfaced, and it is why the clear-then-spawn order below is not reversed.
-    let psql = std::env::var("ASV_UAT033_PSQL")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("psql"));
-    let psql = which(&psql).unwrap_or_else(|| {
-        panic!(
-            "psql was not found on PATH; install the client or set \
-             ASV_UAT033_PSQL to its absolute path"
+with_substrate!(
+    psql_authenticates_without_the_password_in_proc,
+    |substrate: Substrate| async move {
+        // The password reaches the client through `PGPASSFILE`, a file it reads
+        // and does not put in its arguments or environment. That is the *shape*
+        // of the claim being tested: a secret handed to a child must arrive
+        // through a channel the child reads, not through one a reader of `/proc`
+        // can see. Nothing here is mocked. `psql` is the real client, the
+        // substrate is a real server, and the assertions read the kernel's view of
+        // a real process.
+        let passfile =
+            std::env::temp_dir().join(format!("asv-uat033-{}.pgpass", std::process::id()));
+        // `chmod 0600`: libpq refuses a world-readable password file, so this is
+        // what makes the client accept it at all, not a hygiene step.
+        std::fs::write(
+            &passfile,
+            format!(
+                "{}:{}:{}:{}:{}\n",
+                substrate.address,
+                substrate.port,
+                substrate.database,
+                substrate.role,
+                substrate.password
+            ),
         )
-    });
+        .expect("write the passfile");
+        restrict_to_owner(&passfile);
 
-    let child = std::process::Command::new(&psql)
-        .env_clear()
-        .env("PGPASSFILE", &passfile)
-        // The password is *not* set in the child's environment. This is the
-        // assertion's subject, not a comment: if a future change added
-        // `PGPASSWORD`, the environ read below would find the canary.
-        .arg("--host").arg(&host)
-        .arg("--port").arg(&port)
-        .arg("--username").arg(&role)
-        .arg("--dbname").arg(&database)
-        .arg("--no-password")
-        .arg("--tuples-only")
-        .arg("--command").arg("select 41 + 1")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("psql must be installed to run this UAT");
+        let host = substrate.name.clone();
+        let port = substrate.port.to_string();
+        let database = substrate.database.clone();
+        let role = substrate.role.clone();
+        let passfile = passfile.clone();
 
-    let pid = child.id();
-    // Read `/proc` while the child is alive. After it exits the files are
-    // gone, and a leak would become unobservable exactly when the test
-    // finishes looking for it.
-    let environ = environ_of(pid);
-    let cmdline = cmdline_of(pid);
-
-    let output = child.wait_with_output().expect("wait for psql");
-    let _ = std::fs::remove_file(&passfile);
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "psql did not connect: {stderr}\nstdout: {stdout}"
-    );
-    assert_eq!(stdout.trim(), "42", "the real client must run the real statement");
-
-    // The leak check. Both reads are required: a secret in the arguments is
-    // the common mistake, and a secret in the environment is the one that a
-    // wrapper is tempted to introduce later.
-    for (label, entries) in [("environ", environ), ("cmdline", cmdline)] {
-        let entries = entries.unwrap_or_else(|| {
-            panic!("{label} for pid {pid} was unreadable, so this run proves nothing")
+        // Resolve `psql` to an absolute path *before* clearing the environment.
+        // With an empty `PATH` the exec succeeds on argv[0] alone, and then psql
+        // fails with `could not find own program executable`, because it re-execs
+        // itself to find its share directory. This is a real failure the live run
+        // surfaced, and it is why the clear-then-spawn order below is not reversed.
+        let psql = std::env::var("ASV_UAT033_PSQL")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("psql"));
+        let psql = which(&psql).unwrap_or_else(|| {
+            panic!(
+                "psql was not found on PATH; install the client or set \
+             ASV_UAT033_PSQL to its absolute path"
+            )
         });
-        for entry in &entries {
-            assert!(
-                !entry.contains(CANARY),
-                "the password leaked into /proc/{pid}/{label}: {entry}"
-            );
+
+        let child = std::process::Command::new(&psql)
+            .env_clear()
+            .env("PGPASSFILE", &passfile)
+            // The password is *not* set in the child's environment. This is the
+            // assertion's subject, not a comment: if a future change added
+            // `PGPASSWORD`, the environ read below would find the canary.
+            .arg("--host")
+            .arg(&host)
+            .arg("--port")
+            .arg(&port)
+            .arg("--username")
+            .arg(&role)
+            .arg("--dbname")
+            .arg(&database)
+            .arg("--no-password")
+            .arg("--tuples-only")
+            .arg("--command")
+            .arg("select 41 + 1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("psql must be installed to run this UAT");
+
+        let pid = child.id();
+        // Read `/proc` while the child is alive. After it exits the files are
+        // gone, and a leak would become unobservable exactly when the test
+        // finishes looking for it.
+        let environ = environ_of(pid);
+        let cmdline = cmdline_of(pid);
+
+        let output = child.wait_with_output().expect("wait for psql");
+        let _ = std::fs::remove_file(&passfile);
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "psql did not connect: {stderr}\nstdout: {stdout}"
+        );
+        assert_eq!(
+            stdout.trim(),
+            "42",
+            "the real client must run the real statement"
+        );
+
+        // The leak check. Both reads are required: a secret in the arguments is
+        // the common mistake, and a secret in the environment is the one that a
+        // wrapper is tempted to introduce later.
+        for (label, entries) in [("environ", environ), ("cmdline", cmdline)] {
+            let entries = entries.unwrap_or_else(|| {
+                panic!("{label} for pid {pid} was unreadable, so this run proves nothing")
+            });
+            for entry in &entries {
+                assert!(
+                    !entry.contains(&substrate.password),
+                    "the password leaked into /proc/{pid}/{label}: {entry}"
+                );
+            }
         }
+        // The positive control, without which the assertions above are vacuous:
+        // if `/proc` were not actually readable, they would pass no matter what.
+        assert!(
+            !environ_of(std::process::id())
+                .expect("our own environ is readable")
+                .is_empty(),
+            "/proc reads returned nothing, so the leak check cannot fail"
+        );
     }
-    // The positive control, without which the assertions above are vacuous:
-    // if `/proc` were not actually readable, they would pass no matter what.
-    assert!(
-        !environ_of(std::process::id()).expect("our own environ is readable").is_empty(),
-        "/proc reads returned nothing, so the leak check cannot fail"
-    );
-});
+);
 
 /// Restricts a file to its owner, the mode libpq insists on.
 #[cfg(unix)]
 fn restrict_to_owner(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
-    let mut permissions = std::fs::metadata(path).expect("stat the passfile").permissions();
+    let mut permissions = std::fs::metadata(path)
+        .expect("stat the passfile")
+        .permissions();
     permissions.set_mode(0o600);
     std::fs::set_permissions(path, permissions).expect("chmod the passfile");
 }

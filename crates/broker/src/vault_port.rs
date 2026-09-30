@@ -55,8 +55,6 @@ impl SecretPort for VaultSecretPort {
     ///    attached to exactly one request and that request is the one we
     ///    authenticated" is a property of the type, not of a code review.
     fn lend(&self, credential: &str, sink: &mut dyn SecretSink) -> Result<(), SecretError> {
-        #[cfg(test)]
-        eprintln!("LEND credential={credential:?}");
         self.store
             .with_secret(&self.key, credential, |secret| sink.accept(secret))
             .map_err(|error| translate(error, credential))?

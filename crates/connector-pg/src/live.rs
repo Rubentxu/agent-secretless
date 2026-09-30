@@ -32,10 +32,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-use crate::scram::ScramError;
-use crate::wire::{
-    self, QueryResult, ServerMessage, WireError, WireReader,
-};
+use crate::wire::{self, QueryResult, ServerMessage, WireError, WireReader};
 
 /// How long the connector waits for a connection and for each read.
 ///
@@ -82,9 +79,9 @@ impl TlsRoots {
             // platform store alone would produce a connection failure a long
             // way from the cause.
             for certificate in rustls_pemfile_certs(&mut cursor)? {
-                roots
-                    .add(certificate)
-                    .map_err(|error| WireError::Protocol(format!("root certificate rejected: {error}")))?;
+                roots.add(certificate).map_err(|error| {
+                    WireError::Protocol(format!("root certificate rejected: {error}"))
+                })?;
             }
         }
         Ok(roots)
@@ -114,7 +111,10 @@ fn rustls_pemfile_certs(
         let Some(end) = after.find(END) else {
             break;
         };
-        let body: String = after[..end].chars().filter(|c| !c.is_whitespace()).collect();
+        let body: String = after[..end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
         let der = base64::engine::general_purpose::STANDARD
             .decode(body.as_bytes())
             .map_err(|error| WireError::Protocol(format!("root file had bad base64: {error}")))?;
@@ -325,8 +325,8 @@ pub async fn connect(
         &rustls::version::TLS12,
         &rustls::version::TLS13,
     ])
-        .with_root_certificates(roots.store()?)
-        .with_no_client_auth();
+    .with_root_certificates(roots.store()?)
+    .with_no_client_auth();
     // ALPN is mandatory, not a preference. PostgreSQL 18 closes a direct TLS
     // connection whose ClientHello carries no ALPN extension, and the client
     // sees only an `early eof`. Setting it here is the whole fix; the server
@@ -334,8 +334,10 @@ pub async fn connect(
     // extensión de negociación de protocolo ALPN`.
     config.alpn_protocols = vec![crate::wire::ALPN_PROTOCOL.to_vec()];
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-    let server_name = rustls_pki_types::ServerName::try_from(server_name.to_string())
-        .map_err(|_| WireError::Protocol(format!("{server_name} is not a valid TLS server name")))?;
+    let server_name =
+        rustls_pki_types::ServerName::try_from(server_name.to_string()).map_err(|_| {
+            WireError::Protocol(format!("{server_name} is not a valid TLS server name"))
+        })?;
     let tls = tokio::time::timeout(IO_TIMEOUT, connector.connect(server_name, tcp))
         .await
         .map_err(|_| WireError::Protocol("TLS handshake timed out".into()))??;
@@ -437,12 +439,4 @@ async fn drive_handshake<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     }
-}
-
-/// Maps a SCRAM failure onto the transport's error vocabulary.
-///
-/// The password never appears in either: a SCRAM error names the step that
-/// failed, never the material used at it.
-pub fn describe_scram_failure(error: ScramError) -> WireError {
-    WireError::Auth(error.to_string())
 }

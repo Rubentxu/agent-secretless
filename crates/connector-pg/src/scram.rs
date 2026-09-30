@@ -730,7 +730,11 @@ mod tests {
             !message.starts_with("n,,"),
             "the auth message must not carry the gs2 header: {message}"
         );
-        assert_eq!(components[0], format!("n={RFC_ROLE}"), "the username leads the bare client-first");
+        assert_eq!(
+            components[0],
+            format!("n={RFC_ROLE}"),
+            "the username leads the bare client-first"
+        );
         assert!(
             !message.contains(",p="),
             "the auth message is the proof's input and cannot contain the proof"
