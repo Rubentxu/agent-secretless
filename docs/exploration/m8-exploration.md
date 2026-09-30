@@ -178,6 +178,27 @@ of `06-TRANSPARENT-BRIDGE-EBPF.md`).
 
 ## 11. Verdict
 
+**Recorded verdict: PASS.** All three criteria below were re-verified by
+execution on 2026-09-30 at `7e6a352`, not inferred from the code reading:
+
+| Criterion | Evidence | Result |
+|---|---|---|
+| `Verb` extends with the four M8 verbs | `crates/ebpfd/src/verbs.rs:30`, 4 variants plus their wire names | met |
+| `parse_verb` rejects everything outside the closed set | `closed_set_round_trips`, `unknown_verb_is_rejected`, `unknown_verb_carries_the_input_unchanged` | 3/3 ok |
+| `CgroupAttach` prototype exists and the helper recognises the verb | `cgroup_attach_skeleton`, `cgroup_attach_skeleton_returns_ok_with_zero_handle`, `cgroup_attach_skeleton_accepts_max_cgroup_id` | 3/3 ok |
+
+```text
+cargo test -p asv-ebpfd --lib -- closed_set_round_trips unknown_verb_is_rejected \
+  unknown_verb_carries_the_input_unchanged cgroup_attach_skeleton
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out
+```
+
+M9 is therefore unblocked. The verdict was previously stated as a
+condition without being recorded as met, which left the cycle open on a
+question the code had already answered.
+
+The criteria as written:
+
 M8 R&D gate **PASSES** if:
 
 - The `Verb` enum extends with the four M8 verbs.
