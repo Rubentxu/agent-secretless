@@ -1,0 +1,107 @@
+schema_version: 1
+release:
+  candidate: v0.15.0
+  project: agent-secretless
+  last_uat_release: v0.14.0
+generated_by: uat-planner
+generated_at: 2026-09-30T10:09:00Z
+features:
+  - id: UAT-M9-TLS-ACCEPTOR
+    name: "asv-tls-acceptor presents the session leaf over a real TLS handshake"
+    scenarios:
+      - id: S-1
+        title: "A client trusting only the session root completes the handshake"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "asv-tls-acceptor crate compiled"
+        plain_steps:
+          - action: "Run cargo test -p asv-tls-acceptor --test handshake"
+            copy_hint: false
+            expected: "the session-root handshake case is green"
+        technical_steps:
+          - "rustls client with root-anchors = session root only completes the handshake against the acceptor"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p asv-tls-acceptor --test handshake"
+          status: automated
+        rationale: "the whole point of the cycle: a leaf minted for the session, verifiable only by that session's root"
+        evidence:
+          required: false
+          kinds: []
+      - id: S-2
+        title: "A foreign root is refused"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "asv-tls-acceptor crate compiled"
+        plain_steps:
+          - action: "Run cargo test -p asv-tls-acceptor --test handshake"
+            copy_hint: false
+            expected: "the foreign-root case is green, meaning the handshake fails"
+        technical_steps:
+          - "a client whose root store does not contain the session root fails the handshake"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p asv-tls-acceptor --test handshake"
+          status: automated
+        rationale: "an acceptor that accepted any client would provide no confidentiality at all"
+        evidence:
+          required: false
+          kinds: []
+      - id: S-3
+        title: "A leaf is refused when the intermediate is not presented"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "asv-tls-acceptor crate compiled"
+        plain_steps:
+          - action: "Run cargo test -p asv-tls-acceptor --test handshake"
+            copy_hint: false
+            expected: "the missing-intermediate case is green, meaning the handshake fails"
+        technical_steps:
+          - "the chain is presented leaf-then-intermediate; omitting the intermediate breaks verification"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p asv-tls-acceptor --test handshake"
+          status: automated
+        rationale: "locks the chain order, which a reversed chain also breaks and which is otherwise untested by the passing case"
+        evidence:
+          required: false
+          kinds: []
+      - id: S-4
+        title: "OpenSSL completes the handshake, and no OpenSSL-only defect is hiding behind a rustls-to-rustls agreement"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "openssl binary on PATH"
+        plain_steps:
+          - action: "Run cargo test -p asv-tls-acceptor --test openssl_client"
+            copy_hint: false
+            expected: "the correct-hostname case passes and the wrong-hostname case passes"
+        technical_steps:
+          - "openssl s_client -verify_hostname <host> -CAfile <session root PEM> exits zero and prints 'Verification: OK'"
+          - "openssl s_client -verify_hostname <other> exits non-zero against the same acceptor"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p asv-tls-acceptor --test openssl_client"
+          status: automated
+        rationale: "client and server are otherwise both rustls, so a shared bug would cancel out; openssl shares no code with the acceptor"
+        evidence:
+          required: false
+          kinds: []
+      - id: S-5
+        title: "The private key does not appear in diagnostics"
+        priority: P1
+        assignee: developer
+        preconditions:
+          - "asv-tls-acceptor crate compiled"
+        plain_steps:
+          - action: "Run cargo test -p asv-tls-acceptor --lib"
+            copy_hint: false
+            expected: "the debug-does-not-leak case is green"
+        technical_steps:
+          - "format!(\"{:?}\", LeafMaterial) contains no DER of the private key; the key is behind a manual Debug"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p asv-tls-acceptor --lib"
+          status: automated
+        rationale: "a derived Debug on a key-holding struct is the default and the leak, and logs outlive the process"
+        evidence:
+          required: false
+          kinds: []
