@@ -1,0 +1,189 @@
+schema_version: 1
+release:
+  candidate: v0.11.0
+  project: agent-secretless
+  last_uat_release: v0.10.1
+generated_by: uat-planner
+generated_at: 2026-09-30T08:09:00Z
+features:
+  - id: UAT-M10-WORKER
+    name: "M10 isolated worker runtime"
+    scenarios:
+      - id: S-1
+        title: "A worker run completes and is audited with metadata only"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "asv-broker and uat_040 compiled"
+        plain_steps:
+          - action: "Run cargo test --release -p asv-broker --test uat_040_isolated_worker_runtime"
+            copy_hint: false
+            expected: "15/15, including the completed run audited as outcome=ok"
+        technical_steps:
+          - "AuditEventDto::WorkerSpawned outcome == \"ok\" and carries no secret or stdout"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test --release -p asv-broker --test uat_040_isolated_worker_runtime"
+          status: automated
+        rationale: "M10's new capability, exercised through the real spawn path and not through the enum"
+        evidence:
+          required: false
+          kinds: []
+      - id: S-2
+        title: "The seccomp deny-list is unconditional and a non-productive profile is refused"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "Linux host with user namespaces"
+        plain_steps:
+          - action: "Run cargo test --release -p asv-broker --test uat_040_isolated_worker_runtime"
+            copy_hint: false
+            expected: "PassThrough and AllowPolicy are refused as outcome=refused, never downgraded"
+        technical_steps:
+          - "spawn() rejects a non-productive seccomp_profile BEFORE creating the child"
+          - "the M7 deny-list applies unconditionally regardless of profile"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test --release -p asv-broker --test uat_040_isolated_worker_runtime"
+          status: automated
+        rationale: "seccomp_profile was a dead knob until M10; the guard was falsified with `if false` and restored"
+        evidence:
+          required: false
+          kinds: []
+      - id: S-3
+        title: "A worker that triggers the seccomp bite dies by signal and is audited as signaled"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "Linux host with seccomp available"
+        plain_steps:
+          - action: "Run cargo test --release -p asv-broker --test uat_040_isolated_worker_runtime"
+            copy_hint: false
+            expected: "uat_040_seccomp_bite_kills_worker_calling_bpf green, RunOutcome::Signaled observed"
+        technical_steps:
+          - "run.outcome == RunOutcome::Signaled, exit_code == None"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test --release -p asv-broker --test uat_040_isolated_worker_runtime"
+          status: automated
+        rationale: "the sandbox must actually bite; a policy that cannot kill is decoration"
+        evidence:
+          required: false
+          kinds: []
+      - id: S-4
+        title: "A runaway worker is killed at the timeout and audited as timeout"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "asv-broker compiled"
+        plain_steps:
+          - action: "Run cargo test --release -p asv-broker --test uat_040_isolated_worker_runtime"
+            copy_hint: false
+            expected: "uat_040_runaway_worker_is_killed_at_timeout green, outcome=timeout"
+        technical_steps:
+          - "spawn returns Err(SpawnError::Timeout) and the audit record says \"timeout\""
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test --release -p asv-broker --test uat_040_isolated_worker_runtime"
+          status: automated
+        rationale: "M10R-R5 lifetime cap; the audit string is a literal, not derived from the enum, so it needs this check"
+        evidence:
+          required: false
+          kinds: []
+      - id: S-5
+        title: "RunOutcome cannot gain a variant without an audit name and a contract test entry"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "asv-broker lib compiled"
+        plain_steps:
+          - action: "Run cargo test --release -p asv-broker --lib worker::tests"
+            copy_hint: false
+            expected: "10/10; adding a RunOutcome variant fails the build with E0004"
+        technical_steps:
+          - "run_outcome_contract_is_exhaustive is a module-scope const fn with no wildcard arm"
+          - "every_run_outcome_has_a_distinct_audit_name rejects two variants sharing a name"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test --release -p asv-broker --lib worker::tests"
+          status: automated
+        rationale: "dup-r2-003; falsified both directions. The backstop is outside cfg(test) on purpose"
+        evidence:
+          required: false
+          kinds: []
+      - id: S-6
+        title: "A secret in worker stdout is redacted and the transformed value is not"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "asv-broker and uat_040 compiled"
+        plain_steps:
+          - action: "Run cargo test --release -p asv-broker --test uat_040_isolated_worker_runtime"
+            copy_hint: false
+            expected: "uat_040_secret_in_stdout_is_redacted_transformed_is_not green"
+        technical_steps:
+          - "WorkerRun exposes only stdout_redacted / stderr_redacted; raw bytes unreachable"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test --release -p asv-broker --test uat_040_isolated_worker_runtime"
+          status: automated
+        rationale: "M10R-R5; the point of a broker is that the agent cannot read the secret back"
+        evidence:
+          required: false
+          kinds: []
+  - id: UAT-M10-REGRESSION
+    name: "v0.11.0 release integrity"
+    scenarios:
+      - id: S-7
+        title: "The full workspace suite is green at the release candidate"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "release toolchain present"
+        plain_steps:
+          - action: "Run cargo test --workspace --locked"
+            copy_hint: false
+            expected: "482 passed / 0 failed / 1 ignored"
+        technical_steps:
+          - "no test is ignored except the one pre-existing ignored case"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test --workspace --locked"
+          status: automated
+        rationale: "the release gate must rest on the suite, not on a targeted subset"
+        evidence:
+          required: false
+          kinds: []
+      - id: S-8
+        title: "CI gates are green, including the format job that was previously red"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "rustfmt and clippy present"
+        plain_steps:
+          - action: "Run cargo clippy --workspace --all-targets --locked -- -D warnings and cargo fmt --all -- --check"
+            copy_hint: false
+            expected: "clippy clean; fmt reports no drift in any file"
+        technical_steps:
+          - "m10-f06 was filed as a tolerated gap; it was a red CI gate and is now green"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo fmt --all -- --check"
+          status: automated
+        rationale: "a gate that is red blocks the pipeline; tolerance labels must not hide that"
+        evidence:
+          required: false
+          kinds: []
+      - id: S-9
+        title: "The p95 performance gate is a bound, not a formality"
+        priority: P1
+        assignee: developer
+        preconditions:
+          - "developer-grade Linux host"
+        plain_steps:
+          - action: "Run cargo test --release -p asv-broker --test uat_030_perf"
+            copy_hint: false
+            expected: "6/6 and stable across 20 consecutive runs"
+        technical_steps:
+          - "p95 compared in microseconds; budget may not exceed 6x the measured p95"
+          - "6 ms budget holds in BOTH debug (p95 ~4.9 ms) and release (p95 ~1.7 ms)"
+          - "raising the budget 10x must fail the run, not pass it"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test --release -p asv-broker --test uat_030_perf"
+          status: automated
+        rationale: "m10-f03; the gate was a coin flip and then, for one commit, silently removable"
+        evidence:
+          required: false
+          kinds: []

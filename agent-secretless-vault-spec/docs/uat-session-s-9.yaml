@@ -1,0 +1,27 @@
+schema_version: 2
+session_id: auto-S-9-20260930T082058Z
+plan_ref: v0.11.0
+release: v0.11.0
+executor: automated
+executed_by: auto-runner
+started_at: 2026-09-30T08:20:58Z
+finished_at: 2026-09-30T08:20:58Z
+results:
+- scenario_id: S-9
+  status: PASS
+  comment: "pass: `/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test --release -p asv-broker --test uat_030_perf` exited 0"
+  evidence:
+  - kind: command_output
+    ref: sha256:c65fb3191086c3594349b03313c9212b7e246bf12e3c6cba7fad0aed624683aa
+    note: "pass: `/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test --release -p asv-broker --test uat_030_perf` exited 0"
+    captured_at: 2026-09-30T08:20:58Z
+    size_bytes: 935
+    mime: text/plain
+    path: /home/rubentxu/.jcode/scratch/sddk-uat-cli-ev-S-9-1274327.log
+  duration_minutes: 0
+  verdict_at: 2026-09-30T08:20:58Z
+  verdict_duration_ms: 42054
+  repro_command: >-
+    /var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test
+    --release -p asv-broker --test uat_030_perf
+plan_version: 1

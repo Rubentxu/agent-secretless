@@ -1,0 +1,88 @@
+schema_version: 2
+release: v0.11.0
+plan_ref: v0.11.0
+sessions:
+- auto-S-1-20260930T081916Z
+- auto-S-2-20260930T081917Z
+- auto-S-3-20260930T081918Z
+- auto-S-4-20260930T081919Z
+- auto-S-5-20260930T082004Z
+- auto-S-6-20260930T082005Z
+- auto-S-7-20260930T082016Z
+- auto-S-8-20260930T082016Z
+- auto-S-9-20260930T082058Z
+summary:
+  total_scenarios: 9
+  passed: 9
+  failed: 0
+  blocked: 0
+  partial: 0
+  not_run: 0
+  coverage_pct: 100.0
+  defects: 0
+  ux_issues: 0
+  uat_duration_minutes: 0
+features:
+- id: UAT-M10-WORKER
+  name: M10 isolated worker runtime
+  coverage_pct: 100.0
+  scenarios:
+  - scenario_id: S-1
+    status: PASS
+    executor: automated
+    acceptance: pending
+    acceptance_required: true
+  - scenario_id: S-2
+    status: PASS
+    executor: automated
+    acceptance: pending
+    acceptance_required: true
+  - scenario_id: S-3
+    status: PASS
+    executor: automated
+    acceptance: pending
+    acceptance_required: true
+  - scenario_id: S-4
+    status: PASS
+    executor: automated
+    acceptance: pending
+    acceptance_required: true
+  - scenario_id: S-5
+    status: PASS
+    executor: automated
+    acceptance: pending
+    acceptance_required: true
+  - scenario_id: S-6
+    status: PASS
+    executor: automated
+    acceptance: pending
+    acceptance_required: true
+- id: UAT-M10-REGRESSION
+  name: v0.11.0 release integrity
+  coverage_pct: 100.0
+  scenarios:
+  - scenario_id: S-7
+    status: PASS
+    executor: automated
+    acceptance: pending
+    acceptance_required: true
+  - scenario_id: S-8
+    status: PASS
+    executor: automated
+    acceptance: pending
+    acceptance_required: true
+  - scenario_id: S-9
+    status: PASS
+    executor: automated
+    acceptance_required: false
+verdict: READY
+not_ready_blockers: []
+acceptance_blockers:
+- S-1 (machine PASS pero sin acceptance humana)
+- S-2 (machine PASS pero sin acceptance humana)
+- S-3 (machine PASS pero sin acceptance humana)
+- S-4 (machine PASS pero sin acceptance humana)
+- S-5 (machine PASS pero sin acceptance humana)
+- S-6 (machine PASS pero sin acceptance humana)
+- S-7 (machine PASS pero sin acceptance humana)
+- S-8 (machine PASS pero sin acceptance humana)

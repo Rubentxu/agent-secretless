@@ -1,0 +1,27 @@
+schema_version: 2
+session_id: auto-S-8-20260930T082016Z
+plan_ref: v0.11.0
+release: v0.11.0
+executor: automated
+executed_by: auto-runner
+started_at: 2026-09-30T08:20:16Z
+finished_at: 2026-09-30T08:20:16Z
+results:
+- scenario_id: S-8
+  status: PASS
+  comment: "pass: `/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo fmt --all -- --check` exited 0"
+  evidence:
+  - kind: command_output
+    ref: sha256:54db91fcdf400491625ce9c15d17bc6dce9c2bcf4c37994c863ceb008e5f95dd
+    note: "pass: `/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo fmt --all -- --check` exited 0"
+    captured_at: 2026-09-30T08:20:16Z
+    size_bytes: 139
+    mime: text/plain
+    path: /home/rubentxu/.jcode/scratch/sddk-uat-cli-ev-S-8-1274327.log
+  duration_minutes: 0
+  verdict_at: 2026-09-30T08:20:16Z
+  verdict_duration_ms: 282
+  repro_command: >-
+    /var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo fmt --all --
+    --check
+plan_version: 1

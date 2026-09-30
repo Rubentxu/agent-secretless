@@ -1,0 +1,27 @@
+schema_version: 2
+session_id: auto-S-6-20260930T082005Z
+plan_ref: v0.11.0
+release: v0.11.0
+executor: automated
+executed_by: auto-runner
+started_at: 2026-09-30T08:20:05Z
+finished_at: 2026-09-30T08:20:05Z
+results:
+- scenario_id: S-6
+  status: PASS
+  comment: "pass: `/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test --release -p asv-broker --test uat_040_isolated_worker_runtime` exited 0"
+  evidence:
+  - kind: command_output
+    ref: sha256:3f81504f75a618dd9d2161339266cd56341239ad38539d22a360242f942ba23e
+    note: "pass: `/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test --release -p asv-broker --test uat_040_isolated_worker_runtime` exited 0"
+    captured_at: 2026-09-30T08:20:05Z
+    size_bytes: 1442
+    mime: text/plain
+    path: /home/rubentxu/.jcode/scratch/sddk-uat-cli-ev-S-6-1274327.log
+  duration_minutes: 0
+  verdict_at: 2026-09-30T08:20:05Z
+  verdict_duration_ms: 1059
+  repro_command: >-
+    /var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test
+    --release -p asv-broker --test uat_040_isolated_worker_runtime
+plan_version: 1
