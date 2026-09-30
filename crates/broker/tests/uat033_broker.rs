@@ -681,3 +681,88 @@ with_substrate!(
         );
     }
 );
+
+// The factory's pinned name wins over the request's `host`.
+//
+// `LiveConnectorFactory::server_name` was a public field nothing read:
+// `postgres_connect` took the certificate name from the request, so a
+// deployment that configured a name here got the request's name anyway. The
+// existing tests set both to the same value, which is why nothing noticed.
+//
+// The substrate's certificate carries two SANs, `DNS:pg.local.test` and
+// `IP:127.0.0.1`, and the test depends on that: it pins the factory to
+// `pg.local.test` and asks the request for an unrelated host. If the request
+// won, the check would run against `not-the-substrate.example` and fail to
+// connect; because the factory wins, the check runs against `pg.local.test`,
+// which the certificate does carry, and it connects. The companion test below
+// pins nothing and asks for the same unrelated host, and that one is refused.
+// Together the pair shows which name was used, which a single test cannot.
+with_substrate!(
+    a_pinned_name_is_the_one_the_certificate_is_checked_against,
+    |substrate: Substrate| {
+        let (mut state, peer, session, _dir) = brokered(&substrate);
+        // A name the certificate carries, and that the request does not name.
+        let pinned = "pg.local.test".to_string();
+        state.connectors = Box::new(LiveConnectorFactory {
+            roots: Some(
+                TlsRoots::system()
+                    .with_extra_roots(std::fs::read(&substrate.root).expect("root pem")),
+            ),
+            server_name: Some(pinned.clone()),
+        });
+
+        let response = handle(
+            &mut state,
+            &peer,
+            Request::PostgresConnect {
+                session,
+                host: "not-the-substrate.example".to_string(),
+                host_addr: substrate.address.to_string(),
+                port: substrate.port,
+                database: substrate.database.clone(),
+                role: substrate.role.clone(),
+            },
+        );
+        assert!(
+            matches!(response, Response::PostgresConnected { .. }),
+            "the factory pinned {pinned}, which the certificate carries, so the check \
+             must have run against the pinned name and not against the request's \
+             host. Got {response:?}"
+        );
+    }
+);
+
+// The control: the same request host, with no pinned name, is refused. If this
+// connected, the previous test would prove nothing, because a TLS setup that
+// accepts anything would also accept the pinned name.
+with_substrate!(
+    without_a_pinned_name_the_request_host_is_the_one_checked,
+    |substrate: Substrate| {
+        let (mut state, peer, session, _dir) = brokered(&substrate);
+        state.connectors = Box::new(LiveConnectorFactory {
+            roots: Some(
+                TlsRoots::system()
+                    .with_extra_roots(std::fs::read(&substrate.root).expect("root pem")),
+            ),
+            server_name: None,
+        });
+
+        let response = handle(
+            &mut state,
+            &peer,
+            Request::PostgresConnect {
+                session,
+                host: "not-the-substrate.example".to_string(),
+                host_addr: substrate.address.to_string(),
+                port: substrate.port,
+                database: substrate.database.clone(),
+                role: substrate.role.clone(),
+            },
+        );
+        assert!(
+            matches!(response, Response::Error { .. }),
+            "with no pinned name the request's own host is the certificate name, and \
+             not-the-substrate.example is not in the certificate. Got {response:?}"
+        );
+    }
+);

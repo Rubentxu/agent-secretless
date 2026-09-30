@@ -163,6 +163,21 @@ pub trait ConnectorFactory {
         TlsRoots::system()
     }
 
+    /// The name a live PostgreSQL certificate must match.
+    ///
+    /// `None` means the request's own `host` is used. A factory that pins the
+    /// name its certificates are issued for answers `Some`, and that answer
+    /// wins: a request that names a different host must not be able to move
+    /// the certificate check to a name of its choosing.
+    ///
+    /// On the trait for the same reason as [`Self::pg_roots`]. A trust anchor
+    /// that only the production type can express is a trust anchor the rest of
+    /// the broker cannot see, and the certificate name is half of the same
+    /// decision.
+    fn pg_server_name(&self) -> Option<String> {
+        None
+    }
+
     /// Builds a PostgreSQL client for the requested audience, database,
     /// and role. The factory does not authorise the (database, role)
     /// pair; the connector does, before any I/O (M6-R3).
@@ -193,13 +208,19 @@ pub struct LiveConnectorFactory {
     /// connector that goes looking for a trust anchor is a connector whose trust
     /// decision nobody wrote down.
     pub roots: Option<TlsRoots>,
-    /// The name a certificate must match, when it is not the address itself.
+    /// The name a certificate must match, when the factory has one.
     ///
-    /// `None` means the address literal is the name, which is correct for a
-    /// server whose certificate carries an IP SAN and wrong for one that does
-    /// not. A test that passed the wrong name here is caught by the
-    /// certificate check rather than by a configuration error, which is the
-    /// outcome worth having.
+    /// `None` means the request's own `host` is the name, which is correct
+    /// for a server whose certificate carries an IP SAN and wrong for one
+    /// that does not. When this is `Some`, it is the factory that decides the
+    /// name and the request's `host` is only the address to connect to —
+    /// otherwise an agent could point a certificate check at a name it chose.
+    ///
+    /// This used to be a public field that nothing read: `postgres_connect`
+    /// took the name from the request every time, so a deployment that
+    /// configured a different name here got the request's name anyway. A test
+    /// that set both to the same value could not tell. It is read now, and
+    /// `a_factory_name_overrides_the_request_host` is what keeps it honest.
     pub server_name: Option<String>,
 }
 
@@ -253,6 +274,11 @@ impl ConnectorFactory for LiveConnectorFactory {
     /// The roots this factory was configured with, or the platform store.
     fn pg_roots(&self) -> TlsRoots {
         self.roots.clone().unwrap_or_else(TlsRoots::system)
+    }
+
+    /// The pinned certificate name, when the deployment configured one.
+    fn pg_server_name(&self) -> Option<String> {
+        self.server_name.clone()
     }
 }
 
@@ -880,7 +906,15 @@ impl BrokerState {
             // separately from the address on purpose: a client that derived the
             // name from the address would be checking a string, not a
             // certificate.
-            host.to_string(),
+            //
+            // A configured factory name wins over the request's. When a
+            // deployment has pinned the name its certificates are issued for,
+            // a request that names something else must not be able to move the
+            // check, and the only way to guarantee that is for the name to not
+            // come from the request at all.
+            self.connectors
+                .pg_server_name()
+                .unwrap_or_else(|| host.to_string()),
             self.pg_roots(),
             database,
             role,
