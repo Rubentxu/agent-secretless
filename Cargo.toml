@@ -38,6 +38,11 @@ asv-vault = { path = "crates/vault" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# M9 runtime: real x509 for the per-session CA. Already in the lock via
+# connector-http's test-support; declaring it here makes it a shared
+# dependency instead of a per-crate version string.
+rcgen = "0.13"
+time = "0.3"
 thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }

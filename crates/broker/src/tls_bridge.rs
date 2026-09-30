@@ -1,10 +1,10 @@
-//! M9 — Transparent TLS bridge (prototype pass).
+//! M9 — Transparent TLS bridge.
 //!
-//! The full TLS termination runtime is in the M9-runtime follow-up.
-//! This module owns the data types and the threat-control dispatchers
-//! that the runtime will call:
+//! The data types and threat-control dispatchers the runtime calls:
 //!
-//! - `SessionCa` — per-session CA shape (root + intermediate DER).
+//! - `SessionCa` — per-session CA: a self-signed root plus an intermediate.
+//! - `issue_leaf` / `LeafCertificate` — per-host leaves signed by that
+//!   intermediate, carrying real x509.
 //! - `ConnectPolicy` / `authorize_connect` — CONNECT allow-list.
 //! - `authorize_redirect` — cross-origin redirect denial.
 //! - `TrustInjector` trait + `OpenSslEnvInjector` — trust-injection
@@ -14,12 +14,17 @@
 //! Authoritative source:
 //!   `agent-secretless-vault-spec/docs/06-TRANSPARENT-BRIDGE-EBPF.md`
 //!   sections 5, 6 and 7.
+//!
+//! Still not here: the eBPF redirect that makes the bridge transparent, and
+//! the TLS acceptor that presents these leaves. Both need kernel privileges
+//! this environment does not have.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use asv_domain::Authority;
+use time::OffsetDateTime;
 
 /// Default TTL for a session CA: 8 hours.
 pub const DEFAULT_SESSION_CA_TTL: Duration = Duration::from_secs(8 * 3600);
@@ -146,9 +151,13 @@ pub enum NewAuthorityError {
     ZeroPort,
 }
 
-/// The per-session CA. M9-prototype only stores the DER bytes; the
-/// runtime follow-up wires `rcgen::CertificateParams::new` with OsRng.
-#[derive(Debug, Clone)]
+/// The per-session certificate authority.
+///
+/// Real x509 material: a self-signed root and an intermediate the root
+/// signs. Leaves are signed by the intermediate, so a validating peer that
+/// trusts only the root still gets a complete chain. The `seed` argument
+/// exists so unit tests are reproducible; production callers pass
+/// [`rand::random`].
 pub struct SessionCa {
     /// The session this CA belongs to.
     pub session_id: String,
@@ -156,35 +165,101 @@ pub struct SessionCa {
     pub root_der: Vec<u8>,
     /// DER-encoded intermediate certificate.
     pub intermediate_der: Vec<u8>,
+    /// The intermediate's private key, used to sign leaves.
+    ///
+    /// `rcgen::KeyPair` is neither `Clone` nor `Debug`-cheap, so this field is
+    /// not part of the struct's derives. The CA is therefore not `Clone`; a
+    /// session that needs a second handle re-derives from `intermediate_der`
+    /// or shares by reference.
+    pub intermediate_key: rcgen::KeyPair,
+    /// The intermediate certificate itself, kept because `rcgen` needs the
+    /// issuer's `Certificate` (not just its DER) to stamp a leaf's issuer
+    /// field, and exposes no public DER-to-`Certificate` conversion.
+    pub intermediate_cert: rcgen::Certificate,
     /// When the CA was generated.
     pub issued_at: Instant,
     /// How long the CA is valid for.
     pub ttl: Duration,
 }
 
+impl fmt::Debug for SessionCa {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Hand-written because `rcgen::Certificate` is not `Debug`, and
+        // because the intermediate's private key must never reach a log line.
+        f.debug_struct("SessionCa")
+            .field("session_id", &self.session_id)
+            .field("root_der_len", &self.root_der.len())
+            .field("intermediate_der_len", &self.intermediate_der.len())
+            .field("issued_at", &self.issued_at)
+            .field("ttl", &self.ttl)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SessionCa {
-    /// Construct a fresh CA. The `session_id` is opaque; the broker uses
-    /// its existing session identifier type. The `seed` is mixed into the
-    /// root/intermediate DER generation so unit tests are reproducible
-    /// while the runtime follow-up uses `OsRng`.
+    /// Generate a fresh two-tier CA: a self-signed root plus an
+    /// intermediate it signs.
     ///
-    /// The prototype does NOT generate real x509 material; it emits
-    /// `Vec<u8>` payloads that contain the session id, the seed, and a
-    /// header byte. The runtime follow-up replaces the body with
-    /// `rcgen::Certificate::generate_self_signed` + a sibling
-    /// intermediate signed by the root.
+    /// Both certificates carry an explicit `not_before`/`not_after` derived
+    /// from `ttl`. This is not optional: `rcgen`'s default validity window
+    /// is 1975 to 4096, so a certificate generated without setting these
+    /// would outlive every session by two thousand years and quietly defeat
+    /// the TTL the rest of this module enforces.
+    ///
+    /// `seed` is only threaded into the subject so tests can distinguish two
+    /// CAs; the key material itself comes from the system CSPRNG either way.
     pub fn new(session_id: impl Into<String>, seed: u64, ttl: Duration) -> Self {
         let id = session_id.into();
         let issued_at = Instant::now();
-        // Stable, content-addressed payload. The runtime replaces this
-        // with a real DER. The structural claim is that root_der and
-        // intermediate_der are non-empty and distinct.
-        let root_der = synth_ca_der(&id, seed, ROLE_ROOT);
-        let intermediate_der = synth_ca_der(&id, seed, ROLE_INTERMEDIATE);
+        let now = OffsetDateTime::now_utc();
+        let not_after = now + time::Duration::try_from(ttl).unwrap_or(time::Duration::seconds(1));
+
+        let root_key = rcgen::KeyPair::generate().expect("rcgen root key");
+        let mut root_params =
+            rcgen::CertificateParams::new(Vec::<String>::new()).expect("empty SAN list is valid");
+        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        root_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        root_params.not_before = now;
+        root_params.not_after = not_after;
+        root_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, format!("ASV session root {id}"));
+        root_params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationName, format!("asv/{id}/{seed}"));
+        let root = root_params
+            .self_signed(&root_key)
+            .expect("self-signed root");
+
+        let inter_key = rcgen::KeyPair::generate().expect("rcgen intermediate key");
+        let mut inter_params =
+            rcgen::CertificateParams::new(Vec::<String>::new()).expect("empty SAN list is valid");
+        inter_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        inter_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        inter_params.not_before = now;
+        inter_params.not_after = not_after;
+        inter_params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            format!("ASV session intermediate {id}"),
+        );
+        let intermediate = inter_params
+            .signed_by(&inter_key, &root, &root_key)
+            .expect("root signs intermediate");
+
         Self {
             session_id: id,
-            root_der,
-            intermediate_der,
+            root_der: root.der().to_vec(),
+            intermediate_der: intermediate.der().to_vec(),
+            intermediate_key: inter_key,
+            intermediate_cert: intermediate,
             issued_at,
             ttl,
         }
@@ -194,31 +269,6 @@ impl SessionCa {
     pub fn is_expired(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.issued_at) >= self.ttl
     }
-}
-
-const ROLE_ROOT: u8 = 0x01;
-const ROLE_INTERMEDIATE: u8 = 0x02;
-
-fn synth_ca_der(session_id: &str, seed: u64, role: u8) -> Vec<u8> {
-    // The structural DER is a hash of (session_id, seed, role). It is
-    // not a real x509 certificate; the M9-runtime follow-up replaces
-    // this with rcgen output. The point is that the data type exists,
-    // the bytes are non-empty, and the two halves are distinct.
-    use std::hash::{Hash, Hasher};
-    let mut h1 = std::collections::hash_map::DefaultHasher::new();
-    session_id.hash(&mut h1);
-    seed.hash(&mut h1);
-    role.hash(&mut h1);
-    let h1 = h1.finish();
-    let mut h2 = std::collections::hash_map::DefaultHasher::new();
-    role.hash(&mut h2);
-    seed.hash(&mut h2);
-    session_id.hash(&mut h2);
-    let h2 = h2.finish();
-    let mut out = vec![role];
-    out.extend_from_slice(&h1.to_le_bytes());
-    out.extend_from_slice(&h2.to_le_bytes());
-    out
 }
 
 /// The CONNECT allow-list. Authorising a target is a single linear scan
@@ -331,12 +381,14 @@ impl TrustInjector for OpenSslEnvInjector {
 
 /// A leaf certificate minted under a session CA for exactly one host.
 ///
-/// Like [`SessionCa`], the prototype payload is a structural stand-in, not
-/// a real x509 certificate. What is real and asserted by the tests is the
-/// binding: a leaf names one host, and [`LeafCertificate::verify_host`]
-/// refuses any other. The M9-runtime follow-up swaps the body for
-/// `rcgen::CertificateParams` + `signed_by(&intermediate_key)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Real x509: the intermediate signs it, it carries the host as its only
+/// SAN, it is `CA:FALSE`, and its validity ends no later than the CA's. The
+/// per-host binding is enforced twice, on purpose: [`verify_host`] refuses
+/// any other host, and the certificate itself does not name any other host,
+/// so a TLS peer doing its own hostname check agrees with us. A leaf whose
+/// SAN list was merely a superset of the requested host would pass the first
+/// check and defeat the second.
+#[derive(Debug)]
 pub struct LeafCertificate {
     /// The session this leaf belongs to.
     pub session_id: String,
@@ -344,6 +396,8 @@ pub struct LeafCertificate {
     pub host: String,
     /// DER-encoded leaf certificate.
     pub leaf_der: Vec<u8>,
+    /// The leaf's private key, needed to complete a TLS handshake.
+    pub leaf_key: rcgen::KeyPair,
     /// When the leaf was minted.
     pub issued_at: Instant,
     /// How long the leaf is valid for. Never outlives the CA's own TTL in
@@ -432,39 +486,39 @@ pub fn issue_leaf(ca: &SessionCa, host: &str, now: Instant) -> Result<LeafCertif
     let ttl = ca
         .ttl
         .saturating_sub(now.saturating_duration_since(ca.issued_at));
-    let leaf_der = synth_leaf_der(&ca.session_id, &host);
+    let key = rcgen::KeyPair::generate().expect("rcgen leaf key");
+    let not_before = OffsetDateTime::now_utc();
+    // Clamp: the leaf may never outlive the CA, and a wall-clock offset from
+    // the monotonic `Instant` is the honest way to say so in x509 terms.
+    let remaining = time::Duration::try_from(ttl).unwrap_or(time::Duration::seconds(1));
+    let mut params =
+        rcgen::CertificateParams::new(vec![host.clone()]).expect("canonical host is a valid SAN");
+    params.is_ca = rcgen::IsCa::ExplicitNoCa;
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::DigitalSignature,
+        rcgen::KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    params.not_before = not_before;
+    params.not_after = not_before + remaining;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, host.clone());
+    let cert = params
+        .signed_by(&key, &ca.intermediate_cert, &ca.intermediate_key)
+        .expect("intermediate signs leaf");
     Ok(LeafCertificate {
         session_id: ca.session_id.clone(),
         host,
-        leaf_der,
+        leaf_der: cert.der().to_vec(),
+        leaf_key: key,
         issued_at: now,
         ttl,
     })
 }
 
-const ROLE_LEAF: u8 = 0x03;
-
-fn synth_leaf_der(session_id: &str, host: &str) -> Vec<u8> {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    ROLE_LEAF.hash(&mut h);
-    session_id.hash(&mut h);
-    host.hash(&mut h);
-    let a = h.finish();
-    let mut h2 = std::collections::hash_map::DefaultHasher::new();
-    host.hash(&mut h2);
-    session_id.hash(&mut h2);
-    ROLE_LEAF.hash(&mut h2);
-    let b = h2.finish();
-    let mut out = vec![ROLE_LEAF];
-    out.extend_from_slice(&a.to_le_bytes());
-    out.extend_from_slice(&b.to_le_bytes());
-    out
-}
-
-/// The bridge dispatcher. M9-prototype is a single struct that the
-/// runtime follow-up replaces with the `rustls::Server` + `hyper`
-/// acceptor.
+/// The bridge dispatcher. The runtime follow-up replaces the single struct
+/// with a `rustls::Server` + `hyper` acceptor.
 #[derive(Debug, Clone)]
 pub struct Bridge {
     policy: ConnectPolicy,
@@ -813,8 +867,15 @@ mod tests {
         let upper = issue_leaf(&ca, "API.Example.COM", Instant::now()).expect("issuance");
         let lower = issue_leaf(&ca, "api.example.com", Instant::now()).expect("issuance");
         assert_eq!(upper.host, "api.example.com");
-        // One host, one leaf: two spellings must not mint two identities.
-        assert_eq!(upper.leaf_der, lower.leaf_der);
+        // One host, one *name*. The DERs legitimately differ now that leaves
+        // carry real keys: two issuances are two certificates, which is what a
+        // CA is for. What must not differ is the name they assert, or the
+        // session would be able to present a leaf for a spelling the
+        // allowlist never named. The check is therefore on the SAN, not the
+        // bytes, and `leaf_for_one_host_does_not_validate_a_sibling` covers
+        // the refusal direction.
+        assert!(upper.verify_host(lower.host.as_str()).is_ok());
+        assert!(lower.verify_host(upper.host.as_str()).is_ok());
     }
 
     #[test]

@@ -52,6 +52,11 @@ landlock = "0.4"
 # re-export (serde). Both already workspace-wide via the vault and protocol.
 sha2 = { workspace = true }
 serde = { workspace = true }
+# M9 runtime: the per-session CA and its leaves are real x509. `rcgen` and
+# `time` are already in the lock through connector-http's test-support, so this
+# promotes them to real broker dependencies rather than adding anything new.
+rcgen = { workspace = true }
+time = { workspace = true }
 
 [dev-dependencies]
 serde_json = "1"
