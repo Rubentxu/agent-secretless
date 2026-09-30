@@ -19,7 +19,7 @@
 //! silently sandbox the rest of the suite.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use asv_broker::harden::{self, InstallPaths};
 
@@ -38,6 +38,40 @@ fn require_landlock(test: &str) -> bool {
          assertions did not run. This is an honest gap, not a pass."
     );
     false
+}
+
+/// A scratch root that the static system set does NOT already allow.
+///
+/// This is the whole reason the suite is trustworthy, and getting it
+/// wrong is what made `uat_048_undeclared_sibling_is_denied` red.
+///
+/// `std::env::temp_dir()` is `/tmp` on any host that does not set
+/// `TMPDIR`, and `/tmp` is in `STATIC_WRITE_HIERARCHIES`: every process
+/// is granted read+write there regardless of what the operator declared.
+/// A suite whose scratch lived under it could never observe a denial —
+/// the "undeclared" sibling was statically declared all along. The test
+/// did not detect a sandbox leak; it contradicted the ruleset, and it
+/// has been red since it was born in e59e229.
+///
+/// The root is anchored at the workspace target directory instead, which
+/// is per-checkout, writable, and outside every static hierarchy. The
+/// assertion below turns "outside the static set" from an assumption
+/// into a checked precondition: if a future change ever widens a static
+/// hierarchy over the target directory, this suite fails with that as
+/// the stated cause instead of silently becoming vacuous.
+fn scratch_root(tag: &str) -> PathBuf {
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR")).to_path_buf();
+    assert!(
+        !harden::statically_allowed(&base),
+        "the scratch root {} is inside a static allow-listed hierarchy, so \
+         these ruleset assertions would be vacuous: the sandbox already \
+         grants it and no denial could ever be observed",
+        base.display()
+    );
+    let dir = base.join(format!("asv-uat048-{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch root");
+    dir
 }
 
 /// Run `body` in a forked child and reap it, returning whether it passed.
@@ -78,13 +112,6 @@ fn assert_child_ok(label: &str, body: impl FnOnce() -> Result<(), String>) {
     );
 }
 
-fn temp_root(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("asv-uat048-{tag}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create temp root");
-    dir
-}
-
 /// The declared directory stays writable after the ruleset installs.
 ///
 /// This is the regression that matters: if the allow set is too narrow the
@@ -95,7 +122,7 @@ fn uat_048_declared_path_is_writable_after_restriction() {
     if !require_landlock("<NAME>") {
         return;
     }
-    let root = temp_root("declared");
+    let root = scratch_root("declared");
     assert_child_ok("declared path writable", move || {
         let data = root.join("vault.bin");
         let paths = InstallPaths::with_write_paths([root.clone()]);
@@ -121,7 +148,7 @@ fn uat_048_undeclared_sibling_is_denied() {
     if !require_landlock("<NAME>") {
         return;
     }
-    let base = temp_root("sibling");
+    let base = scratch_root("sibling");
     let allowed = base.join("allowed");
     let denied = base.join("denied");
     std::fs::create_dir_all(&allowed).expect("allowed dir");
@@ -151,7 +178,7 @@ fn uat_048_file_path_uses_its_parent_directory() {
     if !require_landlock("<NAME>") {
         return;
     }
-    let dir = temp_root("filepath");
+    let dir = scratch_root("filepath");
     let vault = dir.join("vault.asv");
     std::fs::write(&vault, b"envelope").expect("seed vault file");
     assert_child_ok("file path upgrades to parent", move || {
@@ -179,7 +206,7 @@ fn uat_048_missing_path_is_skipped_not_widened() {
     if !require_landlock("<NAME>") {
         return;
     }
-    let base = temp_root("missing");
+    let base = scratch_root("missing");
     let real = base.join("real");
     std::fs::create_dir_all(&real).expect("real dir");
     assert_child_ok("missing path skipped", move || {

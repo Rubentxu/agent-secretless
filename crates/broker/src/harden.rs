@@ -119,6 +119,76 @@ impl InstallPaths {
     }
 }
 
+/// True when `path` is already covered by a static system hierarchy.
+///
+/// This is the same predicate [`install_landlock`] uses to drop a
+/// declared path that a system rule already grants, exposed so a caller
+/// — in particular a test — can tell whether a rule it declares is
+/// redundant *before* relying on it.
+///
+/// It exists because a ruleset test can be silently vacuous. A test that
+/// picks a scratch directory under `/tmp` and then asserts the ruleset
+/// denies an undeclared sibling of it is asserting something the static
+/// set already contradicts: `/tmp` is granted read+write for every
+/// process, so the write succeeds and the assertion can never hold. The
+/// failure mode is a test that is red for a reason that has nothing to
+/// do with the code under test. A test can ask this function first and
+/// fail loudly with a real cause instead.
+pub fn statically_allowed(path: &std::path::Path) -> bool {
+    static_read_hierarchies()
+        .iter()
+        .chain(static_write_hierarchies().iter())
+        .any(|base| path.starts_with(base))
+}
+
+/// The system locations the broker must read, independent of any flag.
+///
+/// These are not operator choices: the runtime loader, CA store and
+/// kernel introspection interfaces have to be reachable wherever the
+/// distribution puts them, and no CLI flag can express "the right
+/// place for libc".
+pub const STATIC_READ_HIERARCHIES: &[&str] = &[
+    "/usr",           // shared libs, binaries (runtime loader)
+    "/lib",           // loader + libs on merged-usr distros
+    "/lib64",         // loader on split-usr distros
+    "/etc",           // config, ca-certificates, nsswitch
+    "/proc/self",     // own process introspection (logging, peer creds)
+    "/sys/fs/cgroup", // cgroup v2 slice probing/ownership
+    "/dev/null",      // stdio guards
+];
+
+/// The system locations the broker must read AND write, independent of
+/// any flag.
+///
+/// `/tmp`, `/run` and `/var/tmp` are process-wide conventions that any
+/// implementation writes to without being told, so they stay static.
+///
+/// The old set also allowed `/home` and `/var/home` in full, read AND
+/// write. That is the home directory of every user on the box, writable
+/// by a process whose whole job is to hold secrets. It was there because
+/// the vault and audit paths live under `~/.local/state` by default and
+/// the ruleset is irreversible, so a narrower default risked a broker
+/// that could not reach its own vault.
+///
+/// The operator now declares those paths explicitly, so the broad home
+/// rules are gone and the allow set is the paths actually in use. A
+/// default install with no declared paths is therefore NARROWER than it
+/// used to be; that is the correct direction for a sandbox, and `main`
+/// always declares its paths before hardening.
+pub const STATIC_WRITE_HIERARCHIES: &[&str] = &[
+    "/tmp",     // tempdir for runtime files
+    "/run",     // sockets default parent
+    "/var/tmp", // long-lived temp
+];
+
+fn static_read_hierarchies() -> &'static [&'static str] {
+    STATIC_READ_HIERARCHIES
+}
+
+fn static_write_hierarchies() -> &'static [&'static str] {
+    STATIC_WRITE_HIERARCHIES
+}
+
 /// Installs the harden profile on the current process. Idempotent.
 ///
 /// On non-Linux platforms the function is a no-op that returns
@@ -330,41 +400,10 @@ fn install_landlock(paths: &InstallPaths) -> bool {
     let abi = landlock::ABI::V3;
     let handled = AccessFs::from_all(abi);
 
-    // Directories the broker needs READ access to. These are system
-    // locations, not operator choices: the runtime loader, CA store and
-    // kernel introspection interfaces have to be reachable wherever the
-    // distribution puts them, and no CLI flag can express "the right
-    // place for libc".
-    const READ_HIERARCHIES: &[&str] = &[
-        "/usr",           // shared libs, binaries (runtime loader)
-        "/lib",           // loader + libs on merged-usr distros
-        "/lib64",         // loader on split-usr distros
-        "/etc",           // config, ca-certificates, nsswitch
-        "/proc/self",     // own process introspection (logging, peer creds)
-        "/sys/fs/cgroup", // cgroup v2 slice probing/ownership
-        "/dev/null",      // stdio guards
-    ];
-    // System directories the broker needs READ+WRITE access to. /tmp,
-    // /run and /var/tmp are process-wide conventions that any
-    // implementation writes to without being told, so they stay static.
-    const WRITE_HIERARCHIES: &[&str] = &[
-        "/tmp",     // tempdir for runtime files
-        "/run",     // sockets default parent
-        "/var/tmp", // long-lived temp
-    ];
-
-    // The old set allowed /home and /var/home in full, read AND write.
-    // That is the home directory of every user on the box, writable by a
-    // process whose whole job is to hold secrets. It was there because the
-    // vault and audit paths live under ~/.local/state by default and the
-    // ruleset is irreversible, so a narrower default risked a broker that
-    // cannot reach its own vault.
-    //
-    // The operator now declares those paths explicitly, so the broad home
-    // rules are gone and the allow set is the paths actually in use. A
-    // default install with no declared paths is therefore NARROWER than it
-    // used to be; that is the correct direction for a sandbox, and
-    // `main` always declares its paths before hardening.
+    // The static system set is declared once, as `STATIC_READ_HIERARCHIES`
+    // and `STATIC_WRITE_HIERARCHIES`, so that a test asking
+    // `statically_allowed` and the installer asking `covered` cannot
+    // disagree about what the ruleset already grants.
     let mut read_paths: Vec<PathBuf> = paths.read_paths.clone();
     let mut write_paths: Vec<PathBuf> = paths.write_paths.clone();
 
@@ -382,28 +421,22 @@ fn install_landlock(paths: &InstallPaths) -> bool {
     // Deduplicate and drop anything the static system set already covers,
     // so a caller that passes /tmp does not get a duplicate rule and an
     // operator rule cannot widen what the static set deliberately denies.
-    let covered = |p: &PathBuf| {
-        WRITE_HIERARCHIES
-            .iter()
-            .chain(READ_HIERARCHIES.iter())
-            .any(|base| p.starts_with(base))
-    };
-    write_paths.retain(|p| !covered(p));
+    write_paths.retain(|p| !statically_allowed(p));
     write_paths.sort();
     write_paths.dedup();
-    read_paths.retain(|p| !covered(p));
+    read_paths.retain(|p| !statically_allowed(p));
     read_paths.sort();
     read_paths.dedup();
 
     let status = (|| -> Result<landlock::RestrictionStatus, landlock::RulesetError> {
         let mut created = Ruleset::default().handle_access(handled)?.create()?;
-        for path in READ_HIERARCHIES {
+        for path in STATIC_READ_HIERARCHIES {
             if let Ok(fd) = PathFd::new(path) {
                 created = created.add_rule(PathBeneath::new(fd, AccessFs::from_read(abi)))?;
             }
         }
         let rw = AccessFs::from_read(abi) | AccessFs::from_write(abi);
-        for path in WRITE_HIERARCHIES {
+        for path in STATIC_WRITE_HIERARCHIES {
             if let Ok(fd) = PathFd::new(path) {
                 created = created.add_rule(PathBeneath::new(fd, rw))?;
             }
