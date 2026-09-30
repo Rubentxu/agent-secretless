@@ -400,6 +400,24 @@ pub enum Action {
     /// reads end to end, and a generic `HttpRequest` is not authorizable.
     GitHubIssueRead,
     GitHubReleaseCreate,
+    /// The remaining M6-R5 database verbs.
+    ///
+    /// `PostgresConnect` alone cannot express M6-R5: the spec requires a
+    /// policy that allows `connect` but denies `create_table`, which is
+    /// impossible if every statement rides on the gateway verb. These five
+    /// mirror `asv_connector_pg::DbAction` one-for-one, so the connector
+    /// derives the action from the statement and Cedar evaluates it without
+    /// the connector changing (M6-R5, "policy change needs no edit").
+    ///
+    /// A new variant is a breaking change to the policy grammar: it breaks
+    /// every `PolicySet` whose schema omits the action, and Cedar rejects
+    /// the unknown action at evaluation time rather than denying it, so the
+    /// failure is loud.
+    PostgresRead,
+    PostgresInsert,
+    PostgresCreateTable,
+    PostgresDropTable,
+    PostgresAlterTable,
 }
 
 impl fmt::Display for Action {
@@ -413,6 +431,11 @@ impl fmt::Display for Action {
             Self::GitHubIssueCreate => "github.issue.create",
             Self::GitHubIssueRead => "github.issue.read",
             Self::GitHubReleaseCreate => "github.release.create",
+            Self::PostgresRead => "postgres.read",
+            Self::PostgresInsert => "postgres.insert",
+            Self::PostgresCreateTable => "postgres.create_table",
+            Self::PostgresDropTable => "postgres.drop_table",
+            Self::PostgresAlterTable => "postgres.alter_table",
         };
         f.write_str(s)
     }

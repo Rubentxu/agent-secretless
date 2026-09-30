@@ -139,6 +139,76 @@ const SCHEMA_JSON: &str = r#"{
           }
         }
       },
+      "postgres_read": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Database"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
+      "postgres_insert": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Database"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
+      "postgres_create_table": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Database"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
+      "postgres_drop_table": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Database"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
+      "postgres_alter_table": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Database"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
       "http_request": {
         "memberOf": [],
         "appliesTo": {
@@ -710,6 +780,11 @@ fn action_name(action: &Action) -> &'static str {
         Action::GitPush => "git_push",
         Action::SshConnect => "ssh_connect",
         Action::PostgresConnect => "postgres_connect",
+        Action::PostgresRead => "postgres_read",
+        Action::PostgresInsert => "postgres_insert",
+        Action::PostgresCreateTable => "postgres_create_table",
+        Action::PostgresDropTable => "postgres_drop_table",
+        Action::PostgresAlterTable => "postgres_alter_table",
         Action::HttpRequest => "http_request",
         Action::GitHubIssueRead => "github_issue_read",
         Action::GitHubIssueCreate => "github_issue_create",
@@ -1127,4 +1202,73 @@ fn the_entity_type_follows_the_resource_variant() {
              a hardcoded type would make it vacuously false"
         );
     }
+}
+
+/// M6-R5, the spec's exact scenario: a policy that allows `connect` but not
+/// `create_table`, while `select 1` is still served.
+///
+/// The point of the scenario is that the policy is the *only* thing that
+/// changes. No connector code differs between the two engines, so if this
+/// test needed a connector edit to pass, M6-R5 would be false.
+#[test]
+fn m6_r5_policy_denies_create_table_while_serving_read() {
+    let policy = r#"
+permit (principal, action == Action::"postgres_connect", resource is Database);
+permit (principal, action == Action::"postgres_read", resource is Database);
+"#;
+    let engine = PolicyEngine::from_policy_text(policy).expect("policy must validate");
+    let db = || AuthorizationRequest {
+        session: AgentSessionId::new(),
+        action: Action::PostgresConnect,
+        resource: Resource::Database {
+            name: "asv".into(),
+            role: "app".into(),
+        },
+        context: PolicyContext {
+            workspace: "/repo".into(),
+            protected_ref: None,
+            request_digest: Some("digest".into()),
+            peer_uid: 1000,
+        },
+    };
+    let with_action = |action: Action| AuthorizationRequest { action, ..db() };
+
+    assert!(engine.authorize(&db(), None, None).decision.is_allowed());
+    assert!(engine
+        .authorize(&with_action(Action::PostgresRead), None, None)
+        .decision
+        .is_allowed());
+    assert!(!engine
+        .authorize(&with_action(Action::PostgresCreateTable), None, None)
+        .decision
+        .is_allowed());
+}
+
+/// The complement of the scenario above: once a policy allows the DDL verb,
+/// `create_table` becomes allowed with no change to any connector code
+/// (M6-R5, "policy change needs no edit").
+#[test]
+fn m6_r5_allowing_ddl_needs_no_connector_change() {
+    let engine = PolicyEngine::from_policy_text(
+        r#"
+permit (principal, action == Action::"postgres_connect", resource is Database);
+permit (principal, action == Action::"postgres_create_table", resource is Database);
+"#,
+    )
+    .expect("policy must validate");
+    let request = AuthorizationRequest {
+        session: AgentSessionId::new(),
+        action: Action::PostgresCreateTable,
+        resource: Resource::Database {
+            name: "asv".into(),
+            role: "app".into(),
+        },
+        context: PolicyContext {
+            workspace: "/repo".into(),
+            protected_ref: None,
+            request_digest: Some("digest".into()),
+            peer_uid: 1000,
+        },
+    };
+    assert!(engine.authorize(&request, None, None).decision.is_allowed());
 }
