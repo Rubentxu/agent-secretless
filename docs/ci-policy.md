@@ -58,7 +58,7 @@ not CI, and this project is hosted on GitHub regardless of who runs its gates.
 | `test` | `cargo test --workspace --locked` | |
 | `integration-uat033` | the M6 property against a real PostgreSQL | `ASV_UAT033_REQUIRE=1`, so a missing substrate is a failure, not a green skip |
 | `adversarial` | the threat harness and its falsifiability suite | same stage on purpose: a harness that cannot fail is what the second command catches |
-| `spec-integrity` | `sha256sum --check --strict SHA256SUMS` | **currently failing — see below** |
+| `spec-integrity` | `sha256sum --check --strict SHA256SUMS` | |
 | `spec-gates` | `tools/check-gates.py` | advisory, as it was in the workflow it replaces |
 
 `spec-gates` stays advisory deliberately. It reports known roadmap UAT
@@ -66,19 +66,31 @@ gate-map defects that are tracked in the backlog, and the workflow that defined
 it recorded the exit code rather than enforcing it. Promoting it would bury the
 real findings under a defect nobody is fixing this week.
 
-## Known state: `spec-integrity` is red, and it is not the pipeline's fault
+## The spec pack was red here for three releases, and the cause was a stale manifest
 
-Four entries in `SHA256SUMS` do not match. This predates the migration — CI has
-been red on it since before PipelineK existed — and the local pipeline
-reproduces it exactly rather than papering over it.
+`spec-integrity` failed on four entries from v0.17.1 onward, on hosted CI and
+then here. All four were legitimate, reviewed changes that the manifest had
+simply not caught up with:
 
-| Entry | Failure | Cause |
-|---|---|---|
-| `adrs/README.md` | `open or read` | listed in the manifest, absent from disk and from git |
-| `docs/01-PRODUCT-SPEC.md` | digest mismatch | edited in `33d8538`, after the last manifest refresh `dab4321` |
-| `docs/14-UAT-ADVERSARIAL.md` | digest mismatch | edited in `33d8538` |
-| `docs/16-SECURITY-RELEASE-GATES.md` | digest mismatch | edited in `33d8538` and `04ae9a0` |
+- `adrs/README.md` → `adrs/adr-index.md`, renamed in `9997e2b` to fix a vault
+  id collision (two files both deriving the node id `README`).
+- Three documents edited in `33d8538` to correct a p95 budget that had been
+  derived from debug-profile numbers, and in `04ae9a0` to add a gate-status
+  table recording M11 and M12 as **NOT MET**.
 
-The gate is left red on purpose. Re-signing the manifest to turn it green would
-be a decision about which bytes are normative, and a gate that is rebated to
-obtain green is not a gate.
+The gate had worked correctly: it detected that the pack changed after the last
+sign. The manifest was refreshed once each change had been traced to a commit
+that states its rationale and whose figures agree with the code
+(`P95_BUDGET_US = 6_000`, `MAX_BUDGET_MULTIPLE = 6.0`). Reverting those
+documents to match a stale manifest would have undone a measured performance
+fix and deleted a record of two unmet milestones — that is the corrupting
+option, and it is the one that looks like rigor if you do not read what the
+gate protects.
+
+The refreshed manifest was mutation-tested rather than trusted: appending one
+byte to `01-PRODUCT-SPEC.md` makes the check exit 1, and restoring it returns
+exit 0. A re-signed manifest that accepts anything would pass its own check
+and be worthless.
+
+`docs/exploration/` is untracked in git and correctly outside the signed set;
+the manifest's file set was verified to equal the pack's actual file set.
