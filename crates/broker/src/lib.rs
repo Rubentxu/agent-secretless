@@ -618,7 +618,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                 // later. Refusing here reports the real problem instead.
                 return Response::Error {
                     code: ErrorCode::InvalidRequest,
-                    message: format!("no such credential: {credential}"),
+                    message: "credential is not available".into(),
                 };
             }
 
@@ -1769,6 +1769,112 @@ mod surrogate_tests {
         ) {
             Response::SurrogateMinted { surrogate, .. } => (session, surrogate),
             other => panic!("expected a minted surrogate, got {other:?}"),
+        }
+    }
+
+    /// The defect this pins: `MintSurrogate` validates against
+    /// `state.credentials`, and until this cycle nothing in production ever
+    /// filled that list. Every other surrogate test seeds it with
+    /// `insert_credential`, which is why 584 green assertions never noticed
+    /// that a real broker could mint nothing at all.
+    ///
+    /// So this test builds the list the way a running broker does — from a real
+    /// vault on disk, through the inventory loader — and mints against it.
+    #[test]
+    fn a_credential_loaded_from_a_real_vault_can_mint_a_surrogate() {
+        const ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pass = secrecy::SecretString::from("mint-from-vault".to_string());
+        let mut store = asv_vault::VaultStore::create(
+            &dir.path().join("v.asv"),
+            &pass,
+            asv_vault::KdfParams::fast_for_tests(),
+        )
+        .expect("create vault");
+        let key = store.header().unlock(&pass).expect("unlock");
+        store
+            .insert(
+                &key,
+                asv_vault::CredentialMetadata::new(
+                    ID,
+                    "from-the-vault",
+                    asv_vault::CredentialKind::BearerToken,
+                    "github",
+                    "acct",
+                    1,
+                ),
+                asv_domain::secret::SecretBytes::new(b"secret".to_vec()),
+            )
+            .expect("insert");
+
+        let mut state = BrokerState::default();
+        let loaded = crate::inventory::load(&mut state, &store);
+        assert_eq!(
+            loaded,
+            crate::inventory::InventoryLoad {
+                loaded: 1,
+                skipped: 0,
+                collisions: 0,
+            },
+            "the vault credential must have loaded"
+        );
+
+        let peer = pinned_peer();
+        let session = state.sessions.create("/repo".to_string(), &peer);
+        let credential = state.credentials[0].id;
+        assert_eq!(
+            credential.to_wire(),
+            ID,
+            "the loaded handle must be the id the vault stored"
+        );
+
+        match handle(
+            &mut state,
+            &peer,
+            Request::MintSurrogate {
+                session,
+                credential,
+                max_uses: 2,
+                ttl_secs: 60,
+            },
+        ) {
+            Response::SurrogateMinted { .. } => {}
+            other => panic!("a vault credential must be mintable, got {other:?}"),
+        }
+    }
+
+    /// And the guard that was doing the wrong job for the right reason: a
+    /// credential the broker has never heard of is still refused, so loading the
+    /// inventory did not turn the check into a rubber stamp.
+    #[test]
+    fn minting_still_refuses_a_credential_the_broker_does_not_hold() {
+        let mut state = BrokerState::default();
+        let peer = pinned_peer();
+        let session = state.sessions.create("/repo".to_string(), &peer);
+        let unknown = CredentialId::new();
+        let unknown_wire = unknown.to_wire();
+
+        match handle(
+            &mut state,
+            &peer,
+            Request::MintSurrogate {
+                session,
+                credential: unknown,
+                max_uses: 2,
+                ttl_secs: 60,
+            },
+        ) {
+            Response::Error { message, .. } => {
+                assert!(
+                    message.contains("credential is not available"),
+                    "unexpected refusal: {message}"
+                );
+                assert!(
+                    !message.contains(&unknown_wire),
+                    "unknown credential diagnostics must not echo the handle"
+                );
+            }
+            other => panic!("an unknown credential must be refused, got {other:?}"),
         }
     }
 

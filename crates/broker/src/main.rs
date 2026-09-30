@@ -258,8 +258,20 @@ fn main() -> std::io::Result<()> {
             eprintln!("asv: cannot unlock vault {}: {err:?}", vault_path.display());
             std::process::exit(1);
         }));
+        // The broker's own list of what it holds. Without this the vault is
+        // open and lending, yet `ListCredentialMetadata` answers `[]` and
+        // `MintSurrogate` refuses every real credential as unknown — a broker
+        // that cannot see its own vault. Loaded here, while the store is still
+        // owned by this function; the lending port below only lends by id.
+        let inventory = asv_broker::inventory::load(&mut state, &store);
         state.secrets = Some(Arc::new(VaultSecretPort::new(Arc::new(store), key)));
-        tracing::info!(vault = %vault_path.display(), "vault opened and unlocked");
+        tracing::info!(
+            vault = %vault_path.display(),
+            credentials = inventory.loaded,
+            skipped = inventory.skipped,
+            collisions = inventory.collisions,
+            "vault opened and unlocked"
+        );
     }
 
     // M6: the runtime the live PostgreSQL transport runs on. Built here, in the
