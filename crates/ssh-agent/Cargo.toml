@@ -16,3 +16,6 @@ zeroize.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# UAT-028 resolves the local account from the passwd database rather than
+# $USER, because the UAT runner executes scenarios with an empty environment.
+libc = "0.2"

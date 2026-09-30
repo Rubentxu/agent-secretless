@@ -39,7 +39,30 @@ fn uat_028_openssh_authenticates_through_the_broker_socket() {
         .expect("ssh-keygen is installed");
     assert!(keygen.status.success(), "ssh-keygen failed: {keygen:?}");
 
-    let user = std::env::var("USER").expect("USER set");
+    // The ssh user is whatever the client will log in as, which `ssh` takes
+    // from the local username unless told otherwise. The test must not read
+    // $USER to learn it: the UAT runner spawns every scenario with an empty
+    // environment (sddk-gateway/src/runner.rs), so `USER` is absent there and
+    // this line panicked with "USER set: NotPresent". That is exactly the
+    // class of bug a hermetic UAT suite must not have, and it only surfaced
+    // once the scenario was executed by the runner instead of by hand.
+    //
+    // No dependency is added for this. The uid is the same under an empty
+    // environment, and it is what `ssh` and sshd resolve the account from.
+    let user = unsafe {
+        let uid = libc::getuid();
+        let passwd = libc::getpwuid(uid);
+        if passwd.is_null() {
+            None
+        } else {
+            Some(
+                std::ffi::CStr::from_ptr((*passwd).pw_name)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
+    }
+    .expect("resolve the local user name from the passwd database");
     let authorized = dir.path().join("authorized_keys");
     let listed = Command::new("ssh-add")
         .arg("-L")
