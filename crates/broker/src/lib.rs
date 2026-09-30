@@ -300,6 +300,9 @@ fn request_method_name(_state: &BrokerState, response: &Response) -> String {
         Response::IssueCreated { .. } => "create_issue".into(),
         Response::ReleaseCreated { .. } => "create_release".into(),
         Response::AuditRecords { .. } => "audit_query".into(),
+        Response::PostgresConnected { .. } => "postgres_connect".into(),
+        Response::PostgresResult { .. } => "postgres_query".into(),
+        Response::PostgresRevoked { .. } => "postgres_revoke".into(),
         Response::Error { .. } => "(error)".into(),
     }
 }
@@ -634,6 +637,30 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                     }
                 }
                 Err(error) => surrogate_failure(error),
+            }
+        }
+        Request::PostgresConnect { .. } | Request::PostgresQuery { .. } => {
+            // M6-R3: the broker, not the agent, decides which credential backs
+            // a (database, role) pair. Until the live transport lands there is
+            // no honest implementation, and a broker that guessed one would be
+            // the generic "connect to whatever the agent named" surface that
+            // M6-R1 rules out. Refusing keeps the closure honest: the wire
+            // vocabulary exists so an agent gets a precise refusal instead of
+            // an unknown-method error, exactly as AuditQuery does.
+            Response::Error {
+                code: ErrorCode::Denied,
+                message: "postgres transport is not available in this build".into(),
+            }
+        }
+        Request::PostgresRevoke { session } => {
+            // Revoke of a session that was never opened is a no-op, not an
+            // error: the agent is trying to give up access, and failing that
+            // would leave it believing it still holds a session. The session
+            // id is echoed back rather than invented, so the agent can match
+            // the reply to what it asked for.
+            Response::PostgresRevoked {
+                session,
+                backend_terminated: false,
             }
         }
     }

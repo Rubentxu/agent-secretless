@@ -24,11 +24,14 @@ use uuid::Uuid;
 /// Protocol version. A mismatch is a hard failure, never a downgrade
 /// (`docs/03-ARCHITECTURE.md` §6, version negotiation).
 ///
-/// v2 adds the M4 semantic surface. The bump is not cosmetic: an agent that
-/// speaks v1 has no way to express a surrogate, and one that speaks v2 but
-/// reaches a v1 broker must fail loudly at the gate rather than discover the
-/// gap when its first brokered call is denied.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// v2 added the M4 semantic surface. v3 adds the M6 PostgreSQL surface
+/// (`PostgresConnect`, `PostgresQuery`, `PostgresRevoke`). The bump is
+/// required, not cosmetic: the new variants are how an agent reaches a
+/// non-HTTP database at all, so a v2 agent talking to a v3 broker would
+/// find no way to express the request and would fail with an
+/// unknown-method error rather than a version error. Failing at the gate
+/// is the point.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Hard ceiling on a single inbound message. Bounded allocation is required for
 /// any IPC that faces an untrusted peer (`docs/17-IMPLEMENTATION-BOOTSTRAP.md` §9).
@@ -123,6 +126,40 @@ pub enum Request {
         /// Return only records newer than this many seconds.
         since_secs: u64,
     },
+    /// M6-R1: open a PostgreSQL session for a typed audience.
+    ///
+    /// The agent names the audience, the database, and the role. It never
+    /// names a credential: the broker decides which vault entry backs this
+    /// (database, role) pair, so an agent cannot ask for a role it was not
+    /// granted by phrasing the request differently (M6-R3).
+    PostgresConnect {
+        session: AgentSessionId,
+        /// The canonical server name. This is the name the server certificate
+        /// must match, so it is not merely a DNS hint.
+        host: String,
+        /// The address the broker pinned for `host`. Sent explicitly so the
+        /// client cannot re-resolve and reach a different address after the
+        /// broker's policy check passed.
+        host_addr: String,
+        port: u16,
+        database: String,
+        role: String,
+    },
+    /// M6-R5: run one statement on an open PostgreSQL session.
+    ///
+    /// Exactly one statement. The broker parses it, derives the
+    /// [`asv_domain::Action`], and evaluates policy *before* the statement
+    /// reaches the server, so a denied verb never leaves the process.
+    PostgresQuery {
+        session: AgentSessionId,
+        sql: String,
+    },
+    /// M6-R4: tear a PostgreSQL session down before its natural end.
+    ///
+    /// Revoke is a separate verb rather than a query because it must succeed
+    /// even if policy would deny the current statement, and because the agent
+    /// must be able to give up access without knowing a valid statement.
+    PostgresRevoke { session: AgentSessionId },
 }
 
 /// Broker responses. Every variant is safe to return to an agent: none of them
@@ -189,6 +226,34 @@ pub enum Response {
         /// log. A verifier pins the chain to this value.
         chain_head: String,
         dropped: u64,
+    },
+    /// A PostgreSQL session is open.
+    ///
+    /// Carries an opaque session handle and the identifiers the broker chose.
+    /// No password, no connection string, and no root certificate path: the
+    /// agent learns where it is connected and nothing that would let it
+    /// authenticate on its own (M6-R2).
+    PostgresConnected {
+        session: AgentSessionId,
+        database: String,
+        role: String,
+    },
+    /// One statement's result.
+    ///
+    /// `rows` holds the result set as text and `row_count` its length, so a
+    /// client can tell an empty result from a failed query. The broker returns
+    /// the statement's own output and nothing derived from the credential.
+    PostgresResult {
+        row_count: usize,
+        rows: Vec<String>,
+    },
+    /// The session was torn down. `backend_terminated` reports whether the
+    /// broker observed the server drop the connection, which is the only
+    /// evidence that satisfies M6-R4: a broker-side latch would pass the same
+    /// test whether or not the socket died.
+    PostgresRevoked {
+        session: AgentSessionId,
+        backend_terminated: bool,
     },
     Error {
         code: ErrorCode,
@@ -313,6 +378,9 @@ impl Request {
             Request::CreateIssue { .. } => "create_issue",
             Request::CreateRelease { .. } => "create_release",
             Request::AuditQuery { .. } => "audit_query",
+            Request::PostgresConnect { .. } => "postgres_connect",
+            Request::PostgresQuery { .. } => "postgres_query",
+            Request::PostgresRevoke { .. } => "postgres_revoke",
         }
     }
 }
@@ -542,18 +610,26 @@ mod tests {
         assert!(!json.to_lowercase().contains("payload"));
     }
 
-    /// v1 and v2 must not interoperate. If a v2 client could reach a v1
-    /// broker, the failure would surface as a denied call rather than as a
-    /// version error, and the cause would be misattributed.
+    /// Each version bump must be a hard boundary. If a v2 client could reach
+    /// a v3 broker, the failure would surface as a denied call rather than as
+    /// a version error, and the cause would be misattributed. The pinned
+    /// numbers move on every bump; the property does not.
     #[test]
-    fn the_v2_bump_is_a_hard_boundary() {
-        let v1 = decode_request(br#"{"method":"ping","protocol":1}"#).expect("decodes");
-        assert!(
-            check_version(&v1).is_err(),
-            "a v1 client must not be served by a v2 broker"
-        );
-        let v2 = decode_request(br#"{"method":"ping","protocol":2}"#).expect("decodes");
-        assert!(check_version(&v2).is_ok());
+    fn each_version_bump_is_a_hard_boundary() {
+        for old in [1, 2] {
+            let request =
+                decode_request(format!(r#"{{"method":"ping","protocol":{old}}}"#).as_bytes())
+                    .expect("decodes");
+            assert!(
+                check_version(&request).is_err(),
+                "a v{old} client must not be served by a v{PROTOCOL_VERSION} broker"
+            );
+        }
+        let current = decode_request(
+            format!(r#"{{"method":"ping","protocol":{PROTOCOL_VERSION}}}"#).as_bytes(),
+        )
+        .expect("decodes");
+        assert!(check_version(&current).is_ok());
     }
 
     /// Every M4 method must round-trip with its fields intact. A rename or a
@@ -603,6 +679,79 @@ mod tests {
             );
             let decoded: Request = serde_json::from_str(&json).expect("round-trips");
             assert_eq!(decoded, request);
+        }
+    }
+
+    /// Every M6 method must round-trip with its fields intact, for the same
+    /// reason the M4 test exists: a renamed or dropped field would silently
+    /// change the contract both sides compile against.
+    #[test]
+    fn the_m6_postgres_methods_round_trip_on_the_wire() {
+        let session = AgentSessionId::new();
+        for request in [
+            Request::PostgresConnect {
+                session,
+                host: "pg.local.test".into(),
+                host_addr: "127.0.0.1".into(),
+                port: 5432,
+                database: "app".into(),
+                role: "app".into(),
+            },
+            Request::PostgresQuery {
+                session,
+                sql: "select 1".into(),
+            },
+            Request::PostgresRevoke { session },
+        ] {
+            let json = serde_json::to_string(&request).expect("serializes");
+            assert!(
+                json.len() <= MAX_MESSAGE_BYTES,
+                "{json} exceeds the message bound"
+            );
+            let decoded: Request = serde_json::from_str(&json).expect("round-trips");
+            assert_eq!(decoded, request);
+        }
+    }
+
+    /// M6-R2: no PostgreSQL response may carry a credential.
+    ///
+    /// This walks the variants rather than trusting the doc comment, for the
+    /// same reason the M4 test does. The two fields most likely to regress
+    /// here are a connection string and a certificate path: both look like
+    /// harmless configuration and both can carry enough to authenticate.
+    #[test]
+    fn m6_responses_carry_no_secret_field() {
+        for response in [
+            Response::PostgresConnected {
+                session: AgentSessionId::new(),
+                database: "app".into(),
+                role: "app".into(),
+            },
+            Response::PostgresResult {
+                row_count: 1,
+                rows: vec!["1".into()],
+            },
+            Response::PostgresRevoked {
+                session: AgentSessionId::new(),
+                backend_terminated: true,
+            },
+        ] {
+            let json = serde_json::to_string(&response).expect("serializes");
+            let lowered = json.to_lowercase();
+            for forbidden in [
+                "password",
+                "pgpassword",
+                "passfile",
+                "conninfo",
+                "sslrootcert",
+                "sslkey",
+                "secret",
+            ] {
+                assert!(
+                    !lowered.contains(forbidden),
+                    "{json} leaks a credential-bearing field: {forbidden}"
+                );
+            }
         }
     }
 

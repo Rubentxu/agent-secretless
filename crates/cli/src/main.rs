@@ -277,6 +277,31 @@ fn print_response(response: &Response) {
             }
             println!("chain head: {chain_head}");
         }
+        Response::PostgresConnected {
+            session,
+            database,
+            role,
+        } => {
+            println!("postgres session {session} open on {database} as {role}");
+        }
+        Response::PostgresResult { row_count, rows } => {
+            for row in rows {
+                println!("{row}");
+            }
+            eprintln!("({row_count} row(s))");
+        }
+        Response::PostgresRevoked {
+            session,
+            backend_terminated,
+        } => {
+            // The two facts an operator needs are separate: the broker let go,
+            // and the server confirmed the backend is gone. Printing them as
+            // one "revoked" line would hide which of the two actually happened.
+            println!("postgres session {session} revoked");
+            if !backend_terminated {
+                eprintln!("warning: broker did not observe server-side backend termination");
+            }
+        }
         Response::Error { code, message } => {
             // `code` is the stable, scriptable part; `message` is for humans.
             eprintln!("{code:?}: {message}");
