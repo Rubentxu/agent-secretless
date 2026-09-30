@@ -282,7 +282,11 @@ pub enum AuditEventDto {
         injection: String,
         /// Always `ISOLATED_PROCESS_EXPOSURE` for worker runs.
         posture: String,
-        /// "ok" | "failed" | "timeout" | "refused" | "error".
+        /// "ok" | "failed" | "timeout" | "refused" | "error" | "signaled".
+        /// `signaled` means the child died from a signal (e.g. SIGSYS under
+        /// the seccomp deny-list, or SIGKILL after the timeout grace). It was
+        /// missing here while the broker already emitted it, so a consumer
+        /// validating against this vocabulary would reject a real record.
         outcome: String,
         /// Child exit code when the child ran and exited; `None` for
         /// signals, timeouts and refusals.

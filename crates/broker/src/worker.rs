@@ -44,6 +44,13 @@ pub enum SpawnError {
     /// (M10R-R2).
     #[error("egress Allow(…) policy is not enforceable yet; use Deny or wire the M9 bridge")]
     EgressAllowUnsupported,
+    /// The template declares a debug-only seccomp profile. The deny-list
+    /// is installed unconditionally, so accepting the template would apply
+    /// the production filter under a permissive label (M10R-R2/R4).
+    #[error(
+        "template declares a non-production seccomp profile; the M7 deny-list is always applied"
+    )]
+    SeccompProfileNotProduction,
     /// The kernel refused the namespace setup (or the pre-exec hook
     /// died before exec). The child was never exec'd unprotected.
     #[error("isolation unavailable (kernel refused namespaces or hook died pre-exec)")]
@@ -148,6 +155,15 @@ pub fn spawn(
         return Err(SpawnError::EgressAllowUnsupported);
     }
 
+    // The seccomp deny-list is always installed, so a debug-only profile
+    // would otherwise be indistinguishable from a production one while
+    // reading as a weaker posture. Refuse it instead of silently
+    // enforcing the strict filter under a permissive label.
+    if !template.seccomp_profile.is_production() {
+        audit_worker(audit, name, Some(template), None, "refused", None);
+        return Err(SpawnError::SeccompProfileNotProduction);
+    }
+
     // M10R-R1 (continuation): the binary must exist and be an
     // executable file. A registry entry pointing nowhere is an
     // install-time bug, refused before any fork.
@@ -248,20 +264,17 @@ pub fn spawn(
     // exec. Any failure aborts before exec (M10R-R2/R4 fail-closed).
     let binary = template.binary.clone();
     let landlock = template.landlock_profile.clone();
-    let seccomp = template.seccomp_profile;
     unsafe {
-        cmd.pre_exec(
-            move || match child_isolation_hook(&binary, &landlock, seccomp) {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    // SAFETY: write(2) is async-signal-safe; this private
-                    // descriptor remains open until exec because it is CLOEXEC.
-                    let marker = [PRE_EXEC_FAILURE_MARKER];
-                    let _ = libc::write(hook_status_fd, marker.as_ptr().cast(), marker.len());
-                    Err(error)
-                }
-            },
-        );
+        cmd.pre_exec(move || match child_isolation_hook(&binary, &landlock) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // SAFETY: write(2) is async-signal-safe; this private
+                // descriptor remains open until exec because it is CLOEXEC.
+                let marker = [PRE_EXEC_FAILURE_MARKER];
+                let _ = libc::write(hook_status_fd, marker.as_ptr().cast(), marker.len());
+                Err(error)
+            }
+        });
     }
 
     let spawned = cmd.spawn();
@@ -388,11 +401,16 @@ fn pre_exec_hook_failed(reader: &mut std::os::unix::net::UnixStream) -> bool {
 /// The child-side hook: namespaces (M10R-R2), landlock (M10R-R4), then
 /// seccomp. Ordered so the strongest, least-forgiving step is last:
 /// once seccomp is live, no further privileged setup is possible.
+///
+/// The seccomp deny-list is unconditional by design. `WorkerTemplate`
+/// carries a `seccomp_profile`, but PassThrough is debug-only and must not
+/// weaken the worker sandbox, so the profile is not a runtime input here.
+/// Branching on it would let a template opt out of M7's deny-list, which is a
+/// security regression. The profile is checked when a template is registered.
 #[cfg(target_os = "linux")]
 fn child_isolation_hook(
     binary: &Path,
     profile: &crate::isolated_exec::LandlockProfile,
-    _seccomp: crate::isolated_exec::SeccompProfile,
 ) -> std::io::Result<()> {
     // 1) Fresh user + network namespace. The userns is what makes the
     // netns legal for an unprivileged caller. Egress Deny becomes a
@@ -413,8 +431,8 @@ fn child_isolation_hook(
     })?;
 
     // 3) Seccomp deny-list (M7 rules; one source of truth with the
-    // broker's own filter). Both profiles install it; PassThrough is
-    // documented debug-only and does NOT weaken the filter.
+    // broker's own filter). Unconditional: the deny-list is never
+    // skipped, whatever profile the template declares.
     let program = crate::harden::worker_deny_list_filter().ok_or_else(|| {
         eprintln!("asv-worker: seccomp filter unavailable");
         std::io::Error::from(std::io::ErrorKind::Unsupported)
@@ -431,7 +449,6 @@ fn child_isolation_hook(
 fn child_isolation_hook(
     _binary: &Path,
     _profile: &crate::isolated_exec::LandlockProfile,
-    _seccomp: crate::isolated_exec::SeccompProfile,
 ) -> std::io::Result<()> {
     // Honest refusal: the isolation primitives do not exist here.
     Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
@@ -753,6 +770,32 @@ mod tests {
         let err = spawn(&r, "net-worker", SpawnOptions::default(), &mut audit)
             .expect_err("Allow policy must be refused until M9 lands");
         assert!(matches!(err, SpawnError::EgressAllowUnsupported));
+    }
+
+    #[test]
+    fn pass_through_seccomp_profile_is_refused_not_silently_upgraded() {
+        // The deny-list is installed for every template, so a PassThrough
+        // template must be refused outright rather than quietly receiving
+        // the production filter under a permissive label.
+        let mut t = template("debug-worker", "/bin/true");
+        t.seccomp_profile = SeccompProfile::PassThrough;
+        let r = WorkerRegistry::new(vec![t]);
+        let mut audit = AuditLog::new(16);
+        let err = spawn(&r, "debug-worker", SpawnOptions::default(), &mut audit)
+            .expect_err("a debug-only seccomp profile must be refused");
+        assert!(matches!(err, SpawnError::SeccompProfileNotProduction));
+        // Nothing was executed, and the refusal is auditable.
+        let recs = audit.query(0);
+        assert_eq!(recs.len(), 1);
+        match &recs[0].event {
+            AuditEventDto::WorkerSpawned {
+                worker, outcome, ..
+            } => {
+                assert_eq!(worker, "debug-worker");
+                assert_eq!(outcome, "refused");
+            }
+            other => panic!("unexpected audit variant: {other:?}"),
+        }
     }
 
     #[test]

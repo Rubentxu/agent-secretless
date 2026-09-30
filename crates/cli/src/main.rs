@@ -257,17 +257,18 @@ fn print_response(response: &Response) {
             } else {
                 println!("{:<6} {:<12} {:<22} TS", "SEQ", "OUTCOME", "METHOD");
                 for r in records {
-                    let event = match &r.event {
+                    // Read the fields directly. Formatting them into one string
+                    // and splitting on the first space corrupted any method or
+                    // worker name containing a space (a worker literally named
+                    // "sh -c" rendered as method="worker:sh", outcome="-c").
+                    let (method, outcome) = match &r.event {
                         asv_ipc_protocol::AuditEventDto::RequestHandled {
                             method, outcome, ..
-                        } => format!("{method:<22} {outcome}"),
+                        } => (method.clone(), outcome.clone()),
                         asv_ipc_protocol::AuditEventDto::WorkerSpawned {
-                            worker,
-                            outcome,
-                            ..
-                        } => format!("worker:{worker:<15} {outcome}"),
+                            worker, outcome, ..
+                        } => (format!("worker:{worker}"), outcome.clone()),
                     };
-                    let (method, outcome) = event.split_once(' ').unwrap_or((event.as_str(), ""));
                     println!("{:<6} {:<12} {:<22} {}", r.seq, outcome, method, r.ts);
                 }
             }
