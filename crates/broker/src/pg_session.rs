@@ -331,8 +331,32 @@ fn pg_error(error: WireError) -> PgSessionError {
 /// being allocated as a `String` and borrowed back. A separate `String` would
 /// have to be zeroized by hand, and a hand-written zeroize is one refactor away
 /// from not happening.
-#[derive(Debug, Default)]
+///
+/// `Debug` is implemented by hand and prints nothing but a length. The derive
+/// is a real leak, and not a subtle one: `Zeroizing`'s own `Debug` forwards to
+/// the inner `Vec<u8>`, which prints the bytes as decimal numbers. A single log
+/// line containing `Zeroizing([65, 83, 86, ...])` hands over the whole
+/// password to anyone who can read logs, and recovering it is a matter of
+/// parsing those numbers back into bytes. `the_sink_debug_does_not_leak_its_
+/// bytes` recovers the secret from `Debug` output to keep that from coming
+/// back.
+#[derive(Default)]
 pub struct BorrowedSecret(Option<Zeroizing<Vec<u8>>>);
+
+impl std::fmt::Debug for BorrowedSecret {
+    /// Prints the length and nothing else.
+    ///
+    /// The length is not a secret: it is a property of a credential the
+    /// broker was configured with, and a `Debug` that panics or refuses to
+    /// format is worse than one that says how much it is holding. What it must
+    /// not do is print the bytes, in any encoding, including the decimal
+    /// rendering a derived `Debug` would have produced.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BorrowedSecret")
+            .field("len", &self.0.as_ref().map(|bytes| bytes.len()))
+            .finish()
+    }
+}
 
 impl BorrowedSecret {
     /// The borrowed credential, for the one call that needs it.
@@ -427,22 +451,67 @@ mod tests {
     }
 
     #[test]
-    fn the_sink_debug_does_not_print_the_credential() {
+    fn the_sink_debug_does_not_leak_its_bytes() {
         use asv_connector_http::SecretSink;
         let mut sink = BorrowedSecret::default();
         sink.accept(b"ASV-CANARY-sink-DO-NOT-LEAK").expect("accept");
         let rendered = format!("{sink:?}");
+
+        // The assertion the previous version of this test made, searching for
+        // the credential as text. It passed while the bytes were printed, and
+        // passing is how the leak survived: a derived `Debug` renders a
+        // `Vec<u8>` as decimal numbers, so the canary never appeared as text.
         assert!(
             !rendered.contains("ASV-CANARY"),
-            "Debug leaked the credential: {rendered}"
+            "Debug leaked the credential as text: {rendered}"
         );
-        // The contrast that gives the assertion above teeth: a String holding
-        // the same bytes does print them, so this is a real redaction rather
-        // than a canary the Debug format could never have matched.
-        let plain = String::from("ASV-CANARY-sink-DO-NOT-LEAK");
+
+        // The assertion that actually holds the line. A reader of a log line
+        // does not need the text; parsing the numbers back into bytes is
+        // enough, and this does exactly what they would do.
+        let recovered: Option<String> = rendered
+            .split(['[', ']'])
+            .find(|part| part.contains(", "))
+            .map(|numbers| {
+                let bytes: Vec<u8> = numbers
+                    .split(", ")
+                    .filter_map(|n| n.trim().parse::<u8>().ok())
+                    .collect();
+                String::from_utf8_lossy(&bytes).into_owned()
+            });
+        assert_ne!(
+            recovered.as_deref(),
+            Some("ASV-CANARY-sink-DO-NOT-LEAK"),
+            "the password is recoverable from Debug output: {rendered}"
+        );
+
+        // What it does print, so the format is not silently useless.
         assert!(
-            format!("{plain:?}").contains("ASV-CANARY"),
-            "a String prints its contents, so the check above has teeth"
+            rendered.contains("len"),
+            "Debug reports the length: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_derived_debug_this_type_replaced_really_did_leak() {
+        // Kept as a regression witness. `Zeroizing`'s own `Debug` forwards to
+        // the inner `Vec<u8>`, so the `#[derive(Debug)]` this type used to
+        // carry printed the password as decimal bytes. If a future version of
+        // `zeroize` changes that, this test will fail and the reason will be
+        // visible; if someone re-derives `Debug` here, the test above catches
+        // it. Between them the defect cannot come back unnoticed.
+        let derived = zeroize::Zeroizing::new(b"ASV-CANARY-sink-DO-NOT-LEAK".to_vec());
+        let rendered = format!("{derived:?}");
+        let numbers: Vec<u8> = rendered
+            .trim_start_matches("Zeroizing([")
+            .trim_end_matches("])")
+            .split(", ")
+            .map(|n| n.trim().parse::<u8>().expect("decimal byte"))
+            .collect();
+        assert_eq!(
+            String::from_utf8_lossy(&numbers),
+            "ASV-CANARY-sink-DO-NOT-LEAK",
+            "this is what the derived Debug used to hand to a log reader"
         );
     }
 
