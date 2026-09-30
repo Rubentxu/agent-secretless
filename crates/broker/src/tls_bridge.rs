@@ -56,12 +56,16 @@ pub enum InjectError {
     EmptyCa(String),
 }
 
-/// Why leaf issuance failed.
+/// Why leaf issuance or leaf verification failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LeafError {
     /// The session CA has already aged out, so no leaf may be minted under it.
     #[error("session CA for {0} is expired")]
     CaExpired(String),
+    /// The leaf itself has aged out, so it can no longer be presented even
+    /// though its host binding still matches.
+    #[error("leaf for {0} has expired")]
+    LeafExpired(String),
     /// The requested host is not the one the leaf is bound to. Issuance is
     /// per exact host: a leaf for `a.example` must never validate `b.example`.
     #[error("leaf is bound to {bound}, not to {requested}")]
@@ -74,6 +78,13 @@ pub enum LeafError {
     /// The session CA carries no intermediate to sign with.
     #[error("session CA for {0} has no signing material")]
     NoSigner(String),
+    /// The session CA carries no root, so a leaf minted under it would chain
+    /// to nothing and no trust store could validate it.
+    #[error("session CA for {0} has no root")]
+    NoRoot(String),
+    /// The requested host is not a bare, canonical DNS name.
+    #[error("{0}")]
+    InvalidHost(String),
 }
 
 /// Errors that the bridge dispatcher returns.
@@ -353,7 +364,24 @@ impl LeafCertificate {
     /// in a zone can mint for a host it was never asked to vouch for, which
     /// is the whole point of per-host issuance: a session authorized for
     /// `api.github.com` must not gain a leaf for `internal.github.com`.
+    ///
+    /// This checks the name binding only. It does **not** check expiry: the
+    /// leaf is compared structurally, with no clock. Use
+    /// [`LeafCertificate::verify_host_at`] whenever the decision depends on
+    /// time, which is every real TLS handshake.
     pub fn verify_host(&self, host: &str) -> Result<(), LeafError> {
+        self.verify_host_at(host, self.issued_at)
+    }
+
+    /// Exact host binding, plus an expiry check against `now`.
+    ///
+    /// This is the form callers should use. A binding check alone would
+    /// accept an expired leaf, which is a certificate that can no longer
+    /// chain to a live CA but whose name still matches perfectly.
+    pub fn verify_host_at(&self, host: &str, now: Instant) -> Result<(), LeafError> {
+        if self.is_expired(now) {
+            return Err(LeafError::LeafExpired(self.host.clone()));
+        }
         if self.host != host {
             return Err(LeafError::HostMismatch {
                 bound: self.host.clone(),
@@ -366,12 +394,20 @@ impl LeafCertificate {
 
 /// Mints a leaf for `host` under `ca`.
 ///
-/// Fails closed in three cases, all of them security-relevant:
+/// Fails closed in five cases, all of them security-relevant:
 ///
 /// - the CA has expired, so no leaf may outlive its issuer;
 /// - the CA has no intermediate, so there is nothing to sign with;
+/// - the CA has no root, so the chain terminates in nothing;
 /// - the CA material is empty, which would mint a leaf that chains to
-///   nothing.
+///   nothing;
+/// - `host` is not a bare, canonical DNS name, so a leaf could be minted for
+///   a spelling that no allowlist would ever match.
+///
+/// `host` is canonicalized with [`Authority::canonicalize`], the same
+/// authority that the CONNECT allowlist uses. A leaf is therefore bound to
+/// the same notion of "this host" the rest of the codebase has, and two
+/// spellings of one host cannot mint two different leaves.
 pub fn issue_leaf(ca: &SessionCa, host: &str, now: Instant) -> Result<LeafCertificate, LeafError> {
     if ca.is_expired(now) {
         return Err(LeafError::CaExpired(ca.session_id.clone()));
@@ -379,21 +415,28 @@ pub fn issue_leaf(ca: &SessionCa, host: &str, now: Instant) -> Result<LeafCertif
     if ca.intermediate_der.is_empty() {
         return Err(LeafError::NoSigner(ca.session_id.clone()));
     }
-    if host.is_empty() {
-        return Err(LeafError::HostMismatch {
-            bound: ca.session_id.clone(),
-            requested: host.to_string(),
-        });
+    if ca.root_der.is_empty() {
+        return Err(LeafError::NoRoot(ca.session_id.clone()));
     }
+    // Canonicalize before doing anything else with the host. This rejects the
+    // empty string, surrounding whitespace, embedded `:port`, userinfo,
+    // percent-encoding, bare IP literals and single labels, and it lowercases
+    // the rest. A leaf bound to `"API.Example.COM"` would never be matched by
+    // an allowlist that spells the host in canonical form.
+    let host = Authority::canonicalize(host)
+        .map_err(|e| LeafError::InvalidHost(e.to_string()))?
+        .as_str()
+        .to_string();
     // The leaf never outlives the CA: a certificate whose issuer expired
     // first cannot be validated by any trust store that checks the chain.
     let ttl = ca
         .ttl
         .saturating_sub(now.saturating_duration_since(ca.issued_at));
+    let leaf_der = synth_leaf_der(&ca.session_id, &host);
     Ok(LeafCertificate {
         session_id: ca.session_id.clone(),
-        host: host.to_string(),
-        leaf_der: synth_leaf_der(&ca.session_id, host),
+        host,
+        leaf_der,
         issued_at: now,
         ttl,
     })
@@ -708,5 +751,82 @@ mod tests {
     fn issuance_refuses_an_empty_host() {
         let ca = leaf_ca();
         assert!(issue_leaf(&ca, "", Instant::now()).is_err());
+    }
+
+    // ─── Fail-closed edges, each established red before the fix ───
+
+    #[test]
+    fn verify_host_at_rejects_an_expired_leaf() {
+        let ca = leaf_ca();
+        let leaf = issue_leaf(&ca, "api.example.com", Instant::now()).expect("issuance");
+        let after = leaf.issued_at + leaf.ttl;
+        assert!(
+            leaf.is_expired(after),
+            "precondition: the leaf must be expired at {after:?}"
+        );
+        assert_eq!(
+            leaf.verify_host_at("api.example.com", after).unwrap_err(),
+            LeafError::LeafExpired("api.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn issuance_fails_closed_without_a_root() {
+        let mut ca = leaf_ca();
+        ca.root_der.clear();
+        assert_eq!(
+            issue_leaf(&ca, "api.example.com", Instant::now()).unwrap_err(),
+            LeafError::NoRoot("sess-leaf".to_string())
+        );
+    }
+
+    #[test]
+    fn issuance_refuses_a_malformed_host() {
+        let ca = leaf_ca();
+        // Every one of these is a spelling `Authority::canonicalize`
+        // rejects. A leaf bound to any of them could never be matched by a
+        // canonical allowlist: a certificate that authorises nothing while
+        // looking like it authorises something.
+        for bad in [
+            "api.example.com:443",
+            " api.example.com",
+            "api.example.com ",
+            "api example.com",
+            "api.example.com@evil.net",
+            "api.example.com%2e",
+            "[::1]",
+            "localhost",
+        ] {
+            assert!(
+                matches!(
+                    issue_leaf(&ca, bad, Instant::now()),
+                    Err(LeafError::InvalidHost(_))
+                ),
+                "issue_leaf must reject the malformed host {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issuance_canonicalises_the_host() {
+        let ca = leaf_ca();
+        let upper = issue_leaf(&ca, "API.Example.COM", Instant::now()).expect("issuance");
+        let lower = issue_leaf(&ca, "api.example.com", Instant::now()).expect("issuance");
+        assert_eq!(upper.host, "api.example.com");
+        // One host, one leaf: two spellings must not mint two identities.
+        assert_eq!(upper.leaf_der, lower.leaf_der);
+    }
+
+    #[test]
+    fn host_mismatch_reports_a_host_not_a_session_id() {
+        let ca = leaf_ca();
+        let leaf = issue_leaf(&ca, "api.example.com", Instant::now()).expect("issuance");
+        match leaf.verify_host("internal.example.com").unwrap_err() {
+            LeafError::HostMismatch { bound, .. } => assert_ne!(
+                bound, ca.session_id,
+                "HostMismatch.bound is documented as a host, not a session id"
+            ),
+            other => panic!("expected HostMismatch, got {other:?}"),
+        }
     }
 }
