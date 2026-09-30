@@ -240,6 +240,10 @@ export ASV_UAT033_REQUIRE=1
 ENV
 
   step "substrate ready on port $port"
+  # Printed on every run, not only on failure. A TLS or SCRAM negotiation that
+  # a given PostgreSQL version refuses is a property of that version, and the
+  # first question about a red CI job is which one it was.
+  "$bindir/psql" --version
   echo "run the suites with:  eval \"\$(scripts/uat033-pg-substrate.sh env)\"; cargo test --workspace --locked" >&2
   echo "or simply:            scripts/uat033-pg-substrate.sh run" >&2
 }
@@ -289,6 +293,19 @@ cmd_run() {
 
   if [[ $connector -ne 0 || $broker -ne 0 ]]; then
     step "FAILED: connector=$connector broker=$broker"
+    # The server's own account of a failed connection is the fastest route to
+    # the cause and the client never sees it: rustls reports `tls handshake eof`
+    # for a whole class of rejections that PostgreSQL distinguishes in its log
+    # (no shared cipher, unacceptable protocol version, client certificate
+    # demanded). A failure here used to be diagnosable only by attaching a
+    # debugger to the right side of the connection.
+    step "--- last 40 lines of the substrate's PostgreSQL log ---"
+    tail -40 "$ROOT/pg.log" 2>/dev/null || echo "(no server log at $ROOT/pg.log)"
+    step "--- substrate configuration ---"
+    grep -E '^(port|ssl|ssl_cert_file|ssl_key_file|ssl_min_protocol_version|ssl_ciphers|ssl_ecdh_curve)' \
+      "$DATA/postgresql.conf" 2>/dev/null || true
+    step "--- substrate version ---"
+    "$(find_bindir)/psql" --version 2>/dev/null || true
     failed=1
   else
     step "both UAT-033 suites passed against a real PostgreSQL"
