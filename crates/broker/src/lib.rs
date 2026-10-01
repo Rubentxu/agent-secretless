@@ -628,46 +628,93 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             }
         }
 
-        Request::DeleteCredential { .. } => {
-            // The first three reasons below are why deletion is refused even
-            // for an admitted operator. This one is why the *refusal* is
-            // computed rather than written into the message: ADR-0015 gives
-            // the predicate a meaning, and nothing here is guessing.
-            let denial = match admission::admit_control_plane(
-                peer,
-                &state.control_plane,
-                &admission::ProcFs,
-            ) {
-                Ok(()) => "admission granted, but deletion still requires the vault write \
-                           path this broker does not have yet"
-                    .to_string(),
-                Err(denial) => denial.to_string(),
-            };
-            // A credential is not session-scoped, so there is no ownership
-            // A credential is not session-scoped, so there is no ownership
-            // relation to check: every peer reaching this socket is an agent
-            // peer, and every one of them runs as the operator's own uid. A
-            // uid check would therefore pass for the agent as readily as for
-            // the human, which is the opposite of a guard.
+        Request::DeleteCredential { id } => {
+            // ADR-0015, evaluated before the id is looked at and for the same
+            // reason the create verb evaluates it. Two properties of *where*
+            // this check sits, both deliberate:
             //
-            // Deleting a credential is also not a decision an agent may make:
-            // it is the operator giving up access. Until the human control
-            // plane ships there is no authorized caller, so the honest answer
-            // is a closed door — the same one SubmitApproval and AuditQuery
-            // already answer with, and for the same reason.
+            // A refused caller learns nothing about the id. The denial is
+            // computed from the peer's process evidence alone — pin, cgroup,
+            // enrolment — and the string never interpolates `id`, so an
+            // unadmitted peer asking about a credential that exists and one
+            // that does not receives byte-identical answers. The oracle that
+            // made this an existence probe is closed by the placement, not by
+            // a comparison further down.
             //
-            // Two further reasons this cannot be quietly allowed. The
-            // in-memory list is not the vault: a delete here never reached
-            // the encrypted store, so it would look like a revocation and
-            // then be un-done by the next broker restart. And a peer able to
-            // destroy every credential in the running broker holds a
-            // denial-of-service over the operator's entire working setup,
-            // which is exactly the capability a secretless product must not
-            // hand to the thing it exists to constrain.
-            Response::Error {
-                code: ErrorCode::Denied,
-                message: format!("credential deletion refused: {denial}"),
+            // The comment this replaces claimed the vault write path was
+            // absent. It was not: `VaultWritePort::remove` has existed since
+            // the create path landed, and the refusal below is now only ever
+            // reached when a condition genuinely holds.
+            if let Err(denial) =
+                admission::admit_control_plane(peer, &state.control_plane, &admission::ProcFs)
+            {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: format!("credential deletion refused: {denial}"),
+                };
             }
+
+            // Admitted. A broker with no vault open cannot revoke in one, and
+            // the answer says exactly that — which, unlike the old message, is
+            // true at the moment it is printed.
+            let Some(writer) = state.vault_writer.as_ref() else {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: "credential deletion refused: this broker has no vault write path"
+                        .into(),
+                };
+            };
+
+            // The file is the source of truth, so it goes first and it goes
+            // alone. Nothing below has run yet, which is what makes a refused
+            // write leave the inventory and the token table exactly as they
+            // were — the same invariant the create path established, and the
+            // reason the mirror can never advertise a credential the file
+            // still holds.
+            // `to_wire`, not a `Uuid` re-render: the create verb keys the
+            // vault by `to_wire()` and the vault is a `String`-keyed map, so
+            // this must be the same spelling that wrote the record rather than
+            // an independently formatted one that would simply not find it.
+            match writer.remove(&id.to_wire()) {
+                Err(asv_vault::VaultError::NotFound(_)) => {
+                    // Reported, not swallowed, and *only* to a caller
+                    // admission has already accepted. That peer is the
+                    // operator's own enrolled principal, holding a pidfd and
+                    // outside every broker slice; it can already call
+                    // `ListCredentialMetadata` and read the whole inventory, so
+                    // this discloses nothing it does not hold. Answering
+                    // `CredentialDeleted` instead would tell the operator a
+                    // revocation happened when nothing was revoked.
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: "no such credential".into(),
+                    };
+                }
+                Err(error) => {
+                    // The vault's own error, verbatim. It names a condition
+                    // and no secret; rewording it would hide which failure
+                    // mode an operator is looking at.
+                    return Response::Error {
+                        code: ErrorCode::Upstream,
+                        message: format!("credential could not be removed: {error}"),
+                    };
+                }
+                Ok(()) => {}
+            }
+
+            // The write succeeded, so the mirror may now follow it.
+            state.credentials.retain(|c| c.id != id);
+
+            // And the tokens that stood for it go with it. The vault alone
+            // would have made them useless; this is what stops the registry
+            // from still reporting them as live, and the count is what tells
+            // the operator how much was in flight when they pulled the plug.
+            let revoked = state.surrogates.revoke_credential(id);
+            if revoked > 0 {
+                tracing::info!(%revoked, "surrogates revoked with their credential");
+            }
+
+            Response::CredentialDeleted { id }
         }
 
         Request::Authorize {
@@ -1447,6 +1494,7 @@ pub fn register_inventory_credential(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asv_connector_http::{SecretError, SecretSink};
     use asv_domain::CredentialId;
     use asv_domain::CredentialKind;
     use asv_identity::PeerCredentials;
@@ -1838,15 +1886,21 @@ mod tests {
 
         // Identical refusal for an id that exists and one that does not. If
         // these ever differ again, the difference is an oracle.
-        // The two messages are compared to *each other*, byte for byte.
-        // Collecting them is what makes that possible, and it is the property
-        // this test exists for.
+        //
+        // The two messages are compared to *each other*, byte for byte, and
+        // collecting them is what makes that possible. This test used to
+        // assert only that both messages contained "refused:" and
+        // "pidfd-pinned", which any pair of messages differing in every other
+        // byte also satisfies — an oracle with the id appended passes it.
+        // Falsification mutation M5, which appends the id to the refusal, came
+        // back green against the old version of this test; that is how the gap
+        // was found, and the comparison below is what closes it.
         let mut refusals = Vec::new();
         for (label, id) in [("known", known), ("ghost", ghost)] {
             match handle(&mut state, &peer(), Request::DeleteCredential { id }) {
                 Response::Error { code, message } => {
                     assert_eq!(code, ErrorCode::Denied, "{label}");
-                    // The refusal must also name the admission condition that
+                    // The refusal must name the admission condition that
                     // failed. That is a separate property from the oracle
                     // property asserted below, so both are checked.
                     assert!(
@@ -1888,6 +1942,444 @@ mod tests {
                 }
                 other => panic!("unexpected audit variant: {other:?}"),
             }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // The granted path of `DeleteCredential`.
+    //
+    // Everything above this line is about the closed door; everything below is
+    // about the door being open, which is the half that had never existed.
+    // ---------------------------------------------------------------------
+
+    /// A peer that is admitted as the control plane **without a single fake**.
+    ///
+    /// The obvious way to test the granted branch is to inject an admission
+    /// stub, and it is refused here for a reason that is not taste: a seam able
+    /// to answer "this caller is enrolled" is a seam that could also be wired
+    /// to a test double in production, and the whole point of ADR-0015 is that
+    /// the human's identity is never self-asserted.
+    ///
+    /// So each condition is obtained honestly instead:
+    ///
+    /// 1. *pidfd-pinned* — a real `pidfd_open` on this live test process.
+    /// 2. *not under broker control* — by observation, not by stubbing.
+    ///    `parse_cgroup_membership` reports only segments carrying the broker's
+    ///    slice prefix, and a test process is in no broker slice, so the
+    ///    condition holds for the same reason it holds for a human's shell.
+    /// 3. *positively enrolled* — the enrolment record is the operator-held
+    ///    input the ADR makes authoritative, so a test may set it. It is set
+    ///    from this binary's real `/proc/self/exe` and the real SHA-256 of
+    ///    those bytes, which means the check cannot pass by agreeing with a
+    ///    fake: it has to agree with the file the kernel points at.
+    fn admitted_peer() -> WorkloadIdentity {
+        let mut identity = WorkloadIdentity::from_peer(PeerCredentials {
+            pid: std::process::id() as i32,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+        });
+        identity
+            .pin_pidfd()
+            .expect("the test process is live and pinnable");
+        assert!(
+            identity.is_pidfd_pinned(),
+            "the fixture must be pinned or it tests the closed door"
+        );
+        identity
+    }
+
+    /// The enrolment that admits [`admitted_peer`]: this test binary, as it
+    /// really is on this machine at this moment.
+    fn enrolment_of_this_binary() -> admission::Enrolment {
+        let path = std::fs::read_link("/proc/self/exe").expect("this process has an exe");
+        let bytes = std::fs::read(&path).expect("the test binary is readable");
+        admission::Enrolment::empty().enrol(path, admission::sha256(&bytes))
+    }
+
+    /// A real encrypted vault holding one credential, wired into a
+    /// `BrokerState` the way a running broker wires it: a `VaultWritePort` and
+    /// a `SecretPort` over the *same* store instance, the inventory loaded from
+    /// the file, and this binary enrolled as the control plane.
+    ///
+    /// Returns the `TempDir` too, so the vault outlives the test rather than
+    /// being dropped underneath the assertions.
+    fn wired_vault() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        BrokerState,
+        CredentialId,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.asv");
+        let pass = secrecy::SecretString::from("delete-write-through".to_string());
+        let mut store =
+            asv_vault::VaultStore::create(&path, &pass, asv_vault::KdfParams::fast_for_tests())
+                .expect("create vault");
+        let key = store.header().unlock(&pass).expect("unlock");
+
+        let id = CredentialId::new();
+        store
+            .insert(
+                &key,
+                asv_vault::CredentialMetadata::new(
+                    id.to_wire(),
+                    "github-work",
+                    asv_vault::CredentialKind::BearerToken,
+                    "github",
+                    "acct",
+                    1,
+                ),
+                asv_domain::secret::SecretBytes::new(b"the-secret".to_vec()),
+            )
+            .expect("insert");
+
+        let store = Arc::new(std::sync::Mutex::new(store));
+        let key = Arc::new(key);
+
+        let mut state = BrokerState::default();
+        // The inventory is loaded from the file, exactly as production loads
+        // it, so these tests start from the state a real broker is in rather
+        // than from a hand-built mirror that could be wrong in a way the test
+        // would then happily confirm.
+        crate::inventory::load(&mut state, &store.lock().expect("lock"));
+        state.vault_writer = Some(Arc::new(VaultWritePort::new(
+            Arc::clone(&store),
+            Arc::clone(&key),
+        )));
+        state.secrets = Some(Arc::new(VaultSecretPort::new(
+            Arc::clone(&store),
+            Arc::clone(&key),
+        )));
+        state.control_plane = enrolment_of_this_binary();
+
+        assert!(
+            state.credentials.iter().any(|c| c.id == id),
+            "the fixture must actually have loaded the credential it claims to hold"
+        );
+        (dir, path, state, id)
+    }
+
+    /// REQ-1. The revocation reaches the **file**, and that is the whole
+    /// finding: the defect was a delete that removed a credential from the
+    /// running broker and left it in the vault, so the next restart undid the
+    /// revocation.
+    ///
+    /// The check is made from a *second* `VaultStore` opened on the same path
+    /// after the delete. A store sharing the first one's memory would prove
+    /// nothing about the file, and asserting on the live handle is the exact
+    /// mistake this test exists to avoid.
+    #[test]
+    fn an_admitted_delete_reaches_the_vault_file() {
+        let (_dir, path, mut state, id) = wired_vault();
+        let pass = secrecy::SecretString::from("delete-write-through".to_string());
+        let peer = admitted_peer();
+
+        let before = asv_vault::VaultStore::open(&path, &pass).expect("open before");
+        let revision_before = before.revision();
+        assert_eq!(before.list().len(), 1, "the fixture holds one credential");
+
+        match handle(&mut state, &peer, Request::DeleteCredential { id }) {
+            Response::CredentialDeleted { id: reported } => {
+                assert_eq!(reported, id, "the broker reported a different id");
+            }
+            other => panic!("expected a deletion, got {other:?}"),
+        }
+
+        // A different process's worth of state: a fresh handle, decrypted
+        // from the file, with nothing of the running broker's memory in it.
+        let after = asv_vault::VaultStore::open(&path, &pass).expect("open after");
+        assert!(
+            after.list().is_empty(),
+            "the credential is gone from memory but still in the file — the P1"
+        );
+        assert!(
+            after.revision() > revision_before,
+            "a write that does not advance the revision is not a write: {revision_before} -> {}",
+            after.revision()
+        );
+    }
+
+    /// REQ-2. The inventory follows the file and never the reverse: a broker
+    /// must not advertise, or mint against, a credential the file no longer
+    /// has. The mirror image of the create path's original defect.
+    #[test]
+    fn an_admitted_delete_takes_the_credential_out_of_the_inventory() {
+        let (_dir, _path, mut state, id) = wired_vault();
+        let peer = admitted_peer();
+
+        handle(&mut state, &peer, Request::DeleteCredential { id });
+
+        assert!(
+            !state.credentials.iter().any(|c| c.id == id),
+            "the mirror still advertises a deleted credential"
+        );
+        match handle(&mut state, &peer, Request::ListCredentialMetadata) {
+            Response::CredentialMetadata { entries } => {
+                assert!(
+                    entries.is_empty(),
+                    "the operator still sees a credential that is not in the vault"
+                );
+            }
+            other => panic!("expected metadata, got {other:?}"),
+        }
+    }
+
+    /// REQ-2, ordering. Nothing may follow the file until the file has
+    /// actually changed. A refused write must leave the mirror and the token
+    /// table exactly as they were, or the two drift and a credential the vault
+    /// never had starts being advertised.
+    ///
+    /// The refused write is produced honestly, without a stubbing seam: the id
+    /// is in the inventory but not in the file, which is precisely the state
+    /// this ordering is supposed to survive.
+    #[test]
+    fn a_refused_write_leaves_the_inventory_and_the_tokens_alone() {
+        let (_dir, _path, mut state, _id) = wired_vault();
+        let peer = admitted_peer();
+
+        // A credential the broker advertises and the file does not hold.
+        let ghost = register_inventory_credential(
+            &mut state,
+            CredentialMetadata::new("never-written", CredentialKind::BearerToken),
+        );
+        let session = state.sessions.create("/repo".to_string(), &peer);
+        let (surrogate, _) = {
+            let (token, _, _) = state
+                .surrogates
+                .mint(session, ghost, 60, 2, now_secs())
+                .expect("mint");
+            (token, ())
+        };
+        assert_eq!(state.surrogates.len(), 1, "a token is in flight");
+
+        match handle(&mut state, &peer, Request::DeleteCredential { id: ghost }) {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
+                assert_eq!(message, "no such credential");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        assert!(
+            state.credentials.iter().any(|c| c.id == ghost),
+            "a write that never happened must not change the mirror"
+        );
+        assert_eq!(
+            state.surrogates.len(),
+            1,
+            "a write that never happened must not revoke a live token"
+        );
+        assert_eq!(
+            state.surrogates.redeem(&surrogate, session, now_secs()),
+            Ok(ghost),
+            "the token must still work: nothing was actually revoked"
+        );
+    }
+
+    /// REQ-3, both halves. A token minted before the revocation stops working
+    /// *and* stops being counted as live.
+    ///
+    /// These are separate properties and the first one is not this change's
+    /// doing: the lender already fails closed because `with_secret` gates on
+    /// the in-memory body, which the write emptied. The second half is what
+    /// `revoke_credential` adds, and a test that only asserted the first would
+    /// pass against a registry still lying about what is live.
+    #[test]
+    fn tokens_minted_before_a_revocation_stop_working_and_stop_counting() {
+        let (_dir, _path, mut state, id) = wired_vault();
+        let peer = admitted_peer();
+
+        let session = state.sessions.create("/repo".to_string(), &peer);
+        let (surrogate, _, _) = state
+            .surrogates
+            .mint(session, id, 60, 5, now_secs())
+            .expect("mint");
+        assert_eq!(state.surrogates.len(), 1, "the token is live before");
+
+        // The secret really is reachable through the port before the delete,
+        // so the assertion after it is about the delete and not about a
+        // fixture that was never wired.
+        {
+            let mut sink = RecordingSink::default();
+            let port = state
+                .secrets
+                .as_ref()
+                .expect("the fixture wires a secret port")
+                .as_ref();
+            port.lend(&id.to_wire(), &mut sink).expect("lends before");
+            assert_eq!(sink.seen, b"the-secret");
+        }
+
+        handle(&mut state, &peer, Request::DeleteCredential { id });
+
+        // Half one: it cannot get the secret.
+        {
+            let mut sink = RecordingSink::default();
+            let port = state.secrets.as_ref().expect("still wired").as_ref();
+            let error = port
+                .lend(&id.to_wire(), &mut sink)
+                .expect_err("a revoked credential must not lend");
+            assert!(matches!(error, SecretError::NotFound(_)), "{error:?}");
+            assert_eq!(sink.accepts, 0, "the sink ran without a secret");
+        }
+
+        // Half two: the registry stopped calling it live.
+        assert_eq!(
+            state.surrogates.len(),
+            0,
+            "the registry still reports a token for a credential that is gone"
+        );
+        assert_eq!(
+            state.surrogates.redeem(&surrogate, session, now_secs()),
+            Err(SurrogateError::Unknown)
+        );
+    }
+
+    /// REQ-6. An admitted caller asking about an id that is not there is told
+    /// the truth, and is never told a revocation happened when none did.
+    ///
+    /// This is not an oracle, and the distinction is the design. The oracle
+    /// property belongs to the *refused* case, which cannot reach this code at
+    /// all; a caller that gets here is the operator's own enrolled principal
+    /// and can already read the whole inventory through
+    /// `ListCredentialMetadata`. Answering "that succeeded" would be the only
+    /// dishonest option here.
+    #[test]
+    fn an_admitted_caller_is_told_a_ghost_id_does_not_exist() {
+        let (_dir, _path, mut state, id) = wired_vault();
+        let peer = admitted_peer();
+        let ghost = CredentialId::new();
+
+        let response = handle(&mut state, &peer, Request::DeleteCredential { id: ghost });
+
+        match response {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
+                assert_eq!(message, "no such credential");
+            }
+            other => panic!(
+                "a delete of an id that does not exist must not read as a revocation: {other:?}"
+            ),
+        }
+        // And the real credential is untouched by the failed attempt.
+        assert!(
+            state.credentials.iter().any(|c| c.id == id),
+            "a refused delete must not remove anything"
+        );
+    }
+
+    /// REQ-5. The refusal the old code produced claimed the vault write path
+    /// was missing while it was present, which is the kind of lie that costs an
+    /// operator an afternoon. Both branches that can still be reached must
+    /// name a condition that is true when it is printed.
+    #[test]
+    fn no_refusal_claims_a_capability_the_broker_actually_has() {
+        // An unpinned peer, which is the state every other test runs in.
+        let mut state = BrokerState::default();
+        let message = match handle(
+            &mut state,
+            &peer(),
+            Request::DeleteCredential {
+                id: CredentialId::new(),
+            },
+        ) {
+            Response::Error { message, .. } => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert!(
+            !message.contains("does not have yet"),
+            "the refusal claims a missing capability the code does not lack: {message}"
+        );
+        assert!(
+            !message.contains("still requires the vault write path"),
+            "the refusal claims a missing capability the code does not lack: {message}"
+        );
+        // It names a real condition instead, and that condition is the one
+        // that actually failed.
+        assert!(message.contains("pidfd-pinned"), "{message}");
+
+        // The admitted-but-no-vault branch, whose claim *is* true because
+        // there genuinely is no writer. Built in one expression rather than
+        // assigned after `default()`, so the state under test is visible in
+        // the fixture rather than one line away from it.
+        let mut unwired = BrokerState {
+            control_plane: enrolment_of_this_binary(),
+            ..BrokerState::default()
+        };
+        let message = match handle(
+            &mut unwired,
+            &admitted_peer(),
+            Request::DeleteCredential {
+                id: CredentialId::new(),
+            },
+        ) {
+            Response::Error { message, .. } => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert!(
+            message.contains("no vault write path"),
+            "an unwired broker must say so plainly: {message}"
+        );
+        assert!(
+            unwired.vault_writer.is_none(),
+            "the fixture must really be unwired for that claim to be true"
+        );
+    }
+
+    /// REQ-4, the second denial. The anti-oracle test above pins a peer that
+    /// fails the *pin* condition; this one fails the *enrolment* condition,
+    /// which is the branch a real agent on a real machine would hit once it
+    /// somehow carried a pin. Both must answer identically for an id that
+    /// exists and one that does not, and both must leave the vault alone.
+    #[test]
+    fn a_pinned_but_unenrolled_peer_learns_nothing_either() {
+        let (_dir, _path, mut state, id) = wired_vault();
+        // Pinned — condition 3 passes — but the enrolment record is empty, so
+        // condition 2 is the one that fails. That is the branch a real agent
+        // on a real machine would hit if it ever carried a pin.
+        let peer = admitted_peer();
+        state.control_plane = admission::Enrolment::empty();
+
+        let ghost = CredentialId::new();
+        let mut messages = Vec::new();
+        for (label, target) in [("known", id), ("ghost", ghost)] {
+            match handle(&mut state, &peer, Request::DeleteCredential { id: target }) {
+                Response::Error { code, message } => {
+                    assert_eq!(code, ErrorCode::Denied, "{label}");
+                    messages.push(message);
+                }
+                other => panic!("{label}: expected a refusal, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            messages[0], messages[1],
+            "the two answers differ, which is an existence oracle"
+        );
+        assert!(
+            !messages[0].contains(&id.to_wire()),
+            "the refusal leaked the id: {}",
+            messages[0]
+        );
+        assert!(
+            state.credentials.iter().any(|c| c.id == id),
+            "a refused deletion must leave the credential in place"
+        );
+    }
+
+    /// A sink that keeps the bytes it is handed, so a test can assert the
+    /// secret was or was not lent. The real connector sink scrubs on drop;
+    /// this one has to hold them long enough to look at.
+    #[derive(Default)]
+    struct RecordingSink {
+        seen: Vec<u8>,
+        accepts: u32,
+    }
+
+    impl SecretSink for RecordingSink {
+        fn accept(&mut self, secret: &[u8]) -> Result<(), SecretError> {
+            self.seen = secret.to_vec();
+            self.accepts += 1;
+            Ok(())
         }
     }
 

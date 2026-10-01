@@ -215,6 +215,29 @@ impl SurrogateRegistry {
         before - self.records.len()
     }
 
+    /// Drops every surrogate that stands for `credential`, and reports how
+    /// many went.
+    ///
+    /// Scoped by credential rather than by session, because a revocation is
+    /// about the secret and not about who is holding a token for it: an agent
+    /// that minted before the operator revoked is exactly the holder this is
+    /// for, and scoping to the revoking session would leave those behind.
+    ///
+    /// **This is not the control that makes revocation stick.** The vault
+    /// refuses the secret on its own — `with_secret` gates on the in-memory
+    /// body, which the same `transact` that wrote the deletion has already
+    /// emptied — so a token left here would already be worthless. What this
+    /// buys is that the registry stops *claiming* those tokens are live, and
+    /// that the failure an agent meets is a clean refusal at revoke time
+    /// rather than a "no such credential" surprise when it spends a token it
+    /// was told it still had.
+    pub fn revoke_credential(&mut self, credential: CredentialId) -> usize {
+        let before = self.records.len();
+        self.records
+            .retain(|(_, record)| record.credential != credential);
+        before - self.records.len()
+    }
+
     /// Removes every expired record and reports how many went.
     ///
     /// Separate from the read path on purpose: sweeping on redeem would make
@@ -509,6 +532,79 @@ mod tests {
                 "{guess} must be refused as unknown"
             );
         }
+    }
+
+    /// Revoking a credential must kill every token that stands for it, from
+    /// every session, and must report how many died so the broker can tell the
+    /// operator what was in flight.
+    #[test]
+    fn revoking_a_credential_revokes_every_token_for_it() {
+        let doomed = credential();
+        let bystander = credential();
+        let first = session();
+        let second = session();
+        let mut registry = SurrogateRegistry::new();
+        let (first_token, _, _) = registry.mint(first, doomed, 60, 5, T0).expect("mint");
+        let (second_token, _, _) = registry.mint(second, doomed, 60, 5, T0).expect("mint");
+        let (bystander_token, _, _) = registry.mint(first, bystander, 60, 5, T0).expect("mint");
+
+        assert_eq!(registry.revoke_credential(doomed), 2, "both went");
+
+        for token in [&first_token, &second_token] {
+            assert_eq!(
+                registry.redeem(token, first, T0),
+                Err(SurrogateError::Unknown),
+                "a token for a revoked credential must not redeem"
+            );
+        }
+        // The credential that was not revoked is untouched. A revocation that
+        // took the whole table with it would be indistinguishable from a
+        // denial of service against every other credential.
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry.redeem(&bystander_token, first, T0),
+            Ok(bystander),
+            "an unrelated credential's token must survive"
+        );
+    }
+
+    /// Revocation is by credential and not by session, and the difference is
+    /// the whole point: the agent holding a token when the operator revokes is
+    /// the one that must lose it, and scoping to the revoking session would
+    /// leave precisely that agent untouched.
+    #[test]
+    fn a_credential_revocation_crosses_sessions() {
+        let doomed = credential();
+        let holder = session();
+        let mut registry = SurrogateRegistry::new();
+        let (token, _, _) = registry.mint(holder, doomed, 60, 5, T0).expect("mint");
+
+        // The "revoker" is a different session entirely, and still takes it.
+        assert_eq!(registry.revoke_credential(doomed), 1);
+        assert_eq!(
+            registry.redeem(&token, holder, T0),
+            Err(SurrogateError::Unknown)
+        );
+    }
+
+    /// Revoking a credential nobody holds a token for is a no-op that says so,
+    /// not a silent success and not a panic on an empty table.
+    #[test]
+    fn revoking_an_unheld_credential_removes_nothing() {
+        let held = credential();
+        let holder = session();
+        let mut registry = SurrogateRegistry::new();
+        let (token, _, _) = registry.mint(holder, held, 60, 5, T0).expect("mint");
+
+        assert_eq!(registry.revoke_credential(credential()), 0);
+        assert_eq!(registry.len(), 1, "the unrelated token is still there");
+        // Redeemed under its *own* session, so this asserts the token still
+        // works rather than the much weaker "it is not gone".
+        assert_eq!(
+            registry.redeem(&token, holder, T0),
+            Ok(held),
+            "an unrelated token must keep working"
+        );
     }
 
     /// Ending a session must kill its surrogates. If tokens outlived the
