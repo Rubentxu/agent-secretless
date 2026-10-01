@@ -87,6 +87,7 @@ A milestone closes only when its exit UAT is green.
 - UAT-018 audit leak,
 - UAT-025 vault theft,
 - UAT-026 backup/restore.
+- UAT-036,
 
 ---
 
@@ -228,6 +229,8 @@ local authorization under 5 ms. Measuring it is M4 work.
 ### Exit UAT
 
 - UAT-033.
+- UAT-039,
+- UAT-050,
 
 ---
 
@@ -251,7 +254,8 @@ local authorization under 5 ms. Measuring it is M4 work.
 
 - UAT-003,
 - UAT-023,
-- UAT-024.
+- UAT-024,
+- UAT-048,
 
 ### Gate notes
 
@@ -388,6 +392,7 @@ substitution is real and tested, and M9's exit is **not** met by it alone.
 ### Exit UAT
 
 - UAT-021 and UAT-022.
+- UAT-040,
 
 ---
 
@@ -453,6 +458,12 @@ No new broad connector families.
 - docs/manual,
 - signed reproducible artifacts where practical,
 - SBOM.
+
+### RC exit
+
+### Exit UAT
+
+- UAT-035.
 
 ### RC exit
 

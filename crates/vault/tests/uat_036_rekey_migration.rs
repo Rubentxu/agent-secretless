@@ -1,3 +1,4 @@
+//! UAT-036 — passphrase rekey over the versioned envelope.
 //! R2 migration tests: passphrase rekey over the versioned envelope.
 //!
 //! `16-SECURITY-RELEASE-GATES.md` R2 (Vault) requires "migration tests":

@@ -1,3 +1,4 @@
+//! UAT-050 — the broker dispatches on the request type, not a provider string.
 //! M6-R1 — the broker dispatches on the request type, not a provider string.
 //!
 //! Not a normative UAT: `14-UAT-ADVERSARIAL.md` defines UAT-001..UAT-034 and

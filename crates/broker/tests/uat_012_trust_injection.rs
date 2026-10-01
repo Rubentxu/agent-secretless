@@ -1,3 +1,4 @@
+//! UAT-012 — transparent eBPF redirect.
 //! M9 trust injection adapter.
 //!
 //! Not a normative UAT: `14-UAT-ADVERSARIAL.md` titles UAT-012

@@ -1,3 +1,4 @@
+//! UAT-010 — surrogate substitution reaches the provider and the client never sees the secret.
 //! M9 CONNECT allow-list.
 //!
 //! Not a normative UAT: `14-UAT-ADVERSARIAL.md` titles UAT-010 "HTTP

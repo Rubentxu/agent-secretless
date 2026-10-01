@@ -1,3 +1,4 @@
+//! UAT-039 — PostgreSQL scenarios end to end through the connector.
 //! M6 PostgreSQL connector integration — the five M6 scenarios end to end.
 //!
 //! Not a normative UAT: `14-UAT-ADVERSARIAL.md` defines UAT-001..UAT-034 and

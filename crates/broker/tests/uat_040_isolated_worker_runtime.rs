@@ -1,3 +1,4 @@
+//! UAT-040 — isolated worker runtime, denied rather than downgraded.
 //! Isolated worker runtime — the M10 follow-up to UAT-021 and UAT-022.
 //!
 //! Not a normative UAT: `14-UAT-ADVERSARIAL.md` defines UAT-001..UAT-034 and

@@ -1,3 +1,4 @@
+//! UAT-011 — TLS pinning.
 //! M9 redirect denier.
 //!
 //! Not a normative UAT: `14-UAT-ADVERSARIAL.md` titles UAT-011 "TLS

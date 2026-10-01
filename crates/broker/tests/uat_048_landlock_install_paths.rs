@@ -1,3 +1,4 @@
+//! UAT-048 — Landlock scopes the operator's declared paths, not whole hierarchies.
 //! Landlock ruleset scopes the operator's declared paths, not whole hierarchies.
 //!
 //! Not a normative UAT: `14-UAT-ADVERSARIAL.md` defines UAT-001..UAT-034 and

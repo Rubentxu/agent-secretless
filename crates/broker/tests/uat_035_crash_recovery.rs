@@ -1,3 +1,4 @@
+//! UAT-035 — journal replay never advances state past a torn write.
 //! Crash / recovery — journal replay never advances state past a torn write.
 //!
 //! Not a normative UAT: `14-UAT-ADVERSARIAL.md` defines UAT-001..UAT-034 and

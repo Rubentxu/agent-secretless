@@ -315,3 +315,82 @@ offline inspection on a host that does not hold the sealing key.
 Expected: no plaintext secret is recoverable, and the failure path leaves no
 partially decrypted record.
 
+
+## UAT-035 — journal replay never advances state past a torn write
+
+Replay a journal that was being written when the process died.
+
+Expected:
+
+- a complete record set replays in order and reaches the same state;
+- a record torn at the tail is discarded, not half-applied;
+- a record corrupted in the middle stops the replay rather than skipping
+  forward, because a gap applied as if it were whole is how a revocation is
+  undone;
+- an empty journal leaves state where it was.
+
+## UAT-036 — passphrase rekey over the versioned envelope
+
+Migrate a vault to a new passphrase with credentials already stored.
+
+Expected:
+
+- the old passphrase stops opening the vault and the new one opens it with
+  every credential intact;
+- the migration is durable — a second handle sees it;
+- the pre-rekey backup still restores afterwards;
+- a wrong current passphrase fails closed and writes nothing;
+- an empty new passphrase is a configuration error, not a migration.
+
+## UAT-039 — PostgreSQL scenarios end to end through the connector
+
+Run the five M6 scenarios against a live PostgreSQL server.
+
+Expected:
+
+- dispatch is by request tag, so a PostgreSQL request reaches the PostgreSQL
+  connector and nothing else;
+- the `psql` helper is spawned with the password absent from its environment;
+- an unauthorized database or role is denied before authentication, and the
+  denial is indistinguishable from any other denial;
+- revoking the session tears the connection down;
+- the five `DbAction` strings round-trip through the query path, so a policy
+  change needs no connector edit.
+
+## UAT-040 — isolated worker runtime, denied rather than downgraded
+
+Ask the broker to run a command through the isolated worker.
+
+Expected:
+
+- an unregistered program name is refused and the refusal is audited;
+- a denied program is refused, not silently run unisolated;
+- the worker sees only loopback and cannot reach the network;
+- a pre-exec isolation failure is classified and audited as a security event,
+  while an ordinary exec failure stays an I/O error — conflating them would
+  make one of them unalarmed about;
+- injected environment reaches the child only.
+
+## UAT-048 — Landlock scopes the operator's declared paths, not whole hierarchies
+
+Restrict a session with Landlock and then try to write to a declared path, an
+undeclared sibling, and a file path.
+
+Expected:
+
+- the declared path stays writable after the restriction;
+- an undeclared sibling is denied;
+- declaring a *file* path restricts its parent directory and the file itself
+  remains writable;
+- a declared path that does not exist is skipped, never widened to its parent.
+
+## UAT-050 — the broker dispatches on the request type, not a provider string
+
+Send a request that names a provider in its arguments.
+
+Expected:
+
+- a PostgreSQL request routes to the PostgreSQL connector;
+- an HTTP request that names `postgres` still routes to HTTP, because a
+  provider string in the payload must not be able to select a connector;
+- routing follows the request variant alone.
