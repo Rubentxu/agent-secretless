@@ -44,11 +44,11 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
-use asv_broker::{handle, insert_credential, BrokerState, ConnectorFactory, VaultSecretPort};
+use asv_broker::{handle, BrokerState, ConnectorFactory, VaultSecretPort};
 use asv_connector_http::fake_origin::{self, Observed, Reply};
 use asv_connector_http::{Certificate, GithubClient, ResolvedAudience};
 use asv_connector_pg::{PgError, PostgresClient};
-use asv_domain::{AgentSessionId, Authority, CredentialKind, CredentialMetadata, SecretBytes};
+use asv_domain::{AgentSessionId, Authority, CredentialId, SecretBytes};
 use asv_identity::{PeerCredentials, WorkloadIdentity};
 use asv_ipc_protocol::{ErrorCode, Request, Response};
 use asv_vault::{KdfParams, VaultKey, VaultStore};
@@ -110,15 +110,17 @@ fn live() -> (Fixture, AgentSessionId, String) {
         .expect("unlock");
 
     let mut state = BrokerState::default();
-    let credential = insert_credential(
-        &mut state,
-        CredentialMetadata::new("uat005", CredentialKind::BearerToken),
-    );
+    // The inventory is projected the way the broker projects it at startup,
+    // from a record the vault actually holds. An earlier version of this
+    // fixture seeded `state.credentials` directly through a test-only helper,
+    // so the suite exercised a population path production never takes.
+    const CRED: &str = "5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b";
+    let credential = CredentialId::from_wire(CRED).expect("canonical wire form");
     store
         .insert(
             &key,
             asv_vault::CredentialMetadata::new(
-                credential.to_wire(),
+                CRED,
                 "uat005",
                 asv_vault::CredentialKind::Opaque,
                 "github",
@@ -128,6 +130,13 @@ fn live() -> (Fixture, AgentSessionId, String) {
             SecretBytes::new(CANARY.as_bytes().to_vec()),
         )
         .expect("insert");
+    let loaded = asv_broker::inventory::load(&mut state, &store);
+    assert_eq!(
+        (loaded.loaded, loaded.skipped, loaded.collisions),
+        (1, 0, 0),
+        "the fixture vault holds exactly one canonical credential, so any other \
+         count means the projection changed under this suite"
+    );
 
     state.secrets = Some(Arc::new(VaultSecretPort::new(
         Arc::new(store),

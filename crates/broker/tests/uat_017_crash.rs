@@ -33,10 +33,11 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
-use asv_broker::{handle, insert_credential, BrokerState};
-use asv_domain::{CredentialKind, CredentialMetadata};
+use asv_broker::{handle, BrokerState};
+use asv_domain::SecretBytes;
 use asv_identity::{PeerCredentials, WorkloadIdentity};
 use asv_ipc_protocol::{ErrorCode, Request, Response};
+use asv_vault::{KdfParams, VaultStore};
 
 /// A credential the environment is known to contain, and which must never
 /// appear in anything this suite produces.
@@ -75,8 +76,42 @@ fn state_with_session_id() -> (
     asv_domain::AgentSessionId,
 ) {
     let mut state = BrokerState::default();
-    let metadata = CredentialMetadata::new("github-work", CredentialKind::BearerToken);
-    let credential = insert_credential(&mut state, metadata);
+    // The inventory is projected from a real vault record rather than seeded
+    // through a test-only helper, so the credential a minted surrogate is
+    // bound to came from the same path production uses. The vault is then
+    // dropped and `state.secrets` is deliberately left `None`: that is the
+    // condition this suite exists to pin, and a broker that could mint and
+    // then read would have everything it needs to degrade.
+    const CRED: &str = "3c4d5e6f-7081-4293-a4b5-c6d7e8f9012a";
+    let credential = asv_domain::CredentialId::from_wire(CRED).expect("canonical wire form");
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pass = secrecy::SecretString::from("uat017-pass".to_string());
+        let mut store =
+            VaultStore::create(dir.path().join("v.asv"), &pass, KdfParams::fast_for_tests())
+                .expect("create vault");
+        let key = store.header().unlock(&pass).expect("unlock");
+        store
+            .insert(
+                &key,
+                asv_vault::CredentialMetadata::new(
+                    CRED,
+                    "github-work",
+                    asv_vault::CredentialKind::Opaque,
+                    "github",
+                    "o",
+                    1,
+                ),
+                SecretBytes::new(CANARY.as_bytes().to_vec()),
+            )
+            .expect("insert");
+        asv_broker::inventory::load(&mut state, &store);
+    }
+    assert_eq!(
+        state.credentials.len(),
+        1,
+        "the fixture vault holds exactly one canonical credential"
+    );
 
     let peer = pinned_peer();
     let session = state.sessions.create("uat017".into(), &peer);

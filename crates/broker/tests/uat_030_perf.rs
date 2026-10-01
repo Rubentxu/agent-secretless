@@ -47,11 +47,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use asv_broker::ConnectorFactory;
-use asv_broker::{handle, insert_credential, BrokerState, VaultSecretPort};
+use asv_broker::{handle, BrokerState, VaultSecretPort};
 use asv_connector_http::fake_origin::{self, Reply};
 use asv_connector_http::{GithubClient, ResolvedAudience};
 use asv_connector_pg::{PgError, PostgresClient};
-use asv_domain::{AgentSessionId, Authority, CredentialKind, CredentialMetadata, SecretBytes};
+use asv_domain::{AgentSessionId, Authority, CredentialId, SecretBytes};
 use asv_identity::{PeerCredentials, WorkloadIdentity};
 use asv_ipc_protocol::{Request, Response};
 use asv_ssh_agent::AgentSession;
@@ -187,15 +187,16 @@ impl Fixture {
         let key: VaultKey = store.header().unlock(&passphrase()).expect("unlock");
 
         let mut state = BrokerState::default();
-        let credential = insert_credential(
-            &mut state,
-            CredentialMetadata::new("uat030", CredentialKind::BearerToken),
-        );
+        // Projected the way the broker projects its own vault at startup, not
+        // seeded through a test-only helper, so the perf budget is measured
+        // against the population path production actually takes.
+        const CRED: &str = "2b3c4d5e-6f70-4182-93a4-b5c6d7e8f901";
+        let credential = CredentialId::from_wire(CRED).expect("canonical wire form");
         store
             .insert(
                 &key,
                 asv_vault::CredentialMetadata::new(
-                    credential.to_wire(),
+                    CRED,
                     "uat030",
                     asv_vault::CredentialKind::Opaque,
                     "github",
@@ -205,6 +206,7 @@ impl Fixture {
                 SecretBytes::new(CANARY.as_bytes().to_vec()),
             )
             .expect("insert credential");
+        asv_broker::inventory::load(&mut state, &store);
 
         state.secrets = Some(Arc::new(VaultSecretPort::new(
             Arc::new(store),

@@ -7,7 +7,7 @@
 
 use asv_connector_http::{validate_repo, AddressPolicy, GithubClient, GithubError, SecretPort};
 use asv_connector_pg::{LiveConnectorConfig, PgError, PostgresClient, TlsRoots};
-use asv_domain::{AgentSessionId, Authority, CredentialId, CredentialMetadata, Decision, Resource};
+use asv_domain::{AgentSessionId, Authority, CredentialMetadata, Decision, Resource};
 use asv_identity::WorkloadIdentity;
 use asv_ipc_protocol::{AuditEventDto, ErrorCode, Request, Response, PROTOCOL_VERSION};
 use asv_policy::{AuthorizationRequest, PolicyContext, PolicyEngine};
@@ -1263,8 +1263,25 @@ fn bind_peer_identity(request: &mut AuthorizationRequest, peer: &WorkloadIdentit
     request.context.peer_uid = peer.credentials.uid;
 }
 
-/// Seeds a credential for tests and for the M0 CLI smoke path.
-pub fn insert_credential(state: &mut BrokerState, metadata: CredentialMetadata) -> CredentialId {
+/// Seeds a credential directly, bypassing the vault.
+///
+/// Test-only, and gated rather than merely documented because the absence of
+/// this being wired to a vault is what `FND-broker-ignores-vault-inventory`
+/// was: for the life of the project this was the only writer of
+/// `state.credentials`, so a broker holding a real vault still answered
+/// `entries: []`. Production now projects the inventory through
+/// [`crate::inventory::load`], and the four integration suites that used this
+/// helper now do the same.
+///
+/// It stays available to this module's unit tests, which exercise broker
+/// request handling against hand-built state and have no vault to read. What
+/// is closed is the production surface: the production binary target never
+/// compiled it, and now neither does the library.
+#[cfg(test)]
+pub fn insert_credential(
+    state: &mut BrokerState,
+    metadata: CredentialMetadata,
+) -> asv_domain::CredentialId {
     let id = metadata.id;
     state.credentials.push(metadata);
     id
@@ -1273,6 +1290,7 @@ pub fn insert_credential(state: &mut BrokerState, metadata: CredentialMetadata) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asv_domain::CredentialId;
     use asv_domain::CredentialKind;
     use asv_identity::PeerCredentials;
     use asv_policy::{AuthorizationRequest, PolicyContext};
@@ -1718,6 +1736,7 @@ mod tests {
 #[cfg(test)]
 mod surrogate_tests {
     use super::*;
+    use asv_domain::CredentialId;
     use asv_domain::CredentialKind;
     use asv_identity::PeerCredentials;
     use asv_ipc_protocol::MAX_SURROGATE_USES;
