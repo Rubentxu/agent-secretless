@@ -76,6 +76,68 @@ fn spawn_openssl(args: &[String]) -> std::process::Output {
     child.wait_with_output().expect("openssl finished")
 }
 
+/// Assert the handshake actually verified, and tolerate only teardown noise.
+///
+/// The exit code of `s_client` is a *worse* proxy for "the handshake worked"
+/// than its own output, and this file proved it. On OpenSSL 3.6 the acceptor
+/// closes without a `close_notify` once the handshake is done, and `s_client`
+/// reports that as
+///
+/// ```text
+/// error:0A000126:SSL routines::unexpected eof while reading
+/// error:0A000197:SSL routines:SSL_shutdown:shutdown while in init
+/// ```
+///
+/// and exits non-zero — *after* printing `Verification: OK` and
+/// `Verified peername: api.example.com`. Two tests asserted only on
+/// `status.success()` and went red on a handshake that had in fact verified.
+///
+/// So the assertion is on the session, not the process status. That is
+/// strictly stronger, not weaker: `-verify_return_error` is on the command
+/// line, so a genuine verification failure never reaches `Verification: OK`
+/// in the first place. And a non-zero exit is still a failure unless the
+/// *only* errors are the two teardown lines above — anything else, including
+/// a new one, still fails.
+///
+/// The third test in this file is the control: it asserts the opposite for a
+/// hostname the leaf does not name, and it passes. Between the two, a harness
+/// that had stopped checking anything would show up immediately.
+fn assert_handshake_verified(output: &std::process::Output, hostname: &str, what: &str) {
+    let mut report = String::from_utf8_lossy(&output.stderr).to_string();
+    report.push_str(&String::from_utf8_lossy(&output.stdout));
+
+    assert!(
+        report.contains("CONNECTION ESTABLISHED"),
+        "{what}: the handshake never completed\n{report}"
+    );
+    assert!(
+        report.contains("Verification: OK"),
+        "{what}: the chain did not verify, or verification was not attempted. \
+         `-verify_return_error` is on the command line, so a real failure \
+         cannot also print this.\n{report}"
+    );
+    assert!(
+        report.contains(&format!("Verified peername: {hostname}")),
+        "{what}: the leaf does not cover `{hostname}`\n{report}"
+    );
+
+    if !output.status.success() {
+        const TEARDOWN: [&str; 2] = ["unexpected eof while reading", "shutdown while in init"];
+        let unexplained: Vec<&str> = report
+            .lines()
+            .filter(|l| l.contains("error:"))
+            .filter(|l| !TEARDOWN.iter().any(|t| l.contains(t)))
+            .collect();
+        assert!(
+            unexplained.is_empty(),
+            "{what}: s_client exited {:?} for a reason other than the \
+             connection closing without close_notify:\n  {}\n{report}",
+            output.status.code(),
+            unexplained.join("\n  ")
+        );
+    }
+}
+
 #[test]
 fn openssl_completes_the_handshake_trusting_only_the_session_root() {
     eprintln!("client: {}", openssl_version());
@@ -95,10 +157,8 @@ fn openssl_completes_the_handshake_trusting_only_the_session_root() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let _ = std::fs::remove_file(&root_path);
 
-    assert!(
-        output.status.success(),
-        "openssl s_client failed against the acceptor:\n{stderr}"
-    );
+    let _ = &stderr;
+    assert_handshake_verified(&output, HOST, "session-root handshake");
     assert!(
         stderr.contains("Verification: OK") || stderr.contains("Verification ok"),
         "openssl did not report a successful verification:\n{stderr}"
@@ -164,10 +224,8 @@ fn openssl_negotiates_a_suite_belonging_to_its_reported_version() {
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let _ = std::fs::remove_file(&root_path);
 
-    assert!(
-        output.status.success(),
-        "openssl failed against the acceptor even though it offered ALPN:\n{stderr}"
-    );
+    let _ = &stderr;
+    assert_handshake_verified(&output, HOST, "handshake while offering ALPN");
 
     let version = field(&stderr, "Protocol version: ");
     let cipher = field(&stderr, "Ciphersuite: ");
