@@ -1937,6 +1937,90 @@ mod tests {
         }
     }
 
+    /// H1, second half: admission *succeeding* must still not produce an
+    /// approval on the agent socket.
+    ///
+    /// The test above cannot see the hole. It uses `BrokerState::default()`,
+    /// whose enrolment record is empty, so `admit_control_plane` always answers
+    /// `Err(NotEnrolled)` and the handler takes the denial arm. That arm is
+    /// fail-closed for a boring reason: nobody is enrolled.
+    ///
+    /// The arm that matters is the other one. `Ok(())` means the caller
+    /// satisfied all three ADR-0015 conditions — pinned, outside broker
+    /// control, and enrolled by the operator — and the handler still refuses,
+    /// because there is no path from this socket to the policy engine. That
+    /// refusal is the whole of H1's current safety, and before this test
+    /// nothing pinned it: an edit that treated "admission granted" as "proceed"
+    /// would have opened self-approval for every enrolled agent while the test
+    /// above stayed green, because it never reaches that arm.
+    ///
+    /// The assertion is on the *message*, not merely the code. Both arms answer
+    /// `Denied`, so asserting the code alone would pass for the unenrolled
+    /// reason this test exists to rule out. `no path to the policy engine` is
+    /// the `Ok(())` arm's own text and only that arm produces it.
+    #[test]
+    fn an_admitted_peer_still_cannot_submit_an_approval_on_the_agent_socket() {
+        let mut state = BrokerState {
+            control_plane: enrolment_of_this_binary(),
+            ..BrokerState::default()
+        };
+        let peer = admitted_peer();
+
+        // The control, and the reason this test is not a duplicate of the one
+        // above: prove admission genuinely succeeds here. Without this the
+        // assertion below could be satisfied by `NotEnrolled` and would prove
+        // nothing about the arm under test.
+        admission::admit_control_plane(&peer, &state.control_plane, &admission::ProcFs)
+            .expect("this fixture must be admitted, or the test below is vacuous");
+
+        let session = match handle(
+            &mut state,
+            &peer,
+            Request::CreateSession {
+                workspace: "/repo".into(),
+            },
+        ) {
+            Response::SessionCreated { session } => session,
+            other => panic!("expected session creation, got {other:?}"),
+        };
+        let request = AuthorizationRequest {
+            session,
+            action: asv_domain::Action::GitPush,
+            resource: asv_domain::Resource::Repository {
+                owner: "acme".into(),
+                name: "app".into(),
+            },
+            context: PolicyContext {
+                workspace: "/repo".into(),
+                protected_ref: Some("main".into()),
+                request_digest: Some("release-digest".into()),
+                peer_uid: peer.credentials.uid,
+            },
+        };
+
+        match handle(
+            &mut state,
+            &peer,
+            Request::SubmitApproval {
+                request: request.clone(),
+                ttl_secs: 60,
+            },
+        ) {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::Denied, "{message}");
+                assert!(
+                    message.contains("no path to the policy engine"),
+                    "the refusal must come from the admitted arm, not from an \
+                     unenrolment this test is meant to have got past: {message}"
+                );
+            }
+            other => panic!(
+                "an admitted caller minted an approval on the agent socket, \
+                 which is the self-approval hole H1 exists to hold shut: {other:?}"
+            ),
+        }
+    }
+
     /// H2: `PolicyContext.peer_uid` arrives inside the request body, so it is
     /// attacker-controlled. The broker must overwrite it with the
     /// kernel-attested uid before policy sees it, otherwise any uid-aware rule
