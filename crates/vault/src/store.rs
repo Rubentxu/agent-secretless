@@ -1231,6 +1231,20 @@ mod tests {
         // Spec §2 keeps metadata and payload separate. This asserts the
         // stronger property we actually implemented: the body is opaque, so a
         // stolen locked vault does not even reveal which providers are in use.
+        //
+        // Every needle below is at least eight bytes, and that is load-bearing
+        // rather than incidental. This searches the *ciphertext* for the
+        // plaintext, so a short needle collides with the random bytes by
+        // chance at roughly (file_len - n) / 2^(8n): at two bytes that is on
+        // the order of a percent per run for a vault of a few KiB. The first
+        // version of this test used the id `c1` and the username `root`, and
+        // it failed under full-suite load for exactly that reason — a guard
+        // that cries wolf is worse than no guard, because it teaches everyone
+        // to re-run a red suite.
+        //
+        // Longer needles do not weaken the test. A real leak puts the whole
+        // value in the file, so a longer value is still detected, and the
+        // accidental-collision rate drops by orders of magnitude.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut store = vault(&dir);
         let key = store.header().unlock(&pass()).expect("unlock");
@@ -1238,11 +1252,11 @@ mod tests {
             .insert(
                 &key,
                 CredentialMetadata::new(
-                    "c1",
+                    "cred-prod-0001",
                     "prod-db-master",
                     CredentialKind::DatabasePassword,
                     "acme-internal",
-                    "root",
+                    "deploy-service",
                     100,
                 ),
                 canary_secret(),
@@ -1252,15 +1266,16 @@ mod tests {
 
         let bytes = std::fs::read(store.path()).expect("read");
         for needle in [
+            &b"cred-prod-0001"[..],
             &b"prod-db-master"[..],
             &b"acme-internal"[..],
-            &b"root"[..],
-            &b"c1"[..],
+            &b"deploy-service"[..],
         ] {
             assert!(
                 !contains(&bytes, needle),
-                "metadata {:?} leaked into the encrypted file",
-                String::from_utf8_lossy(needle)
+                "metadata {:?} leaked into the {} encrypted bytes",
+                String::from_utf8_lossy(needle),
+                bytes.len(),
             );
         }
     }
