@@ -155,7 +155,7 @@ authors have not written.
 | Gate | Status | Evidence |
 |---|---|---|
 | R11 dependency audit | pass with warning | `cargo audit`: 0 advisories, 337 deps, 1 yanked warning (`yoke-derive` 0.8.3, transitive via `url`→`idna`→`icu`). Recorded as a finding; clearing it means a transitive bump. |
-| R11 full suite | pass | 617 tests enumerated, 616 passed / 0 failed / 1 ignored. The 9 added by the vault write-atomicity fix are the rollback, rename and temp-name cases; the 11 before them are ADR-0015's hostile cases for the three control-plane conditions. `gate-status` re-derives this count from the repository on every run, so the row cannot outlive the suite. The previous revision of this row attributed the count to `v0.17.10`, which was false: that tag predates `crates/broker/tests/admission_control_plane.rs`, so ADR-0015's 11 were not in it. |
+| R11 full suite | pass | 637 tests enumerated, 636 passed / 0 failed / 1 ignored. The 20 added by ADR-0016's credential-create path cover the two refusals it can produce by name, the fresh-open durability check, the grantability of what it creates, a canary that must appear in no response and no vault file, the five kinds the vault can represent plus the four it refuses, and the enrolment record's two failure directions; the 9 before them are the vault write-atomicity cases. `gate-status` re-derives this count from the repository on every run, so the row cannot outlive the suite. |
 | R11 clippy `-D warnings` | pass | clean across `--workspace --all-targets --locked` |
 | R11 formatting | pass | `cargo fmt --all -- --check` clean |
 | R11 `NFR-PERF-001` | pass | UAT-030, 6 ms budget, both profiles, host recorded |
