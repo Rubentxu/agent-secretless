@@ -1,0 +1,20 @@
+[package]
+name = "asv-operator-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Operator-console policy: capabilities, exportability, clipboard, and untrusted-text handling. No Tauri, no WebView, no I/O."
+
+# M5 depends on the domain for the vocabulary it enforces (`Exportability`,
+# `CredentialMetadata`, `CredentialId`). It does NOT depend on the broker:
+# a console that can reach the broker over IPC would be a console that can
+# read a credential, which is the property this crate exists to make
+# impossible. The shell owns the socket; this crate owns the policy.
+[dependencies]
+asv-domain = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

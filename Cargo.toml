@@ -13,6 +13,7 @@ members = [
     "crates/connector-pg",
     "crates/ebpfd",
     "crates/tls-acceptor",
+    "crates/operator-core",
 ]
 # M0 deliberately shipped without a connector, so the UAT threat harness could
 # run with an empty connector surface (docs/15-ROADMAP.md M0 Exit). M4 is the

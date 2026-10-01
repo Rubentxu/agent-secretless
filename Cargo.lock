@@ -248,6 +248,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "asv-operator-core"
+version = "0.22.0"
+dependencies = [
+ "asv-domain",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "asv-policy"
 version = "0.22.0"
 dependencies = [
