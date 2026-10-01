@@ -56,6 +56,59 @@ pub enum Capability {
 }
 
 impl Capability {
+    /// Every capability this build knows about.
+    ///
+    /// This is the vocabulary, and it is the *only* copy. A second,
+    /// hand-kept list of the same variants used to live in this file's test
+    /// module; two lists of the same capabilities is precisely how a console
+    /// ends up exposing something the registry never authorised, so it is gone.
+    ///
+    /// A consumer that wants to enumerate the console surface — the Tauri
+    /// shell does, to prove its command table is a subset of this — reads it
+    /// from here rather than from its own copy, which is the copy that drifts.
+    ///
+    /// The compile-time guard is not this list but [`Capability::as_str`],
+    /// which is an exhaustive `match`: adding a variant breaks the build
+    /// until the name is spelled. Omitting a variant from `ALL` is
+    /// fail-closed — a shell can only iterate what is listed — so the
+    /// failure mode here is a command that never appears, not one that is
+    /// wrongly exposed.
+    pub const ALL: &'static [Capability] = &[
+        Capability::ListCredentials,
+        Capability::AddCredential,
+        Capability::DeleteCredential,
+        Capability::ListPolicies,
+        Capability::ListApprovals,
+        Capability::DecideApproval,
+        Capability::ListSessions,
+        Capability::EndSession,
+        Capability::ReadAudit,
+        Capability::ListPosture,
+        Capability::BeginReveal,
+    ];
+
+    /// The wire name the console uses for this capability.
+    ///
+    /// Matches the `snake_case` serde rename, because a command name that
+    /// exists only in one of those two spellings is a name the registry and
+    /// the transport will disagree about. `test_name_matches_serde` is what
+    /// keeps them equal.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Capability::ListCredentials => "list_credentials",
+            Capability::AddCredential => "add_credential",
+            Capability::DeleteCredential => "delete_credential",
+            Capability::ListPolicies => "list_policies",
+            Capability::ListApprovals => "list_approvals",
+            Capability::DecideApproval => "decide_approval",
+            Capability::ListSessions => "list_sessions",
+            Capability::EndSession => "end_session",
+            Capability::ReadAudit => "read_audit",
+            Capability::ListPosture => "list_posture",
+            Capability::BeginReveal => "begin_reveal",
+        }
+    }
+
     /// Whether invoking this capability can ever yield credential material.
     ///
     /// Every variant answers `false` and the test below says so. That test
@@ -63,6 +116,16 @@ impl Capability {
     /// read" a checked statement rather than a promise in a comment.
     pub const fn returns_secret_material(&self) -> bool {
         false
+    }
+
+    /// Parse a wire name back into a capability.
+    ///
+    /// Deny-by-default in the strictest sense: a name that does not match
+    /// exactly one variant yields `None`, and the caller refuses. There is no
+    /// prefix matching and no case folding, so a name cannot be *close
+    /// enough*.
+    pub fn from_wire(name: &str) -> Option<Capability> {
+        Capability::ALL.iter().copied().find(|c| c.as_str() == name)
     }
 }
 
@@ -164,7 +227,7 @@ mod tests {
         // statement. If a variant is ever added that can yield a value, this
         // is the test that goes red — and it goes red by having to answer
         // `true`, which a reviewer then has to justify.
-        for capability in ALL {
+        for capability in Capability::ALL {
             assert!(
                 !capability.returns_secret_material(),
                 "{capability:?} claims to return credential material; a console \
@@ -200,20 +263,77 @@ mod tests {
         );
     }
 
-    /// Every capability the vocabulary has. Kept by hand so that adding a
-    /// variant makes the exhaustive tests above fail to compile until they
-    /// are updated on purpose.
-    pub const ALL: &[Capability] = &[
-        Capability::ListCredentials,
-        Capability::AddCredential,
-        Capability::DeleteCredential,
-        Capability::ListPolicies,
-        Capability::ListApprovals,
-        Capability::DecideApproval,
-        Capability::ListSessions,
-        Capability::EndSession,
-        Capability::ReadAudit,
-        Capability::ListPosture,
-        Capability::BeginReveal,
-    ];
+    #[test]
+    fn every_wire_name_round_trips() {
+        for capability in Capability::ALL {
+            let name = capability.as_str();
+            assert_eq!(
+                Capability::from_wire(name),
+                Some(*capability),
+                "{name} does not parse back to the capability it came from"
+            );
+        }
+    }
+
+    #[test]
+    fn the_wire_name_matches_the_serde_name() {
+        // Two spellings of the same name is how a registry and a transport
+        // start disagreeing about which commands exist. They are checked
+        // against each other here rather than trusted to memory.
+        for capability in Capability::ALL {
+            let encoded = serde_json::to_string(capability).expect("Capability serialises");
+            let serde_name = encoded.trim_matches('"');
+            assert_eq!(
+                serde_name,
+                capability.as_str(),
+                "{capability:?}: as_str() and the serde rename disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn there_is_no_read_credential() {
+        // S-4. Not "read_credential is refused" — it is that no such name
+        // exists to be refused. The negative test that matters, because a
+        // positive assertion (`from_wire("x").is_none()`) can pass for the
+        // wrong reason: a typo'd function that always returned None would
+        // satisfy it. This one fails the moment a variant is added, because
+        // then the name resolves.
+        for forbidden in [
+            "read_credential",
+            "reveal",
+            "export",
+            "get_secret",
+            "reveal_credential",
+            "copy_credential",
+        ] {
+            assert_eq!(
+                Capability::from_wire(forbidden),
+                None,
+                "`{forbidden}` resolved; a console command that yields a value is \
+                 the bug this repository exists to prevent"
+            );
+        }
+    }
+
+    #[test]
+    fn wire_names_are_matched_exactly() {
+        // No case folding, no prefix matching, no trimming. A name that is
+        // *close* to a real one must be refused, not normalised into it.
+        for near_miss in [
+            "LIST_CREDENTIALS",
+            "List_Credentials",
+            "list_credentials ",
+            " list_credentials",
+            "list_credential",
+            "list_credentialss",
+            "list_credentials\n",
+        ] {
+            assert_eq!(
+                Capability::from_wire(near_miss),
+                None,
+                "`{near_miss}` was accepted; matching must be exact"
+            );
+        }
+    }
 }
