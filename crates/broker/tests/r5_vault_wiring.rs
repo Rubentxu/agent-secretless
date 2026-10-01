@@ -321,8 +321,9 @@ fn asv_vault_test_support_passphrase() -> secrecy::SecretString {
 //
 // The tests above prove the bin *opens* a vault. None of them prove it knows
 // what is inside. It did not: `BrokerState::credentials` is an in-memory list
-// whose only writer is `insert_credential`, a function whose own doc comment
-// says it seeds tests. `main.rs` built the lending port and never read
+// whose only writer was `insert_credential` (now `register_inventory_credential`,
+// which says what it does), a function whose own doc comment says it seeds
+// tests. `main.rs` built the lending port and never read
 // `store.list()`, so `ListCredentialMetadata` answered `[]` and
 // `MintSurrogate` refused every real credential with "no such credential".
 //

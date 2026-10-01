@@ -67,7 +67,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex_lower(&hasher.finalize())
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         s.push_str(&format!("{b:02x}"));
@@ -76,7 +76,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 /// 64 lowercase hex chars: the shape any legal previous-hash anchor has.
-fn is_hex_64(s: &str) -> bool {
+pub(crate) fn is_hex_64(s: &str) -> bool {
     s.len() == 64
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))

@@ -50,6 +50,12 @@ fn main() -> std::io::Result<()> {
     // Durable audit log. Same flag-not-env rule: the file survives broker
     // restarts, so the query window and chain head restore across runs.
     let mut audit_file: Option<PathBuf> = None;
+    // ADR-0016: enrol an operator principal, then exit. Not a socket verb and
+    // deliberately not gated by admission — a caller cannot be required to hold
+    // the permission it is asking to be granted. This is the operator's own act
+    // on their own machine, and the broker is simply the program that owns the
+    // record's format and the directory discipline it needs.
+    let mut enrol_principal: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         let arg = match arg.into_string() {
             Ok(s) => s,
@@ -96,9 +102,17 @@ fn main() -> std::io::Result<()> {
                     std::process::exit(1);
                 }
             }
+            "--enrol-principal" => {
+                let path = args.next().map(PathBuf::from);
+                if path.is_none() {
+                    eprintln!("asv: --enrol-principal requires a path argument");
+                    std::process::exit(1);
+                }
+                enrol_principal = path;
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH] [--audit-max-records N] [--audit-file PATH] [--harden]"
+                    "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH] [--audit-max-records N] [--audit-file PATH] [--enrol-principal PATH] [--harden]"
                 );
                 std::process::exit(0);
             }
@@ -112,6 +126,25 @@ fn main() -> std::io::Result<()> {
             }
         }
     }
+    // Enrolment runs before the vault checks, because it is not a vault
+    // operation: it locates the record by the vault's path, writes it, and
+    // exits. Requiring `--passphrase-file` here would be asking the operator
+    // for the secret to a command that never opens the vault.
+    if let Some(principal) = enrol_principal {
+        let Some(vault) = vault_path.as_ref() else {
+            eprintln!("asv: --enrol-principal needs --vault to locate the enrolment record");
+            std::process::exit(1);
+        };
+        match asv_broker::admission::enrol(vault, &principal) {
+            Ok(record) => println!("enrolled {} into {}", principal.display(), record.display()),
+            Err(error) => {
+                eprintln!("asv: {error}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     match (&vault_path, &passphrase_path) {
         (None, None) => {}
         (Some(v), Some(p)) if v.exists() && p.exists() => {}
@@ -264,7 +297,38 @@ fn main() -> std::io::Result<()> {
         // that cannot see its own vault. Loaded here, while the store is still
         // owned by this function; the lending port below only lends by id.
         let inventory = asv_broker::inventory::load(&mut state, &store);
-        state.secrets = Some(Arc::new(VaultSecretPort::new(Arc::new(store), key)));
+
+        // ADR-0015/0016: the enrolment record lives beside the vault and is
+        // read here, at start, so it survives a restart and names principals
+        // rather than pids. A missing record is the normal state and admits
+        // nobody. A record that exists and cannot be read is fatal: treating a
+        // damaged authorisation file as "nobody enrolled" would hide the
+        // difference between an operator who enrolled nothing and something
+        // that damaged the file granting credential-write authority.
+        match asv_broker::admission::load_enrolment(&vault_path) {
+            Ok(enrolment) => {
+                tracing::info!(
+                    principals = enrolment.principals().len(),
+                    "control-plane enrolment record loaded"
+                );
+                state.control_plane = enrolment;
+            }
+            Err(error) => {
+                eprintln!("asv: cannot read the control-plane enrolment record: {error}");
+                std::process::exit(1);
+            }
+        }
+
+        // One store instance, shared. The lending port needs `&self` and the
+        // writer needs `&mut self`, and `with_secret` gates on the in-memory
+        // body — so a second handle on the same file would answer `NotFound`
+        // for a credential that had just been written to it.
+        let store = Arc::new(std::sync::Mutex::new(store));
+        state.vault_writer = Some(Arc::new(asv_broker::VaultWritePort::new(
+            Arc::clone(&store),
+            Arc::clone(&key),
+        )));
+        state.secrets = Some(Arc::new(VaultSecretPort::new(Arc::clone(&store), key)));
         tracing::info!(
             vault = %vault_path.display(),
             credentials = inventory.loaded,

@@ -7,7 +7,7 @@
 
 use asv_connector_http::{validate_repo, AddressPolicy, GithubClient, GithubError, SecretPort};
 use asv_connector_pg::{LiveConnectorConfig, PgError, PostgresClient, TlsRoots};
-use asv_domain::{AgentSessionId, Authority, CredentialMetadata, Decision, Resource};
+use asv_domain::{AgentSessionId, Authority, CredentialId, CredentialMetadata, Decision, Resource};
 use asv_identity::WorkloadIdentity;
 use asv_ipc_protocol::{AuditEventDto, ErrorCode, Request, Response, PROTOCOL_VERSION};
 use asv_policy::{AuthorizationRequest, PolicyContext, PolicyEngine};
@@ -35,7 +35,7 @@ pub mod worker;
 
 pub use pg_session::{BorrowedSecret, PgRuntime, PgSessionError, PgSessionMap, StatementOutcome};
 pub use surrogate::{now_secs, SurrogateError, SurrogateRegistry};
-pub use vault_port::VaultSecretPort;
+pub use vault_port::{VaultSecretPort, VaultWritePort};
 
 /// In-memory session table. M1 replaces this with persistent, encrypted state;
 /// M0 only needs it to prove the lifecycle boundary.
@@ -330,6 +330,11 @@ pub struct BrokerState {
     /// it in a message, and an empty record makes the verdict a denial, so
     /// wiring it in opens nothing.
     pub control_plane: admission::Enrolment,
+    /// ADR-0016: the only way a credential enters the vault from a running
+    /// broker. `None` means no vault write path is configured and
+    /// `CreateCredential` refuses, for the same fail-closed reason `secrets`
+    /// defaults to `None` rather than fabricating a port.
+    pub vault_writer: Option<Arc<VaultWritePort>>,
 }
 
 impl Default for BrokerState {
@@ -348,6 +353,7 @@ impl Default for BrokerState {
             runtime: None,
             audit: audit::AuditLog::default(),
             control_plane: admission::Enrolment::empty(),
+            vault_writer: None,
         }
     }
 }
@@ -411,6 +417,7 @@ fn request_method_name(_state: &BrokerState, response: &Response) -> String {
         Response::SessionEnded { .. } => "end_session".into(),
         Response::CredentialMetadata { .. } => "list_credential_metadata".into(),
         Response::CredentialDeleted { .. } => "delete_credential".into(),
+        Response::CredentialCreated { .. } => "create_credential".into(),
         Response::Authorization { .. } => "authorize/explain".into(),
         Response::ApprovalIssued { .. } => "submit_approval".into(),
         Response::SurrogateMinted { .. } => "mint_surrogate".into(),
@@ -524,6 +531,102 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
         Request::ListCredentialMetadata => Response::CredentialMetadata {
             entries: state.credentials.iter().map(Into::into).collect(),
         },
+
+        Request::CreateCredential {
+            label,
+            kind,
+            provider,
+            account,
+            secret,
+        } => {
+            // ADR-0015, evaluated before anything is written and for the same
+            // reason the other three control-plane verbs evaluate it: the
+            // refusal is computed, not asserted. An agent session is refused by
+            // the first condition, which is the whole point of planting a
+            // credential behind this door rather than on the agent socket.
+            if let Err(denial) =
+                admission::admit_control_plane(peer, &state.control_plane, &admission::ProcFs)
+            {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: format!("credential creation refused: {denial}"),
+                };
+            }
+
+            // A broker with no vault open cannot write to one. Same
+            // fail-closed reading as every other secret operation: no
+            // fallback, because a fallback here would be "accept the secret and
+            // keep it somewhere that is not the encrypted vault".
+            let Some(writer) = state.vault_writer.as_ref() else {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: "credential creation refused: this broker has no vault write \
+                              path configured"
+                        .into(),
+                };
+            };
+
+            // The broker mints the handle. The operator names the credential;
+            // it cannot address a record it did not create, so the request
+            // cannot be shaped to collide with an existing one.
+            let id = CredentialId::new();
+
+            // The vault's vocabulary has five kinds and the domain's has nine.
+            // Four of the nine cannot be stored without being mislabelled, so
+            // they are refused by name rather than approximated — see
+            // `inventory::vault_kind`.
+            let Some(vault_kind) = inventory::vault_kind(kind) else {
+                return Response::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: format!(
+                        "the vault cannot represent a {kind:?} credential yet; \
+                         store it as a kind it can hold"
+                    ),
+                };
+            };
+
+            let metadata = asv_vault::CredentialMetadata::new(
+                id.to_wire(),
+                label,
+                vault_kind,
+                provider,
+                account,
+                now_secs(),
+            );
+
+            // The vault's `insert` is the transaction: it writes the file or it
+            // does not, and on failure the in-memory body is restored to match
+            // the file rather than diverging from it. That is `v0.18.1`'s work
+            // being spent here, and it is why this call can be treated as the
+            // point of no return rather than a best effort.
+            let bytes = secret.expose().to_vec();
+            let stored = match writer.create(metadata.clone(), asv_domain::SecretBytes::new(bytes))
+            {
+                Ok(id) => id,
+                Err(error) => {
+                    // The error is the vault's, and names no secret. The
+                    // submitted bytes have already been zeroized by the
+                    // `OpaqueSecret` this request owned.
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("credential could not be stored: {error}"),
+                    };
+                }
+            };
+
+            // Only now does the broker's inventory learn about it, and the
+            // order is the requirement: the file is the source of truth and the
+            // in-memory list follows it. Updating it first would produce a
+            // broker advertising a credential the file does not have.
+            if let Some(projected) = inventory::project_one(&metadata) {
+                state.credentials.push(projected);
+            }
+
+            Response::CredentialCreated {
+                id: CredentialId::from_wire(&stored).unwrap_or(id),
+                label: metadata.label,
+            }
+        }
 
         Request::DeleteCredential { .. } => {
             // The first three reasons below are why deletion is refused even
@@ -1312,22 +1415,27 @@ fn bind_peer_identity(request: &mut AuthorizationRequest, peer: &WorkloadIdentit
     request.context.peer_uid = peer.credentials.uid;
 }
 
-/// Seeds a credential directly, bypassing the vault.
+/// Registers a credential in the broker's in-memory inventory, writing nothing.
+///
+/// The name used to be `insert_credential`, and it was a lie: this pushes
+/// metadata into a `Vec` and touches no vault, while a broker holding a real
+/// one would answer `entries: []` — which is exactly what
+/// `FND-broker-ignores-vault-inventory` was. The production path that actually
+/// plants a credential is `Request::CreateCredential` through
+/// [`crate::VaultWritePort`]; renaming this is what stops the next reader from
+/// mistaking an inventory push for a write.
 ///
 /// Test-only, and gated rather than merely documented because the absence of
-/// this being wired to a vault is what `FND-broker-ignores-vault-inventory`
-/// was: for the life of the project this was the only writer of
-/// `state.credentials`, so a broker holding a real vault still answered
-/// `entries: []`. Production now projects the inventory through
-/// [`crate::inventory::load`], and the four integration suites that used this
-/// helper now do the same.
+/// this being wired to a vault is what that finding was. Production projects the
+/// inventory through [`crate::inventory::load`], and so does the create verb
+/// through [`crate::inventory::project_one`].
 ///
 /// It stays available to this module's unit tests, which exercise broker
 /// request handling against hand-built state and have no vault to read. What
 /// is closed is the production surface: the production binary target never
 /// compiled it, and now neither does the library.
 #[cfg(test)]
-pub fn insert_credential(
+pub fn register_inventory_credential(
     state: &mut BrokerState,
     metadata: CredentialMetadata,
 ) -> asv_domain::CredentialId {
@@ -1693,7 +1801,7 @@ mod tests {
     #[test]
     fn listing_credentials_returns_metadata_only() {
         let mut state = BrokerState::default();
-        let id = insert_credential(
+        let id = register_inventory_credential(
             &mut state,
             CredentialMetadata::new("github-work", CredentialKind::BearerToken),
         );
@@ -1722,7 +1830,7 @@ mod tests {
     #[test]
     fn credential_deletion_is_refused_and_does_not_confirm_existence() {
         let mut state = BrokerState::default();
-        let known = insert_credential(
+        let known = register_inventory_credential(
             &mut state,
             CredentialMetadata::new("github-work", asv_domain::CredentialKind::BearerToken),
         );
@@ -1829,7 +1937,7 @@ mod surrogate_tests {
     fn state_with_credential() -> (BrokerState, CredentialId) {
         let mut state = BrokerState::default();
         let metadata = CredentialMetadata::new("github-work", CredentialKind::BearerToken);
-        let id = insert_credential(&mut state, metadata);
+        let id = register_inventory_credential(&mut state, metadata);
         (state, id)
     }
 
@@ -2222,7 +2330,7 @@ mod surrogate_tests {
         const CANARY: &str = "ASV-CANARY-9f2c-DO-NOT-LEAK";
         let mut state = BrokerState::default();
         let metadata = CredentialMetadata::new(CANARY, CredentialKind::BearerToken);
-        let credential = insert_credential(&mut state, metadata);
+        let credential = register_inventory_credential(&mut state, metadata);
         let peer = pinned_peer();
         let session = state.sessions.create("/repo".to_string(), &peer);
 
@@ -2374,7 +2482,7 @@ mod e2e {
         // have their own `CredentialKind` and `CredentialMetadata`, and an
         // unqualified import silently picks the wrong pair.
         let mut state = BrokerState::default();
-        let credential = insert_credential(
+        let credential = register_inventory_credential(
             &mut state,
             asv_domain::CredentialMetadata::new(
                 "github-e2e",
@@ -2397,7 +2505,7 @@ mod e2e {
             .expect("insert");
 
         state.secrets = Some(Arc::new(VaultSecretPort::new(
-            Arc::new(store),
+            Arc::new(std::sync::Mutex::new(store)),
             Arc::new(key),
         )));
 

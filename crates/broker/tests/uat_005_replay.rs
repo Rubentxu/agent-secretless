@@ -139,7 +139,7 @@ fn live() -> (Fixture, AgentSessionId, String) {
     );
 
     state.secrets = Some(Arc::new(VaultSecretPort::new(
-        Arc::new(store),
+        Arc::new(std::sync::Mutex::new(store)),
         Arc::new(key),
     )));
 

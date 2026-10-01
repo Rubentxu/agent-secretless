@@ -151,7 +151,7 @@ fn brokered(
         .expect("insert the password into the vault");
 
     state.secrets = Some(Arc::new(asv_broker::VaultSecretPort::new(
-        Arc::new(store),
+        Arc::new(std::sync::Mutex::new(store)),
         Arc::new(key),
     )));
     state.runtime = Some(runtime());

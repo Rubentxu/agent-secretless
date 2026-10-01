@@ -6,7 +6,8 @@
 //! could be passed as `argv` and leak into shell history — exactly what
 //! `docs/04-SHELL-FIRST-INTEGRATION.md` §9 forbids. M1 adds no-echo ingestion.
 
-use asv_ipc_protocol::{Request, Response, PROTOCOL_VERSION};
+use asv_domain::CredentialKind;
+use asv_ipc_protocol::{OpaqueSecret, Request, Response, PROTOCOL_VERSION};
 use clap::{Parser, Subcommand};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -45,6 +46,29 @@ enum Command {
     },
     /// List credential metadata. Never values.
     Credentials,
+    /// Plant a credential in the broker's vault (ADR-0016).
+    ///
+    /// The secret is read from **stdin**, never from argv and never from the
+    /// environment. Both are readable by any same-uid peer through
+    /// `/proc/<pid>/cmdline` and `/proc/<pid>/environ`, which is a kernel
+    /// property this product does not claim to control — and a design that
+    /// depended on env secrecy would contradict the claim the adversarial
+    /// harness exists to check. stdin is neither.
+    AddCredential {
+        /// Human label for the credential.
+        #[arg(long)]
+        label: String,
+        /// Credential kind (`bearer_token`, `username_password`,
+        /// `ssh_private_key`, `database_credential`, `generic_secret`).
+        #[arg(long, value_name = "KIND")]
+        kind: String,
+        /// Provider the credential belongs to, e.g. `github`.
+        #[arg(long)]
+        provider: String,
+        /// Account the credential belongs to.
+        #[arg(long)]
+        account: String,
+    },
     /// Query the broker's audit log (R9). Denied until the operator control
     /// plane ships; the command reports that refusal honestly.
     Audit {
@@ -76,6 +100,44 @@ async fn main() -> std::io::Result<()> {
         },
         Command::Session { workspace } => Request::CreateSession { workspace },
         Command::Credentials => Request::ListCredentialMetadata,
+        Command::AddCredential {
+            label,
+            kind,
+            provider,
+            account,
+        } => {
+            let kind = match parse_credential_kind(&kind) {
+                Some(kind) => kind,
+                None => {
+                    eprintln!("asv: unknown credential kind {kind:?}");
+                    std::process::exit(2);
+                }
+            };
+            // Read before connecting, so a secret is never sitting in a
+            // request while the socket is unavailable. A trailing newline is
+            // the one byte stripped, because `echo secret |` is the obvious
+            // way to use this and a stored trailing newline would be a
+            // credential that silently never works.
+            let mut secret = String::new();
+            if let Err(error) =
+                std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut secret)
+            {
+                eprintln!("asv: cannot read the secret from stdin: {error}");
+                std::process::exit(2);
+            }
+            let secret = secret.strip_suffix('\n').unwrap_or(&secret).to_string();
+            if secret.is_empty() {
+                eprintln!("asv: no secret on stdin");
+                std::process::exit(2);
+            }
+            Request::CreateCredential {
+                label,
+                kind,
+                provider,
+                account,
+                secret: OpaqueSecret::new(secret.into_bytes()),
+            }
+        }
         Command::Audit { since } => {
             let since_secs = match since.as_deref() {
                 None => 0,
@@ -106,6 +168,28 @@ fn default_socket() -> PathBuf {
 }
 
 /// Parses `90s`, `30m`, `24h`, `7d` into seconds. None on garbage.
+/// The domain's credential kinds, by their wire spelling.
+///
+/// Written out rather than derived from the enum because the CLI is where a
+/// human types, and a human needs the list of what they may type. The four
+/// kinds the vault cannot represent are accepted here and refused by the
+/// broker, which is where that knowledge belongs; the CLI does not keep a
+/// second copy of which ones those are.
+fn parse_credential_kind(text: &str) -> Option<CredentialKind> {
+    Some(match text {
+        "api_key" => CredentialKind::ApiKey,
+        "bearer_token" => CredentialKind::BearerToken,
+        "oauth2" => CredentialKind::OAuth2,
+        "username_password" => CredentialKind::UsernamePassword,
+        "ssh_private_key" => CredentialKind::SshPrivateKey,
+        "x509_client_identity" => CredentialKind::X509ClientIdentity,
+        "aws_access_key" => CredentialKind::AwsAccessKey,
+        "database_credential" => CredentialKind::DatabaseCredential,
+        "generic_secret" => CredentialKind::GenericSecret,
+        _ => return None,
+    })
+}
+
 fn parse_duration_secs(spec: &str) -> Option<u64> {
     let spec = spec.trim();
     let (digits, unit) = spec.split_at(spec.len().checked_sub(1)?);
@@ -215,6 +299,12 @@ fn print_response(response: &Response) {
             }
         }
         Response::CredentialDeleted { id } => println!("credential {id} deleted"),
+        Response::CredentialCreated { id, label } => {
+            // The id and the label the operator supplied. Never the secret: it
+            // was read from stdin, sent once, and is not echoed back by a
+            // command whose whole output is meant to be safe to paste.
+            println!("credential {id} created ({label})");
+        }
         Response::Authorization { explanation } => {
             println!(
                 "authorization: {:?} ({:?})",

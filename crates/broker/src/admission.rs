@@ -138,6 +138,113 @@ impl Enrolment {
     }
 }
 
+/// The file an operator's enrolments live in, beside the vault.
+///
+/// ADR-0015 puts the enrolment record with the vault, written at enrolment and
+/// read back at broker start so it survives a restart. This is that record, as
+/// a sidecar rather than a field inside the encrypted body: the body's format
+/// is a versioned credential map, and grafting an admission record into it
+/// would couple two independent trust domains and re-encrypt the whole vault
+/// every time a principal is added. ADR-0016 records the narrowing.
+pub fn enrolment_path(vault_path: &std::path::Path) -> PathBuf {
+    let mut name = vault_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| "vault.asv".into());
+    name.push(".control-plane");
+    vault_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(name)
+}
+
+/// Enrols `principal` by recording its path and the digest of its contents.
+///
+/// The digest is read now, not at admission time, which is the property that
+/// makes replacing the file at that path *revoke* the enrolment rather than
+/// inherit it. An enrolment that recorded only a path would keep admitting a
+/// different program forever.
+///
+/// The record is plain text in `sha256sum` format — the format this repository
+/// already uses and re-signs for the spec pack — because a format with an
+/// existing, checked-in discipline is worth more here than a bespoke one.
+pub fn enrol(vault_path: &std::path::Path, principal: &std::path::Path) -> Result<PathBuf, String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let principal = std::fs::canonicalize(principal)
+        .map_err(|e| format!("cannot resolve {}: {e}", principal.display()))?;
+    let bytes = std::fs::read(&principal)
+        .map_err(|e| format!("cannot read {}: {e}", principal.display()))?;
+    let digest = crate::audit::hex_lower(&sha256(&bytes));
+    let path = enrolment_path(vault_path);
+
+    // Owner-only from the moment it exists, and a replace rather than an
+    // append-in-place: this file grants the capability to plant credentials.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    writeln!(file, "{digest}  {}", principal.display())
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Reads the enrolment record, answering `Enrolment::empty()` when there is
+/// none.
+///
+/// A missing file is the normal state, not an error: a broker with no
+/// enrolments admits nobody, which is fail-closed and needs no reporting. A
+/// file that exists but cannot be parsed *is* reported, because silently
+/// treating a corrupt authorisation record as "nobody enrolled" would hide the
+/// difference between "the operator never enrolled anyone" and "something
+/// damaged the file that grants credential-write authority".
+pub fn load_enrolment(vault_path: &std::path::Path) -> Result<Enrolment, String> {
+    let path = enrolment_path(vault_path);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Enrolment::empty()),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let mut enrolment = Enrolment::empty();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((digest, principal)) = line.split_once("  ") else {
+            return Err(format!(
+                "{}:{}: not a '<digest>  <path>' record",
+                path.display(),
+                n + 1
+            ));
+        };
+        enrolment = enrolment.enrol(PathBuf::from(principal), parse_digest(digest)?);
+    }
+    Ok(enrolment)
+}
+
+/// Decodes a hex digest, refusing anything that is not exactly 32 bytes.
+///
+/// A malformed record is an error, never a digest of zeroes: a record that
+/// cannot be parsed must not silently admit nobody *and* must not admit
+/// everybody, and it certainly must not produce a digest that some other
+/// file's contents would have to collide with to be accepted.
+fn parse_digest(hex: &str) -> Result<ContentDigest, String> {
+    if !crate::audit::is_hex_64(hex) {
+        return Err(format!("not a 64-character lowercase hex digest: {hex}"));
+    }
+    let mut out = [0u8; 32];
+    for (n, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&hex[n * 2..n * 2 + 2], 16)
+            .map_err(|e| format!("cannot parse digest: {e}"))?;
+    }
+    Ok(out)
+}
+
 /// The prefix `harden.rs` gives every agent-session cgroup slice.
 ///
 /// Re-exported from `harden` rather than restated. Two copies of this string

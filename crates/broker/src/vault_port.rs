@@ -21,24 +21,36 @@
 //! So the connector states the port and the broker implements it. The trait
 //! exists to be implemented on this side of the boundary.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use asv_connector_http::{SecretError, SecretPort, SecretSink};
-use asv_vault::{VaultError, VaultKey, VaultStore};
+use asv_vault::{CredentialMetadata, VaultError, VaultKey, VaultStore};
 
 /// A [`SecretPort`] backed by an encrypted vault.
 ///
 /// Holds the key by `Arc` rather than by value so the port can be shared as
 /// `Arc<dyn SecretPort>` without the broker cloning key material, and so the
 /// key's own `Zeroize` still governs its lifetime.
+///
+/// The store is shared with [`VaultWritePort`] behind a `Mutex`, and both hold
+/// the *same* instance. A second `VaultStore` on the same path would have been
+/// the tidier-looking design and does not work: `with_secret` gates on
+/// `self.body.records`, the **in-memory** body, so a credential written through
+/// another handle is in the file and absent from this one, and the lender would
+/// answer `NotFound` for a credential that is right there.
+///
+/// A `Mutex` rather than an `RwLock` is deliberate and measured, not lazy: the
+/// broker's accept loop (`main.rs`) serves one connection to completion before
+/// accepting the next, so there is no read concurrency to share and a
+/// read/write lock would be a second lock type to reason about for no gain.
 pub struct VaultSecretPort {
-    store: Arc<VaultStore>,
+    store: Arc<Mutex<VaultStore>>,
     key: Arc<VaultKey>,
 }
 
 impl VaultSecretPort {
     /// Builds a port that unlocks credentials from `store` using `key`.
-    pub fn new(store: Arc<VaultStore>, key: Arc<VaultKey>) -> Self {
+    pub fn new(store: Arc<Mutex<VaultStore>>, key: Arc<VaultKey>) -> Self {
         Self { store, key }
     }
 }
@@ -55,9 +67,62 @@ impl SecretPort for VaultSecretPort {
     ///    attached to exactly one request and that request is the one we
     ///    authenticated" is a property of the type, not of a code review.
     fn lend(&self, credential: &str, sink: &mut dyn SecretSink) -> Result<(), SecretError> {
-        self.store
+        let store = self.store.lock().map_err(|_| {
+            // A poisoned lock means a previous holder panicked mid-operation.
+            // That is not a recoverable state for a vault: reporting it as an
+            // ordinary "unavailable" would hide that something already went
+            // wrong, so it is named.
+            SecretError::Unavailable("the vault lock was poisoned by an earlier failure".into())
+        })?;
+        store
             .with_secret(&self.key, credential, |secret| sink.accept(secret))
             .map_err(|error| translate(error, credential))?
+    }
+}
+
+/// The only path by which a credential enters the vault from a running broker.
+///
+/// It lives in this module for the reason the module exists: this is where a
+/// `CredentialId` and a secret meet, and after ADR-0016 that is true of a
+/// credential going *in* as well as one coming out. A separate module for the
+/// writer would have quietly become the second place secret material arrives.
+///
+/// Admission is **not** re-checked here. This port is the mechanism; ADR-0015's
+/// predicate is the broker's decision, and a second check would be a second
+/// place to get it subtly wrong.
+pub struct VaultWritePort {
+    store: Arc<Mutex<VaultStore>>,
+    key: Arc<VaultKey>,
+}
+
+impl VaultWritePort {
+    /// Builds a writer over the same store instance `lender` uses.
+    pub fn new(store: Arc<Mutex<VaultStore>>, key: Arc<VaultKey>) -> Self {
+        Self { store, key }
+    }
+
+    /// Plants `metadata` and `secret` in the vault file.
+    ///
+    /// `insert` rather than `upsert`, and that is a security choice as much as
+    /// a semantic one: it fails closed if the id already exists, so a write can
+    /// never quietly replace the secret behind a credential an agent is already
+    /// holding a live surrogate for. Replacing a secret is a rotation, and
+    /// rotation is a different operation with a different audit story.
+    pub fn create(
+        &self,
+        metadata: CredentialMetadata,
+        secret: asv_domain::SecretBytes,
+    ) -> Result<String, VaultError> {
+        let id = metadata.id.clone();
+        let mut store = self.store.lock().map_err(|_| VaultError::MalformedBody)?;
+        store.insert(&self.key, metadata, secret)?;
+        Ok(id)
+    }
+
+    /// Removes a credential from the vault file.
+    pub fn remove(&self, id: &str) -> Result<(), VaultError> {
+        let mut store = self.store.lock().map_err(|_| VaultError::MalformedBody)?;
+        store.remove(&self.key, id)
     }
 }
 
@@ -119,7 +184,10 @@ mod tests {
                 SecretBytes::new(b"a-second-secret".to_vec()),
             )
             .expect("insert c2");
-        Arc::new(VaultSecretPort::new(Arc::new(store), Arc::new(key)))
+        Arc::new(VaultSecretPort::new(
+            Arc::new(std::sync::Mutex::new(store)),
+            Arc::new(key),
+        ))
     }
 
     /// A sink that keeps whatever it is handed, standing in for the header

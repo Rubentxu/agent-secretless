@@ -124,7 +124,7 @@ struct Fixture {
     /// shape: in production the rotation is a vault-side event that the broker
     /// is never told about, and R7 is exactly the claim that it does not need
     /// to be told.
-    store: Arc<VaultStore>,
+    store: Arc<std::sync::Mutex<VaultStore>>,
     key: Arc<VaultKey>,
     path: std::path::PathBuf,
     origin: fake_origin::FakeOrigin,
@@ -160,7 +160,9 @@ impl Fixture {
             .expect("insert credential");
         asv_broker::inventory::load(&mut state, &store);
 
-        let store = Arc::new(store);
+        // One store instance behind a lock, the shape `main.rs` builds: the
+        // lending port takes `&self` and a writer would need `&mut self`.
+        let store = Arc::new(std::sync::Mutex::new(store));
         let key = Arc::new(key);
         state.secrets = Some(Arc::new(VaultSecretPort::new(
             Arc::clone(&store),
@@ -323,6 +325,8 @@ fn the_credential_id_stays_stable_and_resolvable_across_rotation() {
     // duration of the call — which is the shape R7 depends on.
     let resolved = fixture
         .store
+        .lock()
+        .expect("lock")
         .with_secret(&fixture.key, &id_before.to_wire(), |secret| secret.to_vec())
         .expect("the original id must still resolve after rotation");
     assert_eq!(

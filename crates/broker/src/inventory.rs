@@ -130,6 +130,56 @@ fn kind(kind: VaultKind) -> CredentialKind {
     }
 }
 
+/// The domain's nine kinds onto the vault's five — the direction a *write*
+/// travels, and the only one that can fail.
+///
+/// The reverse direction above is total because the vault's five are the
+/// coarse vocabulary. This one is not: four of the nine have no counterpart,
+/// and everything else would have to collapse into `Opaque` and come back out
+/// of `kind()` as `GenericSecret`. Storing an `ApiKey` and reporting it as a
+/// `GenericSecret` is a credential the operator did not ask for, recorded
+/// under a name they did not choose.
+///
+/// So the unmappable kinds are refused rather than approximated. `None` means
+/// "the vault's vocabulary cannot say what this is yet", and the caller turns
+/// that into a refusal naming the kind. The alternative — a lossy map that
+/// always succeeds — would move a modelling gap from a compile-time exhaustiveness
+/// check to a silent mislabel in a vault, which is the worst place to discover it.
+///
+/// Kept adjacent to `kind()` deliberately: the two directions are only correct
+/// together, and the round trip is what a test should pin.
+pub fn vault_kind(kind: CredentialKind) -> Option<VaultKind> {
+    match kind {
+        CredentialKind::BearerToken => Some(VaultKind::BearerToken),
+        CredentialKind::UsernamePassword => Some(VaultKind::Password),
+        CredentialKind::SshPrivateKey => Some(VaultKind::PrivateKey),
+        CredentialKind::DatabaseCredential => Some(VaultKind::DatabasePassword),
+        CredentialKind::GenericSecret => Some(VaultKind::Opaque),
+        CredentialKind::ApiKey
+        | CredentialKind::OAuth2
+        | CredentialKind::X509ClientIdentity
+        | CredentialKind::AwsAccessKey => None,
+    }
+}
+
+/// Projects one just-written vault record into the broker's public metadata.
+///
+/// Same mapping `load` applies, for the single-record case a create performs.
+/// Exists so a credential created while the broker is running is projected by
+/// the *same* code that projects it at boot; two copies of this conversion
+/// would drift, and the drift would be invisible until a created credential
+/// behaved differently from a loaded one.
+pub fn project_one(record: &asv_vault::CredentialMetadata) -> Option<CredentialMetadata> {
+    CredentialId::from_wire(&record.id)
+        .ok()
+        .map(|id| CredentialMetadata {
+            id,
+            label: record.label.clone(),
+            kind: kind(record.kind),
+            exportability: exportability(record.exportability),
+        })
+}
+
 /// Exportability crosses unchanged, one for one.
 ///
 /// A `NonExportable` credential must not arrive at the broker labelled

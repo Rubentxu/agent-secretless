@@ -209,7 +209,7 @@ impl Fixture {
         asv_broker::inventory::load(&mut state, &store);
 
         state.secrets = Some(Arc::new(VaultSecretPort::new(
-            Arc::new(store),
+            Arc::new(std::sync::Mutex::new(store)),
             Arc::new(key),
         )));
 

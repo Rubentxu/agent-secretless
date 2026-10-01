@@ -4,8 +4,14 @@
 //! domain types". This module is where that is enforced, and the enforcement is
 //! structural rather than conventional:
 //!
-//! - Nothing in this crate implements [`serde::Serialize`] for a secret-bearing
-//!   type, because [`asv_domain::SecretBytes`] has no such impl to call.
+//! - Nothing in this crate implements [`serde::Serialize`] for a **secret-bearing
+//!   domain type**, because [`asv_domain::SecretBytes`] has no such impl to call.
+//!   ADR-0016 added [`OpaqueSecret`], which does serialize, and it is worth being
+//!   precise about why that is not the same thing: it is an opaque byte wrapper
+//!   owned by this crate, not a domain type, it grants no field-level access, and
+//!   its `Debug` redacts. What the M0 requirement protects against — an untrusted
+//!   DTO quietly becoming a live `SecretBytes` or a `VaultKey` — is unchanged,
+//!   because nothing here deserializes into either.
 //! - Requests are an **externally tagged enum of closed shapes**, never a
 //!   generic `{"type": "...", "payload": <opaque>}` bag. There is no path by
 //!   which a client can name a type the broker has not explicitly allowed
@@ -20,6 +26,70 @@ use asv_domain::{
 use asv_policy::{Approval, AuthorizationRequest, ExplainResult};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Secret material on the wire, carried by [`Request::CreateCredential`].
+///
+/// It exists because the alternative was worse, and the reasoning belongs next
+/// to the type rather than in a commit message.
+///
+/// `Request` derives `Debug`, so a bare `Vec<u8>` field would be rendered by
+/// any `{:?}` — including the one `assert_eq!` prints when two requests fail
+/// to match. A newtype whose `Debug` redacts closes both at once. A
+/// hand-written `Debug` for the whole enum would have been the other way to
+/// do it: the compiler enforces that match's exhaustiveness, but nothing stops
+/// the variant added next month from being formatted.
+///
+/// The wrapper is deliberately narrow:
+///
+/// - [`OpaqueSecret::expose`] is the only read path, and is named to be
+///   conspicuous in a stack trace.
+/// - the buffer is zeroized on drop, so a decoded request that is refused
+///   leaves nothing behind.
+/// - `Debug` reports the length and nothing else: a length is operationally
+///   useful, a secret is not.
+///
+/// It is not a secret-bearing *domain* type. Nothing deserializes into
+/// [`asv_domain::SecretBytes`] or a vault key, which is the property the M0
+/// requirement is actually about.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OpaqueSecret(zeroize::Zeroizing<Vec<u8>>);
+
+/// Hand-written rather than derived.
+///
+/// `Zeroizing<Vec<u8>>` has no serde impls unless the whole workspace turns on
+/// `zeroize/serde`, and this crate should not decide that for every other
+/// consumer of the dependency to get one local newtype onto the wire. The
+/// delegation is the whole of it: the bytes in, the same bytes out, and the
+/// `Zeroizing` wrapper still owns the buffer's lifetime.
+impl Serialize for OpaqueSecret {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.as_slice().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for OpaqueSecret {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<u8>::deserialize(deserializer).map(Self::new)
+    }
+}
+
+impl OpaqueSecret {
+    /// Wraps `bytes` as secret material, consuming and zeroizing the original.
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(zeroize::Zeroizing::new(bytes))
+    }
+
+    /// The single read path. See this type's documentation for the contract.
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for OpaqueSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OpaqueSecret(<redacted, {} bytes>)", self.0.len())
+    }
+}
 
 /// Protocol version. A mismatch is a hard failure, never a downgrade
 /// (`docs/03-ARCHITECTURE.md` §6, version negotiation).
@@ -53,6 +123,35 @@ pub enum Request {
     EndSession { session: AgentSessionId },
     /// Returns credential *metadata* only. Never values (ADR-0001).
     ListCredentialMetadata,
+    /// Plants a new credential in the vault (ADR-0016).
+    ///
+    /// The only request in this protocol that carries secret material, and it
+    /// is the reason the protocol's `Debug` story has to stay as narrow as it
+    /// is. Three properties are deliberate:
+    ///
+    /// - **The broker mints the id.** The caller names the credential; it
+    ///   cannot address a record it did not create, and the request cannot be
+    ///   shaped to collide with an existing one.
+    /// - **The secret is bytes, never a path.** A path would put plaintext on
+    ///   disk, and the vault is encrypted at rest; a brief copy in a buffer
+    ///   the broker zeroizes at the decode boundary is the smaller exposure.
+    /// - **Admission decides whether it happens.** ADR-0015's three
+    ///   conditions are evaluated before anything is written, and an agent
+    ///   session is refused by the first of them.
+    ///
+    /// The decode necessarily precedes that decision — the request type is
+    /// not knowable without parsing — so a refused caller still causes these
+    /// bytes to be materialised briefly in a zeroized buffer. They reach
+    /// neither the vault, nor the inventory, nor a response, nor a log.
+    CreateCredential {
+        label: String,
+        kind: CredentialKind,
+        provider: String,
+        account: String,
+        /// The secret. Carried in a redacting wrapper, never a bare `Vec<u8>`:
+        /// see [`OpaqueSecret`].
+        secret: OpaqueSecret,
+    },
     /// Deletes a credential record.
     DeleteCredential { id: CredentialId },
     /// Evaluates a bounded authorization request without exposing secrets.
@@ -181,6 +280,15 @@ pub enum Response {
     },
     CredentialDeleted {
         id: CredentialId,
+    },
+    /// A credential was planted in the vault and is now mintable.
+    ///
+    /// Carries the id and the operator's label, never the secret: the caller
+    /// supplied it and does not need it echoed, and a response is the one place
+    /// an agent is guaranteed to read.
+    CredentialCreated {
+        id: CredentialId,
+        label: String,
     },
     Authorization {
         explanation: ExplainResult,
@@ -381,6 +489,7 @@ impl Request {
             Request::PostgresConnect { .. } => "postgres_connect",
             Request::PostgresQuery { .. } => "postgres_query",
             Request::PostgresRevoke { .. } => "postgres_revoke",
+            Request::CreateCredential { .. } => "create_credential",
         }
     }
 }
