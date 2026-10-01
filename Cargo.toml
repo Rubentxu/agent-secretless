@@ -28,7 +28,7 @@ exclude = ["apps/desktop"]
 # pinning, the redirect policy and the audited send path.
 
 [workspace.package]
-version = "0.23.0"
+version = "0.24.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
