@@ -1,3 +1,7 @@
+//! UAT-031 — untrusted DTO cannot become a secret-bearing domain type.
+//! The evidence is this module's own decoder suite: `unknown_method_is_rejected`,
+//! `every_forbidden_method_name_fails_to_decode`, `malformed_input_fails_closed`,
+//! `oversized_message_is_rejected_before_parsing` and `metadata_dto_has_no_secret_field`.
 //! Versioned broker IPC.
 //!
 //! M0 Exit requires: "untrusted DTOs cannot deserialize into secret-bearing

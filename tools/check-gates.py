@@ -274,6 +274,22 @@ def scan_repo_uat_claims(
                 filename_only.append(
                     (path.relative_to(root).as_posix(), int(filename_match.group(1)))
                 )
+
+    # Inline `#[cfg(test)]` modules. A large share of the suite lives in
+    # `src/`, not `tests/`, and until this loop existed a UAT proven only by an
+    # inline test could never be claimed at all: UAT-031 and UAT-032 are the
+    # two that surfaced the moment it was added. No filename check applies
+    # here -- a `src` file is not named after a UAT, so only an explicit
+    # `//! UAT-NNN — title` header counts, which is the same bar the tests
+    # directory applies.
+    for src_file in sorted(root.glob("crates/*/src/**/*.rs")):
+        scanned += 1
+        head = src_file.read_text(encoding="utf-8", errors="replace")[:2000]
+        declared = declared_uat(head)
+        if declared is not None:
+            uid, title = declared
+            claims.setdefault(uid, []).append(src_file.relative_to(root).as_posix())
+            titled.append((src_file.relative_to(root).as_posix(), uid, title))
     return claims, filename_only, titled, scanned
 
 

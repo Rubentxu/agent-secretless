@@ -1,3 +1,6 @@
+//! UAT-032 — canary never appears in debug or error serialization.
+//! The evidence is this module's suite plus the sibling checks in `ipc-protocol`,
+//! `vault::envelope`, `broker::audit` and the broker's response boundary.
 //! Secret-bearing types for the ASV broker.
 //!
 //! The rule this module exists to enforce comes from ADR-0001 and
