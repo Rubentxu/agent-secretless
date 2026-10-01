@@ -125,6 +125,50 @@ def main() -> int:
         )
     )
 
+    # 5. A tag that does not exist must be named, not ignored. A guard that
+    #    shrugs at a typo'd tag would pass the very row it exists to check.
+    code, out = run_guard(
+        """
+| Gate | Status | Evidence |
+|---|---|---|
+| M11-M13 semver | **NOT MET** | `m99-nope` is inside `v0.17.6` |
+"""
+    )
+    results.append(
+        (
+            "a nonexistent tag is named as drift",
+            code == 1 and "m99-nope" in out,
+            out.strip() or "(no output)",
+        )
+    )
+
+    # 6. A release that does not exist is drift, not an unparseable row.
+    code, out = run_guard(
+        """
+| Gate | Status | Evidence |
+|---|---|---|
+| M11-M13 semver | **NOT MET** | `m12-tpm-vault` is in `v9.9.9` |
+"""
+    )
+    results.append(
+        (
+            "a nonexistent release is named as drift",
+            code == 1 and "v9.9.9" in out,
+            out.strip() or "(no output)",
+        )
+    )
+
+    # 7. A malformed table must not crash the guard. Unparseable is not the
+    #    same as false, and a guard that raises on bad input gets disabled.
+    code, out = run_guard("| Gate | Status |\n|---|---|\n| R11 full suite | pass\n")
+    results.append(
+        (
+            "a malformed table is ignored rather than crashed on",
+            code == 0 and "Traceback" not in out,
+            out.strip() or "(no output)",
+        )
+    )
+
     print("Gate status guard falsifiability\n")
     failures = 0
     for name, ok, detail in results:
