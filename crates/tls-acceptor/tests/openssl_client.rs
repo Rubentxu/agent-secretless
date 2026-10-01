@@ -128,6 +128,83 @@ fn openssl_is_refused_for_a_hostname_the_leaf_does_not_name() {
     );
 }
 
+/// What an implementation that shares no code with this one actually
+/// negotiates.
+///
+/// The rest of the workspace names no cipher suite, no key-exchange group and
+/// no signature algorithm, so `docs/tls-compatibility-matrix.md` had to
+/// publish those rows as *unpinned*. This does not make them pinned — a
+/// default can still change without failing anything — but it turns them from
+/// "nobody looked" into "an independent client was observed", and it asserts
+/// the one thing that is genuinely falsifiable about a default pair: the
+/// ciphersuite has to belong to the protocol version that was reported.
+///
+/// The client offers `h2` and `http/1.1` through ALPN, exactly as `reqwest`
+/// would. The handshake succeeding is therefore also cross-implementation
+/// evidence for the ALPN row: a real third-party client offering `h2` gets a
+/// working connection rather than an `h2` negotiation it could not speak.
+#[test]
+fn openssl_negotiates_a_suite_belonging_to_its_reported_version() {
+    eprintln!("client: {}", openssl_version());
+    let (material, ca) = material_for(HOST);
+    let acceptor = Acceptor::bind(&material, 0).expect("bind");
+
+    let root_path = std::env::temp_dir().join("asv-openssl-negotiated-root.pem");
+    std::fs::write(&root_path, pem_encode(&ca.root_der)).expect("write the trust anchor");
+
+    let mut args = openssl_args(
+        &acceptor.local_addr(),
+        HOST,
+        root_path.to_str().expect("utf-8 path"),
+    );
+    args.push("-alpn".into());
+    args.push("h2,http/1.1".into());
+
+    let output = spawn_openssl(&args);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let _ = std::fs::remove_file(&root_path);
+
+    assert!(
+        output.status.success(),
+        "openssl failed against the acceptor even though it offered ALPN:\n{stderr}"
+    );
+
+    let version = field(&stderr, "Protocol version: ");
+    let cipher = field(&stderr, "Ciphersuite: ");
+
+    // Printed, not only asserted: this is the measurement the TLS
+    // compatibility matrix quotes, and a matrix cell that nobody can reproduce
+    // by running one command is a cell nobody can check.
+    eprintln!("negotiated: {version} / {cipher} (ALPN offered h2,http/1.1)");
+
+    // TLS 1.3 suites are named `TLS_AES_*` or `TLS_CHACHA20_*`. TLS 1.2
+    // suites are not. That naming difference is the whole check, and it is
+    // stable across OpenSSL versions, which pinning a specific default is not.
+    let is_v13_suite =
+        cipher.starts_with("TLS_") && (cipher.contains("AES") || cipher.contains("CHACHA20"));
+    if version.contains("TLSv1.3") {
+        assert!(
+            is_v13_suite,
+            "reported {version} but negotiated {cipher}, which is not a TLS 1.3 suite:\n{stderr}"
+        );
+    } else {
+        assert!(
+            !is_v13_suite,
+            "reported {version} but negotiated {cipher}, which is a TLS 1.3 suite:\n{stderr}"
+        );
+    }
+}
+
+/// Reads the value after a `s_client -brief` field label.
+fn field(stderr: &str, label: &str) -> String {
+    stderr
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(label))
+        .unwrap_or_else(|| panic!("openssl -brief printed no {label:?} line:\n{stderr}"))
+        .trim()
+        .to_string()
+}
+
 /// Minimal DER-to-PEM. Avoids a dependency for one call: the alternative is
 /// adding `rustls-pemfile` to the test surface to convert bytes that are
 /// already in hand.
