@@ -155,7 +155,7 @@ authors have not written.
 | Gate | Status | Evidence |
 |---|---|---|
 | R11 dependency audit | pass with warning | `cargo audit`: 0 advisories, 337 deps, 1 yanked warning (`yoke-derive` 0.8.3, transitive via `url`→`idna`→`icu`). Recorded as a finding; clearing it means a transitive bump. |
-| R11 full suite | pass | 597 tests enumerated, 596 passed / 0 failed / 1 ignored, at `v0.17.6` |
+| R11 full suite | pass | 608 tests enumerated, 607 passed / 0 failed / 1 ignored, at `v0.17.10`. The 11 added by ADR-0015's admission rule are hostile cases for the three control-plane conditions; `gate-status` refuses the run if this row and the repository disagree. |
 | R11 clippy `-D warnings` | pass | clean across `--workspace --all-targets --locked` |
 | R11 formatting | pass | `cargo fmt --all -- --check` clean |
 | R11 `NFR-PERF-001` | pass | UAT-030, 6 ms budget, both profiles, host recorded |

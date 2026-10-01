@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+pub mod admission;
 pub mod audit;
 pub mod harden;
 pub mod inventory;
@@ -321,6 +322,14 @@ pub struct BrokerState {
     /// `handle` call, appended by the public wrapper (not by the inner
     /// dispatcher), so the audit cannot be bypassed by a new variant.
     pub audit: audit::AuditLog,
+    /// The principals enrolled as the human control plane, per ADR-0015.
+    ///
+    /// Empty by default, and empty is the state every broker on this machine
+    /// is actually in. That is deliberate: the three verbs that need this
+    /// derive their refusal from the admission verdict rather than asserting
+    /// it in a message, and an empty record makes the verdict a denial, so
+    /// wiring it in opens nothing.
+    pub control_plane: admission::Enrolment,
 }
 
 impl Default for BrokerState {
@@ -338,6 +347,7 @@ impl Default for BrokerState {
             postgres: PgSessionMap::default(),
             runtime: None,
             audit: audit::AuditLog::default(),
+            control_plane: admission::Enrolment::empty(),
         }
     }
 }
@@ -516,6 +526,21 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
         },
 
         Request::DeleteCredential { .. } => {
+            // The first three reasons below are why deletion is refused even
+            // for an admitted operator. This one is why the *refusal* is
+            // computed rather than written into the message: ADR-0015 gives
+            // the predicate a meaning, and nothing here is guessing.
+            let denial = match admission::admit_control_plane(
+                peer,
+                &state.control_plane,
+                &admission::ProcFs,
+            ) {
+                Ok(()) => "admission granted, but deletion still requires the vault write \
+                           path this broker does not have yet"
+                    .to_string(),
+                Err(denial) => denial.to_string(),
+            };
+            // A credential is not session-scoped, so there is no ownership
             // A credential is not session-scoped, so there is no ownership
             // relation to check: every peer reaching this socket is an agent
             // peer, and every one of them runs as the operator's own uid. A
@@ -538,9 +563,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             // hand to the thing it exists to constrain.
             Response::Error {
                 code: ErrorCode::Denied,
-                message: "credential deletion requires the operator control plane, \
-                          not an agent session"
-                    .into(),
+                message: format!("credential deletion refused: {denial}"),
             }
         }
 
@@ -585,9 +608,23 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             // The human control plane is a separate channel (M4) and does not
             // reach this variant. Until it exists, the honest state is a
             // closed door rather than a pretend approval.
+            //
+            // "The human control plane" was a predicate this broker could not
+            // evaluate. ADR-0015 gave it a meaning, so the refusal now derives
+            // from it rather than asserting it, and the reason names which of
+            // the three conditions failed.
+            let denial = match admission::admit_control_plane(
+                peer,
+                &state.control_plane,
+                &admission::ProcFs,
+            ) {
+                Ok(()) => "admission granted, but approvals have no path to the policy engine yet"
+                    .to_string(),
+                Err(denial) => denial.to_string(),
+            };
             Response::Error {
                 code: ErrorCode::Denied,
-                message: "approval must be issued by the human control plane, not by the requesting agent session".into(),
+                message: format!("approval refused: {denial}"),
             }
         }
 
@@ -672,10 +709,22 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             // closed door until the human control plane ships. Recording the
             // refused attempt is also the point: an agent probing the audit
             // channel is itself an auditable event.
+            //
+            // Same predicate as the other two control-plane verbs, evaluated
+            // rather than restated, for the reason ADR-0015 gives it a meaning.
+            let denial = match admission::admit_control_plane(
+                peer,
+                &state.control_plane,
+                &admission::ProcFs,
+            ) {
+                Ok(()) => "admission granted, but the audit reader has no transport \
+                           to the control plane yet"
+                    .to_string(),
+                Err(denial) => denial.to_string(),
+            };
             Response::Error {
                 code: ErrorCode::Denied,
-                message: "audit query requires the operator control plane, not an agent session"
-                    .into(),
+                message: format!("audit query refused: {denial}"),
             }
         }
 
@@ -1343,7 +1392,13 @@ mod tests {
         match resp {
             Response::Error { code, message } => {
                 assert_eq!(code, ErrorCode::Denied);
-                assert!(message.contains("operator control plane"), "{message}");
+                // Stronger than the old "operator control plane" substring:
+                // the refusal now derives from ADR-0015's admission rule, so
+                // it must name which of the three conditions failed. `peer()`
+                // is built by `from_peer` and is therefore unpinned, so
+                // condition 3 is the one that bites.
+                assert!(message.contains("refused:"), "{message}");
+                assert!(message.contains("pidfd-pinned"), "{message}");
             }
             other => panic!("audit query must never succeed for an agent peer: {other:?}"),
         }
@@ -1679,9 +1734,14 @@ mod tests {
             match handle(&mut state, &peer(), Request::DeleteCredential { id }) {
                 Response::Error { code, message } => {
                     assert_eq!(code, ErrorCode::Denied, "{label}");
+                    // The refusal must name the admission condition that
+                    // failed, and must be identical for an id that exists and
+                    // one that does not — the oracle property the loop above
+                    // exists to protect is unaffected by the wording.
                     assert!(
-                        message.contains("operator control plane"),
-                        "{label}: the refusal must name who may delete: {message}"
+                        message.contains("refused:") && message.contains("pidfd-pinned"),
+                        "{label}: the refusal must name which admission condition \
+                         failed: {message}"
                     );
                 }
                 other => panic!("{label}: expected a refusal, got {other:?}"),
