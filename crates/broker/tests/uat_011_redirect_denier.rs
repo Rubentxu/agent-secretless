@@ -1,9 +1,10 @@
-//! UAT-011 — Redirect denier.
+//! M9 redirect denier.
 //!
-//! Per `agent-secretless-vault-spec/docs/14-UAT-ADVERSARIAL.md`:
-//!
-//! > Compromised unprivileged client follows a cross-origin 30x.
-//! > Expected: broker denies the redirect; audit log shows the denial.
+//! Not a normative UAT: `14-UAT-ADVERSARIAL.md` titles UAT-011 "TLS
+//! pinning", which is a different subject — a client that pins the
+//! upstream certificate and cannot accept the session CA. The filename
+//! retains `uat_011` from when this file was filed under that id; the
+//! requirement these tests actually pin is the M9-R3 one below.
 //!
 //! M9-R3 specifies that `authorize_redirect` accepts only same-origin
 //! redirects while a credential binding is active.

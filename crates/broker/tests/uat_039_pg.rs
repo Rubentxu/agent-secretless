@@ -1,26 +1,16 @@
-//! UAT-039 — M6 PostgreSQL connector integration test.
+//! M6 PostgreSQL connector integration — the five M6 scenarios end to end.
 //!
-//! Exercises the five M6 scenarios in one end-to-end test:
+//! Not a normative UAT: `14-UAT-ADVERSARIAL.md` defines UAT-001..UAT-034 and
+//! UAT-039 is not among them. `15-ROADMAP.md` gates M6 on UAT-033, which
+//! `uat033_broker.rs` and `uat033_live.rs` cover against a real server. This
+//! suite is the connector-level companion; UAT-039 is not a reserved id.
 //!
-//!   M6-S1 — connector dispatch by audience (this test asserts the
-//!           factory exposes a postgres() method without routing an
-//!           HTTP audience through it).
-//!   M6-S2 — `psql` is spawned with `env_clear` and a stdin pipe so
-//!           the password never appears in the agent's env or argv.
+//! Scenarios exercised here:
+//!   M6-S1 — connector dispatch by audience (the factory exposes postgres()
+//!           without routing an HTTP audience through it).
+//!   M6-S2 — `psql` is spawned with `env_clear` and a stdin pipe so the
+//!           password never appears in the agent's env or argv.
 //!   M6-S3 — denial before auth: an unauthorised database is rejected
-//!           without opening a TCP socket.
-//!   M6-S4 — revoke latches the connection's torn_down flag; the next
-//!           query returns PgError::Revoked.
-//!   M6-S5 — the connector surfaces a `DbAction` whose strings match
-//!           the policy grammar.
-//!
-//! The crate this test lives in is `asv-broker`. That is intentional:
-//! it is the broker's side that holds the `ConnectorFactory`, the
-//! `PgPolicy`, and the `revoked` flag. The connector crate holds the
-//! client-side invariants and is exercised from `crates/connector-pg`'s
-//! own unit tests; the broker test exercises the contract between the
-//! two.
-
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

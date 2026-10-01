@@ -1,12 +1,11 @@
-//! UAT-035 — Crash / recovery (M13 RC stabilization).
+//! Crash / recovery — journal replay never advances state past a torn write.
 //!
-//! Per `agent-secretless-vault-spec/docs/14-UAT-ADVERSARIAL.md` and
-//! the M13 spec:
+//! Not a normative UAT: `14-UAT-ADVERSARIAL.md` defines UAT-001..UAT-034 and
+//! UAT-035 is not among them. This suite was written ahead of the spec and took
+//! a number nothing reserves. It is the M13 crash/recovery regression, and it
+//! asserts the journal property directly:
 //!
-//! > The broker MUST be able to recover from a crash mid-mutation by
-//! > replaying the journal. A torn write MUST NOT advance state past
-//! > the last fully-appended record.
-
+//!   A torn write MUST NOT advance state past the last fully-appended record.
 use asv_broker::recovery::{
     CollectingReplay, JournalKind, RecoveryError, RecoveryJournal, ReplayEngine,
 };

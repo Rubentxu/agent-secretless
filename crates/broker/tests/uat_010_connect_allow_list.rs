@@ -1,9 +1,10 @@
-//! UAT-010 — CONNECT allow-list.
+//! M9 CONNECT allow-list.
 //!
-//! Per `agent-secretless-vault-spec/docs/14-UAT-ADVERSARIAL.md`:
-//!
-//! > Compromised unprivileged client requests arbitrary CONNECT tunnel.
-//! > Expected: denied unless target is in the policy's allow-list.
+//! Not a normative UAT: `14-UAT-ADVERSARIAL.md` titles UAT-010 "HTTP
+//! surrogate bridge", which is a different subject — an ordinary CLI
+//! receiving a surrogate token and making an HTTPS request. The filename
+//! retains `uat_010` from when this file was filed under that id; the
+//! requirement these tests actually pin is the M9-R2 one below.
 //!
 //! M9-R2 specifies that `ConnectPolicy::authorize` accepts only the
 //! endpoints in the session's connector audience. This integration

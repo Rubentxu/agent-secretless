@@ -1,36 +1,14 @@
-//! UAT-050 — M6-R1: the broker dispatches on the request type, not a provider string.
+//! M6-R1 — the broker dispatches on the request type, not a provider string.
+//!
+//! Not a normative UAT: `14-UAT-ADVERSARIAL.md` defines UAT-001..UAT-034 and
+//! UAT-050 is not among them. The anchor is the M6 connector-dispatch
+//! requirement recorded in `15-ROADMAP.md` §M6 and the M6 verification report.
 //!
 //! ## Why this file exists
-//!
 //! M6-R1 requires that the `ConnectorFactory` "MUST dispatch on a typed
 //! audience enum, MUST NOT grow per-provider methods, and MUST NOT match the
 //! audience string", and its first scenario says a request "routes to
 //! PostgreSQL; an HTTP URL with 'postgres' does not".
-//!
-//! The M6 verification report recorded that requirement as "implemented and
-//! proven". It was not proven. The test offered as proof,
-//! `uat_039_m6_s1_dispatch_by_tag_routes_postgres_only`, calls
-//! `PgFactory::postgres` **directly** and asserts the returned client has the
-//! role and database it was handed. That asserts a constructor returns its own
-//! arguments. It never sends a request, never enters `handle`, and cannot
-//! distinguish typed dispatch from string matching — the property M6-R1 is
-//! about is not on the path it exercises.
-//!
-//! This file exercises the property where it lives: a `Request` goes in
-//! through `handle`, the same entry point every agent request uses, and the
-//! answer says which connector ran.
-//!
-//! ## The discriminator
-//!
-//! `BrokerState` exposes `runtime` and the broker refuses a PostgreSQL connect
-//! with a named message when there is no async runtime, while a GitHub request
-//! never consults it. That difference is the observation: it tells us which
-//! branch of the dispatcher executed, from outside the broker, with no test
-//! hook added to production code for the purpose.
-//!
-//! These tests need no server and no vault. They assert routing, not
-//! connectivity; the live transport is proven by `uat033_broker`.
-
 use std::sync::Arc;
 
 use asv_broker::{handle, BrokerState, LiveConnectorFactory};

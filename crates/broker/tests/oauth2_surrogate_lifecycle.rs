@@ -1,15 +1,17 @@
-//! UAT-030 — OAuth2 surrogate lifecycle.
+//! OAuth2 surrogate lifecycle — the agent never holds the long-lived credential.
 //!
-//! Per `agent-secretless-vault-spec/docs/14-UAT-ADVERSARIAL.md` and the
-//! M11 spec for the OAuth2 provider framework:
+//! Not a normative UAT. This file previously opened with "UAT-030" and quoted a
+//! requirement from `14-UAT-ADVERSARIAL.md`. UAT-030 is *performance smoke*,
+//! implemented by `uat_030_perf.rs`, and carries the NFR-PERF-001 budget; the
+//! quoted text appears nowhere in the spec pack. Two files claiming UAT-030 made
+//! a normative performance gate ambiguous.
 //!
-//! > The framework MUST NOT expose the long-lived credential; the agent
-//! > only holds the short-lived access token; the broker refreshes.
+//! `15-ROADMAP.md` gates M11 with no fixed UAT set: "each connector is gated by
+//! the acceptance tests it introduces". This file is M11's acceptance test for
+//! the OAuth2 provider framework, not a numbered spec UAT.
 //!
-//! UAT-030 exercises the structural claim: the broker issues a token,
-//! the agent sees only the access bytes, the refresh bytes are
-//! internal to the broker.
-
+//! What it asserts: the broker issues a token, the agent sees only the access
+//! bytes, and the refresh bytes stay internal to the broker.
 use asv_broker::oauth2::{ClientCredentialsIssuer, OAuth2Config, OAuth2Issuer};
 
 fn config() -> OAuth2Config {

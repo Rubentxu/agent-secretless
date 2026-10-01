@@ -133,6 +133,25 @@ days; a status table with nothing checking it is a comment. Claims that depend
 on the host or on an external service are marked below and are deliberately
 not machine-asserted, because nothing in this repository can decide them.
 
+A UAT id cited by a gate must also mean one thing. `tools/check-gates.py`
+verifies that no two test files declare the same id and that no file declares
+an id this document's UAT spec does not define, because a gate reading
+"UAT-030 passed" cannot act on an id two suites claim. It also checks that a
+header which attributes a quotation to the spec pack is quoting something
+that is actually in it: five such quotations were fabricated, each one letting
+a suite present a requirement the spec never stated as though it were
+normative. That check is a hard defect, scored on the longest unbroken run of
+words the quotation shares with the pack, because a plausible sentence about
+vaults still draws most of its individual words from a pack that discusses
+nothing else. A claim whose title shares no content word with the spec's title
+for that id is reported as a warning, not a defect: only the spec author can
+say which side of a misattribution is wrong, and the test is real either way.
+`14-UAT-ADVERSARIAL.md` defines UAT-001 through UAT-034; ids above that range
+are not reserved, and a repository file named for one carries a filename claim
+its header does not back. `check-gates.py` reports those as warnings rather
+than defects, so the gap stays visible without inventing a spec entry the spec
+authors have not written.
+
 | Gate | Status | Evidence |
 |---|---|---|
 | R11 dependency audit | pass with warning | `cargo audit`: 0 advisories, 337 deps, 1 yanked warning (`yoke-derive` 0.8.3, transitive via `url`→`idna`→`icu`). Recorded as a finding; clearing it means a transitive bump. |
@@ -141,9 +160,10 @@ not machine-asserted, because nothing in this repository can decide them.
 | R11 formatting | pass | `cargo fmt --all -- --check` clean |
 | R11 `NFR-PERF-001` | pass | UAT-030, 6 ms budget, both profiles, host recorded |
 | M12 hardware-backed vault | **NOT MET** — host-dependent, not machine-asserted | no TPM on this host (`/dev/tpm*` absent, `/sys/class/tpm` empty, no TPM CPU flag). UAT-034 exercises the structural shape against `SoftwareTpm`, a content-addressed placeholder. No hardware-backed guarantee is claimed. |
-| M11 live OAuth2 provider | **NOT MET** — external dependency, not machine-asserted | `StaticClientCredentialsIssuer` only; no AS interaction, no PKCE. The framework and its 6 tests are real. |
+| M11 live OAuth2 provider | **NOT MET** — external dependency, not machine-asserted | `crates/broker/src/oauth2.rs` defines the trait and one prototype implementation, `ClientCredentialsIssuer`, whose `issue()` synthesises a token instead of performing an HTTPS POST to the token endpoint. No AS interaction, no PKCE anywhere in `crates/`. The module carries 10 `#[test]` functions and `oauth2_surrogate_lifecycle.rs` is M11's acceptance test; `15-ROADMAP.md` gates M11 with no fixed UAT set, so that suite is deliberately not numbered against a spec UAT. Nothing in the runtime calls the module yet. |
 | M11-M13 semver | **NOT MET** | `m11-oauth2-framework`, `m12-tpm-vault` and `m13-rc-stabilization` are all ancestors of `v0.11.0` (`9bd86dd`): the milestone work shipped by riding inside that release, never by being deliberately versioned. No cycle receipt and no version of their own stands behind them, which is why the roadmap's assertion of milestone completion has nothing to point at. `gate-status` verifies the ancestry so this row cannot drift into claiming the opposite. |
 | R10 compatibility truthfulness | partial | the `ISOLATED_PROCESS_EXPOSURE` posture label exists; the per-integration catalog required by M11 has no live provider to populate yet. |
+| M9 exit-UAT trace | **NOT MET** — spec adjudication required | `15-ROADMAP.md` gates M9 on UAT-010, 011, 012 and 013. The spec titles those "HTTP surrogate bridge", "TLS pinning" and "transparent eBPF redirect", and no suite claims any of them: the three files named for those ids test the CONNECT allow-list, the redirect denier and the trust injection adapter, which are M9 *scope* items but not the UATs M9's exit is written against. UAT-013 has no suite at all. The work is implemented; the trace from exit gate to evidence is what is missing, and closing it means deciding whether the spec titles or the suite assignments are wrong — a spec change, not a code change. |
 
 M12 and M11 cannot be closed by writing code on this machine: M12 needs a
 host with a TPM, and M11 needs a real provider to point the framework at.

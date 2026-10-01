@@ -1,20 +1,16 @@
-//! UAT-040 — isolated worker runtime (M10-runtime follow-up).
+//! Isolated worker runtime — the M10 follow-up to UAT-021 and UAT-022.
 //!
-//! Normative anchors:
-//! - `05-CREDENTIAL-ACCESS-MODES.md` §7 (worker controls: separate
+//! Not a normative UAT: `14-UAT-ADVERSARIAL.md` defines UAT-001..UAT-034 and
+//! UAT-040 is not among them. The anchors that DO exist are:
+//! - `05-CREDENTIAL-ACCESS-MODES.md` §7 — worker controls: separate
 //!   identity/ns, narrow fs view, egress deny, short lifetime, output
-//!   filtering, automatic destruction),
-//! - `14-UAT-ADVERSARIAL.md` UAT-021 (egress confinement blocks the
-//!   sink — live form: the worker's netns has no usable network),
-//!   UAT-022 (transformed stdout leak documents the redactor's exact-
-//!   byte limit honestly),
-//! - `docs/specs/m10-isolated-exec/specification.md` (prototype types).
+//!   filtering, automatic destruction;
+//! - `14-UAT-ADVERSARIAL.md` UAT-021 (egress confinement blocks the sink —
+//!   live form: the worker's netns has no usable network) and UAT-022
+//!   (transformed stdout leak, the redactor's exact-boundary check).
 //!
-//! These are LIVE probes: real processes, real namespaces, real
-//! Landlock/seccomp. A probe that cannot run on the host (no
-//! unprivileged userns) is skipped with an explicit marker, never
-//! silently passed.
-
+//! This suite is the runtime follow-up to those two; UAT-040 is not a
+//! reserved id and no release gate cites it.
 use asv_broker::audit::AuditLog;
 use asv_broker::isolated_exec::{
     EgressPolicy, LandlockProfile, Redactor, SeccompProfile, SecretInjectionPlan, WorkerRegistry,

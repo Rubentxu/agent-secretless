@@ -1,10 +1,11 @@
-//! UAT-012 — Trust injection adapter.
+//! M9 trust injection adapter.
 //!
-//! Per `agent-secretless-vault-spec/docs/14-UAT-ADVERSARIAL.md`:
-//!
-//! > Compromised unprivileged client tries to skip the CA-trust setup
-//! > so the agent process never trusts the broker CA. Expected: agent
-//! > cannot authenticate via the TLS bridge.
+//! Not a normative UAT: `14-UAT-ADVERSARIAL.md` titles UAT-012
+//! "transparent eBPF redirect", which is a different subject — routing a
+//! protected cgroup's socket to the ASV bridge without a proxy setting.
+//! The filename retains `uat_012` from when this file was filed under
+//! that id; the requirement these tests actually pin is the M9-R4 one
+//! below.
 //!
 //! M9-R4 specifies that a `TrustInjector` adapter writes the session CA
 //! to a session-scoped path and returns a binding the broker uses to

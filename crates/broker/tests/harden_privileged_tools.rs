@@ -1,18 +1,16 @@
-//! UAT-005 — privileged tool integration.
+//! Hardened startup — the broker installs the harden profile before anything else.
 //!
-//! Normative requirement (`14-UAT-ADVERSARIAL.md`):
+//! Not a normative UAT. This file previously opened with "UAT-005" and quoted
+//! a privileged-tools requirement from `14-UAT-ADVERSARIAL.md`. UAT-005 is
+//! *placeholder replay outside session*, implemented by `uat_005_replay.rs`,
+//! and the quoted text does not appear anywhere in the spec pack. A gate citing
+//! UAT-005 could not tell which file it meant, and a blockquote attributed to
+//! the spec that the spec does not contain is not evidence of anything.
 //!
-//! > Compromised unprivileged client calls all privileged tools
-//! > with adversarial inputs. Expected: no escalation; audit log
-//! > shows the attempt.
-//!
-//! In the M7 cycle this maps to the harden::install profile being
-//! invoked from the broker's startup path so every test process is
-//! already hardened before any other action happens. The test below
-//! is the structural assertion that harden::install is wired into
-//! the broker's `init` and produces a non-empty HardenConfig on the
-//! platform the tests run on.
-
+//! What this suite actually asserts: the M7 harden profile is wired into the
+//! broker's `init`, so every test process is already hardened before any other
+//! action, and that it produces a non-empty `HardenConfig` on the platform the
+//! tests run on.
 use asv_broker::harden::{install, HardenConfig};
 
 #[test]

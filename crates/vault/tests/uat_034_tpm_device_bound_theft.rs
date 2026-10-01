@@ -1,12 +1,11 @@
-//! UAT-034 — TPM / hardware-backed vault (device-bound theft test).
+//! UAT-034 — device-bound vault resists offline extraction.
 //!
-//! Per `agent-secretless-vault-spec/docs/14-UAT-ADVERSARIAL.md` and the
-//! M12 spec:
+//! Per `agent-secretless-vault-spec/docs/14-UAT-ADVERSARIAL.md`:
 //!
-//! > The device-bound vault mode keeps the long-lived passphrase out
-//! > of the vault file. An attacker who steals the file (and the broker
-//! > binary) but does not have the host device in the same PCR state
-//! > cannot open the vault.
+//! > Copy the vault database from a device-bound (TPM-wrapped) vault and
+//! > attempt offline inspection on a host that does not hold the sealing
+//! > key. Expected: no plaintext secret is recoverable, and the failure
+//! > path leaves no partially decrypted record.
 //!
 //! UAT-034 exercises the structural claim: a vault sealed against a
 //! PCR policy is closed if the observed PCRs do not match.

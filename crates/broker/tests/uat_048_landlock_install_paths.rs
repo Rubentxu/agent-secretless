@@ -1,23 +1,12 @@
-//! UAT-048 — Landlock ruleset scopes the operator's declared paths.
+//! Landlock ruleset scopes the operator's declared paths, not whole hierarchies.
+//!
+//! Not a normative UAT: `14-UAT-ADVERSARIAL.md` defines UAT-001..UAT-034 and
+//! UAT-048 is not among them. The real anchor is backlog item
+//! `bl-bl-01M3PS45V9000387DJAFC0YK00` (P2, m7-seccomp-landlock / verify).
 //!
 //! Backlog item `bl-bl-01M3PS45V9000387DJAFC0YK00` (P2, m7-seccomp-landlock
 //! / verify): the Landlock allow set was a static list of whole hierarchies
-//! which included `/home` and `/var/home` in full, read AND write. That is
-//! every user's home directory, writable by the process whose entire job is
-//! to hold secrets, and it was in the ruleset only because the vault and
-//! audit paths live under `~/.local/state` by default and the ruleset is
-//! irreversible. An operator who pointed `--vault` anywhere else got a
-//! broker that could not open its own vault, and a ruleset far wider than
-//! the broker's actual need.
-//!
-//! `InstallPaths` fixes both directions: the operator declares the paths in
-//! use, and the static set shrinks to system locations only.
-//!
-//! LANDLOCK LOCKS ARE IRREVERSIBLE for the process. Every scenario here
-//! therefore runs in a forked child, which asserts its result and exits
-//! with a status the parent reads. Running these in the test process would
-//! silently sandbox the rest of the suite.
-
+//! which included `/home` and `/var/home` in full, read AND write.
 use std::io::Write;
 use std::path::{Path, PathBuf};
 

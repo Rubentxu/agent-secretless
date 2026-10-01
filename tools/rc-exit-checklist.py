@@ -284,7 +284,7 @@ def gate_r2(root: Path) -> list[Check]:
 
 def gate_r3(root: Path) -> list[Check]:
     checks = []
-    names = ["uat_003_proc_inspection.rs", "uat_005_privileged_tools.rs", "uat_005_replay.rs"]
+    names = ["uat_003_proc_inspection.rs", "harden_privileged_tools.rs", "uat_005_replay.rs"]
     found, ev = tests_dir_has(root, "broker", names)
     checks.append(ok("peer credentials / replay UAT present", ev) if found else bad("peer credentials / replay UAT present", ev))
     found, ev = grep_crates(root, r"pidfd|SO_PEERCRED|peer_uid|peer_pid")
@@ -332,7 +332,7 @@ def gate_r6(root: Path) -> list[Check]:
     checks = []
     names = [
         "uat_003_proc_inspection.rs",
-        "uat_005_privileged_tools.rs",
+        "harden_privileged_tools.rs",
         "uat_017_env_scan.rs",
         "uat_021_isolated_worker_egress.rs",
         "uat_022_transformed_stdout_leak.rs",
