@@ -44,6 +44,7 @@ pipeline {
             dir(repo) {
                 sh("python3 scripts/check-gate-status.py")
                 sh("python3 tests/gate_status_drift.py")
+                sh("python3 tests/check_gates_claims.py")
             }
         }
 
