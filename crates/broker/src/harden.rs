@@ -350,6 +350,27 @@ fn set_no_new_privs() -> Result<(), HardenError> {
     Ok(())
 }
 
+/// The cgroup v2 slice name this broker places a session in.
+///
+/// Published because `admission` has to recognise broker slices by name, and
+/// two copies of that string would drift silently: admission would keep
+/// answering "this caller is not under broker control" about slices the broker
+/// had in fact created. One definition, two callers, one test that they agree.
+pub const SESSION_SLICE_PREFIX: &str = "asv.session.";
+
+/// The slice path for a pid, under a cgroup v2 `mount`.
+///
+/// `create_session_slice` builds with this and `admission` recognises with it,
+/// so the two cannot disagree.
+///
+/// Takes any `Display` because the two callers disagree on the pid's type:
+/// `std::process::id()` is `u32` and `PeerCredentials::pid` is `i32`. The
+/// value is only ever formatted, so widening it to one type would invent a
+/// conversion the slice name does not need.
+pub fn session_slice_path(mount: &std::path::Path, pid: impl std::fmt::Display) -> PathBuf {
+    mount.join(format!("{SESSION_SLICE_PREFIX}{pid}"))
+}
+
 #[cfg(target_os = "linux")]
 fn create_session_slice(mount: &std::path::Path) -> Option<PathBuf> {
     // The slice path is `/sys/fs/cgroup/asv.session.<pid>` where
@@ -360,7 +381,7 @@ fn create_session_slice(mount: &std::path::Path) -> Option<PathBuf> {
     // runs. This is the right fail-soft behaviour: a non-privileged
     // broker can still serve, just without its own cgroup.
     let pid = std::process::id();
-    let path = mount.join(format!("asv.session.{}", pid));
+    let path = session_slice_path(mount, pid);
     if std::fs::create_dir(&path).is_ok() {
         // Best-effort attach: ignore failures (e.g. no root).
         let procs = path.join("cgroup.procs");
