@@ -288,9 +288,8 @@ fn the_secret_is_in_neither_argv_nor_environ_of_the_live_cli() {
     // canary in its address space. This is the window the claim is about.
     let cmdline = proc_read(pid, "cmdline")
         .unwrap_or_else(|| panic!("the CLI exited before it could be observed: pid {pid} is gone"));
-    let environ = proc_read(pid, "environ").unwrap_or_else(|| {
-        panic!("the CLI exited before it could be observed: pid {pid} is gone")
-    });
+    let environ = proc_read(pid, "environ")
+        .unwrap_or_else(|| panic!("the CLI exited before it could be observed: pid {pid} is gone"));
 
     // `/proc/<pid>/cmdline` is NUL-separated, and this is the property the
     // doc-comment claims: the secret is not among the arguments.
@@ -382,8 +381,10 @@ fn the_planting_output_carries_no_secret() {
 /// evidence.
 #[test]
 fn a_canary_passed_as_an_argument_is_visible_in_proc() {
-    let fx = Fixture::new("negative");
-
+    // No broker, no vault, no socket: the negative is only about whether
+    // `/proc` reports an argument at all, and standing up a fixture to ask
+    // that would be a second thing that can go wrong.
+    //
     // `sh -c SCRIPT NAME` sets `$0` to NAME, so the canary lands in the
     // child's argument vector.
     //
@@ -414,8 +415,4 @@ fn a_canary_passed_as_an_argument_is_visible_in_proc() {
 
     let _ = child.kill();
     let _ = child.wait();
-    // The fixture is kept alive to the end so the broker outlives the probe.
-    let _ = fx.sock.exists();
-    let _: &Path = fx.vault.as_path();
-    let _: &Path = fx.passphrase.as_path();
 }
