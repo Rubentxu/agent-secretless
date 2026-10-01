@@ -352,3 +352,125 @@ fn no_replay_path_exposes_the_real_credential() {
         "BrokerState::Debug leaked the credential: {rendered_state}"
     );
 }
+
+/// Vector 4 — the **success** path. Added because the leak assertions above
+/// only ever ran against a request that was *refused*.
+///
+/// `no_replay_path_exposes_the_real_credential` renders the `Response` and
+/// `BrokerState` after a denial, and a denial is the cheap case: the handler
+/// returned early, so the credential was never lent and there was nothing to
+/// leak. The path where a credential genuinely crosses into a request and a
+/// real origin answers it is the one that had no leak assertion at all.
+///
+/// That is the shape of the gap this closes: the existing tests prove the
+/// failure path is clean, and the success path was the one nobody looked at.
+#[test]
+fn a_successful_operation_leaks_the_credential_to_nothing_it_renders() {
+    let (mut fixture, session, surrogate) = live();
+
+    let response = handle(
+        &mut fixture.state,
+        &fixture.peer,
+        Request::ReadIssue {
+            session,
+            surrogate,
+            repo: "o/r".into(),
+            number: 1,
+        },
+    );
+    assert!(
+        matches!(response, Response::IssueRead { .. }),
+        "the legitimate operation must succeed, or the assertions below prove \
+         nothing: {response:?}"
+    );
+
+    // The provider really was reached, so a credential really was lent. Without
+    // this the leak assertions could be satisfied by a broker that never
+    // touched the vault at all.
+    assert_eq!(
+        fixture.origin.connections(),
+        1,
+        "the origin saw no request, so nothing was lent and the leak \
+         assertions below would be vacuous"
+    );
+
+    let rendered_response = format!("{response:?}");
+    let rendered_state = format!("{:?}", fixture.state);
+    assert!(
+        !rendered_response.contains(CANARY),
+        "a successful response carried the credential: {rendered_response}"
+    );
+    assert!(
+        !rendered_state.contains(CANARY),
+        "BrokerState::Debug carried the credential after a successful lend: \
+         {rendered_state}"
+    );
+}
+
+/// Vector 5 — the audit record of an operation that used a credential.
+///
+/// The argument for this is structural: `AuditEventDto` has no field that
+/// could hold secret bytes, and the record is appended in the `handle`
+/// wrapper so every variant is audited once. Both are good reasons, and both
+/// are the kind of reason that stops being true when an enum grows a variant.
+///
+/// So this pins the shape *and* the content: the operation is recorded, the
+/// record verifies against its own hash chain, and the serialized event does
+/// not carry the credential.
+#[test]
+fn a_credentialed_operation_is_audited_without_the_credential() {
+    let (mut fixture, session, surrogate) = live();
+
+    let response = handle(
+        &mut fixture.state,
+        &fixture.peer,
+        Request::ReadIssue {
+            session,
+            surrogate,
+            repo: "o/r".into(),
+            number: 1,
+        },
+    );
+    assert!(
+        matches!(response, Response::IssueRead { .. }),
+        "the operation must succeed to be worth auditing: {response:?}"
+    );
+
+    let records = fixture.state.audit.query(0);
+    assert!(
+        !records.is_empty(),
+        "a credentialed operation left no audit record, so the claim that the \
+         broker records the operation without the secret is unfalsifiable"
+    );
+
+    // The record is a chain link, not a line in a log: a broker that wrote
+    // the event could still have written it wrong.
+    fixture
+        .state
+        .audit
+        .verify()
+        .expect("the audit chain verifies after a credentialed operation");
+
+    // Serialized, not just held: an in-memory `Debug` is a different surface
+    // from what the durable audit file will contain.
+    for record in &records {
+        let rendered = serde_json::to_string(&record.event).expect("the event serializes");
+        assert!(
+            !rendered.contains(CANARY),
+            "an audit event carried the credential: {rendered}"
+        );
+    }
+
+    // And the record is the *operation*, not a placeholder.
+    let handled = records.iter().any(|r| {
+        matches!(
+            r.event,
+            asv_ipc_protocol::AuditEventDto::RequestHandled { .. }
+        )
+    });
+    assert!(
+        handled,
+        "no RequestHandled event among {records:?}: the operation was not \
+         recorded as an operation"
+    );
+}
