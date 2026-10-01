@@ -571,18 +571,23 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             // cannot be shaped to collide with an existing one.
             let id = CredentialId::new();
 
-            // The vault's vocabulary has five kinds and the domain's has nine.
-            // Four of the nine cannot be stored without being mislabelled, so
-            // they are refused by name rather than approximated — see
-            // `inventory::vault_kind`.
-            let Some(vault_kind) = inventory::vault_kind(kind) else {
-                return Response::Error {
-                    code: ErrorCode::InvalidRequest,
-                    message: format!(
-                        "the vault cannot represent a {kind:?} credential yet; \
-                         store it as a kind it can hold"
-                    ),
-                };
+            // The vault's storage vocabulary has five kinds and the domain's
+            // has nine. What changed is not the count but the honesty of the
+            // mapping: the four extra now have a storage class *and* record
+            // the kind the operator actually named, so a read gives back what
+            // was asked for. That is why the refusal this replaced is gone —
+            // it existed to stop an `ApiKey` being written as a `BearerToken`
+            // and read back as something the operator never chose, and the
+            // label is what makes that impossible.
+            let vault_kind = inventory::vault_kind(kind);
+            // Recorded only when the storage class does not already say it, so
+            // a record whose two fields agree carries no redundant copy. An
+            // `api_key` held as a `BearerToken` says both; a `bearer_token`
+            // held as a `BearerToken` says one thing, once.
+            let domain_kind = if kind == inventory::kind_of(vault_kind) {
+                None
+            } else {
+                Some(kind)
             };
 
             let metadata = asv_vault::CredentialMetadata::new(
@@ -593,6 +598,12 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                 account,
                 now_secs(),
             );
+            // Set after construction rather than in `new`, which is the shape
+            // every existing caller already has: a new parameter there would be
+            // a compile error at each of the dozen call sites in the vault's
+            // own tests, for a value most of them do not have an opinion about.
+            let mut metadata = metadata;
+            metadata.domain_kind = domain_kind;
 
             // The vault's `insert` is the transaction: it writes the file or it
             // does not, and on failure the in-memory body is restored to match

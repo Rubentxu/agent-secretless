@@ -102,6 +102,33 @@ pub struct CredentialMetadata {
     pub label: String,
     /// Credential kind.
     pub kind: CredentialKind,
+    /// The kind the operator actually asked for, when it is finer than
+    /// [`kind`](Self::kind) can express.
+    ///
+    /// `kind` is the **storage class** — how the secret is held — and it is
+    /// what this vault has always meant by "kind". This field is the
+    /// **label**, and it exists because the storage vocabulary is five and the
+    /// domain's is nine, and collapsing the four extra onto a neighbour would
+    /// hand back a credential under a name the operator did not choose. A
+    /// credential works either way, so a silent change is invisible until
+    /// somebody reads the inventory.
+    ///
+    /// `Option` with `#[serde(default)]` is a format decision, not laziness,
+    /// and it is the reason this field exists instead of a wider enum:
+    ///
+    /// - a vault written **before** this field has no `domain_kind`, so it
+    ///   deserializes to `None` and the storage class alone decides;
+    /// - a vault written **after** it is still readable by a binary that has
+    ///   never heard of the field, because serde ignores what it does not
+    ///   know — the credential stays reachable and only the label is coarser.
+    ///
+    /// Widening [`CredentialKind`] instead would fail the second case: an old
+    /// binary cannot deserialize an unknown enum variant, so the body would
+    /// not parse and **every** credential in the vault would be lost, not
+    /// just the new one. Losing a whole vault to keep one label is not a
+    /// trade worth making, and REQ-4 exists to keep it from being made.
+    #[serde(default)]
+    pub domain_kind: Option<asv_domain::CredentialKind>,
     /// Provider or service name.
     pub provider: String,
     /// Account or user name at the provider.
@@ -132,6 +159,7 @@ impl CredentialMetadata {
             id: id.into(),
             label: label.into(),
             kind,
+            domain_kind: None,
             provider: provider.into(),
             account: account.into(),
             resource: String::new(),
@@ -139,6 +167,25 @@ impl CredentialMetadata {
             exportability: Exportability::NonExportable,
             created_at: now,
             rotated_at: now,
+        }
+    }
+
+    /// The kind to report for this credential: the operator's own choice when
+    /// there is one, and the storage class when there is not.
+    ///
+    /// One place, so there is one answer. A record may legitimately hold both a
+    /// label and a storage class — an `api_key` *is* held as a bearer token —
+    /// and this is what keeps the two from being confused for a conflict.
+    pub fn effective_kind(&self) -> asv_domain::CredentialKind {
+        match self.domain_kind {
+            Some(kind) => kind,
+            None => match self.kind {
+                CredentialKind::Opaque => asv_domain::CredentialKind::GenericSecret,
+                CredentialKind::PrivateKey => asv_domain::CredentialKind::SshPrivateKey,
+                CredentialKind::BearerToken => asv_domain::CredentialKind::BearerToken,
+                CredentialKind::Password => asv_domain::CredentialKind::UsernamePassword,
+                CredentialKind::DatabasePassword => asv_domain::CredentialKind::DatabaseCredential,
+            },
         }
     }
 }
@@ -922,6 +969,201 @@ mod tests {
 
     fn canary_secret() -> SecretBytes {
         SecretBytes::new(CANARY.as_bytes().to_vec())
+    }
+
+    /// A record exactly as it was serialised **before** `domain_kind` existed.
+    ///
+    /// Written out as a literal rather than derived from `CredentialMetadata`,
+    /// because deriving it would inherit `#[serde(default)]` and the test would
+    /// prove that the current struct can read itself. What has to be pinned is
+    /// that a body carrying no such key is still accepted, and only a literal
+    /// actually lacks the key.
+    const LEGACY_METADATA: &str = r#"{
+        "id": "legacy-1",
+        "label": "written before the label existed",
+        "kind": "BearerToken",
+        "provider": "github",
+        "account": "acct",
+        "resource": "",
+        "policy_refs": [],
+        "exportability": "NonExportable",
+        "created_at": 1,
+        "rotated_at": 1
+    }"#;
+
+    /// The same record as a reader from before the field would have seen it:
+    /// no `domain_kind` member at all. This is the shape REQ-4 is about.
+    #[derive(Deserialize)]
+    struct LegacyMetadata {
+        id: String,
+        label: String,
+        kind: CredentialKind,
+        provider: String,
+        account: String,
+        resource: String,
+        policy_refs: Vec<String>,
+        exportability: Exportability,
+        created_at: u64,
+        rotated_at: u64,
+    }
+
+    #[test]
+    fn a_record_written_before_the_label_existed_still_opens() {
+        let legacy: CredentialMetadata =
+            serde_json::from_str(LEGACY_METADATA).expect("a pre-label record must parse");
+        assert_eq!(legacy.id, "legacy-1");
+        assert_eq!(
+            legacy.domain_kind, None,
+            "absent must read as None, not fail"
+        );
+        // And it still answers with the storage class, which is the only
+        // thing it ever said.
+        assert_eq!(
+            legacy.effective_kind(),
+            asv_domain::CredentialKind::BearerToken
+        );
+    }
+
+    /// The requirement that decided the design: a reader without the field
+    /// must still parse a record that has it.
+    ///
+    /// Had the vault's `CredentialKind` been widened instead, an old binary
+    /// meeting an unknown variant would fail to deserialize and the **whole
+    /// body** would be rejected — every credential lost, not just the new
+    /// one. This asserts the opposite actually happens: serde ignores the key
+    /// it does not know, the record survives, and the secret is still
+    /// reachable. Degradation, not destruction.
+    #[test]
+    fn a_reader_without_the_label_still_parses_a_record_that_has_it() {
+        let mut modern = CredentialMetadata::new(
+            "modern-1",
+            "an api key",
+            CredentialKind::BearerToken,
+            "github",
+            "acct",
+            1,
+        );
+        modern.domain_kind = Some(asv_domain::CredentialKind::ApiKey);
+
+        let json = serde_json::to_string(&modern).expect("serialises");
+        let legacy: LegacyMetadata =
+            serde_json::from_str(&json).expect("a pre-label reader must still parse it");
+
+        assert_eq!(legacy.id, "modern-1");
+        assert_eq!(legacy.label, "an api key");
+        assert_eq!(legacy.provider, "github");
+        assert_eq!(legacy.account, "acct");
+        assert_eq!(legacy.resource, "");
+        assert!(legacy.policy_refs.is_empty());
+        assert_eq!(legacy.created_at, 1);
+        assert_eq!(legacy.rotated_at, 1);
+        assert_eq!(
+            legacy.exportability,
+            Exportability::NonExportable,
+            "the exportability class must not drift either — R1 keys off it"
+        );
+        assert_eq!(
+            legacy.kind,
+            CredentialKind::BearerToken,
+            "the storage class is what the old reader sees, and it is intact"
+        );
+        // The label is the only thing lost, and it is a label.
+        assert!(
+            !json.contains("\"secret\""),
+            "metadata must not carry a secret"
+        );
+    }
+
+    /// A label and a storage class together are a fact, not a conflict: an
+    /// `api_key` really is held as a bearer token. The reported kind is the
+    /// label, and the storage class is left exactly as it was rather than
+    /// rewritten to agree — two fields must not end up answering one question.
+    #[test]
+    fn a_label_beside_its_storage_class_reports_the_label() {
+        let mut metadata =
+            CredentialMetadata::new("c1", "l", CredentialKind::BearerToken, "github", "acct", 1);
+        metadata.domain_kind = Some(asv_domain::CredentialKind::OAuth2);
+
+        assert_eq!(
+            metadata.effective_kind(),
+            asv_domain::CredentialKind::OAuth2,
+            "the operator's label must win over the storage class"
+        );
+        assert_eq!(
+            metadata.kind,
+            CredentialKind::BearerToken,
+            "the storage class must not be rewritten to match the label"
+        );
+    }
+
+    /// Every one of the domain's nine kinds survives being stored, read back
+    /// and reopened. The mapping is total, so this is the property that would
+    /// fail first if a variant were ever added without a storage class.
+    #[test]
+    fn all_nine_domain_kinds_survive_a_write_and_a_reopen() {
+        use asv_domain::CredentialKind as DomainKind;
+        let all = [
+            DomainKind::ApiKey,
+            DomainKind::BearerToken,
+            DomainKind::OAuth2,
+            DomainKind::UsernamePassword,
+            DomainKind::SshPrivateKey,
+            DomainKind::X509ClientIdentity,
+            DomainKind::AwsAccessKey,
+            DomainKind::DatabaseCredential,
+            DomainKind::GenericSecret,
+        ];
+        assert_eq!(all.len(), 9, "the domain's vocabulary changed");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.asv");
+        let mut store =
+            VaultStore::create(&path, &pass(), KdfParams::fast_for_tests()).expect("create vault");
+        let key = store.header().unlock(&pass()).expect("unlock");
+
+        for (index, domain) in all.iter().enumerate() {
+            let id = format!("c{index}");
+            let mut metadata = CredentialMetadata::new(
+                id.clone(),
+                format!("label-{index}"),
+                super::tests::storage_class_for(*domain),
+                "github",
+                "acct",
+                1,
+            );
+            metadata.domain_kind = Some(*domain);
+            store
+                .insert(&key, metadata, canary_secret())
+                .expect("insert");
+        }
+
+        let reopened = VaultStore::open(&path, &pass()).expect("reopen");
+        for (index, domain) in all.iter().enumerate() {
+            let metadata = reopened
+                .metadata(&format!("c{index}"))
+                .expect("the record is still there");
+            assert_eq!(
+                metadata.effective_kind(),
+                *domain,
+                "{domain:?} did not survive the file"
+            );
+        }
+    }
+
+    /// The storage class the broker would pick for a domain kind, mirrored
+    /// here so the vault's own test does not depend on the broker's mapping.
+    fn storage_class_for(kind: asv_domain::CredentialKind) -> CredentialKind {
+        match kind {
+            asv_domain::CredentialKind::BearerToken
+            | asv_domain::CredentialKind::ApiKey
+            | asv_domain::CredentialKind::OAuth2 => CredentialKind::BearerToken,
+            asv_domain::CredentialKind::UsernamePassword => CredentialKind::Password,
+            asv_domain::CredentialKind::SshPrivateKey
+            | asv_domain::CredentialKind::X509ClientIdentity
+            | asv_domain::CredentialKind::AwsAccessKey => CredentialKind::PrivateKey,
+            asv_domain::CredentialKind::DatabaseCredential => CredentialKind::DatabasePassword,
+            asv_domain::CredentialKind::GenericSecret => CredentialKind::Opaque,
+        }
     }
 
     /// The atomic write's temp name must differ on every call, including

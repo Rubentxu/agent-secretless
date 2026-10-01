@@ -101,7 +101,7 @@ fn project_records(
                 credentials.push(CredentialMetadata {
                     id,
                     label: record.label.clone(),
-                    kind: kind(record.kind),
+                    kind: record.effective_kind(),
                     exportability: exportability(record.exportability),
                 });
                 result.loaded += 1;
@@ -113,13 +113,19 @@ fn project_records(
     (credentials, result)
 }
 
-/// The vault's five credential kinds onto the domain's nine.
+/// The vault's storage class onto the domain's nine.
 ///
 /// Written out rather than derived: the two enums share only the name
 /// `BearerToken`, so a `From` impl would be a guess dressed as a
 /// conversion. Exhaustive on purpose — adding a variant to either enum breaks
 /// this match at compile time, which is the moment the mapping should be
 /// revisited.
+///
+/// This is a **fallback**, not the answer. A record may carry a
+/// `domain_kind` — the kind the operator chose — and when it does, that is
+/// what the caller is told. The vault's five remain the storage class and
+/// keep every meaning they had; this function only decides what a record with
+/// no label reports.
 fn kind(kind: VaultKind) -> CredentialKind {
     match kind {
         VaultKind::Opaque => CredentialKind::GenericSecret,
@@ -130,36 +136,44 @@ fn kind(kind: VaultKind) -> CredentialKind {
     }
 }
 
-/// The domain's nine kinds onto the vault's five — the direction a *write*
-/// travels, and the only one that can fail.
+/// The domain's nine kinds onto the vault's five storage classes — the
+/// direction a *write* travels.
 ///
-/// The reverse direction above is total because the vault's five are the
-/// coarse vocabulary. This one is not: four of the nine have no counterpart,
-/// and everything else would have to collapse into `Opaque` and come back out
-/// of `kind()` as `GenericSecret`. Storing an `ApiKey` and reporting it as a
-/// `GenericSecret` is a credential the operator did not ask for, recorded
-/// under a name they did not choose.
+/// **Total, since the vault gained a `domain_kind` field.** It used to return
+/// `None` for four kinds and the broker refused them by name; that was the
+/// honest answer then, and it is what stopped an `ApiKey` being written as a
+/// `BearerToken` and read back as something the operator did not ask for.
 ///
-/// So the unmappable kinds are refused rather than approximated. `None` means
-/// "the vault's vocabulary cannot say what this is yet", and the caller turns
-/// that into a refusal naming the kind. The alternative — a lossy map that
-/// always succeeds — would move a modelling gap from a compile-time exhaustiveness
-/// check to a silent mislabel in a vault, which is the worst place to discover it.
+/// The refusal is no longer needed because the label now travels beside the
+/// storage class. Every kind maps, and the mapping is lossy **in a way the
+/// record itself records**: an `ApiKey` is held as a `BearerToken` *and* says
+/// so, and the read prefers what it said. Collapsing without recording would
+/// be the defect; collapsing while recording is the design.
 ///
 /// Kept adjacent to `kind()` deliberately: the two directions are only correct
 /// together, and the round trip is what a test should pin.
-pub fn vault_kind(kind: CredentialKind) -> Option<VaultKind> {
+pub fn vault_kind(kind: CredentialKind) -> VaultKind {
     match kind {
-        CredentialKind::BearerToken => Some(VaultKind::BearerToken),
-        CredentialKind::UsernamePassword => Some(VaultKind::Password),
-        CredentialKind::SshPrivateKey => Some(VaultKind::PrivateKey),
-        CredentialKind::DatabaseCredential => Some(VaultKind::DatabasePassword),
-        CredentialKind::GenericSecret => Some(VaultKind::Opaque),
-        CredentialKind::ApiKey
-        | CredentialKind::OAuth2
-        | CredentialKind::X509ClientIdentity
-        | CredentialKind::AwsAccessKey => None,
+        CredentialKind::BearerToken | CredentialKind::ApiKey | CredentialKind::OAuth2 => {
+            VaultKind::BearerToken
+        }
+        CredentialKind::UsernamePassword => VaultKind::Password,
+        CredentialKind::SshPrivateKey | CredentialKind::X509ClientIdentity => VaultKind::PrivateKey,
+        CredentialKind::AwsAccessKey => VaultKind::PrivateKey,
+        CredentialKind::DatabaseCredential => VaultKind::DatabasePassword,
+        CredentialKind::GenericSecret => VaultKind::Opaque,
     }
+}
+
+/// The storage class a vault kind projects to, as a domain kind.
+///
+/// Exposed so the create verb can ask "does the record already say what the
+/// operator asked for?" without restating the mapping. A second copy of that
+/// match would be a second thing to forget when a variant is added, and the
+/// failure would be a redundant or missing `domain_kind` — invisible until an
+/// operator compared a listing against what they typed.
+pub fn kind_of(storage: VaultKind) -> CredentialKind {
+    kind(storage)
 }
 
 /// Projects one just-written vault record into the broker's public metadata.
@@ -175,7 +189,12 @@ pub fn project_one(record: &asv_vault::CredentialMetadata) -> Option<CredentialM
         .map(|id| CredentialMetadata {
             id,
             label: record.label.clone(),
-            kind: kind(record.kind),
+            // `effective_kind`, not `kind(record.kind)`: the record's own
+            // answer, which is the operator's label when there is one. Calling
+            // the fallback here would read every one of the four kinds this
+            // cycle enables back as a neighbour, and only for a credential
+            // created while the broker was running.
+            kind: record.effective_kind(),
             exportability: exportability(record.exportability),
         })
 }
