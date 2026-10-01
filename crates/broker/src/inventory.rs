@@ -158,12 +158,8 @@ mod tests {
     fn store_with(entries: &[(&str, asv_vault::CredentialKind)]) -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().expect("tempdir");
         let pass = SecretString::from("inventory-unit-pass".to_string());
-        let mut store = Store::create(
-            &dir.path().join("v.asv"),
-            &pass,
-            KdfParams::fast_for_tests(),
-        )
-        .expect("create");
+        let mut store = Store::create(dir.path().join("v.asv"), &pass, KdfParams::fast_for_tests())
+            .expect("create");
         let key = store.header().unlock(&pass).expect("unlock");
         for (id, kind) in entries {
             store
@@ -344,12 +340,8 @@ mod tests {
         const CANARY: &str = "ASV-CANARY-inventory-91d2-DO-NOT-LEAK";
         let dir = tempfile::tempdir().expect("tempdir");
         let pass = SecretString::from("inventory-canary-pass".to_string());
-        let mut store = Store::create(
-            &dir.path().join("v.asv"),
-            &pass,
-            KdfParams::fast_for_tests(),
-        )
-        .expect("create");
+        let mut store = Store::create(dir.path().join("v.asv"), &pass, KdfParams::fast_for_tests())
+            .expect("create");
         let key = store.header().unlock(&pass).expect("unlock");
         store
             .insert(

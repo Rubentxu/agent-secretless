@@ -1786,7 +1786,7 @@ mod surrogate_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let pass = secrecy::SecretString::from("mint-from-vault".to_string());
         let mut store = asv_vault::VaultStore::create(
-            &dir.path().join("v.asv"),
+            dir.path().join("v.asv"),
             &pass,
             asv_vault::KdfParams::fast_for_tests(),
         )
