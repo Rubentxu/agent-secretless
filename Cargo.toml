@@ -15,6 +15,13 @@ members = [
     "crates/tls-acceptor",
     "crates/operator-core",
 ]
+# `apps/desktop` is deliberately NOT a member. It is a separate workspace with
+# its own `[workspace]` table, because the GUI needs webkit2gtk-4.1 / gtk+-3.0
+# *headers* to build, and the pipeline runs `cargo build/test/clippy
+# --workspace` in a clean container that has only the runtime. Listing it here
+# would make every headless pipeline step fail for a dependency the core never
+# touches. The shell has its own build command; see apps/desktop/README.md.
+exclude = ["apps/desktop"]
 # M0 deliberately shipped without a connector, so the UAT threat harness could
 # run with an empty connector surface (docs/15-ROADMAP.md M0 Exit). M4 is the
 # milestone that adds the first one: crates/connector-http carries address

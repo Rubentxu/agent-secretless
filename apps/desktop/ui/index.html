@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      No remote origins anywhere. Not a font, not an analytics beacon, not a
+      CDN for a dependency. `tests/no_remote_assets.py` fails the build if a
+      URL appears in any file in this directory, so this is enforced rather
+      than intended.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'none'"
+    />
+    <title>Agent Secretless</title>
+    <link rel="stylesheet" href="app.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Agent Secretless</h1>
+      <p id="status">starting…</p>
+    </header>
+    <main>
+      <section>
+        <h2>Credentials</h2>
+        <table id="credentials">
+          <thead>
+            <tr>
+              <th>Label</th>
+              <th>Provider</th>
+              <th>Exportability</th>
+              <th>Agent access</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>

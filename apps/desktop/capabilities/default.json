@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Minimum privilege for the console window. `core:default` is deliberately NOT used: it bundles filesystem, shell and http permissions this console has no reason to hold. The window gets event handling and nothing else; every command goes through `dispatch_console`, which the core's capability registry decides.",
+  "windows": ["main"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:webview:allow-internal-toggle-devtools"
+  ]
+}

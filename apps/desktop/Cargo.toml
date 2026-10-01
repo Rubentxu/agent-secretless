@@ -1,0 +1,59 @@
+[package]
+name = "asv-desktop"
+version = "0.22.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/rubentxu/agent-secretless"
+description = "M5 operator console: a thin Tauri shell over asv-operator-core"
+
+# This crate is its own workspace root on purpose. The pipeline runs
+# `cargo build/test/clippy --workspace` in a clean container that has the GUI
+# *runtime* but not the *headers*; listing this as a member of the core
+# workspace would make every headless step depend on webkit2gtk-devel.
+[workspace]
+
+[lib]
+name = "asv_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "asv-console"
+path = "src/main.rs"
+
+[features]
+# `gui` is OFF by default, and that is the point.
+#
+# The security-relevant part of this crate — the command table, the refusal
+# ordering, and the check that no credential value crosses the bridge — has no
+# `tauri` import anywhere. It is only the binary that needs the WebView. With
+# `tauri` as an unconditional dependency, `cargo test --lib` still had to
+# build `webkit2gtk-sys`, which runs `pkg-config`, which needs
+# webkit2gtk-devel. So the tests that need no GUI could not run without it —
+# the dependency leaked into the half of the crate that does not use it.
+#
+# With the feature off, `cargo test` runs the whole policy surface on a
+# headless machine with no GUI toolchain at all. `--features gui` builds the
+# console and its WebView.
+default = []
+gui = ["dep:tauri", "dep:tauri-build"]
+
+[dependencies]
+# The shell's only real dependency is the policy core. It is what the shell
+# asks; the shell has no rules of its own.
+asv-operator-core = { path = "../../crates/operator-core" }
+asv-domain = { path = "../../crates/domain" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# default-features = false drops the updater, the system tray, the notification
+# plugin and the built-in HTTP client. None of them are in M5's scope, and each
+# one is attack surface a console holding exportability decisions has no
+# reason to carry. `wry` is the WebView we actually render through.
+tauri = { version = "2", default-features = false, features = ["wry"], optional = true }
+
+[build-dependencies]
+tauri-build = { version = "2", default-features = false, optional = true }
+
+[profile.release]
+strip = true
