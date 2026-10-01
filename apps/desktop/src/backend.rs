@@ -27,7 +27,13 @@ pub struct CredentialSummary {
 }
 
 /// Where the console gets its data.
-pub trait Backend {
+///
+/// `Send + Sync` is required because Tauri holds the console as managed state
+/// and hands it to whichever worker thread is serving a command. The trait
+/// does not demand thread-safety of its own — the broker client behind it is
+/// already synchronised — but the console that owns it has to be movable into
+/// a thread to be usable at all.
+pub trait Backend: Send + Sync {
     fn list_credential_metadata(&self) -> Vec<CredentialSummary>;
     fn add_credential(&self, payload: &serde_json::Value) -> serde_json::Value;
     fn delete_credential(&self, payload: &serde_json::Value) -> serde_json::Value;

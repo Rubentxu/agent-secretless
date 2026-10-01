@@ -24,10 +24,10 @@ pub mod backend;
 pub mod surface;
 
 use backend::{Backend, Disconnected};
-use surface::{Console, Outcome};
+use surface::Console;
 
 /// Build a console over `backend`.
-pub fn console(backend: Box<dyn Backend>) -> Console {
+pub fn console(backend: Box<dyn Backend + Send + Sync>) -> Console {
     Console::with_backend(backend)
 }
 

@@ -4,7 +4,7 @@
   "version": "0.22.0",
   "identifier": "dev.agentsecretless.console",
   "build": {
-    "frontendDist": "../ui"
+    "frontendDist": "./ui"
   },
   "app": {
     "withGlobalTauri": false,

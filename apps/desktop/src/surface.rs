@@ -86,7 +86,7 @@ pub fn preauthorize(registry: &Registry, wire_name: &str) -> Result<Capability, 
 /// The console: a registry plus the operations that back each capability.
 pub struct Console {
     registry: Registry,
-    backend: Box<dyn Backend>,
+    backend: Box<dyn Backend + Send + Sync>,
 }
 
 impl Default for Console {
@@ -102,7 +102,7 @@ impl Console {
         Self::default()
     }
 
-    pub fn with_backend(backend: Box<dyn Backend>) -> Self {
+    pub fn with_backend(backend: Box<dyn Backend + Send + Sync>) -> Self {
         Self {
             registry: registry(),
             backend,
