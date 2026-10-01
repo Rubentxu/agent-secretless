@@ -119,24 +119,34 @@ Before final release:
   evidenced by UAT-030 with the measured host recorded. A performance claim
   without a recorded host and percentile is not a pass.
 
-## Gate status as of 2026-09-30
+## Gate status as of 2026-10-01
 
 `15-ROADMAP.md` delegates M11 and M13 completion to this document rather
 than to a fixed UAT set. That delegation is only meaningful if the current
-state is stated, so it is stated here. Source: `docs/exploration/m11-m13-convergence.md`.
+state is stated, so it is stated here.
+
+Every claim in the table below that the repository can decide is verified by
+`scripts/check-gate-status.py`, which runs as the `gate-status` stage of
+`pipeline.kts` and fails the build when a row stops matching reality. The
+previous table, written 2026-09-30, had drifted in three rows within eleven
+days; a status table with nothing checking it is a comment. Claims that depend
+on the host or on an external service are marked below and are deliberately
+not machine-asserted, because nothing in this repository can decide them.
 
 | Gate | Status | Evidence |
 |---|---|---|
-| R11 dependency audit | pass | `cargo audit`: 0 advisories, 335 deps |
-| R11 full suite | pass | 486 passed / 0 failed / 1 ignored |
-| R11 clippy `-D warnings` | pass | clean |
+| R11 dependency audit | pass with warning | `cargo audit`: 0 advisories, 337 deps, 1 yanked warning (`yoke-derive` 0.8.3, transitive via `url`→`idna`→`icu`). Recorded as a finding; clearing it means a transitive bump. |
+| R11 full suite | pass | 597 tests enumerated, 596 passed / 0 failed / 1 ignored, at `v0.17.6` |
+| R11 clippy `-D warnings` | pass | clean across `--workspace --all-targets --locked` |
 | R11 formatting | pass | `cargo fmt --all -- --check` clean |
 | R11 `NFR-PERF-001` | pass | UAT-030, 6 ms budget, both profiles, host recorded |
-| M12 hardware-backed vault | **NOT MET** | no TPM on this host (`/dev/tpm*` absent, `/sys/class/tpm` empty, no TPM CPU flag). UAT-034 exercises the structural shape against `SoftwareTpm`, a content-addressed placeholder. No hardware-backed guarantee is claimed. |
-| M11 live OAuth2 provider | **NOT MET** | `StaticClientCredentialsIssuer` only; no AS interaction, no PKCE. The framework and its 6 tests are real. |
-| M11-M13 semver | **NOT MET** | tagged `m11-*`/`m12-*`/`m13-*` with no cycle receipt and no version. `v0.11.0` stays on `9bd86dd` and must not be moved to cover them. |
+| M12 hardware-backed vault | **NOT MET** — host-dependent, not machine-asserted | no TPM on this host (`/dev/tpm*` absent, `/sys/class/tpm` empty, no TPM CPU flag). UAT-034 exercises the structural shape against `SoftwareTpm`, a content-addressed placeholder. No hardware-backed guarantee is claimed. |
+| M11 live OAuth2 provider | **NOT MET** — external dependency, not machine-asserted | `StaticClientCredentialsIssuer` only; no AS interaction, no PKCE. The framework and its 6 tests are real. |
+| M11-M13 semver | **NOT MET** | `m11-oauth2-framework`, `m12-tpm-vault` and `m13-rc-stabilization` are all ancestors of `v0.11.0` (`9bd86dd`): the milestone work shipped by riding inside that release, never by being deliberately versioned. No cycle receipt and no version of their own stands behind them, which is why the roadmap's assertion of milestone completion has nothing to point at. `gate-status` verifies the ancestry so this row cannot drift into claiming the opposite. |
 | R10 compatibility truthfulness | partial | the `ISOLATED_PROCESS_EXPOSURE` posture label exists; the per-integration catalog required by M11 has no live provider to populate yet. |
 
-Two of these cannot be closed by writing code on this machine: M12 needs a
+M12 and M11 cannot be closed by writing code on this machine: M12 needs a
 host with a TPM, and M11 needs a real provider to point the framework at.
 Recording them as open is the correct outcome, not a blocker to route around.
+That is also why the guard does not assert them — a script that asserted them
+would be asserting an author's intent rather than a fact.

@@ -33,6 +33,20 @@ pipeline {
             }
         }
 
+        // The status table that M11/M13 completion is delegated to, checked
+        // against the repository. Placed early for the same reason ci-policy is
+        // first and not for the same cost: `cargo test --list` does compile, but
+        // on the same profile and target dir the `test` stage uses, so the work
+        // is cached rather than repeated — and it puts a falsified governance
+        // document in front of the 15-minute PostgreSQL substrate and the
+        // 30-minute adversarial stage instead of behind them.
+        stage("gate-status") {
+            dir(repo) {
+                sh("python3 scripts/check-gate-status.py")
+                sh("python3 tests/gate_status_drift.py")
+            }
+        }
+
         // Cheap, and it fails first on the things a reviewer would notice.
         stage("static") {
             dir(repo) {
@@ -91,15 +105,17 @@ pipeline {
             }
         }
 
-        // Advisory, and advisory on purpose: `check-gates.py` reports known
-        // roadmap UAT gate-map defects that are tracked in the backlog, and the
-        // workflow being replaced deliberately recorded the exit code instead
-        // of enforcing it. Promoting it to a hard gate would bury the real
-        // ones under a defect nobody is going to fix this week. The exit is
-        // echoed so the report is not lost.
+        // Enforced, not advisory. This used to record its exit code instead of
+        // failing the run, justified by UAT gate-map defects that were tracked
+        // in the backlog. Those defects are resolved: `check-gates.py` reports
+        // 0 hard defects and 0 warnings with 34/34 UAT carrying a gate and 0
+        // orphaned. An exception that outlives its justification stops guarding
+        // while still looking like a gate, so it was removed rather than
+        // reworded. Future gate-map drift turning this red is the intended
+        // behaviour of a gate, not a reason to reintroduce the exception.
         stage("spec-gates") {
             dir(repo) {
-                sh("python3 tools/check-gates.py; rc=${'$'}?; echo \"check-gates.py exit=${'$'}rc (advisory: known gate-map defects are tracked in the backlog)\"")
+                sh("python3 tools/check-gates.py")
             }
         }
     }
