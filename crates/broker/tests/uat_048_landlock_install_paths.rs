@@ -1,13 +1,14 @@
 //! UAT-048 — Landlock scopes the operator's declared paths, not whole hierarchies.
 //! Landlock ruleset scopes the operator's declared paths, not whole hierarchies.
 //!
-//! Not a normative UAT: `14-UAT-ADVERSARIAL.md` defines UAT-001..UAT-034 and
-//! UAT-048 is not among them. The real anchor is backlog item
-//! `bl-bl-01M3PS45V9000387DJAFC0YK00` (P2, m7-seccomp-landlock / verify).
+//! This suite was written ahead of the spec and originally took a number
+//! nothing reserved, which it said so in this header. It is now normative:
+//! UAT-048 is defined in `14-UAT-ADVERSARIAL.md` and owned by M7. The
+//! decision is recorded rather than quietly applied — the suite always proved
+//! the property, and the gap was that the roadmap could not gate on a test
+//! whose id the spec did not recognise. What was provisional was the *number*,
+//! never the property.
 //!
-//! Backlog item `bl-bl-01M3PS45V9000387DJAFC0YK00` (P2, m7-seccomp-landlock
-//! / verify): the Landlock allow set was a static list of whole hierarchies
-//! which included `/home` and `/var/home` in full, read AND write.
 use std::io::Write;
 use std::path::{Path, PathBuf};
 

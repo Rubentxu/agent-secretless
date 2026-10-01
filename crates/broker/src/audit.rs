@@ -1,3 +1,6 @@
+//! UAT-018 — audit leak.
+//! `canary_never_lands_in_a_record` is the property, with the broker's own
+//! `canary_in_request_fields_never_reaches_audit_records` as the integration half.
 //! Tamper-evident audit log (R9).
 //!
 //! Every authenticated request the broker handles appends one record to an

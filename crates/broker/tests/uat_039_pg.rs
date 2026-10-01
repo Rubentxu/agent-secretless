@@ -1,17 +1,14 @@
 //! UAT-039 — PostgreSQL scenarios end to end through the connector.
 //! M6 PostgreSQL connector integration — the five M6 scenarios end to end.
 //!
-//! Not a normative UAT: `14-UAT-ADVERSARIAL.md` defines UAT-001..UAT-034 and
-//! UAT-039 is not among them. `15-ROADMAP.md` gates M6 on UAT-033, which
-//! `uat033_broker.rs` and `uat033_live.rs` cover against a real server. This
-//! suite is the connector-level companion; UAT-039 is not a reserved id.
+//! This suite was written ahead of the spec and originally took a number
+//! nothing reserved, which it said so in this header. It is now normative:
+//! UAT-039 is defined in `14-UAT-ADVERSARIAL.md` and owned by M6. The
+//! decision is recorded rather than quietly applied — the suite always proved
+//! the property, and the gap was that the roadmap could not gate on a test
+//! whose id the spec did not recognise. What was provisional was the *number*,
+//! never the property.
 //!
-//! Scenarios exercised here:
-//!   M6-S1 — connector dispatch by audience (the factory exposes postgres()
-//!           without routing an HTTP audience through it).
-//!   M6-S2 — `psql` is spawned with `env_clear` and a stdin pipe so the
-//!           password never appears in the agent's env or argv.
-//!   M6-S3 — denial before auth: an unauthorised database is rejected
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

@@ -1,3 +1,7 @@
+//! UAT-029 — protected branch policy.
+//! The protected-ref rules, and the approval that satisfies them exactly once:
+//! `protected_push_requires_exact_single_use_approval` in the broker and
+//! `denial_paths_do_not_decrement_approval_uses` here.
 //! Deny-by-default authorization state for M3.
 //!
 //! Cedar is kept behind this adapter. The public types contain authorization

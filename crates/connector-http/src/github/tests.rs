@@ -1,3 +1,7 @@
+//! UAT-007 — cross-origin redirect.
+//! `a_cross_origin_redirect_never_sends_the_credential_to_the_target` and
+//! `a_cross_origin_redirect_never_reaches_the_other_origin`: a redirect is not a licence to
+//! present the credential to whoever asked for it.
 //! Tests for the semantic GitHub surface.
 //!
 //! These run against a real TLS origin with a real certificate, because the

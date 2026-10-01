@@ -1,17 +1,14 @@
 //! UAT-040 — isolated worker runtime, denied rather than downgraded.
 //! Isolated worker runtime — the M10 follow-up to UAT-021 and UAT-022.
 //!
-//! Not a normative UAT: `14-UAT-ADVERSARIAL.md` defines UAT-001..UAT-034 and
-//! UAT-040 is not among them. The anchors that DO exist are:
-//! - `05-CREDENTIAL-ACCESS-MODES.md` §7 — worker controls: separate
-//!   identity/ns, narrow fs view, egress deny, short lifetime, output
-//!   filtering, automatic destruction;
-//! - `14-UAT-ADVERSARIAL.md` UAT-021 (egress confinement blocks the sink —
-//!   live form: the worker's netns has no usable network) and UAT-022
-//!   (transformed stdout leak, the redactor's exact-boundary check).
+//! This suite was written ahead of the spec and originally took a number
+//! nothing reserved, which it said so in this header. It is now normative:
+//! UAT-040 is defined in `14-UAT-ADVERSARIAL.md` and owned by M10. The
+//! decision is recorded rather than quietly applied — the suite always proved
+//! the property, and the gap was that the roadmap could not gate on a test
+//! whose id the spec did not recognise. What was provisional was the *number*,
+//! never the property.
 //!
-//! This suite is the runtime follow-up to those two; UAT-040 is not a
-//! reserved id and no release gate cites it.
 use asv_broker::audit::AuditLog;
 use asv_broker::isolated_exec::{
     EgressPolicy, LandlockProfile, Redactor, SeccompProfile, SecretInjectionPlan, WorkerRegistry,

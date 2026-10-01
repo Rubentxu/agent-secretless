@@ -224,6 +224,15 @@ def declared_uat(head: str) -> tuple[int, str] | None:
     mid-sentence is a reference, not a claim: "isolated worker runtime, the
     M10 follow-up to UAT-021 and UAT-022" cites two UATs it does not own, and
     reading that as ownership is how two files end up claiming one id.
+
+    Reading the whole leading block instead was tried and reverted. A file
+    that legitimately proves two UATs is real — `uat_005_replay.rs` covers
+    UAT-005 and UAT-004 — but widening the scan made every regression re-run a
+    duplicate, and this check counts a second file claiming one id as a hard
+    defect. That is the right default: two files owning one UAT is exactly the
+    ambiguity a gate should refuse rather than resolve. The cost is that a
+    second UAT proven in the same body stays undeclared until it gets a header
+    of its own.
     """
     for line in head.splitlines():
         m = DOC_LINE_RE.match(line)

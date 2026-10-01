@@ -1,3 +1,8 @@
+//! UAT-009 — DNS rebinding.
+//! Address resolution and policy. `private_and_metadata_addresses_are_refused_by_default`,
+//! `smuggled_address_forms_are_refused` and `a_hand_built_audience_cannot_bypass_the_address_policy`
+//! are the property: a name that resolves to a private or metadata address is refused at
+//! connect time, so a rebind between resolve and dial buys nothing.
 //! Address resolution, policy and client construction (D1, D7).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

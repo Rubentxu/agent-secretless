@@ -1,3 +1,6 @@
+//! UAT-025 — vault theft.
+//! Alongside UAT-026 backup/restore in this module: `backup_and_restore_round_trip_on_a_clean_path`,
+//! `backup_is_owner_only_and_opaque`, and the record-redaction suite around them.
 //! Encrypted vault body: credential records, metadata CRUD, and the file
 //! format.
 //!

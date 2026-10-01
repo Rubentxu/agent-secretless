@@ -1,15 +1,14 @@
 //! UAT-050 — the broker dispatches on the request type, not a provider string.
 //! M6-R1 — the broker dispatches on the request type, not a provider string.
 //!
-//! Not a normative UAT: `14-UAT-ADVERSARIAL.md` defines UAT-001..UAT-034 and
-//! UAT-050 is not among them. The anchor is the M6 connector-dispatch
-//! requirement recorded in `15-ROADMAP.md` §M6 and the M6 verification report.
+//! This suite was written ahead of the spec and originally took a number
+//! nothing reserved, which it said so in this header. It is now normative:
+//! UAT-050 is defined in `14-UAT-ADVERSARIAL.md` and owned by M6. The
+//! decision is recorded rather than quietly applied — the suite always proved
+//! the property, and the gap was that the roadmap could not gate on a test
+//! whose id the spec did not recognise. What was provisional was the *number*,
+//! never the property.
 //!
-//! ## Why this file exists
-//! M6-R1 requires that the `ConnectorFactory` "MUST dispatch on a typed
-//! audience enum, MUST NOT grow per-provider methods, and MUST NOT match the
-//! audience string", and its first scenario says a request "routes to
-//! PostgreSQL; an HTTP URL with 'postgres' does not".
 use std::sync::Arc;
 
 use asv_broker::{handle, BrokerState, LiveConnectorFactory};
