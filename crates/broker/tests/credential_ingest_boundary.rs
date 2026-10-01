@@ -48,7 +48,7 @@
 //! developer running the file surgically is.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -99,8 +99,6 @@ impl Drop for Broker {
 struct Fixture {
     dir: PathBuf,
     sock: PathBuf,
-    vault: PathBuf,
-    passphrase: PathBuf,
     _broker: Broker,
 }
 
@@ -160,8 +158,6 @@ impl Fixture {
         Self {
             dir,
             sock,
-            vault,
-            passphrase,
             _broker: broker,
         }
     }
