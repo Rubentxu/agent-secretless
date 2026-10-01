@@ -16,3 +16,4 @@
 | 0012 | Session-scoped TLS CA only | Accepted |
 | 0013 | No arbitrary in-process connector plugins in v1 | Accepted |
 | 0014 | Explicit integration security posture | Accepted |
+| 0015 | Control-plane admission: what separates the human from an agent | Accepted |
