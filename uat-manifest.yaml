@@ -1,0 +1,36 @@
+schema_version: 1
+project_id: ""
+generated_at: ""
+entries:
+- sha256: 235c0161c4ecf6da54892ee0905fed65690c73bea613a03819a1f53cf8e298c7
+  path: /tmp/sddk-uat-cli-ev-S-1-53147.log
+  size_bytes: 715
+  captured_at: 2026-10-01T14:34:45Z
+  scenario_id: S-1
+  session_id: auto-S-1-20261001T143445Z
+  kind: command_output
+  mime: text/plain
+- sha256: e243baaec364f19992311d2527cabdb4df84c362de7803c8922f376b770517d4
+  path: /tmp/sddk-uat-cli-ev-S-2-53147.log
+  size_bytes: 600
+  captured_at: 2026-10-01T14:34:45Z
+  scenario_id: S-2
+  session_id: auto-S-2-20261001T143445Z
+  kind: command_output
+  mime: text/plain
+- sha256: dca103a6e721b3d66e46570683b1e5a058d34bfe401561e29f7c0181c25b1839
+  path: /tmp/sddk-uat-cli-ev-S-3-53147.log
+  size_bytes: 552
+  captured_at: 2026-10-01T14:34:45Z
+  scenario_id: S-3
+  session_id: auto-S-3-20261001T143445Z
+  kind: command_output
+  mime: text/plain
+- sha256: 2519c19cdfc93bb6a61b9af7cc48fa8a59a80621c2b85087687145b1e97fe07a
+  path: /tmp/sddk-uat-cli-ev-S-4-53147.log
+  size_bytes: 590
+  captured_at: 2026-10-01T14:34:45Z
+  scenario_id: S-4
+  session_id: auto-S-4-20261001T143445Z
+  kind: command_output
+  mime: text/plain
