@@ -238,6 +238,62 @@ def check_readme_count(gate: str, evidence: str, failures: list[str]) -> None:
                 )
 
 
+def check_console_surface(gate: str, evidence: str, failures: list[str]) -> None:
+    """M5's front-end must ship no remote origin and a strict CSP.
+
+    UAT-019's first clause is "rendered as data, no script execution", and a
+    CSP is the mechanism that makes it true rather than merely intended. A
+    console that reaches a CDN at runtime is a console whose front-end is
+    whatever that CDN served today, so the check is that no such URL is
+    *written*, not that none happens to load.
+
+    This reads the files. It does not build the WebView, so it can run in the
+    pipeline, which has no display.
+    """
+    ui_dir = REPO / "apps/desktop/ui"
+    conf_path = REPO / "apps/desktop/tauri.conf.json"
+
+    if not ui_dir.is_dir():
+        failures.append(f"{gate}: apps/desktop/ui does not exist, so the claim "
+                        f"that it ships no remote assets cannot be checked")
+        return
+    if not conf_path.is_file():
+        failures.append(f"{gate}: apps/desktop/tauri.conf.json is missing, so the "
+                        f"CSP claim cannot be checked")
+        return
+
+    offenders: list[str] = []
+    for path in sorted(ui_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            # A protocol-relative URL (`//host/...`) is remote too, and it is
+            # the one a naive `http` search misses.
+            for needle in ("http://", "https://", "//cdn.", "src=\"//", "href=\"//"):
+                if needle in line:
+                    offenders.append(f"{path.relative_to(REPO)}:{lineno} contains {needle!r}")
+    if offenders:
+        failures.append(
+            f"{gate}: the console front-end references a remote origin: "
+            + "; ".join(offenders[:5])
+        )
+
+    conf = conf_path.read_text(encoding="utf-8")
+    # `unsafe-inline` is what an injected `<script>` needs when there is no
+    # nonce, and `unsafe-eval` is what turns a string into code. Neither may
+    # appear in a console that renders credential metadata.
+    for banned in ("unsafe-inline", "unsafe-eval"):
+        if banned in conf:
+            failures.append(f"{gate}: the CSP permits {banned}")
+    for required in ("default-src 'self'", "connect-src 'self'", "object-src 'none'"):
+        if required not in conf:
+            failures.append(f"{gate}: the CSP is missing `{required}`")
+    if '"enable": false' not in conf:
+        failures.append(f"{gate}: the asset protocol is not disabled; a console "
+                        f"that serves local files over it can be pointed elsewhere")
+
+
 def main() -> int:
     table_path = TABLE
     args = sys.argv[1:]
@@ -266,6 +322,8 @@ def main() -> int:
             check_dependency_audit(gate, evidence, failures)
         if "readme" in gate.lower():
             check_readme_count(gate, evidence, failures)
+        if "console front-end" in gate.lower() or "remote origin" in gate.lower():
+            check_console_surface(gate, evidence, failures)
 
     if failures:
         print("gate status drift in 16-SECURITY-RELEASE-GATES.md:\n")

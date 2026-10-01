@@ -17,6 +17,7 @@ Run: python3 tests/gate_status_drift.py
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -207,6 +208,62 @@ def main() -> int:
             "a README row with no count is ignored rather than failed",
             code == 0,
             out.strip() or "(no output)",
+        )
+    )
+
+
+    # The console-surface check reads real files, not the table, so it cannot
+    # be driven by a synthetic table the way the others are. It is exercised
+    # directly against a temp tree instead — and both directions matter: a
+    # clean tree must produce no failure (otherwise the gate is noise), and a
+    # tree with a remote origin must produce one that names the file (otherwise
+    # the gate is decoration).
+    def _console_case(leak: str) -> tuple[bool, str]:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("guard", GUARD)
+        guard = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(guard)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "apps/desktop/ui").mkdir(parents=True)
+            (root / "apps/desktop/tauri.conf.json").write_text(
+                json.dumps({
+                    "app": {"security": {
+                        "csp": "default-src 'self'; script-src 'self'; "
+                               "connect-src 'self'; object-src 'none'",
+                        "assetProtocol": {"enable": False, "scope": []},
+                    }},
+                }),
+                encoding="utf-8",
+            )
+            (root / "apps/desktop/ui/app.css").write_text(leak, encoding="utf-8")
+            original = guard.REPO
+            guard.REPO = root
+            try:
+                failures: list[str] = []
+                guard.check_console_surface("R12", "pass", failures)
+            finally:
+                guard.REPO = original
+            return bool(failures), "; ".join(failures)
+
+    ok, detail = _console_case("/* local only, no remote font */")
+    results.append(
+        (
+            "a console front-end with no remote origin passes the R12 check",
+            not ok,
+            detail,
+        )
+    )
+
+    ok, detail = _console_case('@import url("https://fonts.googleapis.com/x");')
+    results.append(
+        (
+            "a remote origin in the front-end fails the R12 check and is named",
+            ok and "app.css" in detail,
+            detail,
         )
     )
 
