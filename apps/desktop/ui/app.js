@@ -34,14 +34,20 @@ function setText(node, text) {
  * function only builds what it is told to build.
  */
 function renderActions(cell, item) {
+  // These are the *wire* values. `Exportability` carries
+  // `#[serde(rename_all = "snake_case")]`, so the broker sends
+  // `human_only`, not `HumanOnly`. Comparing against the Rust spelling was a
+  // silent failure: neither branch matched, no button was built, and a
+  // HumanOnly credential looked exactly like a NonExportable one. The
+  // WebView probe found it by counting buttons, not by reading this comment.
   const permitted =
-    item.exportability === "HumanOnly" || item.exportability === "Exportable";
+    item.exportability === "human_only" || item.exportability === "exportable";
 
   if (!permitted) {
     setText(cell, "—");
     return;
   }
-  if (item.exportability === "HumanOnly") {
+  if (item.exportability === "human_only") {
     const button = document.createElement("button");
     button.type = "button";
     setText(button, "Reveal…");
