@@ -3,16 +3,21 @@
 //!
 //! A surrogate is a bearer-shaped string that stands in for a `CredentialId`
 //! on the wire. The agent can present it; the broker decides whether it means
-//! anything. Three properties carry the whole design, and each one is a
+//! anything. Four properties carry the whole design, and each one is a
 //! response to a specific way this goes wrong:
 //!
 //! 1. **Session-bound.** A surrogate is only ever looked up through the
 //!    session that minted it, so a token stolen from one agent is useless to
 //!    another even if the process is the same.
-//! 2. **Bounded in time and in uses.** A surrogate with an unbounded lifetime
+//! 2. **Class-bound.** The record remembers what *kind* of credential it
+//!    stands for, and redemption asks what kind of operation it is being
+//!    spent on. A token minted from a database password cannot back a GitHub
+//!    call. This is ADR-0011's `audience-bound`, which the registry
+//!    documented for a long time and did not implement (H2).
+//! 3. **Bounded in time and in uses.** A surrogate with an unbounded lifetime
 //!    or use count is a permanent credential with extra steps, which is the
 //!    shape ADR-0011 exists to prevent.
-//! 3. **Compared in constant time.** A byte-by-byte `==` on a token leaks its
+//! 4. **Compared in constant time.** A byte-by-byte `==` on a token leaks its
 //!    prefix to an attacker who can time the rejection, which is enough to
 //!    forge one token from guesses about another.
 //!
@@ -22,7 +27,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use asv_domain::{AgentSessionId, CredentialId};
+use asv_domain::{AgentSessionId, CredentialClass, CredentialId, OperationFamily};
 use rand::RngCore;
 use subtle::ConstantTimeEq;
 
@@ -46,6 +51,15 @@ struct SurrogateRecord {
     session: AgentSessionId,
     /// What the surrogate stands in for. Never the secret.
     credential: CredentialId,
+    /// The class of thing `credential` is, so the token can be refused for an
+    /// operation it is the wrong shape for.
+    ///
+    /// This is the `audience-bound` property ADR-0011 promises. Before it
+    /// existed, a surrogate minted from a database password redeemed happily
+    /// against `ReadIssue` and the broker dialled GitHub with it (H2).
+    /// It is a *type* bound rather than a policy decision, which is why it
+    /// costs a comparison and not a Cedar evaluation.
+    class: CredentialClass,
     /// Absolute expiry as a UNIX timestamp in seconds. Absolute rather than a
     /// deadline computed at mint time, so the record is self-describing and a
     /// clock change cannot silently extend or collapse a window.
@@ -72,6 +86,9 @@ pub enum SurrogateError {
 
     #[error("surrogate was minted for a different session")]
     WrongSession,
+
+    #[error("surrogate stands for a credential of the wrong class for this operation")]
+    WrongClass,
 }
 
 /// The broker-side surrogate table.
@@ -100,10 +117,17 @@ impl SurrogateRegistry {
     /// limits would make every bound on this token advisory. A request for
     /// zero uses mints nothing usable, so it is clamped up to one rather than
     /// producing a token that always fails and looks like a bug.
+    ///
+    /// `class` is recorded rather than derived here, because the registry has
+    /// no vault and cannot know what a `CredentialId` is. The caller resolves
+    /// it from the credential's metadata; making it a parameter keeps this
+    /// module free of the vault and keeps the decision visible at the one
+    /// place that has the facts.
     pub fn mint(
         &mut self,
         session: AgentSessionId,
         credential: CredentialId,
+        class: CredentialClass,
         ttl_secs: u64,
         max_uses: u32,
         now: u64,
@@ -118,6 +142,7 @@ impl SurrogateRegistry {
             SurrogateRecord {
                 session,
                 credential,
+                class,
                 expires_at,
                 remaining_uses: uses,
             },
@@ -126,16 +151,23 @@ impl SurrogateRegistry {
     }
 
     /// Resolves a presented token to the credential it stands for, consuming
-    /// one use.
+    /// one use, and refuses it if the credential is the wrong class for
+    /// `required`.
     ///
     /// Order matters and is deliberate: the token is matched, then the session
-    /// is checked, then expiry, then the budget. A record that is both expired
-    /// and out of uses reports as expired, because the shorter-lived failure is
-    /// the more informative one for an operator reading the log.
-    pub fn redeem(
+    /// is checked, then the class, then expiry, then the budget. A record that
+    /// is both expired and out of uses reports as expired, because the
+    /// shorter-lived failure is the more informative one for an operator
+    /// reading the log.
+    ///
+    /// The class check sits *before* the use is consumed, so a token cannot be
+    /// spent by presenting it at the wrong kind of operation and then run out
+    /// of budget on the operation it was actually minted for.
+    pub fn redeem_for(
         &mut self,
         presented: &str,
         session: AgentSessionId,
+        required: OperationFamily,
         now: u64,
     ) -> Result<CredentialId, SurrogateError> {
         let Some(index) = self.constant_time_lookup(presented) else {
@@ -149,6 +181,13 @@ impl SurrogateRegistry {
         // constant time above.
         if record.session != session {
             return Err(SurrogateError::WrongSession);
+        }
+        // Also not attacker-chosen: the class was resolved from the vault at
+        // mint time and the family is the handler's own constant. The only
+        // attacker-chosen input in this function is `presented`, compared in
+        // constant time above.
+        if !record.class.backs(required) {
+            return Err(SurrogateError::WrongClass);
         }
         if now >= record.expires_at {
             return Err(SurrogateError::Expired);
@@ -324,7 +363,7 @@ mod tests {
         let session = session();
         let credential = credential();
         let (token, _, _) = SurrogateRegistry::new()
-            .mint(session, credential, 60, 3, T0)
+            .mint(session, credential, CredentialClass::Generic, 60, 3, T0)
             .expect("mint succeeds");
         (token, credential)
     }
@@ -352,10 +391,10 @@ mod tests {
     fn two_mints_produce_different_tokens() {
         let mut registry = SurrogateRegistry::new();
         let (first, _, _) = registry
-            .mint(session(), credential(), 60, 1, T0)
+            .mint(session(), credential(), CredentialClass::Generic, 60, 1, T0)
             .expect("mint");
         let (second, _, _) = registry
-            .mint(session(), credential(), 60, 1, T0)
+            .mint(session(), credential(), CredentialClass::Generic, 60, 1, T0)
             .expect("mint");
         assert_ne!(first, second);
     }
@@ -367,18 +406,20 @@ mod tests {
         let session = session();
         let credential = credential();
         let mut registry = SurrogateRegistry::new();
-        let (token, _, uses) = registry.mint(session, credential, 60, 3, T0).expect("mint");
+        let (token, _, uses) = registry
+            .mint(session, credential, CredentialClass::Generic, 60, 3, T0)
+            .expect("mint");
         assert_eq!(uses, 3);
 
         for _ in 0..3 {
             assert_eq!(
-                registry.redeem(&token, session, T0 + 1),
+                registry.redeem_for(&token, session, OperationFamily::GitHub, T0 + 1),
                 Ok(credential),
                 "a use within budget must redeem"
             );
         }
         assert_eq!(
-            registry.redeem(&token, session, T0 + 1),
+            registry.redeem_for(&token, session, OperationFamily::GitHub, T0 + 1),
             Err(SurrogateError::Exhausted),
             "the fourth attempt must be refused"
         );
@@ -391,13 +432,18 @@ mod tests {
         let session = session();
         let credential = credential();
         let mut registry = SurrogateRegistry::new();
-        let (token, _, _) = registry.mint(session, credential, 60, 1, T0).expect("mint");
+        let (token, _, _) = registry
+            .mint(session, credential, CredentialClass::Generic, 60, 1, T0)
+            .expect("mint");
 
         // The legitimate use succeeds.
-        assert_eq!(registry.redeem(&token, session, T0), Ok(credential));
+        assert_eq!(
+            registry.redeem_for(&token, session, OperationFamily::GitHub, T0),
+            Ok(credential)
+        );
         // An attacker replaying the same captured token does not.
         assert_eq!(
-            registry.redeem(&token, session, T0),
+            registry.redeem_for(&token, session, OperationFamily::GitHub, T0),
             Err(SurrogateError::Exhausted)
         );
     }
@@ -410,15 +456,17 @@ mod tests {
         let session = session();
         let mut registry = SurrogateRegistry::new();
         let (token, _, _) = registry
-            .mint(session, credential(), 60, 5, T0)
+            .mint(session, credential(), CredentialClass::Generic, 60, 5, T0)
             .expect("mint");
 
         assert!(
-            registry.redeem(&token, session, T0 + 59).is_ok(),
+            registry
+                .redeem_for(&token, session, OperationFamily::GitHub, T0 + 59)
+                .is_ok(),
             "one second early"
         );
         assert_eq!(
-            registry.redeem(&token, session, T0 + 60),
+            registry.redeem_for(&token, session, OperationFamily::GitHub, T0 + 60),
             Err(SurrogateError::Expired),
             "at the boundary the token must be dead"
         );
@@ -431,7 +479,14 @@ mod tests {
         let session = session();
         let mut registry = SurrogateRegistry::new();
         let (token, expires_at, _) = registry
-            .mint(session, credential(), u64::MAX, 1, T0)
+            .mint(
+                session,
+                credential(),
+                CredentialClass::Generic,
+                u64::MAX,
+                1,
+                T0,
+            )
             .expect("mint");
         assert_eq!(
             expires_at,
@@ -440,10 +495,20 @@ mod tests {
         );
         // Alive one second before the cap, dead exactly at it.
         assert!(registry
-            .redeem(&token, session, T0 + MAX_SURROGATE_TTL_SECS - 1)
+            .redeem_for(
+                &token,
+                session,
+                OperationFamily::GitHub,
+                T0 + MAX_SURROGATE_TTL_SECS - 1
+            )
             .is_ok());
         assert_eq!(
-            registry.redeem(&token, session, T0 + MAX_SURROGATE_TTL_SECS),
+            registry.redeem_for(
+                &token,
+                session,
+                OperationFamily::GitHub,
+                T0 + MAX_SURROGATE_TTL_SECS
+            ),
             Err(SurrogateError::Expired),
             "the cap is a boundary, not a suggestion"
         );
@@ -456,7 +521,14 @@ mod tests {
         let session = session();
         let mut registry = SurrogateRegistry::new();
         let (token, _, reported) = registry
-            .mint(session, credential(), 60, u32::MAX, T0)
+            .mint(
+                session,
+                credential(),
+                CredentialClass::Generic,
+                60,
+                u32::MAX,
+                T0,
+            )
             .expect("mint");
         assert_eq!(
             reported, MAX_SURROGATE_USES,
@@ -468,12 +540,14 @@ mod tests {
         // assertion on the return value alone.
         for attempt in 0..MAX_SURROGATE_USES {
             assert!(
-                registry.redeem(&token, session, T0).is_ok(),
+                registry
+                    .redeem_for(&token, session, OperationFamily::GitHub, T0)
+                    .is_ok(),
                 "use {attempt} is within the clamped budget"
             );
         }
         assert_eq!(
-            registry.redeem(&token, session, T0),
+            registry.redeem_for(&token, session, OperationFamily::GitHub, T0),
             Err(SurrogateError::Exhausted),
             "the budget is the cap, not the request"
         );
@@ -486,9 +560,14 @@ mod tests {
         let session = session();
         let credential = credential();
         let mut registry = SurrogateRegistry::new();
-        let (token, _, uses) = registry.mint(session, credential, 0, 0, T0).expect("mint");
+        let (token, _, uses) = registry
+            .mint(session, credential, CredentialClass::Generic, 0, 0, T0)
+            .expect("mint");
         assert_eq!(uses, 1);
-        assert_eq!(registry.redeem(&token, session, T0), Ok(credential));
+        assert_eq!(
+            registry.redeem_for(&token, session, OperationFamily::GitHub, T0),
+            Ok(credential)
+        );
     }
 
     /// A token minted for one session must not work under another, even from
@@ -497,15 +576,19 @@ mod tests {
     fn a_surrogate_is_bound_to_its_minting_session() {
         let owner = session();
         let mut registry = SurrogateRegistry::new();
-        let (token, _, _) = registry.mint(owner, credential(), 60, 5, T0).expect("mint");
+        let (token, _, _) = registry
+            .mint(owner, credential(), CredentialClass::Generic, 60, 5, T0)
+            .expect("mint");
 
         assert_eq!(
-            registry.redeem(&token, session(), T0),
+            registry.redeem_for(&token, session(), OperationFamily::GitHub, T0),
             Err(SurrogateError::WrongSession),
             "another session must not redeem a valid token"
         );
         assert!(
-            registry.redeem(&token, owner, T0).is_ok(),
+            registry
+                .redeem_for(&token, owner, OperationFamily::GitHub, T0)
+                .is_ok(),
             "the owner still can"
         );
     }
@@ -517,7 +600,7 @@ mod tests {
     fn an_unknown_token_is_refused_without_detail() {
         let mut registry = SurrogateRegistry::new();
         registry
-            .mint(session(), credential(), 60, 1, T0)
+            .mint(session(), credential(), CredentialClass::Generic, 60, 1, T0)
             .expect("mint");
         for guess in [
             "asv1_not-a-real-token",
@@ -527,7 +610,7 @@ mod tests {
             "ASV1_CASE_MISMATCH",
         ] {
             assert_eq!(
-                registry.redeem(guess, session(), T0),
+                registry.redeem_for(guess, session(), OperationFamily::GitHub, T0),
                 Err(SurrogateError::Unknown),
                 "{guess} must be refused as unknown"
             );
@@ -544,15 +627,21 @@ mod tests {
         let first = session();
         let second = session();
         let mut registry = SurrogateRegistry::new();
-        let (first_token, _, _) = registry.mint(first, doomed, 60, 5, T0).expect("mint");
-        let (second_token, _, _) = registry.mint(second, doomed, 60, 5, T0).expect("mint");
-        let (bystander_token, _, _) = registry.mint(first, bystander, 60, 5, T0).expect("mint");
+        let (first_token, _, _) = registry
+            .mint(first, doomed, CredentialClass::Generic, 60, 5, T0)
+            .expect("mint");
+        let (second_token, _, _) = registry
+            .mint(second, doomed, CredentialClass::Generic, 60, 5, T0)
+            .expect("mint");
+        let (bystander_token, _, _) = registry
+            .mint(first, bystander, CredentialClass::Generic, 60, 5, T0)
+            .expect("mint");
 
         assert_eq!(registry.revoke_credential(doomed), 2, "both went");
 
         for token in [&first_token, &second_token] {
             assert_eq!(
-                registry.redeem(token, first, T0),
+                registry.redeem_for(token, first, OperationFamily::GitHub, T0),
                 Err(SurrogateError::Unknown),
                 "a token for a revoked credential must not redeem"
             );
@@ -562,7 +651,7 @@ mod tests {
         // denial of service against every other credential.
         assert_eq!(registry.len(), 1);
         assert_eq!(
-            registry.redeem(&bystander_token, first, T0),
+            registry.redeem_for(&bystander_token, first, OperationFamily::GitHub, T0),
             Ok(bystander),
             "an unrelated credential's token must survive"
         );
@@ -577,12 +666,14 @@ mod tests {
         let doomed = credential();
         let holder = session();
         let mut registry = SurrogateRegistry::new();
-        let (token, _, _) = registry.mint(holder, doomed, 60, 5, T0).expect("mint");
+        let (token, _, _) = registry
+            .mint(holder, doomed, CredentialClass::Generic, 60, 5, T0)
+            .expect("mint");
 
         // The "revoker" is a different session entirely, and still takes it.
         assert_eq!(registry.revoke_credential(doomed), 1);
         assert_eq!(
-            registry.redeem(&token, holder, T0),
+            registry.redeem_for(&token, holder, OperationFamily::GitHub, T0),
             Err(SurrogateError::Unknown)
         );
     }
@@ -594,14 +685,16 @@ mod tests {
         let held = credential();
         let holder = session();
         let mut registry = SurrogateRegistry::new();
-        let (token, _, _) = registry.mint(holder, held, 60, 5, T0).expect("mint");
+        let (token, _, _) = registry
+            .mint(holder, held, CredentialClass::Generic, 60, 5, T0)
+            .expect("mint");
 
         assert_eq!(registry.revoke_credential(credential()), 0);
         assert_eq!(registry.len(), 1, "the unrelated token is still there");
         // Redeemed under its *own* session, so this asserts the token still
         // works rather than the much weaker "it is not gone".
         assert_eq!(
-            registry.redeem(&token, holder, T0),
+            registry.redeem_for(&token, holder, OperationFamily::GitHub, T0),
             Ok(held),
             "an unrelated token must keep working"
         );
@@ -616,21 +709,23 @@ mod tests {
         let mut registry = SurrogateRegistry::new();
         let (doomed_token, _) = {
             let (token, _, _) = registry
-                .mint(doomed, credential(), 60, 5, T0)
+                .mint(doomed, credential(), CredentialClass::Generic, 60, 5, T0)
                 .expect("mint");
             (token, ())
         };
         let (survivor_token, _, _) = registry
-            .mint(survivor, credential(), 60, 5, T0)
+            .mint(survivor, credential(), CredentialClass::Generic, 60, 5, T0)
             .expect("mint");
 
         assert_eq!(registry.revoke_session(doomed), 1, "one token revoked");
         assert_eq!(registry.len(), 1, "the other session's token survives");
         assert_eq!(
-            registry.redeem(&doomed_token, doomed, T0),
+            registry.redeem_for(&doomed_token, doomed, OperationFamily::GitHub, T0),
             Err(SurrogateError::Unknown)
         );
-        assert!(registry.redeem(&survivor_token, survivor, T0).is_ok());
+        assert!(registry
+            .redeem_for(&survivor_token, survivor, OperationFamily::GitHub, T0)
+            .is_ok());
     }
 
     /// Revoke is session-scoped, so one session cannot destroy another's token.
@@ -639,7 +734,9 @@ mod tests {
     fn one_session_cannot_revoke_another_sessions_token() {
         let owner = session();
         let mut registry = SurrogateRegistry::new();
-        let (token, _, _) = registry.mint(owner, credential(), 60, 5, T0).expect("mint");
+        let (token, _, _) = registry
+            .mint(owner, credential(), CredentialClass::Generic, 60, 5, T0)
+            .expect("mint");
 
         assert!(
             !registry.revoke(&token, session()),
@@ -647,7 +744,9 @@ mod tests {
         );
         assert_eq!(registry.len(), 1, "the token is still there");
         assert!(
-            registry.redeem(&token, owner, T0).is_ok(),
+            registry
+                .redeem_for(&token, owner, OperationFamily::GitHub, T0)
+                .is_ok(),
             "and still works"
         );
         assert!(registry.revoke(&token, owner), "the owner can");
@@ -660,19 +759,21 @@ mod tests {
         let session = session();
         let mut registry = SurrogateRegistry::new();
         let (stale, _, _) = registry
-            .mint(session, credential(), 10, 5, T0)
+            .mint(session, credential(), CredentialClass::Generic, 10, 5, T0)
             .expect("mint");
         let (fresh, _, _) = registry
-            .mint(session, credential(), 600, 5, T0)
+            .mint(session, credential(), CredentialClass::Generic, 600, 5, T0)
             .expect("mint");
 
         assert_eq!(registry.sweep(T0 + 100), 1, "one record went");
         assert_eq!(registry.len(), 1);
         assert_eq!(
-            registry.redeem(&stale, session, T0 + 100),
+            registry.redeem_for(&stale, session, OperationFamily::GitHub, T0 + 100),
             Err(SurrogateError::Unknown)
         );
-        assert!(registry.redeem(&fresh, session, T0 + 100).is_ok());
+        assert!(registry
+            .redeem_for(&fresh, session, OperationFamily::GitHub, T0 + 100)
+            .is_ok());
     }
 
     /// A registry reports empty when nothing is live. UAT-030 asserts this

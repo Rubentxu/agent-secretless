@@ -311,6 +311,81 @@ pub enum CredentialKind {
     GenericSecret,
 }
 
+/// Which family of brokered operation a credential may back.
+///
+/// Coarser than [`CredentialKind`] on purpose, and deliberately so. A
+/// [`CredentialKind::GenericSecret`] or [`CredentialKind::BearerToken`] does
+/// not say what the secret is *for* — a GitHub PAT and an arbitrary API key
+/// have the same shape — so pretending to tell them apart would be a guess
+/// with security consequences. [`CredentialClass::Generic`] says "the shape
+/// does not constrain this", and the policy decides what is allowed.
+///
+/// [`CredentialClass::Database`] is the case where the shape genuinely does
+/// constrain the answer. A database password can only ever authenticate
+/// against a database, so letting one back a GitHub call is a type error, not
+/// a judgement call, and is refused as one (H2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialClass {
+    /// The secret's shape places no constraint on the operation it may back.
+    Generic,
+    /// A secret whose shape admits exactly one family: database operations.
+    Database,
+}
+
+impl CredentialClass {
+    /// Derives the class from the credential's kind.
+    ///
+    /// Total by construction: every `CredentialKind` maps somewhere, so adding
+    /// a kind is a compile error here rather than a silent fallthrough to a
+    /// permissive class at some call site.
+    pub fn from_kind(kind: CredentialKind) -> Self {
+        match kind {
+            // `UsernamePassword` is a database login, not an SSH or HTTP
+            // identity: the broker hands it to `PostgresClient` and to
+            // nothing else.
+            CredentialKind::DatabaseCredential | CredentialKind::UsernamePassword => Self::Database,
+            CredentialKind::ApiKey
+            | CredentialKind::BearerToken
+            | CredentialKind::OAuth2
+            | CredentialKind::SshPrivateKey
+            | CredentialKind::X509ClientIdentity
+            | CredentialKind::AwsAccessKey
+            | CredentialKind::GenericSecret => Self::Generic,
+        }
+    }
+
+    /// Whether a credential of this class may back `family`.
+    ///
+    /// `Generic` backs everything; every other class backs exactly its own
+    /// family. Written as an explicit table rather than a `matches!` on
+    /// equality so that the denying arm is visible in the source: a reader
+    /// must be able to see that `Database` on `GitHub` is `false` by
+    /// construction, not by accident of how the enum was written.
+    pub fn backs(&self, family: OperationFamily) -> bool {
+        match (self, family) {
+            (Self::Generic, _) => true,
+            (Self::Database, OperationFamily::Database) => true,
+            (Self::Database, OperationFamily::GitHub) => false,
+        }
+    }
+}
+
+/// A family of brokered operations, used to ask what a surrogate may back.
+///
+/// Coarser than [`Action`] because the question being asked is not "is this
+/// exact verb allowed" — the policy answers that — but "is this token even the
+/// right *shape* for this operation", which is answered before any policy is
+/// consulted and costs a comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationFamily {
+    /// `ReadIssue`, `CreateIssue`, `CreateRelease`.
+    GitHub,
+    /// `PostgresConnect`, `PostgresQuery`.
+    Database,
+}
+
 /// Whether a human may ever obtain the raw value (FR-002).
 ///
 /// `NonExportable` is the default and the one agents should get. The agent

@@ -7,7 +7,10 @@
 
 use asv_connector_http::{validate_repo, AddressPolicy, GithubClient, GithubError, SecretPort};
 use asv_connector_pg::{LiveConnectorConfig, PgError, PostgresClient, TlsRoots};
-use asv_domain::{AgentSessionId, Authority, CredentialId, CredentialMetadata, Decision, Resource};
+use asv_domain::{
+    Action, AgentSessionId, Authority, CredentialClass, CredentialId, CredentialMetadata, Decision,
+    OperationFamily, Resource,
+};
 use asv_identity::WorkloadIdentity;
 use asv_ipc_protocol::{AuditEventDto, ErrorCode, Request, Response, PROTOCOL_VERSION};
 use asv_policy::{AuthorizationRequest, PolicyContext, PolicyEngine};
@@ -811,18 +814,38 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                     message: "surrogate minting requires a pidfd-pinned session".into(),
                 };
             }
-            if !state.credentials.iter().any(|c| c.id == credential) {
+            // The class is resolved from the credential's own metadata rather
+            // than from `provider`, which is a free-form string: `uat_027`
+            // stores `"o/r"` there. `CredentialKind` is a closed enum, and the
+            // lookup was happening anyway, so the class is free.
+            let Some(metadata) = state.credentials.iter().find(|c| c.id == credential) else {
                 // An unknown credential would mint a token that always fails
                 // later. Refusing here reports the real problem instead.
                 return Response::Error {
                     code: ErrorCode::InvalidRequest,
                     message: "credential is not available".into(),
                 };
+            };
+            let class = CredentialClass::from_kind(metadata.kind);
+
+            // H2: the policy is consulted *here*, once, at issuance — not on
+            // every operation. Before this, the GitHub path consulted nothing,
+            // so an operator who tightened `POLICY_TEXT` observed no change
+            // at all; the enforcement point did not exist.
+            //
+            // Mint is the right place because a surrogate *is* a capability:
+            // authorization belongs where the capability is created, and the
+            // created record is what redemption checks. It is also the only
+            // place it is affordable — `uat_030_perf` times 100 `ReadIssue`
+            // calls, so a per-operation Cedar evaluation lands inside the
+            // measured loop, while a mint happens once in fixture setup.
+            if let Err(response) = state.authorize_surrogate_mint(session, peer, class) {
+                return *response;
             }
 
             match state
                 .surrogates
-                .mint(session, credential, ttl_secs, max_uses, now_secs())
+                .mint(session, credential, class, ttl_secs, max_uses, now_secs())
             {
                 Ok((surrogate, expires_at, granted)) => {
                     // The token is never logged. Only its budget and its
@@ -912,7 +935,12 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                     message: error.to_string(),
                 };
             }
-            match state.surrogates.redeem(&surrogate, session, now_secs()) {
+            match state.surrogates.redeem_for(
+                &surrogate,
+                session,
+                OperationFamily::GitHub,
+                now_secs(),
+            ) {
                 Ok(credential) => {
                     let client = match state.github_client() {
                         Ok(client) => client,
@@ -951,7 +979,12 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                     message: error.to_string(),
                 };
             }
-            match state.surrogates.redeem(&surrogate, session, now_secs()) {
+            match state.surrogates.redeem_for(
+                &surrogate,
+                session,
+                OperationFamily::GitHub,
+                now_secs(),
+            ) {
                 Ok(credential) => {
                     let client = match state.github_client() {
                         Ok(client) => client,
@@ -986,7 +1019,12 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                     message: error.to_string(),
                 };
             }
-            match state.surrogates.redeem(&surrogate, session, now_secs()) {
+            match state.surrogates.redeem_for(
+                &surrogate,
+                session,
+                OperationFamily::GitHub,
+                now_secs(),
+            ) {
                 Ok(credential) => {
                     let client = match state.github_client() {
                         Ok(client) => client,
@@ -1059,6 +1097,89 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
 const GITHUB_AUTHORITY: &str = "api.github.com";
 
 impl BrokerState {
+    /// The one policy consultation on the surrogate path, performed at mint
+    /// time rather than at every operation (H2).
+    ///
+    /// The class picks the action and resource that get evaluated. A database
+    /// class is asked about the database read verb; anything else is asked
+    /// about the GitHub read verb, because the credential's shape is the only
+    /// signal available and the policy is what actually decides.
+    ///
+    /// The read verb is used as the representative in both cases on purpose.
+    /// Minting does not commit the holder to a specific verb, and asking the
+    /// policy about the narrowest one would refuse a token that is perfectly
+    /// usable for a broader one it is also permitted to do. The per-verb
+    /// decisions still happen at the operation itself, where the verb is
+    /// known exactly.
+    fn authorize_surrogate_mint(
+        &self,
+        session: AgentSessionId,
+        peer: &WorkloadIdentity,
+        class: CredentialClass,
+    ) -> Result<(), Box<Response>> {
+        let (action, resource) = match class {
+            CredentialClass::Database => (
+                Action::PostgresRead,
+                Resource::Database {
+                    name: String::new(),
+                    role: String::new(),
+                },
+            ),
+            // The audience is the compile-time allowlist constant, not
+            // anything the caller supplied: `ALLOWED_AUDIENCES` in the policy
+            // crate is what makes a GitHub call reachable at all, and a
+            // policy that could widen it from a mint request would reopen the
+            // hole this closes.
+            CredentialClass::Generic => (
+                Action::GitHubIssueRead,
+                Resource::Api {
+                    audience: Authority::canonicalize(GITHUB_AUTHORITY).map_err(|error| {
+                        Box::new(Response::Error {
+                            code: ErrorCode::Denied,
+                            message: format!("github audience is not canonical: {error}"),
+                        })
+                    })?,
+                },
+            ),
+        };
+
+        let workspace = self
+            .sessions
+            .workspace_of(session)
+            .unwrap_or_default()
+            .to_string();
+        // Formatted before `action` is moved into the request below, so the
+        // denial message can still name the verb it is about.
+        let verb = action.to_string();
+        let request = AuthorizationRequest {
+            session,
+            action,
+            resource,
+            context: PolicyContext {
+                workspace,
+                protected_ref: None,
+                request_digest: None,
+                peer_uid: peer.credentials.uid,
+            },
+        };
+        match self.policy.authorize(&request, None, None).decision {
+            Decision::Allow => Ok(()),
+            // Cedar's reason, verbatim, for the same reason
+            // `authorize_postgres_statement` forwards it: a policy author
+            // debugging a denial needs to know which clause fired.
+            Decision::Deny { reason } => Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: format!("policy denied minting a surrogate for {verb}: {reason}"),
+            })),
+            Decision::RequireApproval { approval } => Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: format!(
+                    "policy requires approval {approval} to mint a surrogate for {verb}"
+                ),
+            })),
+        }
+    }
+
     /// The checks every brokered GitHub operation shares, before anything is
     /// spent or sent.
     ///
@@ -1413,10 +1534,15 @@ fn pg_failure(error: PgSessionError) -> Response {
 /// `Expired` and `Exhausted` are separate codes: one says "mint a new token",
 /// the other says "you spent it, mint a new token", and an operator reading a
 /// log needs to tell them apart.
+///
+/// `WrongClass` is `Denied` and not `InvalidRequest` for the same reason
+/// `WrongSession` is: the request was well-formed and the token was real, so
+/// telling the agent to rephrase it would be advice no phrasing can satisfy
+/// (H2).
 fn surrogate_failure(error: SurrogateError) -> Response {
     use SurrogateError::*;
     let code = match error {
-        Unknown | WrongSession => ErrorCode::Denied,
+        Unknown | WrongSession | WrongClass => ErrorCode::Denied,
         Expired => ErrorCode::SurrogateExpired,
         Exhausted => ErrorCode::SurrogateExhausted,
     };
@@ -2157,7 +2283,7 @@ mod tests {
         let (surrogate, _) = {
             let (token, _, _) = state
                 .surrogates
-                .mint(session, ghost, 60, 2, now_secs())
+                .mint(session, ghost, CredentialClass::Generic, 60, 2, now_secs())
                 .expect("mint");
             (token, ())
         };
@@ -2181,7 +2307,9 @@ mod tests {
             "a write that never happened must not revoke a live token"
         );
         assert_eq!(
-            state.surrogates.redeem(&surrogate, session, now_secs()),
+            state
+                .surrogates
+                .redeem_for(&surrogate, session, OperationFamily::GitHub, now_secs()),
             Ok(ghost),
             "the token must still work: nothing was actually revoked"
         );
@@ -2203,7 +2331,7 @@ mod tests {
         let session = state.sessions.create("/repo".to_string(), &peer);
         let (surrogate, _, _) = state
             .surrogates
-            .mint(session, id, 60, 5, now_secs())
+            .mint(session, id, CredentialClass::Generic, 60, 5, now_secs())
             .expect("mint");
         assert_eq!(state.surrogates.len(), 1, "the token is live before");
 
@@ -2241,7 +2369,9 @@ mod tests {
             "the registry still reports a token for a credential that is gone"
         );
         assert_eq!(
-            state.surrogates.redeem(&surrogate, session, now_secs()),
+            state
+                .surrogates
+                .redeem_for(&surrogate, session, OperationFamily::GitHub, now_secs()),
             Err(SurrogateError::Unknown)
         );
     }
