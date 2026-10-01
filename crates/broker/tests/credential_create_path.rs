@@ -368,15 +368,23 @@ fn the_secret_wrapper_exposes_only_through_the_named_read_path() {
 }
 
 // --------------------------------------------------------------------------
-// The kind vocabulary: fail closed rather than mislabel
+// The kind vocabulary: a label beside the storage class
 // --------------------------------------------------------------------------
 
-/// Four of the domain's nine kinds have no vault counterpart. Storing them as
-/// `Opaque` would report them back as `GenericSecret` — a credential the
-/// operator did not ask for, under a name they did not choose.
+/// The four kinds the vault has no storage class for are now stored — and they
+/// must come back as themselves.
+///
+/// This test used to assert the opposite, that they were refused. The refusal
+/// was correct then and it is gone now, and the reason it could go is the
+/// whole point: the record now carries the kind the operator named *beside*
+/// the storage class, so collapsing an `ApiKey` onto `BearerToken` no longer
+/// loses what the operator asked for. Without the label this assertion is
+/// exactly the silent mislabel the refusal existed to prevent, which is why
+/// the round trip is checked and not merely the acceptance.
 #[test]
-fn a_kind_the_vault_cannot_represent_is_refused() {
+fn a_kind_without_a_storage_class_is_stored_and_read_back_as_itself() {
     let mut b = Broker::new(true);
+    let mut planted = Vec::new();
     for kind in [
         CredentialKind::ApiKey,
         CredentialKind::OAuth2,
@@ -385,19 +393,35 @@ fn a_kind_the_vault_cannot_represent_is_refused() {
     ] {
         let response = asv_broker::handle(&mut b.state, &b.handle, create_request(kind));
         match response {
-            Response::Error { message, .. } => assert!(
-                message.contains("cannot represent"),
-                "{kind:?} was refused without saying why: {message}"
-            ),
-            other => panic!("{kind:?} was stored rather than refused: {other:?}"),
+            Response::CredentialCreated { id, .. } => planted.push((kind, id)),
+            other => panic!("{kind:?} was refused rather than stored: {other:?}"),
         }
     }
-    // One vault for all four, so a kind that slipped through would be caught
-    // by the count rather than by whichever iteration happened to run next.
-    assert!(
-        b.reopen().list().is_empty(),
-        "a refused kind left a record in the vault"
-    );
+
+    // Reopened from the file, by a fresh read of the vault rather than from
+    // the broker's in-memory list, so a label held only in memory cannot pass.
+    let reopened = b.reopen();
+    let listed = match asv_broker::handle(
+        &mut b.state,
+        &b.handle,
+        asv_ipc_protocol::Request::ListCredentialMetadata,
+    ) {
+        Response::CredentialMetadata { entries } => entries,
+        other => panic!("expected a listing, got {other:?}"),
+    };
+
+    for (kind, id) in planted {
+        let entry = listed
+            .iter()
+            .find(|e| e.id == *id.as_uuid())
+            .unwrap_or_else(|| panic!("{kind:?} was stored but is not listed"));
+        assert_eq!(
+            entry.kind, kind,
+            "{kind:?} came back as {:?} — the label did not survive the file",
+            entry.kind
+        );
+    }
+    assert_eq!(reopened.list().len(), 4, "every kind reached the file");
 }
 
 /// The five that do survive must come back as themselves, not as a neighbour.
