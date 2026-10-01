@@ -10,20 +10,27 @@
 //! - `TrustInjector` trait + `OpenSslEnvInjector` — trust-injection
 //!   adapter for OpenSSL/libcurl/Node.js-trust-store-legacy.
 //! - `Bridge` — the dispatcher skeleton that the runtime follows.
+//! - `Bridge::serve_connect` — the traffic path: authorise, terminate TLS with
+//!   a per-host leaf, relay to the upstream.
 //!
 //! Authoritative source:
 //!   `agent-secretless-vault-spec/docs/06-TRANSPARENT-BRIDGE-EBPF.md`
 //!   sections 5, 6 and 7.
 //!
-//! Still not here: the eBPF redirect that makes the bridge transparent, and
-//! the TLS acceptor that presents these leaves. Both need kernel privileges
-//! this environment does not have.
+//! Still not here: the eBPF redirect that makes the bridge transparent, and the
+//! substitution that turns the surrogate into a real credential upstream. The
+//! first needs kernel privileges this environment does not have; the second is
+//! the next increment, and its absence is why UAT-010 has no suite. The TLS
+//! acceptor is no longer absent: `serve_connect` terminates through it.
 
 use std::fmt;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use asv_domain::Authority;
+use asv_tls_acceptor::{handshake_once, LeafMaterial};
 use time::OffsetDateTime;
 
 /// Default TTL for a session CA: 8 hours.
@@ -104,6 +111,21 @@ pub enum BridgeError {
     /// Leaf issuance rejected.
     #[error(transparent)]
     Leaf(#[from] LeafError),
+    /// The client did not send a CONNECT request the bridge can serve.
+    #[error("malformed CONNECT request: {0}")]
+    Protocol(String),
+    /// No leaf was available for the requested host.
+    #[error("no leaf available for {0}")]
+    NoLeaf(String),
+    /// The upstream could not be resolved or reached.
+    #[error("upstream unavailable: {0}")]
+    Upstream(String),
+    /// The TLS handshake with the client failed.
+    #[error("client handshake failed: {0}")]
+    Handshake(String),
+    /// A socket operation failed.
+    #[error("bridge io: {0}")]
+    Io(String),
 }
 
 /// A canonicalized (host, port) endpoint. The M9 prototype defines
@@ -547,6 +569,189 @@ impl Bridge {
     /// Returns the number of endpoints in the CONNECT allow-list.
     pub fn allowed_count(&self) -> usize {
         self.policy.len()
+    }
+}
+
+/// A leaf the bridge is willing to present, bound to exactly one host.
+pub struct VerifiedLeaf {
+    certificate: LeafCertificate,
+    material: LeafMaterial,
+}
+
+impl VerifiedLeaf {
+    /// Pairs a minted leaf with the material that presents it.
+    ///
+    /// The chain is ordered `[end-entity, intermediate]`; that order is
+    /// load-bearing, and a client that cannot build a path reports it as a
+    /// trust failure indistinguishable from a missing intermediate.
+    pub fn from_certificate(
+        ca: &SessionCa,
+        certificate: LeafCertificate,
+    ) -> Result<Self, BridgeError> {
+        let material = LeafMaterial::new(
+            ca.root_der.clone(),
+            vec![certificate.leaf_der.clone(), ca.intermediate_der.clone()],
+            certificate.leaf_key.serialize_der(),
+        )
+        .map_err(|e| BridgeError::Handshake(e.to_string()))?;
+        Ok(Self {
+            certificate,
+            material,
+        })
+    }
+}
+
+/// Where the bridge gets per-session leaves from.
+///
+/// A trait rather than a field because `tls_bridge` must not depend on the
+/// vault (D2, enforced by a test): the broker holds the vault and implements
+/// this. The bridge only ever sees material it cannot mint.
+pub trait LeafSource {
+    /// Issues a leaf for exactly `host`, or refuses.
+    ///
+    /// `serve_connect` checks the returned leaf's host binding again. An
+    /// implementation that skips its own check does not weaken the bridge,
+    /// because the bridge does not take its word for it.
+    fn issue_for(&self, host: &str, now: Instant) -> Result<VerifiedLeaf, LeafError>;
+}
+
+/// Turns an authorised target into a socket address.
+///
+/// Also a trait, so a test can point at a loopback origin without DNS and the
+/// runtime can apply whatever address policy it already holds.
+pub trait UpstreamResolver {
+    /// The address to dial for `target`.
+    fn resolve(&self, target: &AuthorityEndpoint) -> Result<SocketAddr, BridgeError>;
+}
+
+/// A CONNECT that has been authorised, TLS-terminated and dialled.
+///
+/// Both halves are returned rather than relayed, because a duplex relay over
+/// one `StreamOwned` has no shape in this rustls version that does not
+/// deadlock. See [`Bridge::serve_connect`].
+#[derive(Debug)]
+pub struct EstablishedTunnel {
+    /// To the client, presenting the session leaf for `target`'s host.
+    pub client: rustls::StreamOwned<rustls::ServerConnection, TcpStream>,
+    /// To the upstream, already connected.
+    pub upstream: TcpStream,
+    /// The authorised target this tunnel is for.
+    pub target: AuthorityEndpoint,
+}
+
+/// Reads a CONNECT request head without reading past its terminator.
+///
+/// A `BufReader` would be the obvious way and it is wrong here: it may buffer
+/// past `\r\n\r\n` and swallow the first bytes of the client's TLS
+/// ClientHello, which then never reach the handshake. This reads one byte at a
+/// time and stops exactly at the terminator.
+fn read_connect_head(stream: &TcpStream) -> Result<String, BridgeError> {
+    const MAX_HEAD: usize = 8 * 1024;
+    let mut reader = stream;
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        reader
+            .read_exact(&mut byte)
+            .map_err(|e| BridgeError::Io(e.to_string()))?;
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            return String::from_utf8(head)
+                .map_err(|_| BridgeError::Protocol("non-UTF-8 head".into()));
+        }
+        if head.len() > MAX_HEAD {
+            return Err(BridgeError::Protocol("CONNECT head exceeds 8 KiB".into()));
+        }
+    }
+}
+
+/// Parses `CONNECT host:port HTTP/1.1`.
+fn parse_connect_target(head: &str) -> Result<AuthorityEndpoint, BridgeError> {
+    let request_line = head
+        .split("\r\n")
+        .next()
+        .ok_or_else(|| BridgeError::Protocol("empty request".into()))?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| BridgeError::Protocol("no method".into()))?;
+    if method != "CONNECT" {
+        return Err(BridgeError::Protocol(format!(
+            "method {method} is not CONNECT"
+        )));
+    }
+    let authority = parts
+        .next()
+        .ok_or_else(|| BridgeError::Protocol("no authority".into()))?;
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| BridgeError::Protocol(format!("{authority} has no port")))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| BridgeError::Protocol(format!("{authority} has a non-numeric port")))?;
+    let authority =
+        Authority::canonicalize(host).map_err(|e| BridgeError::Protocol(format!("{host}: {e}")))?;
+    AuthorityEndpoint::new(authority, port).map_err(|e| BridgeError::Protocol(e.to_string()))
+}
+
+impl Bridge {
+    /// Serves one CONNECT request on `client`, and returns the established
+    /// tunnel.
+    ///
+    /// The order of the operations is the specification, not a detail:
+    /// `handle_connect` authorises **before** the first socket is opened, so a
+    /// target outside the allow-list produces no upstream connection at all,
+    /// not a connection that failed to be authorised.
+    ///
+    /// Why this returns the pair instead of relaying it: a duplex relay over
+    /// one `StreamOwned` needs either `Arc<Mutex<..>>` — which deadlocks the
+    /// moment one direction blocks in a read while holding the lock — or a
+    /// connection API this version of rustls does not offer. Handing the
+    /// tunnel back keeps the security-relevant half here, where it can be
+    /// tested, and leaves the loop to a caller that knows the protocol it is
+    /// relaying.
+    ///
+    /// What this does not do is substitute the surrogate for a real credential
+    /// on the way upstream. The caller sees the decrypted bytes. That is why
+    /// UAT-010 still has no suite.
+    pub fn serve_connect(
+        &self,
+        client: TcpStream,
+        leaves: &dyn LeafSource,
+        upstream: &dyn UpstreamResolver,
+        now: Instant,
+    ) -> Result<EstablishedTunnel, BridgeError> {
+        let head = read_connect_head(&client)?;
+        let target = parse_connect_target(&head)?;
+
+        self.handle_connect(&target)?;
+
+        let mut ack = &client;
+        ack.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .map_err(|e| BridgeError::Io(e.to_string()))?;
+        ack.flush().map_err(|e| BridgeError::Io(e.to_string()))?;
+
+        let leaf = leaves
+            .issue_for(target.host(), now)
+            .map_err(BridgeError::Leaf)?;
+        leaf.certificate.verify_host_at(target.host(), now)?;
+
+        let config = leaf
+            .material
+            .server_config()
+            .map_err(|e| BridgeError::Handshake(e.to_string()))?;
+        let client =
+            handshake_once(client, &config).map_err(|e| BridgeError::Handshake(e.to_string()))?;
+
+        let addr = upstream.resolve(&target)?;
+        let upstream =
+            TcpStream::connect(addr).map_err(|e| BridgeError::Upstream(e.to_string()))?;
+
+        Ok(EstablishedTunnel {
+            client,
+            upstream,
+            target,
+        })
     }
 }
 

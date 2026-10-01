@@ -32,6 +32,14 @@ asv-connector-http.workspace = true
 # depend on the vault.
 asv-connector-pg.workspace = true
 asv-vault.workspace = true
+# M9: `Bridge::serve_connect` terminates TLS presenting a per-session leaf,
+# and `asv-tls-acceptor` is the crate that does the terminating. The
+# dependency runs broker -> acceptor. It does not invert D2: the acceptor
+# still has no vault, no CA key and no way to mint, so a cycle here could not
+# become a path from a connector to the vault even in principle.
+asv-tls-acceptor.workspace = true
+# See the workspace note: rustls is named in `EstablishedTunnel`'s signature.
+rustls.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

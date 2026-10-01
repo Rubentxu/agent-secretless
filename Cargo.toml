@@ -36,6 +36,11 @@ asv-connector-http = { path = "crates/connector-http" }
 asv-connector-pg = { path = "crates/connector-pg" }
 asv-ebpfd = { path = "crates/ebpfd" }
 asv-vault = { path = "crates/vault" }
+# M9: the CONNECT bridge terminates TLS with a per-session leaf, so the
+# broker is the first consumer of the acceptor. The direction is broker ->
+# acceptor, never the reverse: the acceptor still cannot reach a vault or a
+# key, which is the property its own crate boundary exists to hold.
+asv-tls-acceptor = { path = "crates/tls-acceptor" }
 # M9: the tls-acceptor integration tests need a real `SessionCa` to mint a real
 # leaf, and that type lives in the broker. Declared here so the acceptor crate
 # can name it as a path dependency; it is a dev-dependency there, so the
@@ -84,6 +89,16 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
 ] }
 url = "2"
+# M9: `EstablishedTunnel` names `StreamOwned<ServerConnection, TcpStream>` in
+# its public signature, so the broker has to name rustls types rather than hide
+# them behind a box.
+#
+# The features must match every other rustls in the workspace, for the reason
+# `asv-tls-acceptor` already documents: `rustls-tls` resolves to reqwest's
+# `__rustls-ring`, and a mismatch leaves rustls unable to choose a
+# CryptoProvider. It then panics at handshake time rather than failing the
+# build, so the two tests that actually shake a hand are what catch it.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 # M0 accepts a locked dependency set; versions are pinned after a compatibility
 # and advisory review per docs/17-IMPLEMENTATION-BOOTSTRAP.md section 8, which
