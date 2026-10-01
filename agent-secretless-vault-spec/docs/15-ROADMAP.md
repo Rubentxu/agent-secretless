@@ -331,6 +331,30 @@ Keep explicit proxy + service shims; eBPF remains egress/telemetry only.
 - UAT-010, 011, 012, 013,
 - TLS compatibility matrix published from tests.
 
+### The TLS compatibility matrix is published
+
+The second exit criterion is met as of 2026-10-01. The artefact is
+`docs/tls-compatibility-matrix.md`, and it is measured rather than asserted:
+each row names the test that produces it, and the rows that no test covers —
+cipher suites, key-exchange groups, signature algorithms, resumption,
+renegotiation — are published **as untested** rather than omitted.
+
+It is not `docs/12-COMPATIBILITY-MATRIX.md`. That document is a catalogue of
+which tools work with which mechanism; this one is measured protocol behaviour
+on the CONNECT path. Neither stands in for the other.
+
+The measurement found one property that was load-bearing and unwatched: the
+bridge selects no ALPN protocol, and it survives only because
+`LeafMaterial::server_config` never sets `alpn_protocols`. Adding that field —
+one line, and nothing about it reads as a security change — would make the
+bridge negotiate `h2` over a tunnel it does not parse and cannot relay. The
+matrix pins it with a test and records the falsification that proves the test
+can fail.
+
+This closes one exit criterion. It does not move UAT-010 on the CONNECT path,
+and it does not touch UAT-012/013, which are blocked by a measured `EPERM` on
+`BPF_MAP_CREATE`. **M9 remains open.**
+
 ### The substitution increment is separate, and blocked on identity
 
 Substitution on the CONNECT path is not part of what `serve_connect` delivered
