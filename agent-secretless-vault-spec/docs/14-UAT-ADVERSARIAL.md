@@ -82,15 +82,38 @@ Hostname transitions to unauthorized/private/attacker address after initial reso
 
 Expected: broker destination policy controls actual connection; no credential sent to an address outside allowed resolution policy.
 
-## UAT-010 — HTTP surrogate bridge
+## UAT-010 — surrogate substitution reaches the provider and the client never sees the secret
 
-Ordinary CLI receives surrogate token and makes HTTPS request through ASV.
+A session holds a surrogate; the broker redeems it, lends the real credential
+to one request, and the provider answers.
 
 Expected:
 
 - upstream receives correct real auth,
-- CLI memory/environment contains surrogate only,
-- broker audit records operation without secret.
+- the secret appears in nothing the client can observe — the operation's
+  response, the `Debug` of the response or the broker state, the audit record
+  serialized to JSON, or the planting CLI's stdout, stderr, argv or
+  `/proc/<pid>/environ`,
+- broker audit records the operation without the secret.
+
+Suites: `crates/broker/tests/uat_005_replay.rs` (origin receives the real
+credential and never the surrogate; the success path leaks nothing; the
+credentialed operation is audited and the chain verifies) and
+`crates/broker/tests/credential_ingest_boundary.rs` (the plant's own output,
+and `/proc` of the live CLI while it holds the secret).
+
+### What this UAT does not cover
+
+Not the CONNECT proxy path. An ordinary CLI behind `HTTPS_PROXY` presents a
+CONNECT and carries no session, and a surrogate is only redeemable through the
+session that minted it — so substitution on that path is blocked on a
+question about identity, not on a missing parser. `Bridge::handle_connect`
+authorises a destination host and nothing else. That half is
+`FND-m9-connect-substitution`, and M9's exit is not satisfied by this section
+alone.
+
+UAT-012 and UAT-013 are the eBPF redirect and stay gated on the M8 GO by
+ADR-0007.
 
 ## UAT-011 — TLS pinning
 

@@ -323,12 +323,27 @@ Keep explicit proxy + service shims; eBPF remains egress/telemetry only.
 - eBPF transparent routing,
 - HTTP/1.1 + HTTP/2 compatibility where proxy stack supports it,
 - strict CONNECT/redirect controls,
-- UI indicator that TLS interception is active.
+- UI indicator that TLS interception is active,
+- credential substitution on the CONNECT path, in a separate increment.
 
 ### Exit UAT
 
 - UAT-010, 011, 012, 013,
 - TLS compatibility matrix published from tests.
+
+### The substitution increment is separate, and blocked on identity
+
+Substitution on the CONNECT path is not part of what `serve_connect` delivered
+and is not a parser away. `Bridge::handle_connect` authorises a destination
+host; the bridge holds no session. A surrogate is redeemable only through the
+session that minted it, so an ordinary CLI that cannot present a session has
+no surrogate to redeem. Choosing what a session *is* for a client that is not
+the agent — including whether a token may serve as its own proof, which would
+give up the `WrongSession` refusal — is an ADR, not a task.
+
+`FND-m9-connect-substitution` carries the options and their costs. Until that
+is answered, UAT-010 stands on the broker's semantic path, where the
+substitution is real and tested, and M9's exit is **not** met by it alone.
 
 ---
 
