@@ -408,6 +408,14 @@ impl VaultStore {
     }
 
     /// Re-encrypts and writes the vault, bumping the revision.
+    ///
+    /// The revision is bumped in the *encoded copy* and committed to
+    /// `self.header` only after the write lands. Incrementing the live header
+    /// first — as this used to — meant a write that then failed had still
+    /// consumed a revision, so the counter measured attempts rather than
+    /// history. Doing it the other way round and never committing early keeps
+    /// the file and memory in step: both say N before, both say N+1 after,
+    /// and a failed write leaves both at N.
     fn persist(&mut self, key: &VaultKey) -> Result<(), VaultError> {
         let mut nonce = [0u8; 24];
         crate::envelope::fill_random_for_crate(&mut nonce);
@@ -416,17 +424,59 @@ impl VaultStore {
             encrypt_body(key, &nonce, &plaintext).map_err(|_| VaultError::MalformedBody)?;
         plaintext.zeroize();
 
-        self.header.body_nonce = nonce;
-        self.header.revision += 1;
+        let mut header = self.header.clone();
+        header.body_nonce = nonce;
+        header.revision += 1;
 
         let encoded = VaultFile {
-            header: self.header.clone(),
+            header,
             body_ciphertext: ciphertext,
         }
         .encode()?;
 
         write_private(&self.path, &encoded)?;
+
+        // The write landed; now the live header may follow it.
+        self.header.body_nonce = nonce;
+        self.header.revision += 1;
         Ok(())
+    }
+
+    /// Runs a body mutation and persists it, restoring the body if the write
+    /// fails.
+    ///
+    /// `persist` writes to a file, and a write can fail: a full disk, a
+    /// read-only mount, a revoked permission. Without the restore, a failed
+    /// write leaves the mutation in memory with no counterpart on disk, and
+    /// `list()` reads the body — so the broker would report holding a
+    /// credential that is not in the file, and the next successful write of
+    /// any kind would serialise the orphan out.
+    ///
+    /// The whole body is snapshotted rather than an inverse of the mutation
+    /// being undone. That is O(vault size) per write, which costs nothing here
+    /// because writes are operator-driven rather than on any hot path, and it
+    /// cannot be wrong: a new mutation that forgets its inverse gets the
+    /// rollback for free instead of re-opening this defect. If writes ever
+    /// become hot enough for the copy to matter, this is the line to revisit.
+    fn transact<T>(
+        &mut self,
+        key: &VaultKey,
+        mutate: impl FnOnce(&mut VaultBody) -> Result<T, VaultError>,
+    ) -> Result<T, VaultError> {
+        let snapshot = self.body.clone();
+        match mutate(&mut self.body) {
+            Err(error) => {
+                self.body = snapshot;
+                Err(error)
+            }
+            Ok(value) => match self.persist(key) {
+                Ok(()) => Ok(value),
+                Err(error) => {
+                    self.body = snapshot;
+                    Err(error)
+                }
+            },
+        }
     }
 
     /// Adds or replaces a credential and persists.
@@ -436,8 +486,10 @@ impl VaultStore {
         metadata: CredentialMetadata,
         secret: SecretBytes,
     ) -> Result<(), VaultError> {
-        self.body.upsert(metadata, secret);
-        self.persist(key)
+        self.transact(key, |body| {
+            body.upsert(metadata, secret);
+            Ok(())
+        })
     }
 
     /// Adds a credential, failing if the id already exists.
@@ -455,10 +507,12 @@ impl VaultStore {
 
     /// Removes a credential and persists.
     pub fn remove(&mut self, key: &VaultKey, id: &str) -> Result<(), VaultError> {
-        if !self.body.remove(id) {
-            return Err(VaultError::NotFound(id.to_string()));
-        }
-        self.persist(key)
+        self.transact(key, |body| {
+            if !body.remove(id) {
+                return Err(VaultError::NotFound(id.to_string()));
+            }
+            Ok(())
+        })
     }
 
     /// Lists credential metadata. Safe to log: no secret material.
@@ -723,14 +777,70 @@ fn store_decrypt_body(
     body
 }
 
+/// The temp-file name `write_private` writes to before renaming over `path`.
+///
+/// Unique per process and per call, so no two writers — in this process or in
+/// any other — ever truncate the same temp file. The pid alone would not do:
+/// two `VaultStore`s in one process writing the same vault would share it. The
+/// counter is what makes the name per-call.
+///
+/// A crashed writer leaves one of these behind. That is the accepted cost of
+/// the guarantee: the leftover is ciphertext at `0600` whose name says which
+/// pid left it, whereas a shared name risks splicing two bodies into the vault
+/// itself.
+fn tmp_sibling(path: &Path) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("vault");
+    format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// Writes a file with `0600` permissions, creating parents as needed.
 ///
 /// Spec §8 requires minimal filesystem access and a non-dumpable broker; the
 /// vault file is the most sensitive artefact ASV owns, so it is owner-only
 /// from the moment it exists.
+///
+/// Writes `bytes` to `path` so no reader can observe a partial file.
+///
+/// The previous version opened the target with `truncate(true)` and wrote in
+/// place, so every write passed the vault through a truncated state. That was
+/// survivable only because the broker was the sole writer and `&mut self`
+/// enforced it in-process; `with_secret` re-reads the ciphertext from disk on
+/// every call precisely so it sees the newest write, and an in-place write is
+/// exactly what it would catch mid-flight.
+///
+/// The replacement writes a temporary file beside the target and renames it
+/// over, which is atomic within a filesystem. Four details are load-bearing:
+///
+/// - **Same directory.** `rename` across filesystems fails with `EXDEV`, and
+///   a temp file in `/tmp` would make every write fail on any real
+///   deployment.
+/// - **`0600` on the temp file.** The rename carries the temp file's mode onto
+///   the target, so a permissive temp file would leave a world-readable vault.
+/// - **A name no other writer holds.** See `tmp_sibling` below; a shared name
+///   would let two writers splice into one file.
+/// - **Mode re-asserted on the target afterwards.** The old code set `0600` on
+///   every write because an existing file keeps its old mode under umask; the
+///   temp-file path must not quietly drop that defence.
+///
+/// A failure at any point removes the temp file and leaves the previous vault
+/// exactly as it was.
+///
+/// What this does *not* claim: durability across a power cut. The data is
+/// fsynced before the rename, but the directory entry is not, so a crash
+/// immediately after the rename can lose it and leave the previous revision on
+/// disk — the same memory/disagreement this function's callers just stopped
+/// producing, arrived at from the other side. Closing that needs a directory
+/// fsync, which is not here because nothing here could falsify it.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
 
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
@@ -738,25 +848,53 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
             restrict_dir(parent)?;
         }
     }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| VaultError::io(path, e))?;
-    // `create` honours the umask only when creating, and an existing file keeps
-    // its old mode, so set it explicitly on every write.
-    let mut perms = file
-        .metadata()
-        .map_err(|e| VaultError::io(path, e))?
-        .permissions();
-    use std::os::unix::fs::PermissionsExt;
-    perms.set_mode(0o600);
-    file.set_permissions(perms)
-        .map_err(|e| VaultError::io(path, e))?;
-    file.write_all(bytes).map_err(|e| VaultError::io(path, e))?;
-    file.sync_all().map_err(|e| VaultError::io(path, e))?;
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    // A name no other writer can be holding. A shared temp name would let two
+    // writers truncate and fill the *same* file, so the bytes landing there
+    // would be a splice of two bodies — and renaming that spliced file over
+    // the target would destroy a vault, which is a far worse outcome than the
+    // stale revision the second writer's write already costs it. Unique per
+    // process and per call, so the guarantee is the weaker one that still
+    // matters: the target is always a whole vault written by one writer, and
+    // with two writers the last rename wins.
+    let tmp = dir.join(tmp_sibling(path));
+
+    let write = |target: &Path| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(target)?;
+        // `create` honours the umask only when creating, and an existing file
+        // keeps its old mode, so set it explicitly on every write.
+        let mut perms = file.metadata()?.permissions();
+        perms.set_mode(0o600);
+        file.set_permissions(perms)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    };
+
+    if let Err(e) = write(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(VaultError::io(path, e));
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(VaultError::io(path, e));
+    }
+
+    // The rename carried the temp file's mode across; re-assert on the target
+    // so the defence the old in-place path provided is not lost.
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o600);
+        let _ = std::fs::set_permissions(path, perms);
+    }
     Ok(())
 }
 
@@ -784,6 +922,26 @@ mod tests {
 
     fn canary_secret() -> SecretBytes {
         SecretBytes::new(CANARY.as_bytes().to_vec())
+    }
+
+    /// The atomic write's temp name must differ on every call, including
+    /// twice in a row from the same process on the same path. A shared name
+    /// would let two writers truncate and fill one file, and renaming that
+    /// over the target would splice two bodies into the vault.
+    #[test]
+    fn the_temp_name_is_unique_per_call() {
+        let path = Path::new("/vaults/vault.asv");
+        let first = tmp_sibling(path);
+        let second = tmp_sibling(path);
+        assert_ne!(first, second, "two writes shared a temp name: {first}");
+        assert!(
+            first.starts_with(".vault.asv.") && first.ends_with(".tmp"),
+            "temp name is not the expected shape: {first}"
+        );
+        assert!(
+            first.contains(&std::process::id().to_string()),
+            "temp name does not carry the pid: {first}"
+        );
     }
 
     #[test]
