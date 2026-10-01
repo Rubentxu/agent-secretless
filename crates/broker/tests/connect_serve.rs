@@ -21,6 +21,7 @@ use asv_broker::tls_bridge::{
     SessionCa, UpstreamResolver, VerifiedLeaf,
 };
 use asv_domain::Authority;
+use asv_tls_acceptor::LeafMaterial;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
@@ -490,4 +491,205 @@ impl ServerCertVerifier for PinningVerifier {
             SignatureScheme::ECDSA_NISTP256_SHA256,
         ]
     }
+}
+
+// ---------------------------------------------------------------------------
+// The TLS compatibility matrix, measured rather than assumed.
+//
+// `15-ROADMAP.md:331-332` makes "TLS compatibility matrix published from tests"
+// an exit criterion for M9. Until now nothing measured the surface, so every
+// cell was an assumption about a library default. The server config is built
+// in `crates/tls-acceptor/src/config.rs:113` and sets neither
+// `alpn_protocols` nor `with_protocol_versions`, so the bridge inherits
+// rustls' defaults wholesale.
+//
+// These tests exist to make each cell falsifiable. An ordinary CLI reaches
+// this bridge through `HTTPS_PROXY`, and `reqwest` with `rustls-tls` offers
+// `h2` and `http/1.1` through ALPN to nearly any modern server — which is
+// exactly the case these clients reproduce.
+// ---------------------------------------------------------------------------
+
+/// A client that offers ALPN, pinned to an explicit version list.
+///
+/// Offering the protocol list is the point: a client that offers nothing
+/// cannot tell "the server selected nothing" from "the server never saw an
+/// offer", and the cell would be unfalsifiable.
+fn alpn_client(
+    root_der: &[u8],
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> Arc<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(root_der.to_vec()))
+        .expect("the session root is a valid trust anchor");
+    let mut config = ClientConfig::builder_with_protocol_versions(versions)
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Arc::new(config)
+}
+
+/// Drives one CONNECT through the bridge and returns the client's TLS state.
+///
+/// Shared by the three matrix cells so they differ only in the client config,
+/// which is the variable under test.
+fn handshake_through_bridge(
+    ca: SessionCa,
+    client_config: Arc<ClientConfig>,
+) -> rustls::ClientConnection {
+    let origin = Origin::start();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bridge binds");
+    let bridge = bridge_allowing(HOST, 443);
+
+    let (client, server_side) = connect_pair(&listener, HOST, 443);
+    let handle = {
+        let leaves = SessionLeaves { ca };
+        let upstream = FixedUpstream { addr: origin.addr };
+        thread::spawn(move || bridge.serve_connect(server_side, &leaves, &upstream, Instant::now()))
+    };
+
+    let mut ack_reader = client.try_clone().expect("clone");
+    let ack = read_head(&mut ack_reader);
+    assert!(
+        ack.starts_with("HTTP/1.1 200"),
+        "the target is authorised before the handshake, got {ack:?}"
+    );
+
+    let tls = handshake(client_config, client).expect("the session leaf must verify");
+    handle
+        .join()
+        .expect("bridge thread")
+        .expect("the bridge establishes the tunnel");
+    tls.conn
+}
+
+/// The bridge selects no ALPN protocol, and this is the reason it must not.
+///
+/// The CONNECT path is a byte relay the bridge does not own: `serve_connect`
+/// returns `EstablishedTunnel` and stops. An `h2` negotiation would hand the
+/// caller a connection carrying HPACK frames it has no parser for, and the
+/// caller would be reading framing as if it were plaintext. So HTTP/1.1 on
+/// this path is a property, not an accident — and today it holds only because
+/// `server_config()` never sets `alpn_protocols`.
+///
+/// Nothing else in the workspace tests this. `connect_serve.rs` completes
+/// handshakes with default clients, `handshake.rs` in the acceptor asserts
+/// only the version, and no test in the tree offers ALPN to this config and
+/// looks at the answer.
+#[test]
+fn a_client_offering_h2_and_http11_gets_no_alpn_selected() {
+    let ca = SessionCa::new("matrix-alpn", 41, Duration::from_secs(3600));
+    let root_der = ca.root_der.clone();
+
+    let conn = handshake_through_bridge(
+        ca,
+        alpn_client(
+            &root_der,
+            &[&rustls::version::TLS13, &rustls::version::TLS12],
+        ),
+    );
+
+    assert_eq!(
+        conn.alpn_protocol(),
+        None,
+        "the bridge must select no ALPN protocol: it relays bytes it does not parse, \
+         so an h2 negotiation would hand the caller a connection it cannot read"
+    );
+}
+
+/// The negative control the ALPN cell above depends on.
+///
+/// Asserting `None` is only as strong as the ability of the same observation to
+/// see `Some`. This runs the identical client against the *same*
+/// `server_config()` with the single field that the bridge leaves unset, and
+/// requires the selection to be visible. Without it, a rustls feature change
+/// or a silently broken observation would make the test above pass for the
+/// wrong reason — which is how `credential_ingest_boundary.rs` found two false
+/// greens earlier in this repository.
+#[test]
+fn the_observation_method_detects_a_selection_when_a_server_offers_alpn() {
+    let ca = SessionCa::new("alpn-control", 43, Duration::from_secs(3600));
+    let root_der = ca.root_der.clone();
+    let leaf = issue_leaf(&ca, HOST, Instant::now()).expect("control leaf");
+    // The same `LeafMaterial` the bridge assembles internally, reached the way
+    // `crates/tls-acceptor/tests/handshake.rs` reaches it, because
+    // `VerifiedLeaf::material` is private to the broker crate.
+    let material = LeafMaterial::new(
+        ca.root_der.clone(),
+        vec![leaf.leaf_der.clone(), ca.intermediate_der.clone()],
+        leaf.leaf_key.serialize_der(),
+    )
+    .expect("control material");
+
+    // Byte-for-byte the config the bridge uses, plus the one field it omits.
+    let mut config = material.server_config().expect("server config");
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("control server binds");
+    let addr = listener.local_addr().expect("control addr");
+    let handle = thread::spawn(move || {
+        let (socket, _) = listener.accept().expect("control accepts");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let connection =
+            rustls::ServerConnection::new(Arc::new(config)).expect("server connection");
+        let mut tls = rustls::StreamOwned::new(connection, socket);
+        tls.conn
+            .complete_io(&mut tls.sock)
+            .expect("server handshake");
+    });
+
+    let client = TcpStream::connect(addr).expect("control connect");
+    let tls = handshake(alpn_client(&root_der, &[&rustls::version::TLS13]), client)
+        .expect("the control handshake must complete");
+
+    assert_eq!(
+        tls.conn.alpn_protocol(),
+        Some(b"http/1.1".as_slice()),
+        "when a server does offer ALPN the client must see the selection, \
+         otherwise the None above proves nothing"
+    );
+    handle.join().expect("control thread");
+}
+
+/// The ceiling: a client offering TLS 1.3 gets TLS 1.3.
+///
+/// The acceptor's `handshake.rs` asserts membership in `{TLS 1.2, TLS 1.3}`,
+/// which is a weaker statement: it would still pass if the bridge silently
+/// downgraded to 1.2 forever. This pins which one is negotiated from above.
+#[test]
+fn a_client_offering_tls13_negotiates_tls13() {
+    let ca = SessionCa::new("matrix-tls13", 47, Duration::from_secs(3600));
+    let root_der = ca.root_der.clone();
+
+    let conn = handshake_through_bridge(ca, alpn_client(&root_der, &[&rustls::version::TLS13]));
+
+    assert_eq!(
+        conn.protocol_version(),
+        Some(rustls::ProtocolVersion::TLSv1_3),
+        "the highest version both sides offer must be the one negotiated, \
+         not a silent downgrade to 1.2"
+    );
+}
+
+/// The floor: a client offering only TLS 1.2 still completes.
+///
+/// This is the cell that would break silently if the workspace ever dropped
+/// rustls' `tls12` feature — the handshake would start failing for every
+/// client that cannot do 1.3, which is the majority of `curl` builds in the
+/// wild. The feature is declared at `Cargo.toml:101`; this is what pins it.
+#[test]
+fn a_client_offering_only_tls12_still_completes() {
+    let ca = SessionCa::new("matrix-tls12", 53, Duration::from_secs(3600));
+    let root_der = ca.root_der.clone();
+
+    let conn = handshake_through_bridge(ca, alpn_client(&root_der, &[&rustls::version::TLS12]));
+
+    assert_eq!(
+        conn.protocol_version(),
+        Some(rustls::ProtocolVersion::TLSv1_2),
+        "TLS 1.2 is the floor the workspace's `tls12` feature buys; \
+         dropping it would refuse most real clients"
+    );
 }
