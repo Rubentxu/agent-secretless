@@ -6,7 +6,7 @@
 //! could be passed as `argv` and leak into shell history — exactly what
 //! `docs/04-SHELL-FIRST-INTEGRATION.md` §9 forbids. M1 adds no-echo ingestion.
 
-use asv_domain::CredentialKind;
+use asv_domain::{CredentialId, CredentialKind};
 use asv_ipc_protocol::{OpaqueSecret, Request, Response, PROTOCOL_VERSION};
 use clap::{Parser, Subcommand};
 use std::io::{Read, Write};
@@ -68,6 +68,18 @@ enum Command {
         /// Account the credential belongs to.
         #[arg(long)]
         account: String,
+    },
+    /// Revoke a credential: remove it from the vault and drop every surrogate
+    /// standing for it.
+    ///
+    /// Carries no secret, so there is none to read from stdin — the id is the
+    /// whole of the request. It still goes through the same control-plane door
+    /// as `add-credential`: this is the operator giving up access, and no agent
+    /// session may do it.
+    DeleteCredential {
+        /// The credential id, in the canonical spelling `asv credentials` prints.
+        #[arg(value_name = "ID")]
+        id: String,
     },
     /// Query the broker's audit log (R9). Denied until the operator control
     /// plane ships; the command reports that refusal honestly.
@@ -136,6 +148,24 @@ async fn main() -> std::io::Result<()> {
                 provider,
                 account,
                 secret: OpaqueSecret::new(secret.into_bytes()),
+            }
+        }
+        Command::DeleteCredential { id } => {
+            // Parsed rather than passed through: the broker keys the vault by
+            // the canonical wire spelling, so a id that is merely a valid UUID
+            // in some other spelling would be accepted here and then miss in
+            // the vault, and the operator would be told the credential does not
+            // exist. Failing here names the real problem.
+            //
+            // The error is input-free by construction (`CredentialId`'s parse
+            // error carries no text), so nothing the operator typed comes back
+            // out through a diagnostic.
+            match CredentialId::from_wire(&id) {
+                Ok(id) => Request::DeleteCredential { id },
+                Err(_) => {
+                    eprintln!("asv: {id:?} is not a credential id; copy it from `asv credentials`");
+                    std::process::exit(2);
+                }
             }
         }
         Command::Audit { since } => {
@@ -430,13 +460,14 @@ mod tests {
     /// `clap` builds this from the same `Parser` impl the binary uses, so the
     /// test cannot drift from the real surface.
     ///
-    /// `render_long_help`, and the distinction is load-bearing rather than
+    /// `render_long_help`, and this detail is load-bearing rather than
     /// cosmetic. `Command::to_string()` is `Display`, which renders the
-    /// command's *name* — for this binary, the single string `"asv"`. An
+    /// command's *name* — for this binary the single string `"asv"`. An
     /// assertion over that string cannot fail for any reason except the
-    /// program being renamed, so the check that no subcommand exposes a secret
-    /// was comparing one word against six forbidden ones and passing for free.
-    /// The help text is the actual surface, and that is what is read here.
+    /// program being renamed, so the test that checks no subcommand exposes a
+    /// secret was checking one word against six forbidden ones and passing
+    /// vacuously. The help text is the actual surface, and that is what is
+    /// read here.
     fn cli_definition() -> String {
         use clap::CommandFactory;
         Cli::command().render_long_help().to_string()
@@ -449,5 +480,44 @@ mod tests {
         };
         let bytes = serde_json::to_vec(&req).expect("serializes");
         assert!(bytes.len() < asv_ipc_protocol::MAX_MESSAGE_BYTES);
+    }
+
+    /// A revocation is only reachable if the operator has a verb for it. The
+    /// broker accepting the request is not the same as a human being able to
+    /// ask, and this cycle exists because a capability with no door was
+    /// mistaken for a finished one.
+    #[test]
+    fn the_operator_has_a_revocation_verb() {
+        let rendered = cli_definition();
+        assert!(
+            rendered.contains("delete-credential"),
+            "no verb can revoke a credential: {rendered}"
+        );
+    }
+
+    /// The id has to arrive in the spelling the vault is keyed by. A valid
+    /// UUID in any other spelling — uppercase, braced, unhyphenated — parses
+    /// as a UUID and misses in the vault, so the operator would be told the
+    /// credential does not exist and would have no way to tell that from a real
+    /// answer. Rejecting here is what makes that failure impossible.
+    #[test]
+    fn a_revocation_id_must_be_canonically_spelled() {
+        let canonical = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        assert!(
+            CredentialId::from_wire(canonical).is_ok(),
+            "the canonical form"
+        );
+
+        for wrong in [
+            "0F8FAD5B-D9CB-469F-A165-70867728950E",   // uppercase
+            "{0f8fad5b-d9cb-469f-a165-70867728950e}", // braced
+            "0f8fad5bd9cb469fa16570867728950e",       // unhyphenated
+            "not-a-uuid",
+        ] {
+            assert!(
+                CredentialId::from_wire(wrong).is_err(),
+                "this spelling would miss in the vault: {wrong}"
+            );
+        }
     }
 }
