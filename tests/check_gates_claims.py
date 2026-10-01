@@ -15,6 +15,8 @@ promises, and each was run against the real repository before being pinned:
 7. a faithful quotation, re-wrapped to the line width, is not a defect
 8. a claim whose title shares no content word with the spec's title for
    that id warns without failing
+9. ownership is checked on every test file, not only the ones whose
+   filename encodes an id
 
 Case 4 exists because the check got it wrong first: a header reading
 "UAT-035 is not among them" matched the claim pattern and reported a file as
@@ -230,6 +232,23 @@ def main() -> int:
     results.append((
         "a claim whose title diverges from the spec warns without failing",
         code == 0 and "the id and the test do not describe the same thing" in out,
+        out.strip().splitlines()[-1] if out.strip() else "(no output)",
+    ))
+
+    # 9. Ownership is checked on every test file, not only the ones whose
+    #    name encodes an id. This is the defect the check had on its first
+    #    working version: the claim scan skipped any file not named
+    #    uat_NNN, so a *renamed* file could claim an id another file owns
+    #    and be never read. Found by re-introducing the original UAT-005
+    #    duplicate into the renamed file and watching the check stay green.
+    code, out = run({
+        "uat_005_replay.rs": CLAIM_005,
+        "harden_privileged_tools.rs": CLAIM_005,
+    })
+    results.append((
+        "a renamed file claiming another file's id is still a defect",
+        code == 1 and "claimed by 2 test files" in out
+        and "harden_privileged_tools.rs" in out,
         out.strip().splitlines()[-1] if out.strip() else "(no output)",
     ))
 

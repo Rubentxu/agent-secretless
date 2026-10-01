@@ -258,18 +258,21 @@ def scan_repo_uat_claims(
         if not tests_dir.is_dir():
             continue
         for path in sorted(tests_dir.glob("*.rs")):
-            if not UAT_FILENAME_RE.match(path.name):
-                continue
             scanned += 1
             head = path.read_text(encoding="utf-8", errors="replace")[:2000]
             declared = declared_uat(head)
+            filename_match = UAT_FILENAME_RE.match(path.name)
             if declared is not None:
                 uid, title = declared
                 claims.setdefault(uid, []).append(path.relative_to(root).as_posix())
                 titled.append((path.relative_to(root).as_posix(), uid, title))
-            else:
+            elif filename_match is not None:
+                # Only a file whose *name* implies an id can leave one
+                # implied but unasserted. Restricting the claim scan to
+                # uat-named files, as this did first, let a renamed file
+                # claim an id another file owns without being read at all.
                 filename_only.append(
-                    (path.relative_to(root).as_posix(), int(UAT_FILENAME_RE.match(path.name).group(1)))
+                    (path.relative_to(root).as_posix(), int(filename_match.group(1)))
                 )
     return claims, filename_only, titled, scanned
 
