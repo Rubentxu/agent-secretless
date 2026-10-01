@@ -16,8 +16,9 @@ agent ──(surrogate / socket)──▶ broker ──(real credential)──�
 
 > **Status: pre-1.0 RC preparation (M13 + gates R2/R3/R5/R6 done).**
 >
-> The workspace compiles with **424 tests green** (`--release`, canonical flakes
-> excluded). The vault, SSH signing, HTTP/PostgreSQL brokering, policy, OAuth2
+> The workspace compiles with **693 tests green** (`--release`, canonical flakes
+> excluded; the count is re-derived every CI run by the `R11 README test count`
+> gate, so this line cannot go stale again). The vault, SSH signing, HTTP/PostgreSQL brokering, policy, OAuth2
 > framework, TPM sealing and crash recovery exist and are tested. Remaining
 > before a 1.0 that the maintainer has not yet approved: signed reproducible
 > artifacts (R0), full certification pass (R11), and the M5 operator dashboard.
@@ -72,12 +73,20 @@ type system:
 Stated plainly, because a security project that oversells itself is worthless:
 
 - **No operator dashboard.** The Tauri 2 UI is M5, not started.
-- **PostgreSQL has no live transport.** The connector's decision logic is
-  complete and tested; `LiveConnectorFactory::postgres` returns
-  `UnsupportedInThisBuild` until `tokio-postgres` is wired.
-- **`harden::install` is not wired into the binary.** The M7 hardening profile
-  (PR_SET_DUMPABLE, Landlock, seccomp) exists with tests but is opt-in by
-  design; the broker ships with `RLIMIT_CORE=0` only for now.
+- **`LiveConnectorFactory::postgres` returns a real client, not
+  `UnsupportedInThisBuild`.** The enum variant still exists, but it is the
+  *trait default* at `crates/broker/src/lib.rs:191`; the production override
+  is at `:257`. UAT-033 runs against a real PostgreSQL in CI. *(This line
+  said the opposite for several milestones: it was reading the trait default
+  and reporting it as production behaviour.)*
+- **The M7 hardening profile is opt-in, not unwired.** `harden::install_with`
+  is called from `crates/broker/src/main.rs:195` behind `--harden`; the broker
+  ships with `RLIMIT_CORE=0` only when it is not passed. *(This line previously
+  said it was "not wired into the binary", which was false.)*
+- **A dedicated broker uid is not used.** The broker runs as you, so a process
+  running as you can read its memory; only `PR_SET_DUMPABLE=0` and Landlock
+  stand in the way. A separate uid (M7) is what makes that denial
+  unconditional.
 - **No signed artifacts yet (R0).** Reproducible-build and signing tooling
   (cosign/sigstore) is the next gate.
 - **TPM support is a prototype.** `SoftwareTpm` stands in for hardware; do not
@@ -94,7 +103,7 @@ Stated plainly, because a security project that oversells itself is worthless:
 cargo build --release -p asv-broker
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# expected: passed=424 failed=0 ignored=1
+# expected: passed=692 failed=0 ignored=1
 ```
 
 Try the broker with a vault:

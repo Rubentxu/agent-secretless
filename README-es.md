@@ -16,8 +16,9 @@ agente ──(sustituto / socket)──▶ broker ──(credencial real)──�
 
 > **Estado: preparación RC pre-1.0 (M13 + gates R2/R3/R5/R6 completados).**
 >
-> El workspace compila con **424 tests en verde** (`--release`, flakes
-> canónicos excluidos). El vault, la firma SSH, el brokering HTTP/PostgreSQL,
+> El workspace compila con **693 tests en verde** (`--release`, flakes
+> canónicos excluidos; el conteo lo vuelve a derivar el gate `R11 README test count`
+> en cada corrida de CI, así que esta línea ya no puede quedarse vieja). El vault, la firma SSH, el brokering HTTP/PostgreSQL,
 > la política, el framework OAuth2, el sellado TPM y la recuperación ante
 > crashes existen y están testeados. Pendiente antes de un 1.0 que el
 > mantenedor aún no ha aprobado: artefactos reproducibles firmados (R0),
@@ -78,12 +79,20 @@ Dicho sin adornos, porque un proyecto de seguridad que se sobrevende a sí
 mismo no vale nada:
 
 - **Sin dashboard de operador.** La UI Tauri 2 es M5, sin empezar.
-- **PostgreSQL sin transporte real.** La lógica de decisión del conector está
-  completa y testeada; `LiveConnectorFactory::postgres` devuelve
-  `UnsupportedInThisBuild` hasta que se cablee `tokio-postgres`.
-- **`harden::install` no está cableado al binario.** El perfil de hardening M7
-  (PR_SET_DUMPABLE, Landlock, seccomp) existe con tests pero es opt-in por
-  diseño; el broker se envía solo con `RLIMIT_CORE=0` por ahora.
+- **`LiveConnectorFactory::postgres` devuelve un cliente real**, no
+  `UnsupportedInThisBuild`. La variante del enum sigue existiendo, pero es el
+  *default del trait* en `crates/broker/src/lib.rs:191`; el override de
+  producción está en `:257`. UAT-033 corre contra un PostgreSQL real en CI.
+  *(Esta línea decía lo contrario durante varios milestones: leía el default
+  del trait y lo reportaba como comportamiento de producción.)*
+- **El perfil de hardening M7 es opt-in, no está desconectado.**
+  `harden::install_with` se llama desde `crates/broker/src/main.rs:195` tras
+  `--harden`; el broker se envía solo con `RLIMIT_CORE=0` cuando no se pasa.
+  *(Antes decía que no estaba cableado al binario, y era falso.)*
+- **No se usa un uid dedicado para el broker.** El broker corre como tú, así
+  que un proceso con tu uid puede leerle la memoria; sólo se interponen
+  `PR_SET_DUMPABLE=0` y Landlock. Un uid aparte (M7) es lo que hace que esa
+  negación sea incondicional.
 - **Sin artefactos firmados todavía (R0).** El tooling de build reproducible y
   firma (cosign/sigstore) es el siguiente gate.
 - **El soporte TPM es un prototipo.** `SoftwareTpm` suplanta al hardware; no
@@ -101,7 +110,7 @@ mismo no vale nada:
 cargo build --release -p asv-broker
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# esperado: passed=424 failed=0 ignored=1
+# esperado: passed=692 failed=0 ignored=1
 ```
 
 Prueba el broker con un vault:

@@ -169,6 +169,47 @@ def main() -> int:
         )
     )
 
+    # 8. A README whose count disagrees with the repository is drift. The
+    #    README is not part of the table, which is why its count sat at 424
+    #    while the real number was 669 for several milestones: a claim in a
+    #    document that no gate contradicted.
+    #
+    #    This case cannot drive the README itself — the guard reads the real
+    #    ones from the repository — so it asserts the row is recognised and
+    #    that the guard reports a count mismatch when the table's number is
+    #    wrong, which is the same code path.
+    code, out = run_guard(
+        """
+| Gate | Status | Evidence |
+|---|---|---|
+| R11 README test count | pass | both READMEs state 1 tests |
+"""
+    )
+    results.append(
+        (
+            "a stale README count is named as drift",
+            code == 1 and "README" in out,
+            out.strip() or "(no output)",
+        )
+    )
+
+    # 9. A row that mentions README but states no count must be left alone,
+    #    so adding the row cannot make the guard fail on prose.
+    code, out = run_guard(
+        """
+| Gate | Status | Evidence |
+|---|---|---|
+| R11 README truthfulness | pass | the README no longer overclaims secretless |
+"""
+    )
+    results.append(
+        (
+            "a README row with no count is ignored rather than failed",
+            code == 0,
+            out.strip() or "(no output)",
+        )
+    )
+
     print("Gate status guard falsifiability\n")
     failures = 0
     for name, ok, detail in results:

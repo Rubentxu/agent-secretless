@@ -169,6 +169,75 @@ def shutil_which(name: str) -> str | None:
     return which(name)
 
 
+# The README states a test count in three places, in two languages, and it was
+# wrong in both for as long as nobody looked. A count in a document is a claim
+# like any other; the only difference is that nothing was checking it.
+#
+# R11's own row is re-derived every run, so the table could not drift. The
+# README is not in the table, which is exactly why it drifted: the count was
+# true once, then quietly stopped being true, and nothing in CI noticed for
+# three milestones.
+# The lookbehind is not decoration. Without it, `python3 tests/adversarial`
+# matches as "3 tests", and a command in the quick-start block became a
+# failure. The number has to be a token of its own, not the tail of an
+# identifier.
+README_CLAIM = re.compile(r"(?<![A-Za-z0-9_])(\d+)\s+tests\b", re.IGNORECASE)
+
+
+def readme_files() -> list[Path]:
+    """Every README the project ships, so a second translation cannot drift alone."""
+    return [p for p in (REPO / "README.md", REPO / "README-es.md") if p.exists()]
+
+
+def check_readme_count(gate: str, evidence: str, failures: list[str]) -> None:
+    """The README must state the suite size the repository actually has.
+
+    Scans every `N tests` claim in every shipped README and compares it with
+    the same enumeration R11 uses, so the two numbers cannot disagree.
+    """
+    stated = re.search(r"(\d+)\s+tests", evidence)
+    if not stated:
+        return
+    expected = int(stated.group(1))
+
+    proc = subprocess.run(
+        ["cargo", "test", "--workspace", "--locked", "--", "--list"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        failures.append(
+            f"{gate}: could not enumerate the suite to check the README's "
+            f"{expected} (cargo test --list failed); refusing to pass an "
+            f"unverified claim"
+        )
+        return
+    observed = sum(1 for line in proc.stdout.splitlines() if line.strip() and ": test" in line)
+
+    # The row's own number first. The first version of this check compared
+    # only the READMEs against the repository, so a row stating the wrong
+    # count passed as long as the READMEs agreed with each other. The
+    # falsifiability case for it is what caught that: the row is a claim too,
+    # and a claim that the table and the documents agree on is not a claim
+    # anyone has checked.
+    if expected != observed:
+        failures.append(
+            f"{gate}: the table states {expected} tests, "
+            f"{observed} are enumerated"
+        )
+
+    for readme in readme_files():
+        text = readme.read_text(encoding="utf-8")
+        for claimed in README_CLAIM.findall(text):
+            if int(claimed) != observed:
+                failures.append(
+                    f"{gate}: {readme.name} states {claimed} tests, "
+                    f"{observed} are enumerated"
+                )
+
+
 def main() -> int:
     table_path = TABLE
     args = sys.argv[1:]
@@ -195,6 +264,8 @@ def main() -> int:
             check_full_suite(gate, evidence, failures)
         if "dependency audit" in gate.lower():
             check_dependency_audit(gate, evidence, failures)
+        if "readme" in gate.lower():
+            check_readme_count(gate, evidence, failures)
 
     if failures:
         print("gate status drift in 16-SECURITY-RELEASE-GATES.md:\n")
