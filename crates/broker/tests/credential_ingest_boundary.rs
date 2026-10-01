@@ -32,6 +32,20 @@
 //! variable, the child would stop blocking on stdin, the `/proc` read would
 //! race a process that is already gone, and the first assertion below would
 //! fail on the missing `/proc` entry rather than passing quietly.
+//!
+//! # Run it with a freshly built `asv`
+//!
+//! This file drives the **real `asv` binary**, located by path rather than
+//! through `CARGO_BIN_EXE_*`. `cargo test -p asv-broker` does not rebuild
+//! `asv-cli`, so the binary in the target directory can be arbitrarily stale
+//! while the test compiles and passes.
+//!
+//! That is not hypothetical: falsifying the first assertion by making
+//! `add-credential` echo the secret left all three tests **green**, because
+//! the test ran against the pre-mutation binary. `cargo build --workspace`
+//! first, and the same mutation goes red on exactly one test. The pipeline's
+//! `build` stage runs before `test`, so CI is not exposed to this — a
+//! developer running the file surgically is.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
