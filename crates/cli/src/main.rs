@@ -429,9 +429,17 @@ mod tests {
     /// A human-readable rendering of the parser, used as the oracle above.
     /// `clap` builds this from the same `Parser` impl the binary uses, so the
     /// test cannot drift from the real surface.
+    ///
+    /// `render_long_help`, and the distinction is load-bearing rather than
+    /// cosmetic. `Command::to_string()` is `Display`, which renders the
+    /// command's *name* — for this binary, the single string `"asv"`. An
+    /// assertion over that string cannot fail for any reason except the
+    /// program being renamed, so the check that no subcommand exposes a secret
+    /// was comparing one word against six forbidden ones and passing for free.
+    /// The help text is the actual surface, and that is what is read here.
     fn cli_definition() -> String {
         use clap::CommandFactory;
-        Cli::command().to_string()
+        Cli::command().render_long_help().to_string()
     }
 
     #[test]
