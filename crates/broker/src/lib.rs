@@ -1838,23 +1838,37 @@ mod tests {
 
         // Identical refusal for an id that exists and one that does not. If
         // these ever differ again, the difference is an oracle.
+        // The two messages are compared to *each other*, byte for byte.
+        // Collecting them is what makes that possible, and it is the property
+        // this test exists for.
+        let mut refusals = Vec::new();
         for (label, id) in [("known", known), ("ghost", ghost)] {
             match handle(&mut state, &peer(), Request::DeleteCredential { id }) {
                 Response::Error { code, message } => {
                     assert_eq!(code, ErrorCode::Denied, "{label}");
-                    // The refusal must name the admission condition that
-                    // failed, and must be identical for an id that exists and
-                    // one that does not — the oracle property the loop above
-                    // exists to protect is unaffected by the wording.
+                    // The refusal must also name the admission condition that
+                    // failed. That is a separate property from the oracle
+                    // property asserted below, so both are checked.
                     assert!(
                         message.contains("refused:") && message.contains("pidfd-pinned"),
                         "{label}: the refusal must name which admission condition \
                          failed: {message}"
                     );
+                    refusals.push(message);
                 }
                 other => panic!("{label}: expected a refusal, got {other:?}"),
             }
         }
+        assert_eq!(
+            refusals[0], refusals[1],
+            "the two refusals differ in a byte, which is exactly the existence \
+             oracle this verb must not be"
+        );
+        assert!(
+            !refusals[0].contains(&known.to_wire()),
+            "the refusal echoed the id back to an unadmitted caller: {}",
+            refusals[0]
+        );
 
         // The refusal did not touch the store: the credential is still there,
         // so a denied delete cannot be mistaken for a revocation.
