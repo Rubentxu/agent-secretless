@@ -45,6 +45,19 @@ pipeline {
                 sh("python3 scripts/check-gate-status.py")
                 sh("python3 tests/gate_status_drift.py")
                 sh("python3 tests/check_gates_claims.py")
+                // SDDK derives a project's identity from the git remote URL,
+                // and a checkout pointing at a different repository resolves
+                // to a different project with an empty ledger — where a write
+                // succeeds with no warning at all. Measured 2026-10-01;
+                // backlog bl-bl-01M3RYX76R000387QXS2QR7NC0, P0. The guard is
+                // in the same stage as the other claim-vs-repository checks
+                // because that is what it is: a claim in this repository that
+                // the repository can contradict. The falsifiability suite runs
+                // beside it for the same reason it does for the others — a
+                // guard that cannot fail is not a guard, and this repository
+                // has now found three that could not.
+                sh("python3 scripts/check-project-identity.py")
+                sh("python3 tests/project_identity_drift.py")
             }
         }
 
