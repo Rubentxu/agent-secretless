@@ -18,3 +18,4 @@
 | 0014 | Explicit integration security posture | Accepted |
 | 0015 | Control-plane admission: what separates the human from an agent | Accepted |
 | 0016 | How a human credential reaches the vault | Accepted |
+| 0017 | How an operator's revocation actually takes effect | Accepted |

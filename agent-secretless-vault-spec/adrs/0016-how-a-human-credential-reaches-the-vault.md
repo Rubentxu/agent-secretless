@@ -97,9 +97,12 @@ enrolled nobody.
   vault, the inventory, a response, or a log. Admission governs the *write*;
   the buffer's lifetime is bounded either way. This is stated rather than
   glossed because it is the honest cost of reusing one socket.
-- **`DeleteCredential` remains un-wired.** It is admitted by the same rule and
-  still writes nothing, so revocation does not survive a restart. Closing that
-  is its own decision.
+- **`DeleteCredential` was un-wired here; ADR-0017 closed it.** It was admitted
+  by the same rule and still wrote nothing, so revocation did not survive a
+  restart. That gap is now closed by
+  [ADR-0017](0017-how-an-operators-revocation-takes-effect.md), which wires the
+  verb to `VaultWritePort::remove` and adds the `asv delete-credential` verb.
+  Read this consequence as history, not as current state.
 - **M5's real transport is still ADR-0009's.** This ADR is a floor, not a
   destination. If the control-plane socket lands, this decision is revisited
   and the secret's path narrows — the admission rule does not change.
