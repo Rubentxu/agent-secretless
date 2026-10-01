@@ -1,0 +1,28 @@
+schema_version: 2
+session_id: auto-S-2-20261001T143445Z
+plan_ref: v0.22.0
+release: v0.22.0
+executor: automated
+executed_by: auto-runner
+started_at: 2026-10-01T14:34:45Z
+finished_at: 2026-10-01T14:34:45Z
+results:
+- scenario_id: S-2
+  status: PASS
+  comment: "pass: `/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p asv-broker --test connect_serve session_leaf_handshakes_and_the_tunnel_is_live_in_both_directions` exited 0"
+  evidence:
+  - kind: command_output
+    ref: sha256:e243baaec364f19992311d2527cabdb4df84c362de7803c8922f376b770517d4
+    note: "pass: `/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p asv-broker --test connect_serve session_leaf_handshakes_and_the_tunnel_is_live_in_both_directions` exited 0"
+    captured_at: 2026-10-01T14:34:45Z
+    size_bytes: 600
+    mime: text/plain
+    path: /tmp/sddk-uat-cli-ev-S-2-53147.log
+  duration_minutes: 0
+  verdict_at: 2026-10-01T14:34:45Z
+  verdict_duration_ms: 312
+  repro_command: >-
+    /var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p
+    asv-broker --test connect_serve
+    session_leaf_handshakes_and_the_tunnel_is_live_in_both_directions
+plan_version: 1

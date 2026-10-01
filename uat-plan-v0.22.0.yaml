@@ -1,0 +1,87 @@
+schema_version: 1
+release:
+  candidate: v0.22.0
+  project: agent-secretless
+  last_uat_release: v0.15.0
+generated_by: uat-planner
+generated_at: 2026-10-01T14:36:00Z
+features:
+  - id: UAT-M9-CONNECT-SERVE
+    name: "asv-broker serves a CONNECT that a client can actually complete a TLS handshake through"
+    scenarios:
+      - id: S-1
+        title: "A target outside the allow-list is refused before any socket is opened"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "asv-broker crate compiled"
+        plain_steps:
+          - action: "Run cargo test -p asv-broker --test connect_serve an_unauthorised_target_opens_no_upstream_socket"
+            copy_hint: false
+            expected: "the unauthorised-target case is green, meaning no upstream connection was recorded"
+        technical_steps:
+          - "the bridge authorises the target before TcpStream::connect, and the counting leaf source records zero issuances for it"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p asv-broker --test connect_serve an_unauthorised_target_opens_no_upstream_socket"
+          status: automated
+        rationale: "before this cycle handle_connect authorised and returned, so the allow-list governed no traffic at all; a refusal that arrives after the dial is a refusal that already leaked the connection"
+        evidence:
+          required: false
+          kinds: []
+      - id: S-2
+        title: "A client trusting only the session root completes the handshake and both directions carry bytes"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "asv-broker crate compiled"
+        plain_steps:
+          - action: "Run cargo test -p asv-broker --test connect_serve session_leaf_handshakes_and_the_tunnel_is_live_in_both_directions"
+            copy_hint: false
+            expected: "the handshake completes and the byte sent by the client appears at the origin, and the origin's reply returns to the client"
+        technical_steps:
+          - "a rustls client with root-anchors = session root only handshakes against the bridge, and the established pair is a real origin behind it"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p asv-broker --test connect_serve session_leaf_handshakes_and_the_tunnel_is_live_in_both_directions"
+          status: automated
+        rationale: "a stub that terminates TLS and stops proves the handshake and nothing about the traffic, and the byte comparison is what separates the two"
+        evidence:
+          required: false
+          kinds: []
+      - id: S-3
+        title: "A leaf minted for a different host is refused"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "asv-broker crate compiled"
+        plain_steps:
+          - action: "Run cargo test -p asv-broker --test connect_serve a_leaf_minted_for_another_host_is_refused"
+            copy_hint: false
+            expected: "the wrong-host case is green, meaning the handshake is refused"
+        technical_steps:
+          - "the bridge re-checks the host binding after the handshake; removing verify_host_at turns this case red and leaves the other three green"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p asv-broker --test connect_serve a_leaf_minted_for_another_host_is_refused"
+          status: automated
+        rationale: "a leaf issued for one host must not terminate a session for another, and a general alarm would not localise the missing check"
+        evidence:
+          required: false
+          kinds: []
+      - id: S-4
+        title: "A client that pins the upstream certificate is refused, and the bridge is not patched to accommodate it"
+        priority: P0
+        assignee: developer
+        preconditions:
+          - "asv-broker crate compiled"
+        plain_steps:
+          - action: "Run cargo test -p asv-broker --test connect_serve a_pinning_client_is_refused_and_the_bridge_does_not_patch_it"
+            copy_hint: false
+            expected: "the pinning case is green, meaning the handshake fails in the bridge and the bridge's own certificate is never substituted for the pinned one"
+        technical_steps:
+          - "a client whose verifier anchors the origin's own certificate refuses the bridge's session leaf; the refusal happens in the handshake, not before it and not by letting it through"
+        automation:
+          ref: "/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p asv-broker --test connect_serve a_pinning_client_is_refused_and_the_bridge_does_not_patch_it"
+          status: automated
+        rationale: "UAT-011: this is the first release where a pinning client has a suite to fail against, which is what makes credential substitution testable instead of debatable"
+        evidence:
+          required: false
+          kinds: []

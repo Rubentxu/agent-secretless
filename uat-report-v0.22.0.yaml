@@ -1,0 +1,53 @@
+schema_version: 2
+release: v0.22.0
+plan_ref: v0.22.0
+sessions:
+- auto-S-1-20261001T143445Z
+- auto-S-2-20261001T143445Z
+- auto-S-3-20261001T143445Z
+- auto-S-4-20261001T143445Z
+summary:
+  total_scenarios: 4
+  passed: 4
+  failed: 0
+  blocked: 0
+  partial: 0
+  not_run: 0
+  coverage_pct: 100.0
+  defects: 0
+  ux_issues: 0
+  uat_duration_minutes: 0
+features:
+- id: UAT-M9-CONNECT-SERVE
+  name: >-
+    asv-broker serves a CONNECT that a client can actually complete a TLS handshake
+    through
+  coverage_pct: 100.0
+  scenarios:
+  - scenario_id: S-1
+    status: PASS
+    executor: automated
+    acceptance: pending
+    acceptance_required: true
+  - scenario_id: S-2
+    status: PASS
+    executor: automated
+    acceptance: pending
+    acceptance_required: true
+  - scenario_id: S-3
+    status: PASS
+    executor: automated
+    acceptance: pending
+    acceptance_required: true
+  - scenario_id: S-4
+    status: PASS
+    executor: automated
+    acceptance: pending
+    acceptance_required: true
+verdict: READY
+not_ready_blockers: []
+acceptance_blockers:
+- S-1 (machine PASS pero sin acceptance humana)
+- S-2 (machine PASS pero sin acceptance humana)
+- S-3 (machine PASS pero sin acceptance humana)
+- S-4 (machine PASS pero sin acceptance humana)

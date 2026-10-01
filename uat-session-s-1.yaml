@@ -1,0 +1,27 @@
+schema_version: 2
+session_id: auto-S-1-20261001T143445Z
+plan_ref: v0.22.0
+release: v0.22.0
+executor: automated
+executed_by: auto-runner
+started_at: 2026-10-01T14:34:45Z
+finished_at: 2026-10-01T14:34:45Z
+results:
+- scenario_id: S-1
+  status: PASS
+  comment: "pass: `/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p asv-broker --test connect_serve an_unauthorised_target_opens_no_upstream_socket` exited 0"
+  evidence:
+  - kind: command_output
+    ref: sha256:235c0161c4ecf6da54892ee0905fed65690c73bea613a03819a1f53cf8e298c7
+    note: "pass: `/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p asv-broker --test connect_serve an_unauthorised_target_opens_no_upstream_socket` exited 0"
+    captured_at: 2026-10-01T14:34:45Z
+    size_bytes: 715
+    mime: text/plain
+    path: /tmp/sddk-uat-cli-ev-S-1-53147.log
+  duration_minutes: 0
+  verdict_at: 2026-10-01T14:34:45Z
+  verdict_duration_ms: 3187
+  repro_command: >-
+    /var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p
+    asv-broker --test connect_serve an_unauthorised_target_opens_no_upstream_socket
+plan_version: 1

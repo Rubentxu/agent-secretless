@@ -1,0 +1,27 @@
+schema_version: 2
+session_id: auto-S-3-20261001T143445Z
+plan_ref: v0.22.0
+release: v0.22.0
+executor: automated
+executed_by: auto-runner
+started_at: 2026-10-01T14:34:45Z
+finished_at: 2026-10-01T14:34:45Z
+results:
+- scenario_id: S-3
+  status: PASS
+  comment: "pass: `/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p asv-broker --test connect_serve a_leaf_minted_for_another_host_is_refused` exited 0"
+  evidence:
+  - kind: command_output
+    ref: sha256:dca103a6e721b3d66e46570683b1e5a058d34bfe401561e29f7c0181c25b1839
+    note: "pass: `/var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p asv-broker --test connect_serve a_leaf_minted_for_another_host_is_refused` exited 0"
+    captured_at: 2026-10-01T14:34:45Z
+    size_bytes: 552
+    mime: text/plain
+    path: /tmp/sddk-uat-cli-ev-S-3-53147.log
+  duration_minutes: 0
+  verdict_at: 2026-10-01T14:34:45Z
+  verdict_duration_ms: 293
+  repro_command: >-
+    /var/home/rubentxu/Proyectos/rust/agent-secretless/tools/uat-cargo test -p
+    asv-broker --test connect_serve a_leaf_minted_for_another_host_is_refused
+plan_version: 1
