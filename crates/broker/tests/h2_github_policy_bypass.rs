@@ -1,44 +1,69 @@
-//! H2 — the GitHub operation trio does not consult the policy engine.
+//! H2 — the GitHub operation trio did not consult the policy engine.
+//!
+//! **Status: fixed.** This file was a failing `#[ignore]`d test; it is now a
+//! passing test that asserts the refusal. What follows is kept as the record
+//! of what was wrong, because a defect with no recorded cause tends to come
+//! back.
 //!
 //! # What was observed
 //!
 //! The M5 end-to-end test minted a surrogate for a `PostgresConnect` request
 //! and presented it to `ReadIssue`. The broker accepted it and dialled
-//! `api.github.com`.
+//! `api.github.com`:
+//!
+//! ```text
+//! request to api.github.com failed: the provider did not answer with JSON
+//! ```
 //!
 //! # What the design says
 //!
 //! ADR-0011 describes a surrogate as `session-scoped`, **`audience-bound`**,
 //! time-limited and provider-invalid. `audience-bound` is the binding
 //! dimension, so the honest question is not "is it action-bound" but "is the
-//! audience checked at all".
+//! audience checked at all". It was not.
 //!
 //! # The answer, from the code
 //!
-//! `ReadIssue` does three things and no more (`crates/broker/src/lib.rs:897`):
+//! `ReadIssue` did three things and no more (`crates/broker/src/lib.rs:897`):
 //!
 //!   1. `authorize_github(session, peer)`
 //!   2. `validate_repo(&repo)`
 //!   3. `state.surrogates.redeem(&surrogate, session, now)`
 //!
-//! and `authorize_github` checks exactly two things: that the peer owns the
-//! session, and that a vault is open. There is no `Authorize` call, no Cedar
+//! and `authorize_github` checked exactly two things: that the peer owns the
+//! session, and that a vault is open. There was no `Authorize` call, no Cedar
 //! evaluation, and no grant lookup anywhere on that path.
 //!
-//! The contrast is the finding. `PostgresQuery` calls
+//! The contrast was the finding. `PostgresQuery` called
 //! `authorize_postgres_statement(session, peer, &sql)` before the statement
-//! reaches the server, so a Postgres operation is evaluated per statement.
-//! `ReadIssue` is not evaluated at all. A session that was never granted
-//! anything can read, create and release GitHub issues as long as its peer
-//! owns it and a vault is open.
+//! reached the server, so a Postgres operation was evaluated per statement.
+//! `ReadIssue` was not evaluated at all.
 //!
-//! # What this test asserts
+//! # The fix, in two halves
 //!
-//! Not "the credential leaked" — it did not, and the surrogate is still a
-//! surrogate. It asserts the narrower and load-bearing claim: **no policy
-//! decision is consulted on this path.** A broker that started evaluating
-//! policy would answer `Denied` before any network call, and this test would
-//! go red, which is the point of writing it.
+//! **The class binding.** `SurrogateRecord` now records the
+//! [`CredentialClass`] of the credential it stands for, and redemption asks
+//! which [`OperationFamily`] it is being spent on. A database-class token
+//! cannot back a GitHub call. This is the type-level half, and it is the half
+//! this test exercises.
+//!
+//! **The issuance gate.** `MintSurrogate` now performs exactly one
+//! `policy.authorize(...)` call, at mint, for the family the credential
+//! belongs to. Before this, the policy was not consulted anywhere on the
+//! GitHub path, so an operator who tightened `POLICY_TEXT` observed no change
+//! at all. Minting is the right place: a surrogate *is* a capability, and
+//! authorization belongs where the capability is created. It is also the only
+//! affordable place — `uat_030_perf` times 100 `ReadIssue` calls, so a
+//! per-operation evaluation would land inside the measured loop.
+//!
+//! The issuance gate has its own test (`m5_console_e2e` does not cover it;
+//! see `h2_issuance_policy_gate.rs`), because the default policy *permits* the
+//! GitHub trio, and a test that only ever sees a permit proves nothing about
+//! the deny branch.
+//!
+//! [asv_domain::CredentialClass]: https://docs.rs/asv-domain
+//! [`CredentialClass`]: asv_domain::CredentialClass
+//! [`OperationFamily`]: asv_domain::OperationFamily
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -48,8 +73,8 @@ use std::process::{Child, Command, Stdio};
 use asv_domain::{Action, CredentialKind, Decision, Resource};
 use asv_ipc_protocol::{ErrorCode, OpaqueSecret, Request, Response};
 use asv_policy::{AuthorizationRequest, PolicyContext};
-use secrecy::SecretString;
 use asv_vault::{KdfParams, VaultStore};
+use secrecy::SecretString;
 
 struct BrokerGuard(Child);
 
@@ -80,33 +105,32 @@ fn roundtrip(sock: &std::path::Path, request: &Request) -> Response {
     serde_json::from_slice(&buf[..n]).expect("parse response")
 }
 
-/// Ignored on purpose, and that is the finding.
+/// The GitHub trio refuses a surrogate minted from the wrong class of
+/// credential, before any network is touched.
 ///
-/// This test asserts the *secure* behaviour: a session authorized for one
-/// database action must not be able to use a surrogate minted from it to read
-/// a GitHub issue. It fails today, with
+/// This used to be `#[ignore]`d and failing. The broker accepted the token and
+/// dialled `api.github.com`:
 ///
 /// ```text
 /// request to api.github.com failed: the provider did not answer with JSON
 /// ```
 ///
-/// — the broker dialled GitHub, which is what "it never evaluated the policy"
-/// looks like from the outside.
+/// # The assertion is deliberately exact
 ///
-/// It is `#[ignore]`d rather than deleted so the defect is pinned in code
-/// instead of living in a tracker nobody opens. `cargo test -- --ignored`
-/// runs it. The day someone fixes the GitHub path this stops being ignored,
-/// and when it is un-ignored without a fix the suite goes red on purpose.
+/// The first version of this test asserted only `code != Upstream`. That
+/// passes for *any* error, and — because the check sat inside an `if let
+/// Response::Error` — it also passed when the answer was not an error at all,
+/// which is to say it would have passed on a successful GitHub read. A test
+/// that cannot fail is not evidence, so the assertion here is on the exact
+/// code and on the reason.
 ///
-/// **Fix shape:** `ReadIssue` (and `CreateIssue`, `CreateRelease`) must call
-/// the policy engine the way `PostgresQuery` calls
-/// `authorize_postgres_statement` — evaluate the request, and refuse before
-/// the surrogate is spent and before the network is touched.
+/// The reason matters as much as the code: `WrongClass` proves the refusal came
+/// from the binding and not from an incidental failure like an unreachable
+/// host, an exhausted budget or a malformed argument. Asserting the code
+/// alone would let any of those pass.
 #[test]
-#[ignore = "H2: documents a live policy bypass on the GitHub trio; un-ignore when fixed"]
-fn a_session_with_no_grant_can_still_reach_the_github_operations() {
-    let dir = std::env::temp_dir()
-        .join(format!("asv-h2-{}-{}", std::process::id(), line!()));
+fn a_surrogate_minted_from_a_database_credential_cannot_reach_github() {
+    let dir = std::env::temp_dir().join(format!("asv-h2-{}-{}", std::process::id(), line!()));
     std::fs::create_dir_all(&dir).expect("create dir");
     let sock = dir.join("broker.sock");
     let vault_path = dir.join("vault.asv");
@@ -198,14 +222,17 @@ fn a_session_with_no_grant_can_still_reach_the_github_operations() {
         other => panic!("a forged surrogate was honoured: {other:?}"),
     }
 
-    // --- the finding: a REAL surrogate is honoured for anything -----------
-    // Authorize this session for one database action, mint a surrogate, and
-    // then present it to a GitHub read. The GitHub path never evaluates
-    // policy, so the token is enough on its own.
+    // --- the setup: a REAL surrogate, minted from that database credential --
+    // Minting succeeds, and it is allowed to: the default policy permits the
+    // database read verb, so the issuance gate passes this one. What the mint
+    // records is the *class*, and the class is what the operation checks.
     let request = AuthorizationRequest {
         session,
         action: Action::PostgresConnect,
-        resource: Resource::Database { name: "app".into(), role: "readonly".into() },
+        resource: Resource::Database {
+            name: "app".into(),
+            role: "readonly".into(),
+        },
         context: PolicyContext {
             workspace: "/tmp/project".into(),
             protected_ref: None,
@@ -213,7 +240,14 @@ fn a_session_with_no_grant_can_still_reach_the_github_operations() {
             peer_uid: 0,
         },
     };
-    match roundtrip(&sock, &Request::Authorize { request, capability: None, approval: None }) {
+    match roundtrip(
+        &sock,
+        &Request::Authorize {
+            request,
+            capability: None,
+            approval: None,
+        },
+    ) {
         Response::Authorization { explanation } => assert!(
             !matches!(explanation.decision, Decision::Deny { .. }),
             "the database request was denied, so there is no grant to widen: {:?}",
@@ -224,26 +258,75 @@ fn a_session_with_no_grant_can_still_reach_the_github_operations() {
 
     let surrogate = match roundtrip(
         &sock,
-        &Request::MintSurrogate { session, credential: credential_id, max_uses: 2, ttl_secs: 300 },
+        &Request::MintSurrogate {
+            session,
+            credential: credential_id,
+            max_uses: 2,
+            ttl_secs: 300,
+        },
     ) {
         Response::SurrogateMinted { surrogate, .. } => surrogate,
         other => panic!("expected a surrogate, got {other:?}"),
     };
 
+    // --- the finding, now asserted -----------------------------------------
     let answer = roundtrip(
         &sock,
-        &Request::ReadIssue { session, surrogate, repo: "routable-bypass-target/nonexistent".into(), number: 1 },
+        &Request::ReadIssue {
+            session,
+            surrogate: surrogate.clone(),
+            repo: "routable-bypass-target/nonexistent".into(),
+            number: 1,
+        },
     );
 
-    // A broker that evaluated policy on this path would answer `Denied` here,
-    // because the session was authorized for a database and not for GitHub.
-    // Reaching the network instead is the bypass, made observable.
-    if let Response::Error { code, message } = &answer {
-        assert_ne!(
-            *code,
-            ErrorCode::Upstream,
-            "the GitHub path now refuses, so it evaluates policy — H2 is fixed, \
-             and this test should be rewritten to assert the refusal. Got: {message}"
-        );
+    match answer {
+        Response::Error { code, message } => {
+            assert_eq!(
+                code,
+                ErrorCode::Denied,
+                "the refusal must be an authorization decision, not an upstream \
+                 or validation failure: {message}"
+            );
+            assert!(
+                message.contains("wrong class"),
+                "the refusal must name the class binding, otherwise some other \
+                 refusal satisfied this test: {message}"
+            );
+            assert!(
+                !message.contains(CANARY),
+                "the refusal leaked the secret: {message}"
+            );
+        }
+        other => panic!(
+            "H2 is NOT fixed: a database-class surrogate reached the GitHub \
+             operations and the broker answered {other:?}"
+        ),
+    }
+
+    // The budget must be intact. A refusal for the wrong class is a refusal to
+    // spend, not a spend — so presenting the same token again must produce the
+    // *same* refusal, not `Exhausted`. An implementation that charged a use per
+    // refused attempt would pass the assertion above and quietly burn the
+    // token, so the second presentation is the control.
+    let second = roundtrip(
+        &sock,
+        &Request::ReadIssue {
+            session,
+            surrogate: surrogate.clone(),
+            repo: "routable-bypass-target/nonexistent".into(),
+            number: 1,
+        },
+    );
+    match second {
+        Response::Error { code, message } => {
+            assert_eq!(code, ErrorCode::Denied, "second presentation: {message}");
+            assert!(
+                message.contains("wrong class"),
+                "the second refusal must be the same class refusal, not an \
+                 exhausted budget: {message}"
+            );
+        }
+        other => panic!("the second presentation reached GitHub: {other:?}"),
     }
 }
