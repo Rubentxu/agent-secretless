@@ -355,23 +355,43 @@ bridge negotiate `h2` over a tunnel it does not parse and cannot relay. The
 matrix pins it with a test and records the falsification that proves the test
 can fail.
 
-This closes one exit criterion. It does not move UAT-010 on the CONNECT path,
-and it does not touch UAT-012/013, which are blocked by a measured `EPERM` on
-`BPF_MAP_CREATE`. **M9 remains open.**
+This closed one exit criterion. It did not move UAT-010 on the CONNECT path,
+and it does not touch UAT-012/013, which are superseded by the M8 NO-GO rather
+than blocked: the feature they gate will not ship, so the question they posed
+is answered rather than outstanding.
 
-### The substitution increment is separate, and blocked on identity
+### The substitution increment: identity, answered
 
-Substitution on the CONNECT path is not part of what `serve_connect` delivered
-and is not a parser away. `Bridge::handle_connect` authorises a destination
-host; the bridge holds no session. A surrogate is redeemable only through the
-session that minted it, so an ordinary CLI that cannot present a session has
-no surrogate to redeem. Choosing what a session *is* for a client that is not
-the agent — including whether a token may serve as its own proof, which would
-give up the `WrongSession` refusal — is an ADR, not a task.
+This section used to read that substitution on the CONNECT path was *not a
+parser away* and was blocked on an identity question, and it pointed at
+`FND-m9-connect-substitution` as carrying "the options and their costs". **That
+finding was referenced by this file and by `tls_bridge.rs` and existed in no
+document at all** — referencing it is not having it. Writing the options down
+was part of the work.
 
-`FND-m9-connect-substitution` carries the options and their costs. Until that
-is answered, UAT-010 stands on the broker's semantic path, where the
-substitution is real and tested, and M9's exit is **not** met by it alone.
+ADR-0019 records four. The obvious one, taking the session from the kernel via
+the socket peer, was **discarded by measurement**: `SO_PEERCRED` on a connected
+`AF_INET` socket returns the unavailable sentinel (`pid=0 uid=-1 gid=-1`),
+with an `AF_UNIX` control on the same machine returning the correct pid. Letting
+the token be its own proof was discarded because it gives up `WrongSession`.
+"CONNECT does not substitute" was kept, but as the **failure** rather than as
+an alternative: a CONNECT that proves no session gets no tunnel, which is why
+`EstablishedTunnel::session` is an `AgentSessionId` and not an `Option`.
+
+What was chosen is a signed nonce. `asv run` opens a real session and binds its
+public key to it over the kernel-authenticated socket; the CONNECT client
+presents its key blob plus a signature over a nonce derived from the
+destination; the bridge resolves that to the session whose **registered** key
+verifies, and redeems the surrogate in it. `crates/broker/tests/uat_010_connect_substitution.rs`
+proves it end to end with real keys and a real origin socket, falsified eight
+ways.
+
+UAT-012 and UAT-013 were superseded by the M8 NO-GO. UAT-011 was already
+covered and the TLS compatibility matrix was published from tests. **M9 is
+closed.** What is *not* claimed is on the M9 row of the release gates: no
+production listener wires the relay into a running broker, one request is served
+per tunnel, and the destination-derived nonce prevents a proof from being
+transferred to another destination without being freshness.
 
 ---
 

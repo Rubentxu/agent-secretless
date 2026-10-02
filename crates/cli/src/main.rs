@@ -810,6 +810,14 @@ fn print_response(response: &Response) {
                         asv_ipc_protocol::AuditEventDto::WorkerSpawned {
                             worker, outcome, ..
                         } => (format!("worker:{worker}"), outcome.clone()),
+                        // ADR-0019. A substitution is not a verb the agent
+                        // invoked, so it has no method name; the destination is
+                        // what an operator reads here. Rendering the session
+                        // would be the more useful column in a different
+                        // view, and this one has three.
+                        asv_ipc_protocol::AuditEventDto::CredentialSubstituted {
+                            destination, outcome, ..
+                        } => (format!("connect:{destination}"), outcome.clone()),
                     };
                     println!("{:<6} {:<12} {:<22} {}", r.seq, outcome, method, r.ts);
                 }

@@ -98,19 +98,54 @@ Expected:
 
 Suites: `crates/broker/tests/uat_005_replay.rs` (origin receives the real
 credential and never the surrogate; the success path leaks nothing; the
-credentialed operation is audited and the chain verifies) and
+credentialed operation is audited and the chain verifies),
 `crates/broker/tests/credential_ingest_boundary.rs` (the plant's own output,
-and `/proc` of the live CLI while it holds the secret).
+and `/proc` of the live CLI while it holds the secret), and
+`crates/broker/tests/uat_010_connect_substitution.rs` (the same claim on the
+CONNECT proxy path, end to end).
 
-### What this UAT does not cover
+### The CONNECT path, and what still is not covered
 
-Not the CONNECT proxy path. An ordinary CLI behind `HTTPS_PROXY` presents a
-CONNECT and carries no session, and a surrogate is only redeemable through the
-session that minted it — so substitution on that path is blocked on a
-question about identity, not on a missing parser. `Bridge::handle_connect`
-authorises a destination host and nothing else. That half is
-`FND-m9-connect-substitution`, and M9's exit is not satisfied by this section
-alone.
+The CONNECT path used to be excluded from this section, and the exclusion was
+correct at the time: an ordinary CLI behind `HTTPS_PROXY` presents a CONNECT
+and carries no session, and a surrogate is only redeemable through the
+session that minted it, so substitution there was blocked on a question about
+identity rather than on a missing parser. `Bridge::handle_connect` authorised a
+destination host and nothing else.
+
+ADR-0019 answered that question and `uat_010_connect_substitution.rs` now
+covers the path. An ordinary CLI opens a real session against the broker, and
+the broker binds that session's public signing key to it over the
+kernel-authenticated socket. The CONNECT client presents
+`x-asv-session-proof`, which is its key blob plus a signature over a nonce
+derived from the destination, and the bridge resolves it to the session whose
+**registered** key verifies. The surrogate is then redeemed in that session,
+the credential is lent, the authorization header is rewritten on the way
+upstream, and the response is relayed back without ever touching the client
+side. The suite runs a full rustls client with server-name verification, real
+ed25519 keys, the real `SurrogateRegistry`, and a real origin socket, and it
+cannot pass vacuously: every arm asserts the origin received the credential,
+and every refusal arm asserts it was forwarded zero bytes.
+
+Three things this section still does not claim, stated rather than left to be
+discovered:
+
+- **No production listener.** `relay_substituted` is wired to no socket in
+  `main.rs`. What is verified is the capability and its refusal behaviour, not
+  a running proxy. Reaching a live deployment is the next increment.
+- **One request per tunnel.** The relay reads the first inner request head,
+  forwards it, and relays the upstream's response. A second request on the
+  same tunnel is not served.
+- **No freshness.** The nonce is derived from the destination, not from a
+  per-tunnel value, because a server-issued nonce would cost a round trip
+  before the CONNECT that an ordinary HTTP client cannot pay. What that buys
+  is that a proof does not transfer to another destination; what it does not
+  buy is replay protection against the same destination, and the replay bound
+  is the single-use surrogate, which was already spent.
+
+The one CONNECT refusal that is not the client's fault to fix: a destination
+outside the allow-list is refused **before** the proof is examined, so an
+unauthorised target cannot induce a signature verification at all.
 
 UAT-012 and UAT-013 are the eBPF redirect and stay gated on the M8 GO by
 ADR-0007.
