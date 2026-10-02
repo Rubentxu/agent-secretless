@@ -1119,7 +1119,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             }
             state.postgres_connect(
                 session,
-                &destination.host.to_string(),
+                destination.host.as_str(),
                 &destination.addr.to_string(),
                 port,
                 database,
@@ -1494,6 +1494,30 @@ impl BrokerState {
     ///    declared hosts went through the same function, so a legitimate
     ///    alternative spelling of a real host still matches.
     fn pg_destination(&self, host: &str, host_addr: &str) -> Result<&PgDestination, Box<Response>> {
+        // Syntax before configuration, and the order is the contract. A
+        // malformed address is a statement about the *request*, and it has to
+        // stay that way whatever the deployment happens to be configured with:
+        // reporting "this broker has no destinations" to a caller who sent
+        // nonsense answers a question they did not ask and describes the
+        // broker's setup to a peer that gets to choose its next move. It also
+        // silently disables the existing guarantee that a malformed address is
+        // refused as `InvalidRequest` before the credential is lent.
+        let addr: IpAddr = host_addr.parse().map_err(|error| {
+            Box::new(Response::Error {
+                code: ErrorCode::InvalidRequest,
+                message: format!("host_addr is not an IP address: {error}"),
+            })
+        })?;
+        // An unusable host name is also the request's fault, so it is answered
+        // as `Denied` about the name rather than as a deployment question.
+        let requested = Authority::canonicalize(host).map_err(|error| {
+            Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: format!("host is not a usable server name: {error}"),
+            })
+        })?;
+
+        // Configuration last, now that the request is known to be well formed.
         let declared = self.connectors.pg_destinations();
         if declared.is_empty() {
             return Err(Box::new(Response::Error {
@@ -1503,20 +1527,6 @@ impl BrokerState {
                     .into(),
             }));
         }
-        // The address is parsed before the host so a malformed literal is
-        // reported as a malformed literal rather than as an unknown host.
-        let addr: IpAddr = host_addr.parse().map_err(|error| {
-            Box::new(Response::Error {
-                code: ErrorCode::InvalidRequest,
-                message: format!("host_addr is not an IP address: {error}"),
-            })
-        })?;
-        let requested = Authority::canonicalize(host).map_err(|error| {
-            Box::new(Response::Error {
-                code: ErrorCode::Denied,
-                message: format!("host is not a usable server name: {error}"),
-            })
-        })?;
         declared
             .iter()
             .find(|d| d.host == requested && d.addr == addr)
@@ -4042,6 +4052,22 @@ mod e2e {
         BrokerState::default()
     }
 
+    /// Declares `db.example` as a destination, so a test whose subject is a
+    /// *later* check can get past the destination gate (H5) and reach it.
+    ///
+    /// Without this every inline PostgreSQL refusal test would exercise the
+    /// destination gate instead of the thing it was written to prove, and would
+    /// go on passing for the wrong reason.
+    fn declares_db_example(state: &mut BrokerState) {
+        state.connectors = Box::new(LiveConnectorFactory {
+            destinations: vec![
+                PgDestination::new("db.example", "93.184.216.34".parse().unwrap())
+                    .expect("a canonical host"),
+            ],
+            ..LiveConnectorFactory::default()
+        });
+    }
+
     /// A peer whose pid is the current process, which is what the session
     /// store records, so ownership checks pass.
     fn self_peer() -> WorkloadIdentity {
@@ -4058,6 +4084,7 @@ mod e2e {
         // refused" here would be sending an operator to look at the network,
         // when the actual cause is a broker that was never given a runtime.
         let mut state = bare();
+        declares_db_example(&mut state);
         let peer = self_peer();
         let session = state.sessions.create("/repo".into(), &peer);
         state.secrets = Some(Arc::new(RefusingPort));
