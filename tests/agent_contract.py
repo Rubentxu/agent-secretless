@@ -44,15 +44,46 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 GOLDEN_DIR = REPO / "tests" / "golden"
 def _default_binary() -> Path:
-    """Where `cargo build` leaves `asv`.
+    """Where the build left `asv`, asked of the build itself.
 
-    Derived from `CARGO_TARGET_DIR` when it is set, because this repository
-    pins it to a shared directory and a hardcoded path would make the suite
-    fail on any machine that does not happen to have that layout.
+    The obvious answer — `CARGO_TARGET_DIR` or `<repo>/target` — is wrong on
+    any machine whose `~/.cargo/config.toml` sets `build.target-dir`, and this
+    repository is developed on one. Cargo honours that config; this script
+    would not, so it looked in `<repo>/target`, found nothing, and exited 2 in
+    the `agent-contract` stage while the `build` stage right before it
+    reported success. The failure looked like a missing binary and was really
+    two components disagreeing about where binaries live.
+
+    So the question is put to cargo, which is the only component that has the
+    full answer: environment variable, then config file, then default. The
+    environment variable is still honoured first, because that is the
+    documented override, and `<repo>/target` remains the last resort for a
+    checkout with no cargo available to ask.
     """
-    target = os.environ.get("CARGO_TARGET_DIR")
-    base = Path(target) if target else REPO / "target"
-    return base / "debug" / "asv"
+    override = os.environ.get("ASV_BIN")
+    if override:
+        return Path(override)
+
+    from_env = os.environ.get("CARGO_TARGET_DIR")
+    if from_env:
+        return Path(from_env) / "debug" / "asv"
+
+    try:
+        meta = subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--no-deps",
+             "--manifest-path", str(REPO / "Cargo.toml")],
+            capture_output=True, text=True, check=True, timeout=120)
+        target_dir = json.loads(meta.stdout)["target_directory"]
+        candidate = Path(target_dir) / "debug" / "asv"
+        if candidate.exists():
+            return candidate
+    except (OSError, subprocess.SubprocessError, KeyError, ValueError, json.JSONDecodeError):
+        # Cargo missing, offline, or answering something unexpected. The
+        # fallback below is the honest guess, and a wrong guess ends in a
+        # message that names the path it tried.
+        pass
+
+    return REPO / "target" / "debug" / "asv"
 
 
 BINARY = Path(os.environ.get("ASV_BIN", "")) if os.environ.get("ASV_BIN") else _default_binary()

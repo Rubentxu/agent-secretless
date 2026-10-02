@@ -137,10 +137,51 @@ pipeline {
         // about a key that *moved*, and a golden cannot say that a value is
         // the wrong one. An agent contract is consumed by name, so both are
         // needed.
+        // Runs after `build` because stages execute in declaration order.
+        // There is no `dependsOn` in this DSL: `StageSpec` carries steps,
+        // options, environment, directives and a post-condition, and no
+        // dependency field. A `dependsOn("build")` here does not fail loudly
+        // at review time — it fails the first time anybody runs the pipeline,
+        // which is why this line existed unrun.
         stage("agent-contract") {
-            dependsOn("build")
             dir(repo) {
                 sh("python3 tests/agent_contract.py")
+            }
+        }
+
+        // Does the published skill still describe this build? The skill lives
+        // in another repository (ADR-05), so this stage is cross-repository.
+        //
+        // The exit code is the design. `skill_contract.py` exits 77 when it
+        // cannot find a skill checkout, and that is translated into a loud
+        // skip rather than into a pass or a failure: a machine without the
+        // sibling checkout genuinely cannot run the comparison, and a stage
+        // that fails there teaches people to delete the stage. The stage
+        // reports 0 only after saying out loud that it did not compare
+        // anything.
+        //
+        // Written with `sh` and nothing else because `sh`, `dir` and
+        // `timeout` are the only constructs this file already proves; an
+        // unproven DSL call in a pipeline file is a build that stops working
+        // for everyone the first time it is parsed, and this file is parsed.
+        stage("skill-contract") {
+            dir(repo) {
+                sh(
+                    """
+                    set -u
+                    set +e
+                    python3 tests/skill_contract.py
+                    code=${'$'}?
+                    set -e
+                    if [ "${'$'}code" = "77" ]; then
+                      echo "skill-contract SKIPPED: no agent-secretless checkout found."
+                      echo "  Set ASV_SKILL_DIR to the skills/agent-secretless directory"
+                      echo "  of a Rubentxu/agent-skill checkout to compare the skill."
+                      exit 0
+                    fi
+                    exit "${'$'}code"
+                    """.trimIndent()
+                )
             }
         }
 
