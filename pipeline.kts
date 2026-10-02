@@ -149,6 +149,17 @@ pipeline {
             }
         }
 
+        // DX4. The exit test is that two independent channels install the
+        // same product, so the check builds a release, installs it through
+        // both entry points, and compares the bytes. It also runs the two
+        // refusals UAT-DX-008 asks for: a bundle whose bytes were altered, and
+        // a bundle carrying a binary no component declares.
+        stage("distribution-channels") {
+            dir(repo) {
+                sh("python3 tests/distribution_channels.py")
+            }
+        }
+
         // Does the published skill still describe this build? The skill lives
         // in another repository (ADR-05), so this stage is cross-repository.
         //

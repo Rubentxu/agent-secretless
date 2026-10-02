@@ -136,6 +136,8 @@ impl Discovery {
             self.protocol_compatible,
         );
 
+        let origin = crate::installrecord::origin();
+
         let data = json!({
             "broker": {
                 "reachable": self.broker_reachable,
@@ -152,6 +154,15 @@ impl Discovery {
                 "ready": self.installation_ready,
                 "channel": crate::doctor::detect_channel(),
                 "managed_by": crate::doctor::detect_managed_by(),
+                // DX4, and deliberately with its provenance. `channel` is a
+                // path heuristic; this is the record the installer wrote. An
+                // agent told "mise" must be able to tell that from an agent
+                // told "mise" because its path happens to contain a mise
+                // directory, because the first one has a mise that owns the
+                // update path and the second one does not.
+                "installed_via": origin.installed_via.as_str(),
+                "installed_via_source": origin.provenance.as_str(),
+                "update_via": origin.installed_via.update_hint(),
             },
             "capabilities": capabilities.capabilities.iter().map(|c| json!({
                 "name": c.name,

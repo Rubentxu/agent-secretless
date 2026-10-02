@@ -17,6 +17,7 @@ pub mod agent;
 #[path = "capabilities/mod.rs"]
 pub mod capabilities;
 pub mod doctor;
+pub mod installrecord;
 pub mod ipc;
 pub mod layout;
 pub mod render;

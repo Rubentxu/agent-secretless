@@ -228,6 +228,52 @@ def compare_shape(name: str, document: dict, fixed: set[str], fixed_data: set[st
 # --- the properties a golden cannot express ------------------------------
 
 
+def test_installed_via_comes_with_its_provenance() -> None:
+    """DX4: `installed_via` is only useful if it can be weighed.
+
+    The golden pins the shape — that `installed_via` and
+    `installed_via_source` are present at all. This pins the meaning, which is
+    the part a shape check cannot: a value read from a file the installer
+    wrote and a value guessed from a path containing a mise directory are
+    different claims, and an agent told "mise" has to be able to tell which one
+    it is looking at. Without `installed_via_source` the two are
+    indistinguishable, and the ADR's "inform the correct mechanism" has
+    nothing to inform.
+    """
+    sources = {"record", "no-record", "unreadable"}
+    values = {"installer", "mise", "package-manager", "source"}
+
+    for argv in (["agent", "discover", "--json"], ["doctor", "--json"]):
+        with tempfile.TemporaryDirectory(prefix="asv-contract-") as tmp:
+            home = Path(tmp)
+            (home / "run").mkdir()
+            _, out, _ = run(argv, home)
+            label = argv[-2]
+            document = json.loads(out)
+            installation = document.get("data", {}).get("installation", {})
+
+            via = installation.get("installed_via")
+            source = installation.get("installed_via_source")
+            check(via in values, f"{label}: installed_via={via!r} is a known channel")
+            check(source in sources, f"{label}: installed_via_source={source!r} says where it came from")
+            check(
+                "update_via" in installation,
+                f"{label}: the update mechanism is stated, or explicitly null",
+            )
+            # A source tree is the one channel that owns nothing, so there is
+            # no mechanism to name. Anything else must name one.
+            if via == "source" and source == "no-record":
+                check(
+                    installation.get("update_via") is None,
+                    f"{label}: a source tree claims no update mechanism",
+                )
+            else:
+                check(
+                    installation.get("update_via") is not None,
+                    f"{label}: {via!r} names the mechanism that owns the update",
+                )
+
+
 def test_every_link_carries_the_contract_fields() -> None:
     """`06-CLI-CONTRACT.md` §4, on every document this build emits."""
     with tempfile.TemporaryDirectory(prefix="asv-contract-") as tmp:

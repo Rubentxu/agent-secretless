@@ -10,8 +10,11 @@
     "capability_derivation": "UNKNOWN",
     "installation": {
       "channel": "source",
+      "installed_via": "source",
+      "installed_via_source": "no-record",
       "managed_by": "direct",
-      "ready": false
+      "ready": false,
+      "update_via": null
     }
   },
   "error": {

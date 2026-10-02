@@ -121,6 +121,7 @@ fn sample(stop_broker: bool) -> Observation {
         },
         channel: "stable",
         managed_by: "direct",
+        origin: crate::installrecord::InstallationOrigin::source_without_record(),
     }
 }
 

@@ -187,6 +187,8 @@ pub struct Observation {
     pub hardening: Hardening,
     pub channel: &'static str,
     pub managed_by: &'static str,
+    /// Who placed these files, and how we know.
+    pub origin: crate::installrecord::InstallationOrigin,
 }
 
 /// Whether a directory exists, and what mode it ended up with.
@@ -218,6 +220,10 @@ pub struct DoctorReport {
     pub hardening: Hardening,
     pub installation_channel: &'static str,
     pub managed_by: &'static str,
+    /// Who placed these files, and how we know. Carried through unchanged:
+    /// `doctor` reports what it observed and the judgement is about the
+    /// installation, not about who owns it.
+    pub origin: crate::installrecord::InstallationOrigin,
     pub checks: Vec<Check>,
     pub warnings: Vec<Warning>,
 }
@@ -556,12 +562,31 @@ impl DoctorReport {
             });
         }
 
+        // An install record that exists and cannot be read is the one case
+        // worth a warning: the installation was placed by something, and the
+        // owner is now unknown. `installed_via` still reports `source` so the
+        // field is never absent, but `installed_via_source: unreadable` is
+        // what stops a reader treating that as a finding — and it is what
+        // stops an update path from deciding it owns these files.
+        if obs.origin.provenance == crate::installrecord::Provenance::Unreadable {
+            warnings.push(Warning {
+                code: "INSTALL_RECORD_UNREADABLE".into(),
+                message: format!(
+                    "an install record exists but could not be read, so the owner of \
+                     this installation is unknown. Do not treat these files as \
+                     unowned: {}",
+                    obs.origin.reason.as_deref().unwrap_or("no reason recorded")
+                ),
+            });
+        }
+
         Self {
             cli_version: obs.cli_version,
             socket: obs.socket,
             hardening: obs.hardening,
             installation_channel: obs.channel,
             managed_by: obs.managed_by,
+            origin: obs.origin,
             checks,
             warnings,
         }
@@ -644,6 +669,18 @@ impl DoctorReport {
             "installation": {
                 "channel": self.installation_channel,
                 "managed_by": self.managed_by,
+                // DX4. `installed_via` is the field the ADR asks for, and it
+                // ships with its provenance because a value read from a file
+                // and a value guessed from a path are not the same claim.
+                // `channel` above is still the path heuristic; this is the
+                // record, and when the record is unreadable that is said
+                // rather than papered over with `source`.
+                "installed_via": self.origin.installed_via.as_str(),
+                "installed_via_source": self.origin.provenance.as_str(),
+                "installed_via_owns_updates": self.origin.installed_via.owns_updates(),
+                "install_version": self.origin.record.as_ref().map(|r| r.version.as_str()),
+                "install_root": self.origin.record.as_ref().map(|r| r.install_root.display().to_string()),
+                "update_via": self.origin.installed_via.update_hint(),
             },
             "checks": self.checks.iter().map(|c| serde_json::json!({
                 "id": c.id,
@@ -776,6 +813,7 @@ impl Observation {
             hardening: detect_hardening(),
             channel: detect_channel(),
             managed_by: detect_managed_by(),
+            origin: crate::installrecord::origin(),
         }
     }
 }
