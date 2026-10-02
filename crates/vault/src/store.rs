@@ -399,18 +399,18 @@ impl VaultFile {
         // plain `+ 8` on the next line — found by the envelope fuzzer in
         // its first 20 seconds. `body_len_at` is the checked position of
         // the body-length field, and every later slice derives from it.
-        let header_end = PREFIX.checked_add(header_len).ok_or(VaultError::MalformedBody)?;
+        let header_end = PREFIX
+            .checked_add(header_len)
+            .ok_or(VaultError::MalformedBody)?;
         let body_len_at = header_end.checked_add(8).ok_or(VaultError::MalformedBody)?;
         if bytes.len() < body_len_at {
             return Err(VaultError::MalformedBody);
         }
         let header: VaultHeader = serde_json::from_slice(&bytes[PREFIX..header_end])
             .map_err(|_| VaultError::Serialization)?;
-        let body_len = u64::from_le_bytes(
-            bytes[header_end..body_len_at]
-                .try_into()
-                .expect("8 bytes"),
-        ) as usize;
+        let body_len =
+            u64::from_le_bytes(bytes[header_end..body_len_at].try_into().expect("8 bytes"))
+                as usize;
         let body_end = body_len_at
             .checked_add(body_len)
             .ok_or(VaultError::MalformedBody)?;
