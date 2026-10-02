@@ -29,6 +29,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use asv_connector_http::SecretSink;
 use asv_domain::{AgentSessionId, Authority};
 use asv_tls_acceptor::{handshake_once, LeafMaterial};
 use time::OffsetDateTime;
@@ -698,6 +699,120 @@ pub fn proof_nonce(presented_key: &[u8], target: &AuthorityEndpoint) -> Vec<u8> 
     hasher.update(target.host().as_bytes());
     hasher.update((target.port() as u64).to_be_bytes());
     hasher.finalize().to_vec()
+}
+
+/// Why a credential could not be substituted into a CONNECT request.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SubstitutionError {
+    /// The request carried no bearer token to substitute.
+    #[error("request carries no bearer credential")]
+    NoCredential,
+    /// The surrogate is unknown, expired, exhausted, of the wrong class,
+    /// or belongs to another session.
+    ///
+    /// Carries no reason, and that is load-bearing rather than tidy. A
+    /// caller that could tell "unknown token" from "wrong session" learns
+    /// whether a token it holds is real, which is the difference between
+    /// "try another one" and "you do not own this". Every one of those
+    /// causes answers the same way, and the detail is logged where the
+    /// operator can read it and the caller cannot.
+    #[error("the presented surrogate was refused")]
+    Refused,
+    /// The port refused to lend.
+    #[error("the credential could not be lent: {0}")]
+    Lend(String),
+}
+
+/// Where the bridge gets credential substitution from.
+///
+/// The third trait for the same reason as `LeafSource`: `tls_bridge` must
+/// not depend on the vault or the broker's state (D2, enforced by a test).
+/// What the bridge contributes is the header surgery; what the
+/// implementation contributes is the decision.
+pub trait CredentialSubstituter {
+    /// Redeems `surrogate` **in `session`** and lends what it stands for
+    /// into `sink`.
+    ///
+    /// The session is the tunnel's, resolved from a signature in
+    /// `serve_connect`. It is not the client's to choose, which is what
+    /// keeps `WrongSession` meaningful: a token minted elsewhere still
+    /// fails, because "elsewhere" is now a fact the broker established
+    /// rather than a claim it accepted.
+    fn substitute(
+        &self,
+        surrogate: &str,
+        session: AgentSessionId,
+        sink: &mut dyn SecretSink,
+    ) -> Result<(), SubstitutionError>;
+}
+
+/// The bearer token in a request, if it has one.
+///
+/// Returns the value without the `Bearer ` prefix, which is the form a
+/// surrogate is presented in and the form `redeem_for` takes.
+pub fn bearer_token(request: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(request).ok()?;
+    for line in text.split("\r\n") {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        let value = value.trim();
+        return Some(match value.split_once(' ') {
+            Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => {
+                token.trim().to_string()
+            }
+            _ => value.to_string(),
+        });
+    }
+    None
+}
+
+/// Returns `request` with its bearer token replaced.
+///
+/// The rewrite is byte-oriented on purpose: re-serialising the request
+/// would reformat headers the provider may be sensitive to, and would
+/// risk normalising a token that contains bytes a naive parse would
+/// mangle. Only the token's extent is replaced, and the length change is
+/// accounted for so the head and body boundary is preserved.
+pub fn replace_bearer_token(
+    request: &[u8],
+    replacement: &str,
+) -> Result<Vec<u8>, SubstitutionError> {
+    let text = std::str::from_utf8(request).map_err(|_| SubstitutionError::NoCredential)?;
+    let mut out = Vec::with_capacity(request.len() + replacement.len());
+    let mut replaced = false;
+    let mut offset = 0usize;
+    for line in text.split_inclusive("\r\n") {
+        let Some((name, _value)) = line.split_once(':') else {
+            out.extend_from_slice(line.as_bytes());
+            offset += line.len();
+            continue;
+        };
+        if !replaced && name.trim().eq_ignore_ascii_case("authorization") {
+            let value_start = offset + name.len() + 1;
+            let body_end = offset + line.len();
+            let raw_value = &text[value_start..body_end];
+            let kept_prefix = match raw_value.split_once(' ') {
+                Some((scheme, _)) => scheme.len() + 1,
+                None => 0,
+            };
+            out.extend_from_slice(&request[offset..value_start + kept_prefix]);
+            out.extend_from_slice(replacement.as_bytes());
+            out.extend_from_slice(b"\r\n");
+            replaced = true;
+            offset = body_end;
+            continue;
+        }
+        out.extend_from_slice(line.as_bytes());
+        offset += line.len();
+    }
+    if !replaced {
+        return Err(SubstitutionError::NoCredential);
+    }
+    Ok(out)
 }
 
 /// The header a CONNECT client presents its session proof in.
@@ -1454,5 +1569,131 @@ mod proof_tests {
         assert_ne!(proof_nonce(b"k", &a), proof_nonce(b"k", &b));
         assert_ne!(proof_nonce(b"k", &a), proof_nonce(b"kk", &a));
         assert_eq!(proof_nonce(b"k", &a), proof_nonce(b"k", &a));
+    }
+}
+
+/// The substitution itself: a surrogate in a request becomes the real
+/// credential on the way upstream, and the client never sees it.
+#[cfg(test)]
+mod substitution_tests {
+    use super::*;
+
+    const REAL: &[u8] = b"ASV-REAL-CANARY-4d7e2a91-must-reach-upstream";
+    const SURROGATE: &str = "asv_gh_9f2c7d10";
+
+    fn request_with(token: &str) -> Vec<u8> {
+        format!(
+            "GET /repos/o/r/issues HTTP/1.1\r\nHost: api.github.test\r\nAuthorization: Bearer {token}\r\nAccept: application/json\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    /// A port that hands out `REAL` for exactly `mine`, and refuses for
+    /// every other session — the way `redeem_for` behaves.
+    struct Port {
+        mine: AgentSessionId,
+    }
+
+    impl CredentialSubstituter for Port {
+        fn substitute(
+            &self,
+            surrogate: &str,
+            session: AgentSessionId,
+            sink: &mut dyn SecretSink,
+        ) -> Result<(), SubstitutionError> {
+            if surrogate != SURROGATE {
+                return Err(SubstitutionError::Refused);
+            }
+            if session != self.mine {
+                // The refusal a token from another session gets.
+                return Err(SubstitutionError::Refused);
+            }
+            sink.accept(REAL)
+                .map_err(|e| SubstitutionError::Lend(e.to_string()))
+        }
+    }
+
+    /// Collects what the port lends, and never keeps the borrow.
+    struct Collect(Vec<u8>);
+    impl SecretSink for Collect {
+        fn accept(&mut self, secret: &[u8]) -> Result<(), asv_connector_http::SecretError> {
+            self.0.extend_from_slice(secret);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_bearer_token_is_read_out_of_the_request() {
+        assert_eq!(
+            bearer_token(&request_with(SURROGATE)).as_deref(),
+            Some(SURROGATE)
+        );
+        assert!(bearer_token(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn the_upstream_request_carries_the_real_credential_and_not_the_surrogate() {
+        let session = AgentSessionId::new();
+        let port = Port { mine: session };
+        let original = request_with(SURROGATE);
+        let token = bearer_token(&original).expect("a bearer token");
+
+        let mut sink = Collect(Vec::new());
+        port.substitute(&token, session, &mut sink)
+            .expect("substitution");
+
+        let upstream = replace_bearer_token(&original, std::str::from_utf8(&sink.0).unwrap())
+            .expect("rewrite");
+        let text = String::from_utf8(upstream).expect("utf-8 request");
+
+        assert!(text.contains(std::str::from_utf8(REAL).unwrap()));
+        assert!(
+            !text.contains(SURROGATE),
+            "the surrogate was forwarded upstream: {text}"
+        );
+        // Everything that is not the token survives byte for byte.
+        assert!(text.starts_with("GET /repos/o/r/issues HTTP/1.1\r\n"));
+        assert!(text.contains("Host: api.github.test\r\n"));
+        assert!(text.contains("Accept: application/json\r\n"));
+    }
+
+    #[test]
+    fn a_surrogate_from_another_session_is_still_refused() {
+        let mine = AgentSessionId::new();
+        let theirs = AgentSessionId::new();
+        let port = Port { mine };
+        let mut sink = Collect(Vec::new());
+        let outcome = port.substitute(SURROGATE, theirs, &mut sink);
+        assert!(
+            matches!(outcome, Err(SubstitutionError::Refused)),
+            "a token from another session was redeemed: {outcome:?}"
+        );
+        assert!(
+            sink.0.is_empty(),
+            "a refused substitution still lent the credential"
+        );
+    }
+
+    #[test]
+    fn a_request_with_no_authorization_header_is_refused_rather_than_guessed() {
+        let bare = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert!(bearer_token(bare).is_none());
+        assert!(matches!(
+            replace_bearer_token(bare, "anything"),
+            Err(SubstitutionError::NoCredential)
+        ));
+    }
+
+    #[test]
+    fn the_refusal_says_the_same_thing_whatever_was_wrong() {
+        // The caller must not be able to tell "unknown token" from "wrong
+        // session", because that is the difference between a client that
+        // retries and a client that learns it does not own the credential.
+        let mine = AgentSessionId::new();
+        let port = Port { mine };
+        let mut sink = Collect(Vec::new());
+        let unknown = port.substitute("asv_gh_deadbeef", mine, &mut sink);
+        let wrong_session = port.substitute(SURROGATE, AgentSessionId::new(), &mut sink);
+        assert_eq!(unknown, wrong_session);
     }
 }

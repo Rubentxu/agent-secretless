@@ -51,7 +51,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
-use asv_domain::{AgentSessionId, CredentialKind};
+use asv_domain::CredentialKind;
 use asv_ipc_protocol::{OpaqueSecret, Request, Response};
 use asv_vault::{KdfParams, VaultStore};
 use secrecy::SecretString;
