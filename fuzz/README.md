@@ -9,6 +9,7 @@ and requires nightly Rust via `cargo-fuzz`.
 | Target | Boundary under test | Invariant |
 |---|---|---|
 | `fuzz_ipc_decode_request` | `asv_ipc_protocol::decode_request` | total function: `Ok(Request)` or `Err(ProtocolError)`, never panic |
+| `fuzz_vault_envelope_decode` | `asv_vault::VaultFile::decode` | total function over untrusted bytes: `Ok` or `Err`, never panic; every accepted input survives `decode`-then-`encode` unchanged |
 
 ## Running (nightly only)
 

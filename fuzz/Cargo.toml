@@ -13,10 +13,18 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 asv-ipc-protocol = { path = "../crates/ipc-protocol" }
+asv-vault = { path = "../crates/vault" }
 
 [[bin]]
 name = "fuzz_ipc_decode_request"
 path = "fuzz_targets/fuzz_ipc_decode_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_vault_envelope_decode"
+path = "fuzz_targets/fuzz_vault_envelope_decode.rs"
 test = false
 doc = false
 bench = false

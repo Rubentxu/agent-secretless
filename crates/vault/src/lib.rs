@@ -46,7 +46,7 @@ pub mod tpm;
 pub use envelope::{EnvelopeError, KdfParams, VaultHeader, VaultKey, ENVELOPE_VERSION};
 pub use store::{
     CredentialKind, CredentialMetadata, CredentialRecord, Exportability, VaultBody, VaultError,
-    VaultStore,
+    VaultFile, VaultStore,
 };
 
 /// Version of this crate, for diagnostics and receipts.

@@ -350,14 +350,25 @@ impl VaultError {
 
 /// The on-disk file layout: magic, length-prefixed header, length-prefixed
 /// body ciphertext.
+///
+/// Public, with private fields, so the envelope parser can be held to its
+/// contract from outside the crate: [`VaultFile::decode`] is a total function
+/// over untrusted bytes — `Ok` or `Err`, never panic — and every accepted
+/// input must survive the `decode`-then-`encode` round trip unchanged. The
+/// fuzz target `fuzz_vault_envelope_decode` (in the `fuzz/` workspace) is
+/// what enforces both, against arbitrary bytes rather than a table of known
+/// bad ones.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct VaultFile {
+pub struct VaultFile {
     header: VaultHeader,
     body_ciphertext: Vec<u8>,
 }
 
 impl VaultFile {
-    fn encode(&self) -> Result<Vec<u8>, VaultError> {
+    /// Serializes the envelope: magic, length-prefixed header JSON,
+    /// length-prefixed body ciphertext — the exact shape [`VaultFile::decode`]
+    /// parses, so the writer and the parser cannot drift apart silently.
+    pub fn encode(&self) -> Result<Vec<u8>, VaultError> {
         let header_json =
             serde_json::to_vec(&self.header).map_err(|_| VaultError::Serialization)?;
         let mut out = Vec::with_capacity(
@@ -371,33 +382,42 @@ impl VaultFile {
         Ok(out)
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, VaultError> {
+    /// Parses the on-disk envelope from arbitrary bytes. Total function:
+    /// `Ok` or `Err`, never panic, on any input whatsoever — the length
+    /// arithmetic is `checked_add` end to end and every slice is taken
+    /// after a bound that proves it. See the type's docs for the fuzz
+    /// contract that keeps that sentence true.
+    pub fn decode(bytes: &[u8]) -> Result<Self, VaultError> {
         const PREFIX: usize = 8 + 8;
         if bytes.len() < PREFIX || &bytes[..8] != ENVELOPE_MAGIC {
             return Err(VaultError::MalformedBody);
         }
         let header_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes")) as usize;
-        let header_end = PREFIX
-            .checked_add(header_len)
-            .ok_or(VaultError::MalformedBody)?;
-        if bytes.len() < header_end + 8 {
+        // Every length add is checked, and the check carries forward: a
+        // header length near usize::MAX passes `PREFIX.checked_add` (the
+        // sum is merely huge, not overflowing) and then overflowed the
+        // plain `+ 8` on the next line — found by the envelope fuzzer in
+        // its first 20 seconds. `body_len_at` is the checked position of
+        // the body-length field, and every later slice derives from it.
+        let header_end = PREFIX.checked_add(header_len).ok_or(VaultError::MalformedBody)?;
+        let body_len_at = header_end.checked_add(8).ok_or(VaultError::MalformedBody)?;
+        if bytes.len() < body_len_at {
             return Err(VaultError::MalformedBody);
         }
         let header: VaultHeader = serde_json::from_slice(&bytes[PREFIX..header_end])
             .map_err(|_| VaultError::Serialization)?;
         let body_len = u64::from_le_bytes(
-            bytes[header_end..header_end + 8]
+            bytes[header_end..body_len_at]
                 .try_into()
                 .expect("8 bytes"),
         ) as usize;
-        let body_end = header_end
-            .checked_add(8)
-            .and_then(|v| v.checked_add(body_len))
+        let body_end = body_len_at
+            .checked_add(body_len)
             .ok_or(VaultError::MalformedBody)?;
         if bytes.len() != body_end {
             return Err(VaultError::MalformedBody);
         }
-        let body_ciphertext = bytes[header_end + 8..body_end].to_vec();
+        let body_ciphertext = bytes[body_len_at..body_end].to_vec();
         Ok(Self {
             header,
             body_ciphertext,
@@ -960,6 +980,24 @@ mod tests {
     use std::io::Write;
 
     const CANARY: &str = "ASV-CANARY-4f2b9c1e7a-DO-NOT-LEAK";
+
+    /// Fuzz regression (crash-6396125b3da22c2a02504e2f935c5206f9600b16):
+    /// a header length of `usize::MAX - 16` passes `PREFIX.checked_add`
+    /// with room to spare — the sum is usize::MAX, huge but not overflowing
+    /// — and then overflowed the plain `+ 8` that followed. The fix carries
+    /// the check forward (`body_len_at`), and this input must be an `Err`,
+    /// in debug and in release, for any file length.
+    #[test]
+    fn header_length_near_usize_max_is_rejected_not_panicked() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(ENVELOPE_MAGIC);
+        bytes.extend_from_slice(&0xFFFFFFFFFFFFFFEFu64.to_le_bytes());
+        bytes.extend_from_slice(b"{\"version\":1}");
+        assert!(matches!(
+            VaultFile::decode(&bytes),
+            Err(VaultError::MalformedBody)
+        ));
+    }
 
     fn pass() -> SecretString {
         SecretString::from("test-passphrase".to_string())
