@@ -744,6 +744,46 @@ fn a_surrogate_from_another_session_is_still_refused_and_the_right_one_still_wor
     );
 }
 
+/// **A2, the second layer.** A signature made under one key, presented with
+/// a *different* key's blob, resolves to nothing.
+///
+/// This is the falsifier for the blob guard in `SessionStore::resolve`, and it
+/// was missing. Every other arm in this file presents a blob and a signature
+/// that belong together, so a resolver that dropped the requirement that they
+/// match — and verified against whichever registered key happened to verify
+/// first — would have stayed green through all of them. The two layers only
+/// have independent witnesses when a test deliberately mismatches them.
+#[test]
+fn a_signature_under_one_key_presented_with_another_keys_blob_resolves_to_nothing() {
+    let rig = Rig::new();
+    let target = endpoint(HOST, 443);
+
+    // Session A's blob is what is *presented*, and the nonce the bridge
+    // checks is derived from the presented blob — so the nonce is derived
+    // from A's blob here too.
+    //
+    // That detail is the whole test. A first version derived the nonce from
+    // B's blob instead, which made the signature fail against every key for a
+    // reason that had nothing to do with the blob guard, and the mutation that
+    // removed the guard left the suite green. A falsification that does not
+    // falsify is not evidence, and this is the second time in this block that
+    // one nearly passed for one.
+    let presented_blob = public_key_blob(&rig.key_a.verifying_key());
+    let nonce = proof_nonce(&presented_blob, &target);
+    // Signed by B, presented under A's blob.
+    let signature = rig.key_b.sign(&nonce).to_bytes();
+    let proof = format!("{}.{}", b64(&presented_blob), b64(&signature));
+
+    let error = rig.tunnel_refused(Some(proof), 443);
+    assert!(
+        matches!(error, BridgeError::NoSessionProof),
+        "a mismatched blob and signature resolved to a session: {error:?}. With the \
+         blob guard present the lookup lands on A and A's key rejects B's signature; \
+         with it removed, B's key verifies and the tunnel comes up as B."
+    );
+    assert_eq!(rig.origin.accepted(), 0);
+}
+
 // ---------------------------------------------------------------------------
 // A3 (corrected) — the proof does not transfer to another destination
 // ---------------------------------------------------------------------------
