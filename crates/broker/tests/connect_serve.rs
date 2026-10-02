@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 
 use asv_broker::tls_bridge::{
     issue_leaf, AuthorityEndpoint, Bridge, BridgeError, ConnectPolicy, LeafError, LeafSource,
-    SessionCa, UpstreamResolver, VerifiedLeaf,
+    SessionCa, SessionProofs, UpstreamResolver, VerifiedLeaf, SESSION_PROOF_HEADER,
 };
-use asv_domain::Authority;
+use asv_domain::{AgentSessionId, Authority};
 use asv_tls_acceptor::LeafMaterial;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -67,6 +67,37 @@ impl LeafSource for CountingLeaves {
             .map_err(|_| LeafError::InvalidHost("leaf material could not be assembled".to_string()))
     }
 }
+
+/// A proof resolver for the tests in this file.
+///
+/// A double, and deliberately labelled as one: `serve_connect` refuses a
+/// CONNECT that proves no session (ADR-0019, `spec.md` R-9.6), so these tests
+/// need *something* that resolves. What they pin is TLS — leaf issuance,
+/// version negotiation, ALPN, pinning refusal — and a real ed25519 key per
+/// test would obscure exactly that. The real thing is proved end to end, with
+/// real keys and the real `verify_proof`, in
+/// `uat_010_connect_substitution.rs`.
+struct AnyProof {
+    session: AgentSessionId,
+}
+
+impl SessionProofs for AnyProof {
+    fn resolve(
+        &self,
+        _presented_key: &[u8],
+        _nonce: &[u8],
+        _signature: &[u8],
+    ) -> Option<AgentSessionId> {
+        Some(self.session)
+    }
+}
+
+/// A proof that parses but proves nothing, for `AnyProof` to accept.
+///
+/// Both halves must be non-empty after base64 decoding, or `parse_session_proof`
+/// reads the absence as "no proof" and this file would be testing the refusal
+/// rather than the thing it names.
+const ANY_PROOF: &str = "AAAA.BBBB";
 
 /// Resolves every target to one address, so a test needs no DNS.
 struct FixedUpstream {
@@ -150,7 +181,12 @@ fn connect_pair(listener: &TcpListener, host: &str, port: u16) -> (TcpStream, Tc
         TcpStream::connect(listener.local_addr().expect("bridge addr")).expect("connect");
     let (server_side, _) = listener.accept().expect("bridge accepts");
     client
-        .write_all(format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .write_all(
+            format!(
+                "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}\r\n{SESSION_PROOF_HEADER}: {ANY_PROOF}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
         .expect("write CONNECT");
     client.flush().expect("flush");
     (client, server_side)
@@ -266,8 +302,11 @@ fn session_leaf_handshakes_and_the_tunnel_is_live_in_both_directions() {
     let handle = {
         let leaves = SessionLeaves { ca };
         let upstream = FixedUpstream { addr: origin.addr };
+        let proofs = AnyProof {
+            session: AgentSessionId::new(),
+        };
         thread::spawn(move || {
-            bridge.serve_connect(server_side, &leaves, &upstream, None, Instant::now())
+            bridge.serve_connect(server_side, &leaves, &upstream, Some(&proofs), Instant::now())
         })
     };
 
@@ -368,7 +407,9 @@ fn a_leaf_minted_for_another_host_is_refused() {
                 ca: SessionCa::new("wrong-host", 17, Duration::from_secs(3600)),
             },
             &FixedUpstream { addr: origin.addr },
-            None,
+            Some(&AnyProof {
+                session: AgentSessionId::new(),
+            }),
             Instant::now(),
         )
         .expect_err("a leaf for another host must be refused");
@@ -412,8 +453,11 @@ fn a_pinning_client_is_refused_and_the_bridge_does_not_patch_it() {
     let handle = {
         let leaves = SessionLeaves { ca: session_ca };
         let upstream = FixedUpstream { addr: origin.addr };
+        let proofs = AnyProof {
+            session: AgentSessionId::new(),
+        };
         thread::spawn(move || {
-            bridge.serve_connect(server_side, &leaves, &upstream, None, Instant::now())
+            bridge.serve_connect(server_side, &leaves, &upstream, Some(&proofs), Instant::now())
         })
     };
 
@@ -551,8 +595,11 @@ fn handshake_through_bridge(
     let handle = {
         let leaves = SessionLeaves { ca };
         let upstream = FixedUpstream { addr: origin.addr };
+        let proofs = AnyProof {
+            session: AgentSessionId::new(),
+        };
         thread::spawn(move || {
-            bridge.serve_connect(server_side, &leaves, &upstream, None, Instant::now())
+            bridge.serve_connect(server_side, &leaves, &upstream, Some(&proofs), Instant::now())
         })
     };
 

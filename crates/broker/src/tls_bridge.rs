@@ -664,10 +664,14 @@ pub struct EstablishedTunnel {
     pub target: AuthorityEndpoint,
     /// The session this tunnel belongs to (ADR-0019).
     ///
-    /// Resolved from a signature, not asserted by the client. It is `None`
-    /// only on a path that does not attempt substitution at all; a tunnel
-    /// that is going to carry a credential always has one.
-    pub session: Option<AgentSessionId>,
+    /// Not an `Option`, and that is the fail-closed half stated as a type
+    /// rather than as a comment. An earlier revision made it optional "only
+    /// on a path that does not attempt substitution at all", which is exactly
+    /// the anonymous tunnel `spec.md` R-9.6 forbids: a client with no proof
+    /// was getting a working CONNECT to an allow-listed host, carrying its
+    /// own credential, with no session behind it. A type that cannot hold
+    /// "no session" cannot be misread by the next caller who adds one.
+    pub session: AgentSessionId,
 }
 
 /// Where the bridge gets session proofs from.
@@ -893,17 +897,36 @@ pub fn replace_bearer_token(
         };
         if !replaced && name.trim().eq_ignore_ascii_case("authorization") {
             let value_start = offset + name.len() + 1;
-            let body_end = offset + line.len();
-            let raw_value = &text[value_start..body_end];
-            let kept_prefix = match raw_value.split_once(' ') {
-                Some((scheme, _)) => scheme.len() + 1,
-                None => 0,
-            };
+            let line_end = offset + line.len();
+            // The value ends *before* the line terminator. Including the
+            // `\r\n` would make it part of the value, and a header with no
+            // scheme would then look like a value that ends in whitespace.
+            let value_end = offset + line.strip_suffix("\r\n").unwrap_or(line).len();
+            let raw_value = &text[value_start..value_end];
+            // Whitespace between the colon and the scheme belongs to the
+            // header, not to the value.
+            //
+            // This is load-bearing and it was wrong once: splitting the raw
+            // value on the first space splits on the space *after the colon*,
+            // yielding an empty scheme and a one-byte prefix, so the rewrite
+            // emitted `Authorization: <token>` — the auth scheme silently
+            // dropped. Every test that only searched the outgoing bytes for
+            // the credential still passed. The length is what caught it.
+            let trimmed = raw_value.trim_start();
+            let mut kept_prefix = raw_value.len() - trimmed.len();
+            if let Some((scheme, rest)) = trimmed.split_once(char::is_whitespace) {
+                // Every separating space is kept, not just one. RFC 7235's
+                // `credentials = scheme [ 1*SP token68 ]` allows more than one,
+                // and a header that came in as `Bearer   tok` goes out as it
+                // arrived apart from the token.
+                kept_prefix += scheme.len() + 1;
+                kept_prefix += rest.len() - rest.trim_start().len();
+            }
             out.extend_from_slice(&request[offset..value_start + kept_prefix]);
             out.extend_from_slice(replacement.as_bytes());
             out.extend_from_slice(b"\r\n");
             replaced = true;
-            offset = body_end;
+            offset = line_end;
             continue;
         }
         out.extend_from_slice(line.as_bytes());
@@ -1074,23 +1097,30 @@ impl Bridge {
         // The destination is authorised before the proof is even looked at.
         // A target outside the allow-list must not be able to induce a
         // signature verification, let alone a credential loan.
-        let session = match parse_session_proof(&head) {
-            None => None,
-            Some(proof) => {
-                let Some(proofs) = proofs else {
-                    return Err(BridgeError::NoSessionProof);
-                };
-                let nonce = proof_nonce(&proof.key, &target);
-                match proofs.resolve(&proof.key, &nonce, &proof.signature) {
-                    Some(session) => Some(session),
-                    // A presented proof that does not resolve is a failure,
-                    // not an anonymous tunnel. Forwarding it unsubstituted
-                    // would send the client's credential to the outside
-                    // world and report a provider error instead of the
-                    // truth.
-                    None => return Err(BridgeError::NoSessionProof),
-                }
-            }
+        //
+        // And there is no third answer here. A CONNECT with no proof header is
+        // refused exactly like one whose proof does not resolve: an anonymous
+        // tunnel is the thing ADR-0019 option 4 calls the honest behaviour,
+        // implemented as the *failure* rather than as an alternative. An
+        // earlier revision let `session` be `None` and opened a working tunnel
+        // for a client that had proved nothing — it could carry a credential
+        // to an allow-listed host with no session behind it, which is the
+        // exact shape R-9.6 says must close.
+        let session = {
+            let Some(proofs) = proofs else {
+                return Err(BridgeError::NoSessionProof);
+            };
+            let Some(proof) = parse_session_proof(&head) else {
+                return Err(BridgeError::NoSessionProof);
+            };
+            let nonce = proof_nonce(&proof.key, &target);
+            // A presented proof that does not resolve is a failure, not an
+            // anonymous tunnel. Forwarding it unsubstituted would send the
+            // client's credential to the outside world and report a provider
+            // error instead of the truth.
+            proofs
+                .resolve(&proof.key, &nonce, &proof.signature)
+                .ok_or(BridgeError::NoSessionProof)?
         };
 
         let mut ack = &client;
@@ -1232,7 +1262,7 @@ impl EstablishedTunnel {
         audit: &mut dyn SubstitutionAudit,
         limits: RelayLimits,
     ) -> Result<SubstitutionOutcome, BridgeError> {
-        let session = self.session.ok_or(BridgeError::NoSessionProof)?;
+        let session = self.session;
         let destination = format!("{}:{}", self.target.host(), self.target.port());
 
         let head = read_inner_head(&mut self.client, limits.max_head)?;
@@ -1940,6 +1970,50 @@ mod substitution_tests {
         assert!(
             sink.0.is_empty(),
             "a refused substitution still lent the credential"
+        );
+    }
+
+    /// The scheme is part of the header, and a substring search cannot see it
+    /// go missing.
+    ///
+    /// This test exists because it was missing. The assertion above searched
+    /// the forwarded bytes for the credential and for the absence of the
+    /// surrogate, and it stayed green while `replace_bearer_token` emitted
+    /// `Authorization: <token>` — the `Bearer ` scheme silently dropped,
+    /// because splitting the raw value on the first space splits on the space
+    /// *after the colon* and so finds an empty scheme. What caught it was a
+    /// byte-length comparison one commit later, in the end-to-end suite.
+    ///
+    /// The lesson is in the shape: "contains the secret" is not the same
+    /// claim as "is the request correct", and only the second one notices a
+    /// header that came out malformed in every other respect.
+    #[test]
+    fn the_authorization_scheme_survives_the_rewrite() {
+        let original = request_with(SURROGATE);
+        let credential = std::str::from_utf8(REAL).expect("ascii credential");
+        let rewritten =
+            String::from_utf8(replace_bearer_token(&original, credential).expect("rewrite"))
+                .expect("utf-8 request");
+
+        assert_eq!(
+            rewritten,
+            format!(
+                "GET /repos/o/r/issues HTTP/1.1\r\nHost: api.github.test\r\nAuthorization: Bearer {credential}\r\nAccept: application/json\r\n\r\n"
+            ),
+            "the rewrite must be byte-identical apart from the token's extent"
+        );
+
+        // And the two shapes that differ: no scheme at all, and extra spaces
+        // after the colon. Both have to keep their own spacing.
+        let bare = b"GET / HTTP/1.1\r\nAuthorization:tok\r\n\r\n";
+        assert_eq!(
+            String::from_utf8(replace_bearer_token(bare, "abc").expect("rewrite")).unwrap(),
+            "GET / HTTP/1.1\r\nAuthorization:abc\r\n\r\n"
+        );
+        let spaced = b"GET / HTTP/1.1\r\nAuthorization:   Bearer   tok\r\n\r\n";
+        assert_eq!(
+            String::from_utf8(replace_bearer_token(spaced, "abc").expect("rewrite")).unwrap(),
+            "GET / HTTP/1.1\r\nAuthorization:   Bearer   abc\r\n\r\n"
         );
     }
 
