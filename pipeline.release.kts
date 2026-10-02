@@ -71,8 +71,14 @@ pipeline {
                 // deriving its own expectations from the same tool that built
                 // the artifacts, so the manifest is produced here, separately,
                 // and the next stage only reads it.
+                //
+                // The redirect writes to a temp path and renames: dist *reads*
+                // this same file as its previous-run input, and truncating it
+                // in place races the read — an empty file is a parse failure,
+                // and a diagnostic JSON is what lands when dist notices. Same
+                // defect class the publish script's own header describes.
                 sh("mkdir -p target/distrib")
-                sh("dist manifest --output-format=json --artifacts=all > target/distrib/dist-manifest.json")
+                sh("dist manifest --output-format=json --artifacts=all > target/distrib/dist-manifest.json.tmp && mv target/distrib/dist-manifest.json.tmp target/distrib/dist-manifest.json")
             }
         }
 
@@ -92,6 +98,17 @@ pipeline {
                 // right binaries plus one forbidden one has perfect checksums.
                 sh("python3 packaging/stage-bundle.py --check")
                 sh("python3 tests/distribution_bundle.py")
+            }
+        }
+
+        // Sign before upload. sha256.sum (which pins every artifact by
+        // digest) and each archive get a minisign signature; the public key
+        // is staged so a verifier can check without trusting this repo. The
+        // stage refuses to run without a key: an unsigned artifact set must
+        // fail loudly here rather than publish quietly.
+        stage("sign") {
+            dir(repo) {
+                sh("scripts/sign-release-artifacts.sh")
             }
         }
 

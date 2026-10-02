@@ -88,6 +88,15 @@ fi
 # up a `dist-manifest.json` from a previous run of a different version, and
 # uploading a manifest that describes other artifacts is how a release ends up
 # advertising files it does not contain.
+#
+# Signatures are the one deliberate carve-out: a `<artifact>.minisig` sidecar
+# produced by the sign stage rides alongside its artifact when present. The
+# sidecar is not in the manifest because dist does not know about signatures,
+# but it is not a directory-listing gamble either: it attaches only to a name
+# the manifest already listed, and the sign stage verified each one against
+# the staged public key before this script ran. `release.pub` rides along so
+# a verifier can check the signature without trusting this repository to
+# describe its own key.
 mapfile -t ASSETS < <(
   python3 - "${DISTRIB}/dist-manifest.json" "${DISTRIB}" <<'PY'
 import json, sys, pathlib
@@ -102,6 +111,12 @@ for release in manifest.get("releases", []):
         path = distrib / name
         # source.tar.gz and sha256.sum are workspace-global; emit them once.
         print(path)
+        sidecar = distrib / f"{name}.minisig"
+        if sidecar.exists():
+            print(sidecar)
+pubkey = distrib / "release.pub"
+if pubkey.exists():
+    print(pubkey)
 PY
 )
 
