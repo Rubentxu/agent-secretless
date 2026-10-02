@@ -1,0 +1,36 @@
+# The core product as dist sees it: ONE app, the two declared runtime binaries.
+#
+# This is a `dist:` generic project, not a `cargo:` one, and that is the whole
+# point of DX0. A `cargo:` member tells dist "package every [[bin]] in this
+# workspace", and that set is decided by whatever binaries happen to exist —
+# which is how `asv-vault-tool`, a harness tool, ended up on the list of things
+# a user would be handed. A `dist:` project names its binaries explicitly, so
+# the set is a statement rather than an inventory.
+#
+# `binaries` is a second declaration of what ships, and it is the one dist
+# actually reads. That duplication is real and it is watched:
+# `scripts/check-release-config.py` fails if this list and
+# `distribution/manifest.toml` disagree, and `tests/distribution_bundle.py`
+# reads the archives dist produces to confirm the bytes match. Two places to
+# update is worse than one; two places that cannot drift silently is better
+# than one that is checked by nobody.
+
+[package]
+name = "agent-secretless"
+# Checked against the workspace Cargo.toml by check-release-config.py. dist
+# requires a literal here, so it cannot be inherited.
+version = "0.25.0"
+repository = "https://github.com/Rubentxu/agent-secretless"
+license = "MIT"
+description = "Local credential control plane for AI agents"
+binaries = ["asv", "asv-brokerd"]
+
+# Where dist looks for the compiled binaries, relative to this file's
+# directory. stage-bundle.py writes them here, flat, because that is the shape
+# dist resolves: `<out-dir>/<binary-name>`.
+out-dir = "target"
+
+# The build. stage-bundle.py reads distribution/manifest.toml and builds only
+# the components marked `shipped`, so the manifest — not this file — decides
+# what gets compiled into the bundle.
+build-command = ["python3", "stage-bundle.py"]

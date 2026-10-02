@@ -1,0 +1,34 @@
+[workspace]
+# One member, and it is not the cargo workspace. See packaging/dist.toml for
+# why: a `cargo:` member tells dist to package whatever `[[bin]]` declarations
+# the workspace happens to contain, and that inventory is not a product
+# decision. The `dist:` member names the two runtime binaries explicitly, which
+# makes the product boundary a statement the release has to agree with.
+members = ["dist:packaging"]
+
+[dist]
+# Recorded, not consumed: there is no CI backend in this repository, so
+# nothing fetches this version for a runner. It is here because dist requires
+# it and because it documents which dist produced the current artifact layout.
+#
+# The absence of a `ci` key is deliberate and load-bearing. `ci` is the setting
+# that makes dist generate `.github/workflows/release.yml`;
+# `scripts/ci-policy.sh` fails any pipeline run that finds a workflow, but it
+# only sees the file, not the cause. `scripts/check-release-config.py` fails on
+# the key itself, so the cause cannot be committed and then acted on later.
+cargo-dist-version = "0.32.0"
+installers = ["shell"]
+targets = ["x86_64-unknown-linux-gnu"]
+checksum = "sha256"
+# The public CLI only. `asv-brokerd` goes to libexec and never appears here;
+# putting it on PATH is what UAT-DX-002 forbids, and the installer places it by
+# its manifest `install_as`, not by this value.
+install-path = "~/.local/bin"
+# `.tar.zst`, not the `.tar.xz` default, to match the artifact naming in
+# docs/asv-agent-first-evolution/04-ADR-DISTRIBUTION.md. The key is
+# `unix-archive`, not `archive-format` — the latter is accepted by older
+# configs and is silently ignored here, so the first attempt at this setting
+# produced a `.tar.xz` and a green run. It belongs at workspace level because
+# it is a global artifact setting; a package-level copy is not read.
+unix-archive = ".tar.zst"
+hosting = "github"

@@ -2,6 +2,13 @@
 /target/
 **/*.rs.bk
 
+# dist's flat output directory. `packaging/stage-bundle.py` writes the compiled
+# binaries there for dist to find, and they are 13 MB of build product per
+# target. The `/target/` rule above is anchored to the repository root and does
+# not cover this one; a binary committed by accident is a binary every future
+# clone carries, and a staged one is invisible in a diff of source files.
+/packaging/target/
+
 # Python bytecode from the adversarial harness
 __pycache__/
 *.py[cod]

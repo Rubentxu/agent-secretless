@@ -116,3 +116,18 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# The profile dist builds release artifacts with. It exists so that "the binary
+# a user installs" and "the binary the pipeline tested" are the same binary,
+# without making a release build inherit whatever `[profile.release]` happens to
+# be tuned to for local iteration.
+#
+# `panic = "abort"` is inherited from release above, and that is deliberate for
+# a daemon: the broker's journal is fsync'd before the work it describes, so a
+# crash — panicked or killed — is recovered on the next start either way, and
+# `Restart=on-failure` in the systemd unit turns the abort into a restart. What
+# it does remove is the option of catching a panic in-process, which the unit
+# comment in `packaging/asv-brokerd.service` depends on.
+[profile.dist]
+inherits = "release"
+lto = "thin"

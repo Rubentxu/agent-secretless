@@ -1,0 +1,90 @@
+# agent-secretless broker — systemd *user* unit.
+#
+# Installed to ~/.config/systemd/user/asv-brokerd.service by scripts/install.sh.
+# This is a template: the vault and passphrase paths below are the defaults the
+# installer creates, and you are expected to edit them once.
+#
+# ## Why a user unit and not a system one
+#
+# The broker is not a system service. It runs as you, deliberately: a dedicated
+# broker uid is M7 and does not exist yet, which the README states. A system
+# unit would imply a machine-wide identity the product does not have. A user
+# unit also gets the right lifetime for free — it starts with your session and
+# stops when you log out, which is when a credential broker holding your
+# unlocked vault keys should stop.
+#
+# ## What is deliberately NOT in this file
+#
+# No `ProtectSystem=strict`, no `ProtectHome=read-only`, no `PrivateTmp`. This
+# is not an oversight, and it is the one thing worth reviewing in this file.
+#
+# Those directives are the obvious sandbox for a secret-bearing process, and
+# they are all correct-looking. They are also all wrong for this binary today,
+# and a wrong sandbox is worse than no sandbox: the broker refuses to start if
+# it cannot open its vault, so a `ProtectSystem=strict` that blocks the audit
+# log produces a service that fails at boot with an error about a path, and the
+# operator's reasonable conclusion is that the broker is broken.
+#
+# The broker's actual write set was not enumerated before this unit was
+# written. `ProtectSystem=strict` would need `ReadWritePaths=` for the runtime
+# directory, the audit log and the vault, and choosing those wrong in either
+# direction is a real defect rather than a hardening. So the unit ships with
+# the directives whose behaviour is well understood, and the sandboxing waits
+# to be done against a measured write set. That is a real gap, recorded here
+# rather than papered over.
+#
+# ## What IS here, and why each is safe
+#
+# `NoNewPrivileges` is the one sandbox directive included. It is a one-way
+# ratchet set before exec, it cannot break a write, and the broker's own
+# `harden` path already sets `PR_SET_NO_NEW_PRIVS` for the same reason.
+#
+# `Restart=on-failure` is lifecycle, not security, and it matters more than it
+# looks: UAT-017 already proves the broker recovers from a crash without
+# losing or double-applying a journalled write, and this is what puts that
+# recovery into a real deployment rather than only into a test.
+
+[Unit]
+Description=agent-secretless broker (local credential control plane)
+Documentation=https://github.com/Rubentxu/agent-secretless
+# The broker is useless without its vault, and there is no ordering to express
+# against a plain file, so this is documentation rather than a real dependency.
+After=default.target
+
+[Service]
+Type=simple
+
+# The socket path is passed explicitly rather than left to the broker's default.
+# `%t` is systemd's specifier for the runtime directory, and the default is
+# derived from the running uid — the two agree whenever the runtime directory
+# is the spec default, and this line is what makes them agree even when it is
+# not. It also makes the path visible in `systemctl --user cat`, which is where
+# someone goes when the CLI cannot reach the broker.
+#
+# The binary path is `%h/.local/libexec/asv/asv-brokerd` because that is where
+# `distribution/manifest.toml` installs the private runtime, and NOT because a
+# path is spelled this way in three places. An earlier version of this file
+# used `%h/.local/bin`, matching dist's `install-path` — and that was wrong,
+# because `install-path` is where the *public CLI* goes. It put the
+# secret-bearing process on PATH, which is what UAT-DX-002 forbids and what
+# P1 in the specification rules out: the user should never need to know this
+# process exists. `scripts/check-release-config.py` composes this path from the
+# manifest and fails the build if the two disagree, in either direction.
+ExecStart=%h/.local/libexec/asv/asv-brokerd %t/asv/broker.sock --vault %h/.local/share/asv/vault.asv --passphrase-file %h/.config/asv/passphrase
+
+# Configuration travels by argv and the passphrase by file, never by
+# environment. The broker is forbidden from reading the environment
+# (uat_017_env_scan, rule D9) precisely so that a credential cannot re-enter
+# through an inherited variable, and a unit that passed the passphrase as
+# `$ASV_PASSPHRASE` would undo that from outside the process.
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+
+# The socket is 0600 inside a 0700 directory and the broker refuses to start if
+# it already exists, so it cannot clobber a running instance. Setting the
+# socket to 0600 here too is belt-and-braces on the same property.
+UMask=0077
+
+[Install]
+WantedBy=default.target
