@@ -50,6 +50,7 @@ Run: python3 packaging/stage-bundle.py [--out DIR] [--target TRIPLE] [--check]
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -63,6 +64,36 @@ DEFAULT_OUT = REPO / "target" / "dist" / "staging"
 # dist's `out-dir`, which it resolves relative to this script's own directory
 # because the package root is `packaging/`.
 FLAT_OUT = Path(__file__).resolve().parent / "target"
+
+
+def resolve_target_dir() -> Path:
+    """Where cargo actually put the build, resolved the way cargo resolves it.
+
+    The order below is cargo's own: `--target-dir` (not used here), then
+    `CARGO_TARGET_DIR`, then `build.target-dir` from any cargo config file,
+    then `./target`. The second step is the one that bit: a machine whose
+    global cargo config redirects the target directory to a shared disk
+    builds fine and leaves nothing under the repo's `target/`, and an
+    env-only check reported the binaries as absent — a false version of
+    exactly the failure this script exists to make loud. Rather than
+    re-parsing cargo's config files (scoping rules, per-target overrides),
+    ask cargo itself: `cargo metadata` reports the target directory the
+    same build invocations will use.
+    """
+    env = os.environ.get("CARGO_TARGET_DIR")
+    if env:
+        return Path(env)
+    probe = subprocess.run(
+        ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode == 0:
+        target_directory = json.loads(probe.stdout).get("target_directory")
+        if target_directory:
+            return Path(target_directory)
+    return REPO / "target"
 
 
 def die(message: str) -> None:
@@ -112,8 +143,8 @@ def build(manifest: dict, target: str | None, out: Path) -> list[str]:
     if result.returncode != 0:
         die("the build failed; nothing was staged")
 
-    cargo_target = os.environ.get("CARGO_TARGET_DIR", str(REPO / "target"))
-    profile_dir = Path(cargo_target) / ("dist" if not target else f"{target}/dist")
+    cargo_target = resolve_target_dir()
+    profile_dir = cargo_target / ("dist" if not target else f"{target}/dist")
 
     staged: list[str] = []
     for component in manifest.get("component", []):
