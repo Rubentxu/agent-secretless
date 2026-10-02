@@ -20,3 +20,4 @@
 | 0016 | How a human credential reaches the vault | Accepted |
 | 0017 | How an operator's revocation actually takes effect | Accepted |
 | 0018 | A credential carries the kind the operator chose, beside the one it is stored as | Accepted |
+| 0019 | A CONNECT client proves its session by signing, because the kernel does not know it | Accepted |
