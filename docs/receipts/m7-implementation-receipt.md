@@ -35,8 +35,9 @@ test result: ok. 9 passed; 0 failed               (uat_024)
 test result: ok. 4 passed; 0 failed               (uat_048)
 ```
 
-`admission.rs` carries 11 further hostile tests on the admission rule itself,
-each built around a way the "no session means human" mistake would slip through.
+`crates/broker/tests/admission_control_plane.rs` carries 11 further hostile
+tests on the admission rule itself, each built around a way the "no session
+means human" mistake would slip through.
 
 ## Known limitations
 

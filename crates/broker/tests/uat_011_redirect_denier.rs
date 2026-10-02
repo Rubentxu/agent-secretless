@@ -1,15 +1,20 @@
-//! UAT-011 — TLS pinning.
-//! M9 redirect denier.
+//! M9 redirect denier. **This file claims no UAT, and the filename does not
+//! mean that it does.**
 //!
-//! Not a normative UAT: `14-UAT-ADVERSARIAL.md` titles UAT-011 "TLS
-//! pinning", which is a different subject — a client that pins the
-//! upstream certificate and cannot accept the session CA. The filename
-//! retains `uat_011` from when this file was filed under that id; the
-//! requirement these tests actually pin is the M9-R3 one below.
+//! The name is historical. UAT-011 is "TLS pinning" — a client that pins the
+//! upstream certificate and cannot accept the session CA — and that is proved
+//! by `connect_serve.rs::a_pinning_client_is_refused_and_the_bridge_does_not_patch_it`,
+//! not here. This suite pins M9-R3, the redirect denier, which is a different
+//! requirement.
+//!
+//! An earlier revision of this header claimed UAT-011 and then disclaimed it
+//! by quoting the spec's own title, "TLS pinning", as the thing that was *not*
+//! the subject. It is the same string, so the disclaimer refuted the claim
+//! above it and established nothing. A claim that survives only because
+//! nobody read the line under it is a claim the gate should not accept.
 //!
 //! M9-R3 specifies that `authorize_redirect` accepts only same-origin
 //! redirects while a credential binding is active.
-
 use asv_broker::tls_bridge::{authorize_redirect, AuthorityEndpoint, RedirectError};
 use asv_domain::Authority;
 

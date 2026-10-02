@@ -1,16 +1,21 @@
-//! UAT-012 — transparent eBPF redirect.
-//! M9 trust injection adapter.
+//! M9 trust injection adapter. **This file claims no UAT, and the filename
+//! does not mean that it does.**
 //!
-//! Not a normative UAT: `14-UAT-ADVERSARIAL.md` titles UAT-012
-//! "transparent eBPF redirect", which is a different subject — routing a
-//! protected cgroup's socket to the ASV bridge without a proxy setting.
-//! The filename retains `uat_012` from when this file was filed under
-//! that id; the requirement these tests actually pin is the M9-R4 one
-//! below.
+//! The name is historical. UAT-012 is "transparent eBPF redirect" — routing a
+//! protected cgroup's socket to the bridge with no proxy setting — and it is
+//! recorded as **superseded**, not outstanding, by the M8 NO-GO in
+//! `16-SECURITY-RELEASE-GATES.md`. This suite pins M9-R4, which is about
+//! writing a session CA somewhere and handing back a binding.
 //!
-//! M9-R4 specifies that a `TrustInjector` adapter writes the session CA
-//! to a session-scoped path and returns a binding the broker uses to
-//! spawn the agent's process tree with the right env vars.
+//! An earlier revision of this header claimed UAT-012 and then disclaimed it
+//! by quoting "transparent eBPF redirect" as the thing that was not the
+//! subject, which is the same string the claim had just used. Claiming a
+//! superseded UAT and a different requirement in the same breath is worse
+//! than claiming nothing, because the gate counts it as coverage.
+//!
+//! M9-R4 specifies that a `TrustInjector` adapter writes the session CA to a
+//! session-scoped path and returns a binding the broker uses to spawn the
+//! agent's process tree with the right env vars.
 
 use asv_broker::tls_bridge::{
     AuthorityEndpoint, Bridge, ConnectPolicy, InjectError, OpenSslEnvInjector, SessionCa,

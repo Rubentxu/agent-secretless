@@ -16,7 +16,7 @@ agente ──(sustituto / socket)──▶ broker ──(credencial real)──�
 
 > **Estado: preparación RC pre-1.0 (M13 + gates R2/R3/R5/R6 completados).**
 >
-> El workspace compila con **706 tests en verde** (`--release`, flakes
+> El workspace compila con **713 tests en verde** (`--release`, flakes
 > canónicos excluidos; el conteo lo vuelve a derivar el gate `R11 README test count`
 > en cada corrida de CI, así que esta línea ya no puede quedarse vieja). El vault, la firma SSH, el brokering HTTP/PostgreSQL,
 > la política, el framework OAuth2, el sellado TPM y la recuperación ante

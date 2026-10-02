@@ -49,7 +49,16 @@ a socket that answers once is not a socket that answers under load.
 - **UAT-001 is not declared by a header.** The property is proved in
   `crates/ssh-agent/src/lib.rs` and in the socket suite, but no file carries
   the `//! UAT-001 — ...` line, so `check-gates.py` cannot see it. It is one of
-  the eleven accounted for in the `UAT claim coverage` row, not an omission.
+  the ids accounted for in the `UAT claim coverage` row, not an omission.
+  The row named only eleven ids and left UAT-001 and UAT-014 out of its
+  enumeration entirely, so citing it here was citing a row that did not
+  mention the thing being cited; the row has since been corrected to carry
+  both. The witnesses are
+  `crates/ssh-agent/tests/m2_socket_uat.rs::uat_001_real_socket_lists_public_key_and_signs_without_export`
+  and, for UAT-014,
+  `::uat_014_revoke_removes_socket_and_blocks_new_operations` — the same file,
+  whose first doc line claims nothing and whose name does not look like a UAT,
+  so it is invisible to both the header scan and the filename inference.
 - M2 predates the surrogate class binding this cycle added. Its tests still
   pass because `GenericSecret` and `BearerToken` both map to
   `CredentialClass::Generic`, which backs every family — correct for an SSH

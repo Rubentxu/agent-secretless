@@ -1,15 +1,22 @@
-//! UAT-010 — surrogate substitution reaches the provider and the client never sees the secret.
-//! M9 CONNECT allow-list.
+//! M9 CONNECT allow-list. **This file claims no UAT, and the filename does not
+//! mean that it does.**
 //!
-//! Not a normative UAT: `14-UAT-ADVERSARIAL.md` titles UAT-010 "HTTP
-//! surrogate bridge", which is a different subject — an ordinary CLI
-//! receiving a surrogate token and making an HTTPS request. The filename
-//! retains `uat_010` from when this file was filed under that id; the
-//! requirement these tests actually pin is the M9-R2 one below.
+//! The name is historical: this file was once filed under UAT-010, and the
+//! subject moved underneath it. UAT-010 is now "surrogate substitution reaches
+//! the provider and the client never sees the secret", which is proved
+//! elsewhere and not here — substitution needs a session and a surrogate, and
+//! this suite has neither.
 //!
-//! M9-R2 specifies that `ConnectPolicy::authorize` accepts only the
-//! endpoints in the session's connector audience. This integration
-//! test exercises the broker-side `tls_bridge::Bridge::handle_connect`
+//! An earlier revision of this header claimed UAT-010 and then disclaimed it
+//! two lines later, citing a title the spec no longer used. The checker could
+//! not catch it, because the claim line reproduced the spec title verbatim and
+//! so matched. A claim line that is withdrawn four lines later is not a claim;
+//! it is a false claim with a footnote.
+//!
+//! What these tests actually pin is M9-R2: `ConnectPolicy::authorize` accepts
+//! only the endpoints in the session's connector audience, exercised through
+//! the broker-side `tls_bridge::Bridge::handle_connect` from the surface a real
+//! broker would call.
 //! from the surface a real broker would call.
 
 use asv_broker::tls_bridge::{AuthorityEndpoint, Bridge, ConnectError, ConnectPolicy};
