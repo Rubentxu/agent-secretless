@@ -127,6 +127,22 @@ permit (principal, action == Action::"postgres_read", resource is Database);
 /// It is installed instead of the live factory so that "the request reached the
 /// connector" is decidable without a network, and so a test can never pass by
 /// accident because GitHub happened to be slow.
+/// The one destination this fake deployment declares.
+///
+/// A `static`, because the trait method returns a borrow of the slice and a
+/// `OnceLock` declared inside the method would not outlive the call.
+fn declared_destination() -> &'static [asv_broker::PgDestination] {
+    use std::sync::OnceLock;
+    static DECLARED: OnceLock<Vec<asv_broker::PgDestination>> = OnceLock::new();
+    DECLARED.get_or_init(|| {
+        vec![asv_broker::PgDestination::new(
+            "db.internal",
+            "127.0.0.1".parse().expect("a literal address"),
+        )
+        .expect("a canonical host")]
+    })
+}
+
 struct GateProbe;
 
 impl ConnectorFactory for GateProbe {
@@ -139,6 +155,14 @@ impl ConnectorFactory for GateProbe {
             audience: "gate-probe".into(),
             detail: REACHED_THE_FACTORY.into(),
         })
+    }
+
+    /// Declares one destination, because H5's destination gate runs *before*
+    /// the policy gate. Without this the two PostgreSQL cases below would be
+    /// refused by the destination gate and would go on passing for a reason
+    /// that has nothing to do with the policy they exist to test.
+    fn pg_destinations(&self) -> &[asv_broker::PgDestination] {
+        declared_destination()
     }
 }
 

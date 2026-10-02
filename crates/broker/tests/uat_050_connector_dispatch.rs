@@ -39,13 +39,26 @@ impl SecretPort for OpenVault {
     }
 }
 
-/// A broker with a session owned by `peer`, a vault open, and no async runtime.
+/// A broker with a session owned by `peer`, a vault open, one declared
+/// destination, and no async runtime.
 ///
 /// No runtime means the PostgreSQL branch fails at a point unique to it, and
 /// the vault being open means the request gets far enough to reach it.
+///
+/// The declared destination is not decoration: H5's destination gate runs
+/// before the transport, so a factory with the default empty list would refuse
+/// at the gate and these tests would pass without ever observing the routing
+/// they are about. `db.example` at loopback is declared for exactly that reason.
 fn broker_with_session(peer: &WorkloadIdentity) -> (BrokerState, AgentSessionId) {
     let mut state = BrokerState {
-        connectors: Box::new(LiveConnectorFactory::default()),
+        connectors: Box::new(LiveConnectorFactory {
+            destinations: vec![asv_broker::PgDestination::new(
+                "db.example",
+                "127.0.0.1".parse().expect("a literal address"),
+            )
+            .expect("a canonical host")],
+            ..LiveConnectorFactory::default()
+        }),
         secrets: Some(Arc::new(OpenVault)),
         ..Default::default()
     };
@@ -81,7 +94,7 @@ fn m6_r1_a_postgres_request_routes_to_postgres() {
         Request::PostgresConnect {
             session,
             host: "db.example".into(),
-            host_addr: "93.184.216.34".into(),
+            host_addr: "127.0.0.1".into(),
             port: 5432,
             database: "asv".into(),
             role: "app".into(),
@@ -151,7 +164,7 @@ fn m6_r1_routing_follows_the_request_variant() {
         Request::PostgresConnect {
             session: pg_session,
             host: "db.example".into(),
-            host_addr: "93.184.216.34".into(),
+            host_addr: "127.0.0.1".into(),
             port: 5432,
             database: "asv".into(),
             role: "app".into(),

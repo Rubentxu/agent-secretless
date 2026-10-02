@@ -163,6 +163,13 @@ fn brokered(
         .unwrap_or_else(|error| panic!("read {}: {error}", substrate.root.display()));
     state.connectors = Box::new(LiveConnectorFactory {
         roots: Some(TlsRoots::system().with_extra_roots(pem)),
+        // H5: the deployment declares the one destination it lends to, and the
+        // certificate is checked against *that* name. The request below names
+        // the same pair, so it is the declared entry that reaches the socket.
+        destinations: vec![
+            asv_broker::PgDestination::new(&substrate.name, substrate.address)
+                .expect("the substrate name is a canonical host"),
+        ],
         server_name: Some(substrate.name.clone()),
     });
 
@@ -798,25 +805,32 @@ with_substrate!(
 // existing tests set both to the same value, which is why nothing noticed.
 //
 // The substrate's certificate carries two SANs, `DNS:pg.local.test` and
-// `IP:127.0.0.1`, and the test depends on that: it pins the factory to
-// `pg.local.test` and asks the request for an unrelated host. If the request
-// won, the check would run against `not-the-substrate.example` and fail to
-// connect; because the factory wins, the check runs against `pg.local.test`,
-// which the certificate does carry, and it connects. The companion test below
-// pins nothing and asks for the same unrelated host, and that one is refused.
-// Together the pair shows which name was used, which a single test cannot.
+// `IP:127.0.0.1`, and both tests below depend on that.
+//
+// H5 changed what this pair is about. The old pair proved that a *pinned*
+// `server_name` overrode the request's host, which meant the certificate was
+// checked against a name the deployment configured but the request did not
+// name. That is now subsumed: the broker resolves the request against the
+// deployment's declared destinations and then uses the **declared** host as
+// the certificate name, so a request cannot reach the TLS stage at all unless
+// it named a declared host. The stronger pair is therefore: the declared
+// destination connects, and the undeclared one is refused before any socket.
 with_substrate!(
-    a_pinned_name_is_the_one_the_certificate_is_checked_against,
+    the_declared_destination_is_the_one_the_certificate_is_checked_against,
     |substrate: Substrate| {
         let (mut state, peer, session, _dir) = brokered(&substrate);
-        // A name the certificate carries, and that the request does not name.
-        let pinned = "pg.local.test".to_string();
+        // `brokered` declared this exact pair, so the request and the
+        // declaration agree and the certificate is checked against the declared
+        // name, which the substrate's certificate carries.
+        let declared = substrate.name.clone();
         state.connectors = Box::new(LiveConnectorFactory {
             roots: Some(
                 TlsRoots::system()
                     .with_extra_roots(std::fs::read(&substrate.root).expect("root pem")),
             ),
-            server_name: Some(pinned.clone()),
+            destinations: vec![asv_broker::PgDestination::new(&declared, substrate.address)
+                .expect("a canonical host")],
+            server_name: Some(declared.clone()),
         });
 
         let response = handle(
@@ -824,7 +838,7 @@ with_substrate!(
             &peer,
             Request::PostgresConnect {
                 session,
-                host: "not-the-substrate.example".to_string(),
+                host: declared.clone(),
                 host_addr: substrate.address.to_string(),
                 port: substrate.port,
                 database: substrate.database.clone(),
@@ -833,27 +847,20 @@ with_substrate!(
         );
         assert!(
             matches!(response, Response::PostgresConnected { .. }),
-            "the factory pinned {pinned}, which the certificate carries, so the check \
-             must have run against the pinned name and not against the request's \
-             host. Got {response:?}"
+            "the deployment declared {declared} and the request named it, so the \
+             certificate must have been checked against the declared name. Got {response:?}"
         );
     }
 );
 
-// The control: the same request host, with no pinned name, is refused. If this
-// connected, the previous test would prove nothing, because a TLS setup that
-// accepts anything would also accept the pinned name.
+// The control: the same deployment, the same address, and the same granted
+// `(database, role)` — only the host differs. This is UAT-006's scenario with a
+// real server one address away, so "refused" here means refused before the
+// socket, not refused by a certificate mismatch after dialling it.
 with_substrate!(
-    without_a_pinned_name_the_request_host_is_the_one_checked,
+    an_undeclared_host_is_refused_before_any_socket_is_opened,
     |substrate: Substrate| {
         let (mut state, peer, session, _dir) = brokered(&substrate);
-        state.connectors = Box::new(LiveConnectorFactory {
-            roots: Some(
-                TlsRoots::system()
-                    .with_extra_roots(std::fs::read(&substrate.root).expect("root pem")),
-            ),
-            server_name: None,
-        });
 
         let response = handle(
             &mut state,
@@ -867,10 +874,25 @@ with_substrate!(
                 role: substrate.role.clone(),
             },
         );
-        assert!(
-            matches!(response, Response::Error { .. }),
-            "with no pinned name the request's own host is the certificate name, and \
-             not-the-substrate.example is not in the certificate. Got {response:?}"
-        );
+        match &response {
+            Response::Error { code, message } => {
+                assert_eq!(
+                    *code,
+                    asv_ipc_protocol::ErrorCode::Denied,
+                    "a host the deployment never declared must be denied by the \
+                     destination gate. Got {response:?}"
+                );
+                assert!(
+                    !message.contains("certificate") && !message.contains("TLS"),
+                    "the refusal must come from the destination gate and not from a \
+                     certificate mismatch after dialling, or the gate is not what \
+                     stopped it. Got: {message}"
+                );
+            }
+            other => panic!(
+                "the agent named a host this deployment never declared and it was \
+                 accepted. Got {other:?}"
+            ),
+        }
     }
 );
