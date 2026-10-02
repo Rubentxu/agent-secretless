@@ -193,8 +193,23 @@ async fn main() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Where to dial the broker when `--socket` is not given.
+///
+/// Derived from the running user, and preferring `XDG_RUNTIME_DIR` when the
+/// session set one, so a user on a non-default runtime directory finds the
+/// broker without reading a manual. The rule itself lives in
+/// `asv_ipc_protocol::socket`, which the broker also calls: this function only
+/// supplies the override, because the CLI is deliberately exempt from the
+/// environment quarantine in `uat_017_env_scan.rs` (`asv run` has to read the
+/// environment in order to scrub it) while the broker is not.
+///
+/// The literal that used to live here was `/run/user/1000/...`, which resolved
+/// only for the account that wrote it.
 fn default_socket() -> PathBuf {
-    PathBuf::from("/run/user/1000/asv/broker.sock")
+    asv_ipc_protocol::socket::resolve_socket_path(
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        unsafe { libc::getuid() },
+    )
 }
 
 /// Parses `90s`, `30m`, `24h`, `7d` into seconds. None on garbage.

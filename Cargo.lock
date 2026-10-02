@@ -160,6 +160,7 @@ dependencies = [
  "asv-ipc-protocol",
  "asv-ssh-agent",
  "clap",
+ "libc",
  "serde_json",
  "tokio",
  "tracing",

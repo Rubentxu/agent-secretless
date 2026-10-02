@@ -38,8 +38,25 @@ fn main() -> std::io::Result<()> {
     // `std::env::var*` in broker/connector production sources). The first
     // positional argument is the socket path; flags may appear before or
     // after it. Anything else is rejected.
+    //
+    // The default socket path is derived from the *running* uid rather than
+    // written down. It used to be the literal `/run/user/1000/...`, which was
+    // correct on one account on one machine and nowhere else: every user a
+    // release is installed for would have the broker try to bind inside a
+    // runtime directory that is not theirs. The derivation lives in
+    // `asv_ipc_protocol::socket` so this binary and the CLI cannot drift
+    // apart — a CLI dialling one path while the broker listens on another is
+    // indistinguishable from a broker that is merely down.
+    //
+    // `getuid()` is a syscall, not an environment read, so it costs nothing
+    // against the D9 quarantine that `uat_017_env_scan.rs` enforces. For the
+    // same reason the broker does not consult `XDG_RUNTIME_DIR`: it may not
+    // read the environment, so it takes the uid rule and the CLI, which is
+    // exempt from the scan, may override it. Both land on the same path
+    // whenever the runtime directory is the spec default.
     let mut args = std::env::args_os().skip(1);
-    let mut socket_path: PathBuf = PathBuf::from("/run/user/1000/asv/broker.sock");
+    let mut socket_path: PathBuf =
+        asv_ipc_protocol::socket::default_socket_path(unsafe { libc::getuid() });
     let mut vault_path: Option<PathBuf> = None;
     let mut passphrase_path: Option<PathBuf> = None;
     let mut harden = false;

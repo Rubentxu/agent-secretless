@@ -53,8 +53,7 @@ fn workspace_root() -> PathBuf {
 
 fn caller_source(relative: &str) -> String {
     let path = workspace_root().join(relative);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
 /// Line numbers of any `/run/user/<digits>` literal — a runtime directory with

@@ -53,8 +53,11 @@ pub const SOCKET_FILE_NAME: &str = "broker.sock";
 /// is what makes it a safe fallback rather than a guess — a session with a
 /// different runtime directory is unusual, and a session with *no* runtime
 /// directory is a broken session either way.
-pub fn default_socket_path(_uid: u32) -> PathBuf {
-    Path::new("/run/user/1000").join(SOCKET_SUBDIR).join(SOCKET_FILE_NAME)
+pub fn default_socket_path(uid: u32) -> PathBuf {
+    Path::new("/run/user")
+        .join(uid.to_string())
+        .join(SOCKET_SUBDIR)
+        .join(SOCKET_FILE_NAME)
 }
 
 /// The resolved default, honouring a caller-supplied runtime directory.
