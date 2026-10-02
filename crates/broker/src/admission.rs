@@ -112,6 +112,18 @@ pub struct Principal {
 /// with the vault; adding that format belongs to the cycle that adds the
 /// credential-write verb, and reaching for it now would drag the vault's
 /// `&mut self` write seam into a cycle about deciding who may call.
+///
+/// # Custody contract
+///
+/// The principals in this list are the operator's own binaries — the console
+/// and its helper — and nothing else. Every verb gated behind
+/// [`admit_control_plane`] (credential writes, approvals, audit reads) is
+/// reachable only through that gate, so the list *is* the operator/agent
+/// boundary: enrolling an agent binary here would let it mint the approvals
+/// it is supposed to earn and read the audit stream, which is the
+/// self-approval hole H1 exists to hold shut. Nothing in code can prove who
+/// runs `enrol` — that is an operational rule, and it is written here
+/// because a boundary that lives only in someone's head is not a boundary.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Enrolment {
     principals: Vec<Principal>,

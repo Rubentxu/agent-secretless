@@ -859,35 +859,40 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             }
         }
 
-        Request::SubmitApproval { .. } => {
-            // An agent connection may never approve its own request. UAT-015
-            // requires the broker to block *until a human approves*, and
-            // ADR-0004 keeps approval lifecycle an application concern whose
-            // validity arrives as trusted context. Exposing this method on the
-            // agent IPC made the gate self-satisfying: the agent minted the
-            // very approval it was being asked to earn.
+        Request::SubmitApproval { request, ttl_secs } => {
+            // UAT-015: the broker blocks a high-risk action until a human
+            // approves, and ADR-0015 is what makes "a human" decidable: the
+            // peer must pass control-plane admission, which means it is the
+            // operator's own enrolled binary — pin, cgroup and enrolment all
+            // checked against process evidence. An agent binary is not in
+            // that list and never may be (see the custody contract on
+            // [`admission::Enrolment`]); that operational rule, not the
+            // socket, is what keeps an agent from minting the approval it is
+            // being asked to earn.
             //
-            // The human control plane is a separate channel (M4) and does not
-            // reach this variant. Until it exists, the honest state is a
-            // closed door rather than a pretend approval.
+            // The policy engine does the rest and has always done it: the
+            // mint binds the approval to exactly this request (session,
+            // action, resource, request digest), `authorize` re-checks that
+            // binding, expiry and the use budget on every presentation, and
+            // the budget is spent only on the allow path.
             //
-            // "The human control plane" was a predicate this broker could not
-            // evaluate. ADR-0015 gave it a meaning, so the refusal now derives
-            // from it rather than asserting it, and the reason names which of
-            // the three conditions failed.
-            let denial = match admission::admit_control_plane(
-                peer,
-                &state.control_plane,
-                &admission::ProcFs,
-            ) {
-                Ok(()) => "admission granted, but approvals have no path to the policy engine yet"
-                    .to_string(),
-                Err(denial) => denial.to_string(),
-            };
-            Response::Error {
-                code: ErrorCode::Denied,
-                message: format!("approval refused: {denial}"),
+            // APPROVAL_REMAINING_USES is 1 on purpose: UAT-015's "allow
+            // once" cannot be replayed after use, and a one-use budget
+            // makes the replay structurally `ApprovalConsumed` rather than
+            // a matter of operator discipline. Making it configurable is a
+            // wire change and is deliberately out of scope.
+            if let Err(denial) =
+                admission::admit_control_plane(peer, &state.control_plane, &admission::ProcFs)
+            {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: format!("approval refused: {denial}"),
+                };
             }
+            let approval = state
+                .policy
+                .issue_approval(&request, ttl_secs, APPROVAL_REMAINING_USES);
+            Response::ApprovalIssued { approval }
         }
 
         Request::MintSurrogate {
@@ -984,29 +989,29 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             }
         }
 
-        Request::AuditQuery { .. } => {
+        Request::AuditQuery { since_secs } => {
             // R9 separation of duties: audit readers must not be audit
-            // writers. Every peer that can reach this socket is an agent peer
-            // (the broker's whole threat model), so the honest answer is a
-            // closed door until the human control plane ships. Recording the
-            // refused attempt is also the point: an agent probing the audit
-            // channel is itself an auditable event.
-            //
-            // Same predicate as the other two control-plane verbs, evaluated
-            // rather than restated, for the reason ADR-0015 gives it a meaning.
-            let denial = match admission::admit_control_plane(
-                peer,
-                &state.control_plane,
-                &admission::ProcFs,
-            ) {
-                Ok(()) => "admission granted, but the audit reader has no transport \
-                           to the control plane yet"
-                    .to_string(),
-                Err(denial) => denial.to_string(),
-            };
-            Response::Error {
-                code: ErrorCode::Denied,
-                message: format!("audit query refused: {denial}"),
+            // writers. This verb reads and never mutates — the records come
+            // from the same log whose chain `AuditLog::verify` checks, so a
+            // reader sees exactly what the verifier would see, with no
+            // second source and no write path in reach. Admission is the
+            // same predicate as the other control-plane verbs, and the
+            // dispatcher records the query itself: an agent probing the
+            // audit channel is refused and the refusal is an audited event.
+            if let Err(denial) =
+                admission::admit_control_plane(peer, &state.control_plane, &admission::ProcFs)
+            {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: format!("audit query refused: {denial}"),
+                };
+            }
+            Response::AuditRecords {
+                records: state.audit.query(since_secs),
+                // The chain head and the eviction count ride along so a
+                // verifier can pin the chain and loss is never silent.
+                chain_head: state.audit.head().to_string(),
+                dropped: state.audit.dropped(),
             }
         }
 
@@ -1195,6 +1200,13 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
 /// be able to point a credential at any endpoint that presents a valid
 /// certificate for it, which is the generic HTTP escape hatch M4-R9 rules out.
 const GITHUB_AUTHORITY: &str = "api.github.com";
+
+/// The use budget of every approval the broker mints. UAT-015's "allow once"
+/// cannot be replayed after use; a one-use budget makes the replay
+/// structurally `ApprovalConsumed` (the policy denies it) instead of a matter
+/// of operator discipline. Making it configurable is a wire change and is
+/// deliberately out of scope — see the `SubmitApproval` handler.
+const APPROVAL_REMAINING_USES: u32 = 1;
 
 impl BrokerState {
     /// The one policy consultation on the surrogate path, performed at mint
@@ -2032,6 +2044,63 @@ mod tests {
         assert_eq!(state.audit.query(0).len(), 1);
     }
 
+    /// The other half of the audit-query contract: an *admitted* control-plane
+    /// peer reads the real log — the same chain `verify` checks, never a copy
+    /// — and the read leaves the chain intact. R9's separation holds by shape:
+    /// this verb has no write path in reach.
+    #[test]
+    fn an_admitted_peer_reads_the_audit_chain_and_it_still_verifies() {
+        let mut state = BrokerState {
+            control_plane: enrolment_of_this_binary(),
+            ..BrokerState::default()
+        };
+        let operator = admitted_peer();
+        admission::admit_control_plane(&operator, &state.control_plane, &admission::ProcFs)
+            .expect("this fixture must be admitted, or the test below is vacuous");
+
+        // Traffic so the log has records, and one of them is the audited read
+        // itself: query(0) returns every record, including the one this
+        // request just wrote.
+        let _ = handle(
+            &mut state,
+            &operator,
+            Request::CreateSession {
+                workspace: "/repo".into(),
+            },
+        );
+        match handle(&mut state, &operator, Request::AuditQuery { since_secs: 0 }) {
+            Response::AuditRecords { records, .. } => {
+                // The records are real: the create_session traffic above is
+                // in them, metadata only. (The event's session field is None
+                // here: the session is created BY that request, so the
+                // audited method does not name one yet.)
+                let saw_session = records.iter().any(|r| match &r.event {
+                    asv_ipc_protocol::AuditEventDto::RequestHandled { method, .. } => {
+                        method == "create_session"
+                    }
+                    other => panic!("unexpected audit variant: {other:?}"),
+                });
+                assert!(
+                    saw_session,
+                    "the read must return the real log: {records:?}"
+                );
+            }
+            other => panic!("an admitted peer must read the audit log: {other:?}"),
+        }
+        // The dispatcher recorded the read itself AFTER the handler queried,
+        // so the log now carries it — and the chain still verifies with the
+        // read's own event inside.
+        let after = state.audit.query(0);
+        let read_audited = after.iter().any(|r| match &r.event {
+            asv_ipc_protocol::AuditEventDto::RequestHandled { method, .. } => {
+                method == "audit_query"
+            }
+            other => panic!("unexpected audit variant: {other:?}"),
+        });
+        assert!(read_audited, "the read itself must be audited: {after:?}");
+        assert_eq!(state.audit.verify(), Ok(()));
+    }
+
     #[test]
     fn canary_in_request_fields_never_reaches_audit_records() {
         const CANARY: &str = "ASV-CANARY-7f3c9a11-BROKER-AUDIT";
@@ -2270,45 +2339,53 @@ mod tests {
         }
     }
 
-    /// H1, second half: admission *succeeding* must still not produce an
-    /// approval on the agent socket.
+    /// UAT-015 — policy approval, end to end: the high-risk action blocks
+    /// until an admitted control-plane peer approves it; the approval binds
+    /// the exact request; "allow once" cannot be replayed after use.
     ///
-    /// The test above cannot see the hole. It uses `BrokerState::default()`,
-    /// whose enrolment record is empty, so `admit_control_plane` always answers
-    /// `Err(NotEnrolled)` and the handler takes the denial arm. That arm is
-    /// fail-closed for a boring reason: nobody is enrolled.
+    /// H1 is the gate this closes, and its history explains the shape. The
+    /// verb used to refuse unconditionally after a *successful* admission —
+    /// "admission granted, but approvals have no path to the policy engine
+    /// yet" — because wiring it here was feared as self-approval. What makes
+    /// minting here safe is not the socket but the custody contract on
+    /// [`admission::Enrolment`]: the enrolled list is the operator's own
+    /// binaries and an agent binary must never enter it. The test above pins
+    /// the unenrolled refusal; this one must not be satisfiable by the boring
+    /// reason, so it asserts admission genuinely succeeds before anything
+    /// else.
     ///
-    /// The arm that matters is the other one. `Ok(())` means the caller
-    /// satisfied all three ADR-0015 conditions — pinned, outside broker
-    /// control, and enrolled by the operator — and the handler still refuses,
-    /// because there is no path from this socket to the policy engine. That
-    /// refusal is the whole of H1's current safety, and before this test
-    /// nothing pinned it: an edit that treated "admission granted" as "proceed"
-    /// would have opened self-approval for every enrolled agent while the test
-    /// above stayed green, because it never reaches that arm.
-    ///
-    /// The assertion is on the *message*, not merely the code. Both arms answer
-    /// `Denied`, so asserting the code alone would pass for the unenrolled
-    /// reason this test exists to rule out. `no path to the policy engine` is
-    /// the `Ok(())` arm's own text and only that arm produces it.
+    /// Every step asserts content, not just shape: the mint carries the
+    /// exact binding (session, action, digest, budget), the spend allows
+    /// once, the replay comes back `ApprovalConsumed`, and an approval spent
+    /// on a request it does not describe comes back `ApprovalMismatch` —
+    /// ids are not interchangeable, which is the property that keeps the
+    /// approval path from reopening the hole by another route.
     #[test]
-    fn an_admitted_peer_still_cannot_submit_an_approval_on_the_agent_socket() {
+    fn an_admitted_operator_mints_an_approval_the_agent_can_spend_once() {
+        // UAT-015 — policy approval, end to end over the IPC handlers:
+        // a high-risk request is blocked until an admitted control-plane peer
+        // approves it; the approval binds the exact request; one use; the
+        // replay is refused as consumed.
         let mut state = BrokerState {
             control_plane: enrolment_of_this_binary(),
             ..BrokerState::default()
         };
-        let peer = admitted_peer();
+        let operator = admitted_peer();
 
-        // The control, and the reason this test is not a duplicate of the one
-        // above: prove admission genuinely succeeds here. Without this the
-        // assertion below could be satisfied by `NotEnrolled` and would prove
-        // nothing about the arm under test.
-        admission::admit_control_plane(&peer, &state.control_plane, &admission::ProcFs)
+        // The control, and the reason this test is not a duplicate of the
+        // unenrolled one above: prove admission genuinely succeeds here.
+        // Without this the mint assertion below could be satisfied by
+        // `NotEnrolled` and would prove nothing about the path under test.
+        admission::admit_control_plane(&operator, &state.control_plane, &admission::ProcFs)
             .expect("this fixture must be admitted, or the test below is vacuous");
 
+        // The agent's session: same peer for simplicity of the fixture — the
+        // session belongs to whoever created it, and the operator here plays
+        // both sides. Custody of the enrolment is what makes the operator the
+        // operator; the socket is shared by design (see admission docs).
         let session = match handle(
             &mut state,
-            &peer,
+            &operator,
             Request::CreateSession {
                 workspace: "/repo".into(),
             },
@@ -2327,31 +2404,131 @@ mod tests {
                 workspace: "/repo".into(),
                 protected_ref: Some("main".into()),
                 request_digest: Some("release-digest".into()),
-                peer_uid: peer.credentials.uid,
+                peer_uid: operator.credentials.uid,
             },
         };
 
-        match handle(
+        // 1. Without an approval the high-risk request is blocked, with a
+        //    decision that names what it wants.
+        let blocked = match handle(
             &mut state,
-            &peer,
+            &operator,
+            Request::Authorize {
+                request: request.clone(),
+                capability: None,
+                approval: None,
+            },
+        ) {
+            Response::Authorization { explanation } => explanation,
+            other => panic!("expected an authorization decision, got {other:?}"),
+        };
+        assert!(
+            matches!(
+                blocked.decision,
+                asv_domain::Decision::RequireApproval { .. }
+            ),
+            "the protected-main push must block on approval first, got {:?}",
+            blocked.decision
+        );
+
+        // 2. The admitted operator submits the approval for exactly this
+        //    request and gets the minted approval back.
+        let approval = match handle(
+            &mut state,
+            &operator,
             Request::SubmitApproval {
                 request: request.clone(),
                 ttl_secs: 60,
             },
         ) {
-            Response::Error { code, message } => {
-                assert_eq!(code, ErrorCode::Denied, "{message}");
-                assert!(
-                    message.contains("no path to the policy engine"),
-                    "the refusal must come from the admitted arm, not from an \
-                     unenrolment this test is meant to have got past: {message}"
-                );
-            }
-            other => panic!(
-                "an admitted caller minted an approval on the agent socket, \
-                 which is the self-approval hole H1 exists to hold shut: {other:?}"
+            Response::ApprovalIssued { approval } => approval,
+            other => panic!("an admitted operator must be able to mint: {other:?}"),
+        };
+        assert_eq!(approval.session, request.session);
+        assert_eq!(approval.action, request.action);
+        assert_eq!(approval.request_digest, request.context.request_digest);
+        assert_eq!(approval.remaining_uses, APPROVAL_REMAINING_USES);
+
+        // 3. The agent presents the approval id: the push goes through, once.
+        let spent = match handle(
+            &mut state,
+            &operator,
+            Request::Authorize {
+                request: request.clone(),
+                capability: None,
+                approval: Some(approval.id),
+            },
+        ) {
+            Response::Authorization { explanation } => explanation,
+            other => panic!("expected the approved push to be evaluated, got {other:?}"),
+        };
+        assert!(
+            matches!(spent.decision, asv_domain::Decision::Allow),
+            "the approved push must be allowed, got {:?}",
+            spent.decision
+        );
+
+        // 4. Allow once: the replay is refused as consumed, and the refusal
+        //    is the policy's own reason, reached over the same handler.
+        let replay = match handle(
+            &mut state,
+            &operator,
+            Request::Authorize {
+                request: request.clone(),
+                capability: None,
+                approval: Some(approval.id),
+            },
+        ) {
+            Response::Authorization { explanation } => explanation,
+            other => panic!("expected the replay to be evaluated, got {other:?}"),
+        };
+        assert!(
+            matches!(
+                replay.decision,
+                asv_domain::Decision::Deny { ref reason } if reason == "approval consumed"
             ),
-        }
+            "the replay must be refused as consumed, got {:?}",
+            replay.decision
+        );
+
+        // 5. The binding is exact: an approval is only ever spent on the
+        //    request it describes. A different digest must mismatch even
+        //    with a fresh approval minted for that other request — the
+        //    ids are not interchangeable.
+        let mut other_request = request.clone();
+        other_request.context.request_digest = Some("other-digest".into());
+        let other_approval = match handle(
+            &mut state,
+            &operator,
+            Request::SubmitApproval {
+                request: other_request.clone(),
+                ttl_secs: 60,
+            },
+        ) {
+            Response::ApprovalIssued { approval } => approval,
+            other => panic!("the second mint must also succeed: {other:?}"),
+        };
+        let mismatch = match handle(
+            &mut state,
+            &operator,
+            Request::Authorize {
+                request,
+                capability: None,
+                approval: Some(other_approval.id),
+            },
+        ) {
+            Response::Authorization { explanation } => explanation,
+            other => panic!("expected the mismatching spend to be evaluated, got {other:?}"),
+        };
+        assert!(
+            matches!(
+                mismatch.decision,
+                asv_domain::Decision::Deny { ref reason } if reason == "approval mismatch"
+            ),
+            "spending an approval on a request it does not describe must \
+             mismatch, got {:?}",
+            mismatch.decision
+        );
     }
 
     /// H2: `PolicyContext.peer_uid` arrives inside the request body, so it is
