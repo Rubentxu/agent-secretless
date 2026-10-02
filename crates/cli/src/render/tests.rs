@@ -113,6 +113,7 @@ fn sample(stop_broker: bool) -> Observation {
         vault_unlockable: TriState::Yes,
         service_unit: FileState::Absent,
         unit_target: Some("/home/u/.local/libexec/asv/asv-brokerd".into()),
+        broker_facts: None,
         hardening: Hardening {
             landlock: TriState::No,
             seccomp: TriState::Unknown,

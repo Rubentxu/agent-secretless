@@ -14,6 +14,8 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 pub mod agent;
+#[path = "capabilities/mod.rs"]
+pub mod capabilities;
 pub mod doctor;
 pub mod ipc;
 pub mod layout;
@@ -86,6 +88,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// What this installation can do, derived from the running broker.
+    Capabilities {
+        /// Emit the `asv.agent/v1` envelope instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// The agent-facing surface. One command is enough to start.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     /// Plant a credential in the broker's vault (ADR-0016).
     ///
     /// The secret is read from **stdin**, never from argv and never from the
@@ -130,6 +143,20 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum AgentCommand {
+    /// The whole agent-facing surface: what this is, whether the broker is
+    /// up, what it can do, and the links to follow. Takes no arguments and
+    /// needs no prior knowledge — that is the point of it.
+    Discover {
+        /// Emit the `asv.agent/v1` envelope. The default for a machine reader
+        /// and required by the contract; the flag exists so the human and
+        /// machine forms are the same command rather than two commands.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
@@ -156,6 +183,9 @@ async fn main() -> std::io::Result<()> {
     match &command {
         Command::Setup { json } => return run_setup(*json),
         Command::Doctor { json } => return run_doctor(&socket, *json),
+        Command::Agent {
+            command: AgentCommand::Discover { json },
+        } => return run_discover(&socket, *json),
         _ => {}
     }
 
@@ -166,6 +196,7 @@ async fn main() -> std::io::Result<()> {
     // remaining tabular renderers have somewhere to be ported to.
     let json = match &command {
         Command::Status { json } | Command::Credentials { json } => *json,
+        Command::Capabilities { json } => return run_capabilities(&socket, *json),
         _ => false,
     };
 
@@ -242,8 +273,11 @@ async fn main() -> std::io::Result<()> {
             Request::AuditQuery { since_secs }
         }
         Command::Run { .. } => unreachable!("run handled before broker IPC"),
-        Command::Setup { .. } | Command::Doctor { .. } => {
-            unreachable!("setup and doctor are handled before broker IPC")
+        Command::Setup { .. }
+        | Command::Doctor { .. }
+        | Command::Capabilities { .. }
+        | Command::Agent { .. } => {
+            unreachable!("these are handled before broker IPC")
         }
     };
 
@@ -290,6 +324,11 @@ pub fn observe_broker_socket() -> doctor::SocketOutcome {
 
 /// The same, against an explicit socket, so a test can point it at a broker
 /// that answers whatever the test needs it to.
+pub fn observe_broker_at(socket: &std::path::Path) -> doctor::SocketOutcome {
+    observe_broker_socket_at(socket)
+}
+
+/// The same, against an explicit socket.
 pub fn observe_broker_socket_at(socket: &std::path::Path) -> doctor::SocketOutcome {
     let request = Request::Ping {
         protocol: PROTOCOL_VERSION,
@@ -311,6 +350,7 @@ pub fn observe_broker_socket_at(socket: &std::path::Path) -> doctor::SocketOutco
 pub fn response_kind(response: &Response) -> &'static str {
     match response {
         Response::Pong { .. } => "Pong",
+        Response::BrokerInfo { .. } => "BrokerInfo",
         Response::SessionCreated { .. } => "SessionCreated",
         Response::SessionEnded { .. } => "SessionEnded",
         Response::CredentialMetadata { .. } => "CredentialMetadata",
@@ -355,6 +395,63 @@ fn run_doctor(socket: &std::path::Path, json: bool) -> std::io::Result<()> {
     // Degraded exits zero: it is usable, and a setup script that treats a
     // missing Landlock as a failure will be disabled by its users.
     if report.status() == agent::schema::Status::Blocked {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `asv agent discover`, the entry point an agent is given.
+///
+/// The installation state is judged from the layout rather than asked about,
+/// because the question it answers is "is there anything to discover" and a
+/// command that needs a broker to answer "is the broker up" has already
+/// failed.
+fn run_discover(socket: &std::path::Path, json: bool) -> std::io::Result<()> {
+    let layout = layout::for_current_user();
+    let installation_ready = layout.vault.exists() && layout.broker_lookup.is_found();
+    let discovery = agent::discover::discover(socket, installation_ready);
+
+    if json {
+        println!("{}", render::json::envelope(&discovery.to_envelope()));
+    } else {
+        print!("{}", discovery.render_human());
+    }
+
+    // `blocked` and `error` both exit non-zero so a script can branch; the
+    // difference is in the `code`, not in the exit status, because an agent
+    // that treated them as the same thing would report "not ready" for a
+    // version mismatch, which is a different problem with a different fix.
+    if matches!(
+        discovery.status,
+        agent::schema::Status::Blocked | agent::schema::Status::Error
+    ) {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run_capabilities(socket: &std::path::Path, json: bool) -> std::io::Result<()> {
+    let outcome = observe_broker_at(socket);
+    let (facts, reachable) = match outcome {
+        doctor::SocketOutcome::Answered { .. } => (ipc::fetch_broker_facts(socket), true),
+        _ => (None, false),
+    };
+    let compatible = facts
+        .as_ref()
+        .map(|f| f.protocol == PROTOCOL_VERSION)
+        .unwrap_or(false);
+
+    let report = capabilities::CapabilityReport::from_broker(facts.as_ref(), reachable, compatible);
+
+    if json {
+        println!("{}", render::json::envelope(&report.to_envelope()));
+    } else {
+        print!("{}", report.render_human());
+    }
+    if matches!(
+        report.status(),
+        agent::schema::Status::Blocked | agent::schema::Status::Error
+    ) {
         std::process::exit(1);
     }
     Ok(())
@@ -545,6 +642,26 @@ fn print_response(response: &Response) {
     match response {
         Response::Pong { protocol } => {
             println!("broker reachable, protocol v{protocol}");
+        }
+        // The broker's self-description. Every field here was already
+        // obtainable by asking, which is what makes printing it safe: nothing
+        // here is derived from a session, a credential, or a workspace. The
+        // flags are booleans about the answering process's own hardening, and
+        // a caller that could not have learned them by asking would have had
+        // to read /proc/<pid>/status of a process it is not allowed to debug.
+        Response::BrokerInfo {
+            product_version,
+            dumpable_disabled,
+            landlock_installed,
+            seccomp_installed,
+            no_new_privs,
+            ..
+        } => {
+            println!("broker {product_version} (protocol {PROTOCOL_VERSION})");
+            println!(
+                "  dumpable disabled: {dumpable_disabled}   no_new_privs: {no_new_privs}   \
+                 landlock: {landlock_installed}   seccomp: {seccomp_installed}"
+            );
         }
         Response::SessionCreated { session } => {
             println!("session {session} created");

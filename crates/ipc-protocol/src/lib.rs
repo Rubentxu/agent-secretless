@@ -126,6 +126,20 @@ pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 pub enum Request {
     /// Liveness and version negotiation.
     Ping { protocol: u16 },
+    /// Asks the broker to describe itself.
+    ///
+    /// Added in DX2 because `asv doctor` had two facts it could not report:
+    /// whether the running broker disabled `PR_SET_DUMPABLE`, and which
+    /// product version it was built as. `Ping` carries a protocol number and
+    /// nothing else, so the CLI could only answer "unknown" for both — and
+    /// 09-IMPLEMENTATION-GUIDE.md §2 permits widening IPC precisely for "a
+    /// fact that the broker is the only authority able to know".
+    ///
+    /// Read-only, carries no session and no secret, and is answered before
+    /// any authorisation decision: a caller that cannot reach the broker at
+    /// all is the case this exists to serve, and requiring a session to learn
+    /// whether a session is possible would be circular.
+    AgentInfo { protocol: u16 },
     /// Opens a bounded agent session.
     CreateSession { workspace: String },
     /// Closes a session and invalidates its grants.
@@ -277,6 +291,34 @@ pub enum Request {
 pub enum Response {
     Pong {
         protocol: u16,
+    },
+    /// The broker's own description of itself.
+    ///
+    /// Every field is a fact about the process that answered, observed from
+    /// inside it. None of them can be inferred by the caller: `dumpable` is a
+    /// `prctl` on *this* pid, and a CLI reading `/proc/<pid>/status` would be
+    /// reading a field that another same-uid process can influence, which is
+    /// the property the whole broker is built to refuse.
+    BrokerInfo {
+        protocol: u16,
+        product_version: String,
+        /// `PR_SET_DUMPABLE` is 0 in the answering process.
+        dumpable_disabled: bool,
+        /// `PR_SET_NO_NEW_PRIVS` is set.
+        no_new_privs: bool,
+        /// A live Landlock ruleset is restricting this process.
+        landlock_installed: bool,
+        /// A live seccomp-bpf deny-list is installed.
+        seccomp_installed: bool,
+        /// The kernel offers cgroup v2, and a session slice was created.
+        cgroup_v2: bool,
+        /// Capabilities this build actually compiled in, as wire names.
+        ///
+        /// Derived from the running process rather than from the roadmap, per
+        /// R9 in `11-RISKS-OPEN-QUESTIONS.md`: "capabilities derived from the
+        /// runtime; not from the roadmap or from types that exist but have no
+        /// complete path."
+        capabilities: Vec<String>,
     },
     SessionCreated {
         session: AgentSessionId,
@@ -482,6 +524,7 @@ impl Request {
     pub fn method_name(&self) -> &'static str {
         match self {
             Request::Ping { .. } => "ping",
+            Request::AgentInfo { .. } => "agent_info",
             Request::CreateSession { .. } => "create_session",
             Request::EndSession { .. } => "end_session",
             Request::ListCredentialMetadata => "list_credential_metadata",

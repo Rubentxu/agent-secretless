@@ -185,6 +185,13 @@ fn main() -> std::io::Result<()> {
     // of M7-R1); missing kernel features (Landlock on < 5.13, seccomp
     // denied by the sandbox) degrade loudly to a warning instead of
     // killing a broker the operator explicitly asked to harden.
+    // DX2: the harden block fills this in and the request path reads it,
+    // so `asv doctor` can report the broker's real protections instead of
+    // `unknown`. Declared out here because the block is conditional and a
+    // broker run with `--no-harden` is exactly the case that must report
+    // none of them.
+    let mut self_report: Option<asv_broker::selfreport::SelfReport> = None;
+
     if harden {
         // The Landlock ruleset is irreversible, so the paths the broker is
         // actually pointed at have to be allowed BEFORE it installs, or the
@@ -209,12 +216,22 @@ fn main() -> std::io::Result<()> {
                 install_paths.write_paths.push(dir.to_path_buf());
             }
         }
+        // DX2: kept for `Request::AgentInfo` rather than logged and dropped.
+        // `asv doctor` asks the broker for these over the socket.
         let cfg = asv_broker::harden::install_with(install_paths).unwrap_or_else(|err| {
             eprintln!("asv: --harden failed on a mandatory step: {err}");
             std::process::exit(1);
         });
         let dumpable_zero = asv_broker::harden::dumpable_is_zero();
         let no_new_privs = asv_broker::harden::no_new_privs_is_set();
+        // DX2: the same three numbers, kept rather than logged and dropped.
+        // `asv doctor` asks the broker for these over the socket, and before
+        // this they existed only for the length of the log line below.
+        self_report = Some(asv_broker::selfreport::SelfReport::from_harden(
+            &cfg,
+            dumpable_zero,
+            no_new_privs,
+        ));
         // Honest labels: `landlock_installed` and `seccomp_installed` are
         // REAL — a live Landlock ruleset (restrict_self succeeded) and a
         // live seccomp-bpf deny-list (ptrace/process_vm_readv/kexec_load/
@@ -261,12 +278,14 @@ fn main() -> std::io::Result<()> {
             set_socket_dir_mode(parent)?;
         }
     }
-
     let listener = UnixListener::bind(&socket_path)?;
     set_socket_mode(&socket_path)?;
     tracing::info!(path = %socket_path.display(), protocol = asv_ipc_protocol::PROTOCOL_VERSION, "broker listening");
 
     let mut state = BrokerState::default();
+    if let Some(report) = self_report {
+        state.self_report = report;
+    }
     if let Some(path) = audit_file.as_deref() {
         // Durable audit (R9 follow-up). Fail-closed: a chain that does not
         // verify on disk is not extended; a broken durable log must be

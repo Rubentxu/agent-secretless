@@ -1,0 +1,61 @@
+{
+  "data": {
+    "broker": {
+      "compatible": false,
+      "hardening": null,
+      "reachable": false,
+      "version": null
+    },
+    "capabilities": [],
+    "capability_derivation": "UNKNOWN",
+    "installation": {
+      "channel": "source",
+      "managed_by": "direct",
+      "ready": false
+    }
+  },
+  "error": {
+    "code": "SETUP_REQUIRED",
+    "message": "this installation has not been set up. `asv setup` creates the runtime layout, the vault and the service."
+  },
+  "links": [
+    {
+      "description": "Inspect installation and broker health",
+      "invoke": {
+        "argv": [
+          "doctor",
+          "--json"
+        ],
+        "program": "asv"
+      },
+      "operation": "system.doctor",
+      "rel": "asv://rels/doctor",
+      "requires_human": false,
+      "safety": "read-only"
+    },
+    {
+      "description": "Create the runtime layout and start the broker service",
+      "invoke": {
+        "argv": [
+          "setup",
+          "--json"
+        ],
+        "program": "asv"
+      },
+      "operation": "system.setup",
+      "rel": "asv://rels/setup",
+      "requires_human": false,
+      "safety": "local-configuration"
+    }
+  ],
+  "product_version": "<product_version>",
+  "protocol_version": 3,
+  "schema": "asv.agent/v1",
+  "status": "blocked",
+  "warnings": [
+    {
+      "code": "CAPABILITIES_UNKNOWN",
+      "message": "the capability list is empty because the broker could not be asked, not because this build has none."
+    }
+  ]
+}

@@ -20,6 +20,65 @@
 use asv_ipc_protocol::Response;
 use serde_json::json;
 
+/// What the broker said about itself, and the socket it answered on.
+///
+/// A local type rather than the wire enum, because two of these fields are
+/// used to decide what to *print* and one is used to decide whether to trust
+/// the answer at all. Passing the raw `Response` around would let a future
+/// caller print a field that was never meant to be printed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerFacts {
+    pub protocol: u16,
+    pub product_version: String,
+    pub dumpable_disabled: bool,
+    pub no_new_privs: bool,
+    pub landlock_installed: bool,
+    pub seccomp_installed: bool,
+    pub capabilities: Vec<String>,
+}
+
+impl BrokerFacts {
+    fn from_response(response: &Response) -> Option<Self> {
+        match response {
+            Response::BrokerInfo {
+                protocol,
+                product_version,
+                dumpable_disabled,
+                no_new_privs,
+                landlock_installed,
+                seccomp_installed,
+                capabilities,
+                ..
+            } => Some(Self {
+                protocol: *protocol,
+                product_version: product_version.clone(),
+                dumpable_disabled: *dumpable_disabled,
+                no_new_privs: *no_new_privs,
+                landlock_installed: *landlock_installed,
+                seccomp_installed: *seccomp_installed,
+                capabilities: capabilities.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Asks the broker to describe itself.
+///
+/// `None` for every failure mode — refused socket, wrong protocol, a broker
+/// too old to have the request. The caller decides what each means, because
+/// "could not ask" and "asked and was told there are none" are different
+/// answers and a merged one is how discovery ends up advertising nothing for
+/// the wrong reason.
+pub fn fetch_broker_facts(socket: &std::path::Path) -> Option<BrokerFacts> {
+    let request = asv_ipc_protocol::Request::AgentInfo {
+        protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+    };
+    crate::call(socket, &request)
+        .ok()
+        .and_then(|r| BrokerFacts::from_response(&r))
+}
+
 /// The outcome of a broker-backed command.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApplicationResult {

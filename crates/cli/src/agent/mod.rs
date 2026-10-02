@@ -14,8 +14,11 @@
 //! concludes the two agree about the installation when neither one said
 //! anything about the other.
 
+#[path = "discover/mod.rs"]
+pub mod discover;
 pub mod relations;
 pub mod schema;
 
+pub use discover::Discovery;
 pub use relations::{AgentInvoke, AgentLink, AgentRel, Safety};
 pub use schema::{AgentError, Envelope, Status, Warning, SCHEMA};

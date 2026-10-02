@@ -121,6 +121,38 @@ pub enum SocketOutcome {
     /// that is down: the first means "stale socket or another program", the
     /// second means "the service is not running".
     Unexpected { detail: String },
+    /// A broker answered, and this is what it said about itself.
+    ///
+    /// DX1 reported `unknown` for the broker's version and its core-dump
+    /// setting because `Ping` carries neither. DX2 widened the IPC for exactly
+    /// those two facts, so this variant is what turns a guess into a
+    /// measurement — and it is the only way to learn them, because the CLI
+    /// reading `/proc/<pid>/status` would be reading a field another same-uid
+    /// process can influence.
+    SelfReported(Box<crate::ipc::BrokerFacts>),
+}
+
+impl SocketOutcome {
+    /// The protocol version the peer reported, when it reported one.
+    ///
+    /// An accessor rather than a pattern match at each use site, because
+    /// `SelfReported` and `Answered` are the same event seen at two
+    /// resolutions: one is the liveness handshake, the other is that plus the
+    /// broker's description. Treating them as two cases meant the protocol
+    /// check had to learn about `SelfReported` separately, and a third way of
+    /// learning about the broker would have needed it again.
+    pub fn observed_protocol(&self) -> Option<u16> {
+        match self {
+            SocketOutcome::Answered { protocol } => Some(*protocol),
+            SocketOutcome::SelfReported(facts) => Some(facts.protocol),
+            SocketOutcome::Unreachable { .. } | SocketOutcome::Unexpected { .. } => None,
+        }
+    }
+
+    /// Whether the peer is the broker, at either resolution.
+    pub fn is_broker(&self) -> bool {
+        self.observed_protocol().is_some()
+    }
 }
 
 /// Kernel facilities the broker would use, as this kernel offers them.
@@ -150,6 +182,8 @@ pub struct Observation {
     pub service_unit: FileState,
     /// Where the installed unit's `ExecStart` actually points, if it has one.
     pub unit_target: Option<PathBuf>,
+    /// What the broker said about itself, when it was asked.
+    pub broker_facts: Option<crate::ipc::BrokerFacts>,
     pub hardening: Hardening,
     pub channel: &'static str,
     pub managed_by: &'static str,
@@ -384,11 +418,21 @@ impl DoctorReport {
                 detail: "the broker answered".into(),
                 remedy: None,
             },
+            SocketOutcome::SelfReported(facts) => Check {
+                id: "broker.socket".into(),
+                label: "Broker socket".into(),
+                state: CheckState::Ok,
+                detail: format!(
+                    "the broker answered, and reports itself as {}",
+                    facts.product_version
+                ),
+                remedy: None,
+            },
         });
 
-        let protocol_compatible = match &obs.socket {
-            SocketOutcome::Answered { protocol } => {
-                if *protocol == asv_ipc_protocol::PROTOCOL_VERSION {
+        let protocol_compatible = match obs.socket.observed_protocol() {
+            Some(protocol) => {
+                if protocol == asv_ipc_protocol::PROTOCOL_VERSION {
                     Check {
                         id: "broker.protocol".into(),
                         label: "Protocol".into(),
@@ -448,9 +492,31 @@ impl DoctorReport {
             "the broker will run without a syscall filter",
         ));
 
-        // The one that is genuinely unobservable, kept as its own check so
-        // that the gap is visible rather than inferred from its absence.
-        checks.push(if obs.hardening.broker_dumpable.observed() {
+        // Measured, since DX2 widened the IPC for it.
+        checks.push(if let Some(facts) = &obs.broker_facts {
+            Check {
+                id: "broker.dumpable".into(),
+                label: "Broker core dumps".into(),
+                state: if facts.dumpable_disabled {
+                    CheckState::Ok
+                } else {
+                    CheckState::Warn
+                },
+                detail: format!(
+                    "the broker reports PR_SET_DUMPABLE={}",
+                    if facts.dumpable_disabled { "0" } else { "1" }
+                ),
+                remedy: if facts.dumpable_disabled {
+                    None
+                } else {
+                    Some(
+                        "the broker is attached to a debugger. Start it with the harden \
+                         profile, or find out why hardening was skipped."
+                            .into(),
+                    )
+                },
+            }
+        } else if obs.hardening.broker_dumpable.observed() {
             Check {
                 id: "broker.dumpable".into(),
                 label: "Broker core dumps".into(),
@@ -478,15 +544,17 @@ impl DoctorReport {
             }
         });
 
-        // The broker's own product version is the second unobservable fact,
-        // and the reason is the same: `Pong` carries a protocol number and
-        // nothing else.
-        warnings.push(Warning {
-            code: "BROKER_VERSION_UNOBSERVABLE".into(),
-            message: "the handshake reports a protocol version, not a product version; \
-                      `broker_version` is reported as null rather than assumed equal"
-                .into(),
-        });
+        // A warning only when the broker did not describe itself. Since DX2
+        // the version is a measurement, so a document still claiming
+        // "unobservable" is making a claim about the connection.
+        if obs.broker_facts.is_none() {
+            warnings.push(Warning {
+                code: "BROKER_VERSION_UNOBSERVABLE".into(),
+                message: "the broker did not describe itself, so `broker_version` is \
+                          reported as null rather than assumed equal to the CLI's"
+                    .into(),
+            });
+        }
 
         Self {
             cli_version: obs.cli_version,
@@ -534,16 +602,42 @@ impl DoctorReport {
         let protocol_compatible = self
             .check("broker.protocol")
             .map(|c| c.state == CheckState::Ok || c.state == CheckState::Warn);
-        let socket_reachable = matches!(self.socket, SocketOutcome::Answered { .. });
+        let socket_reachable = matches!(
+            self.socket,
+            SocketOutcome::Answered { .. } | SocketOutcome::SelfReported { .. }
+        );
 
         let data = serde_json::json!({
             "cli_version": self.cli_version,
-            // Null, not the CLI's own version. See the warning on the report.
-            "broker_version": serde_json::Value::Null,
+            // A measurement since DX2, a sentence when there was none, and
+            // never the CLI's own version — that was the guess this replaced.
+            "broker_version": match &self.socket {
+                SocketOutcome::SelfReported(facts) => {
+                    serde_json::Value::String(facts.product_version.clone())
+                }
+                _ => serde_json::Value::String(
+                    "unknown: the broker did not describe itself".into(),
+                ),
+            },
             "protocol_compatible": protocol_compatible,
             "socket": { "reachable": socket_reachable },
             "hardening": {
-                "dumpable_disabled": self.hardening.broker_dumpable.as_str(),
+                "dumpable_disabled": match &self.socket {
+                    SocketOutcome::SelfReported(facts) => {
+                        serde_json::Value::String(
+                            if facts.dumpable_disabled { "true" } else { "false" }.into(),
+                        )
+                    }
+                    _ => serde_json::Value::String(self.hardening.broker_dumpable.as_str().into()),
+                },
+                "no_new_privs": match &self.socket {
+                    SocketOutcome::SelfReported(facts) => {
+                        serde_json::Value::String(
+                            if facts.no_new_privs { "true" } else { "false" }.into(),
+                        )
+                    }
+                    _ => serde_json::Value::String("unknown".into()),
+                },
                 "landlock": self.hardening.landlock.as_str(),
                 "seccomp": self.hardening.seccomp.as_str(),
             },
@@ -654,7 +748,14 @@ impl Observation {
             .socket_override
             .clone()
             .unwrap_or_else(crate::default_socket);
-        let socket = crate::observe_broker_socket_at(&socket_path);
+        let mut socket = crate::observe_broker_socket_at(&socket_path);
+        let broker_facts = match &socket {
+            SocketOutcome::Answered { .. } => crate::ipc::fetch_broker_facts(&socket_path),
+            _ => None,
+        };
+        if let Some(facts) = &broker_facts {
+            socket = SocketOutcome::SelfReported(Box::new(facts.clone()));
+        }
         let vault = file_state(&layout.vault);
         let vault_unlockable = match vault {
             FileState::Present { .. } => unlockable(layout),
@@ -664,6 +765,7 @@ impl Observation {
         Self {
             cli_version: crate::build_version().to_string(),
             socket,
+            broker_facts,
             broker_lookup: layout::lookup_broker_binary(),
             config_dir: dir_state(&layout.config_dir),
             data_dir: dir_state(&layout.data_dir),
@@ -794,7 +896,7 @@ fn probe_seccomp() -> TriState {
 /// than expected, and answering it wrongly is worse than not answering: a
 /// `cargo install` build reporting `mise` sends somebody to delete a mise
 /// plugin that was never involved.
-fn detect_channel() -> &'static str {
+pub fn detect_channel() -> &'static str {
     let Ok(exe) = std::env::current_exe() else {
         return "unknown";
     };
@@ -810,7 +912,7 @@ fn detect_channel() -> &'static str {
 
 /// What put this `asv` here — the difference between a user running the
 /// installer and a package manager having done it.
-fn detect_managed_by() -> &'static str {
+pub fn detect_managed_by() -> &'static str {
     if std::env::var_os("ASV_INSTALLER").is_some() {
         "installer"
     } else {

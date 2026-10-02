@@ -127,6 +127,23 @@ pipeline {
             }
         }
 
+        // DX2. Runs the built binary, not the test harness: the goldens pin
+        // the shape of the document an agent actually receives, and a golden
+        // produced by calling the code directly would keep passing after the
+        // wiring between them broke.
+        //
+        // The goldens pin shape and the property tests pin meaning. Neither
+        // catches what the other catches — the property tests say nothing
+        // about a key that *moved*, and a golden cannot say that a value is
+        // the wrong one. An agent contract is consumed by name, so both are
+        // needed.
+        stage("agent-contract") {
+            dependsOn("build")
+            dir(repo) {
+                sh("python3 tests/agent_contract.py")
+            }
+        }
+
         // The M6 property against a real PostgreSQL. This is the stage that
         // silently skipped for three releases and let a write-as-read
         // authorization bypass ship green; `uat033-pg-substrate.sh run` sets

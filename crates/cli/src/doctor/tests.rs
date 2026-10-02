@@ -27,6 +27,7 @@ fn healthy() -> Observation {
         vault_unlockable: TriState::Yes,
         service_unit: FileState::Present { mode: 0o644 },
         unit_target: Some("/home/u/.local/libexec/asv/asv-brokerd".into()),
+        broker_facts: None,
         hardening: Hardening {
             landlock: TriState::Yes,
             seccomp: TriState::Yes,
@@ -336,19 +337,134 @@ fn the_contract_fields_are_present_in_every_state() {
     }
 }
 
-/// `broker_version` is null, not a copy of the CLI's own version.
+/// `broker_version` is never a copy of the CLI's own version.
 ///
 /// An earlier shape of this report filled it in, on the reasoning that a
 /// broker and a CLI from the same bundle are the same build. That is usually
-/// true and is not a fact: the protocol handshake carries a version number
-/// and nothing else, so the field would be an assumption wearing a value.
+/// true and is not a fact.
+///
+/// DX1 could only report `null`, because `Ping` carries a protocol number and
+/// nothing else. DX2 widened the IPC, so there is now a real value to report
+/// when the broker describes itself — and a sentence saying it did not when it
+/// did not. The property this test guards is the one that survived both: the
+/// field is never the CLI's version guessed at it.
 #[test]
-fn the_broker_version_is_null_rather_than_assumed() {
+fn the_broker_version_is_never_the_clis_own() {
+    let cli_version = env!("CARGO_PKG_VERSION");
+
+    // No broker facts: says so, rather than guessing.
     let value: serde_json::Value =
         serde_json::from_str(&DoctorReport::judge(healthy()).to_envelope().to_json()).unwrap();
+    let reported = value["data"]["broker_version"].as_str().unwrap();
+    assert_ne!(
+        reported, cli_version,
+        "the broker's version was filled in with the CLI's"
+    );
     assert!(
-        value["data"]["broker_version"].is_null(),
-        "broker_version was filled in from a source that cannot know it"
+        reported.contains("unknown"),
+        "an unobserved version should say so, not read like a version: {reported}"
+    );
+
+    // With broker facts: the measured value, which is a different string from
+    // the CLI's even when both builds are the same version.
+    let facts = crate::ipc::BrokerFacts {
+        protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+        product_version: "0.26.0-broker".into(),
+        dumpable_disabled: true,
+        no_new_privs: true,
+        landlock_installed: true,
+        seccomp_installed: true,
+        capabilities: vec!["system.health".into()],
+    };
+    let measured = DoctorReport::judge(Observation {
+        socket: SocketOutcome::SelfReported(Box::new(facts)),
+        broker_facts: None,
+        ..healthy()
+    });
+    let value: serde_json::Value = serde_json::from_str(&measured.to_envelope().to_json()).unwrap();
+    assert_eq!(value["data"]["broker_version"], "0.26.0-broker");
+}
+
+/// The core-dump setting is a measurement now, not a shrug.
+#[test]
+fn a_broker_that_describes_itself_gets_a_measured_dumpable_check() {
+    let facts = crate::ipc::BrokerFacts {
+        protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+        product_version: "0.26.0".into(),
+        dumpable_disabled: true,
+        no_new_privs: true,
+        landlock_installed: true,
+        seccomp_installed: true,
+        capabilities: vec![],
+    };
+    let report = DoctorReport::judge(Observation {
+        socket: SocketOutcome::SelfReported(Box::new(facts.clone())),
+        broker_facts: Some(facts),
+        ..healthy()
+    });
+
+    let check = report.check("broker.dumpable").unwrap();
+    assert_eq!(
+        check.state,
+        CheckState::Ok,
+        "a broker that reported PR_SET_DUMPABLE=0 is reported as unknown"
+    );
+    assert!(
+        check.detail.contains("PR_SET_DUMPABLE=0"),
+        "{}",
+        check.detail
+    );
+
+    let codes: Vec<&str> = report.warnings.iter().map(|w| w.code.as_str()).collect();
+    assert!(
+        !codes.contains(&"BROKER_HARDENING_UNOBSERVABLE"),
+        "the warning fired for a fact that was measured: {codes:?}"
+    );
+    assert!(
+        !codes.contains(&"BROKER_VERSION_UNOBSERVABLE"),
+        "the version warning fired for a broker that described itself: {codes:?}"
+    );
+}
+
+/// A broker that reports `PR_SET_DUMPABLE=1` is a finding, not a shrug.
+///
+/// The fail-closed direction: the previous default could not produce this
+/// case at all, because it had no way to learn it.
+#[test]
+fn a_debuggable_broker_is_a_warning_with_a_remedy() {
+    let facts = crate::ipc::BrokerFacts {
+        protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+        product_version: "0.26.0".into(),
+        dumpable_disabled: false,
+        no_new_privs: false,
+        landlock_installed: false,
+        seccomp_installed: false,
+        capabilities: vec![],
+    };
+    let report = DoctorReport::judge(Observation {
+        socket: SocketOutcome::SelfReported(Box::new(facts.clone())),
+        broker_facts: Some(facts),
+        ..healthy()
+    });
+
+    let check = report.check("broker.dumpable").unwrap();
+    assert_eq!(check.state, CheckState::Warn);
+    assert!(
+        check.remedy.as_ref().unwrap().contains("debugger"),
+        "the remedy should name what is wrong: {:?}",
+        check.remedy
+    );
+    // Degraded, not blocked. A debuggable broker still works — it is just
+    // observable to another same-uid process, which is the property this
+    // product exists to reduce. An earlier version of this test asserted
+    // `Ready` in the same breath as asserting a `Warn`, which is a
+    // contradiction: a warn degrades by definition, and the assertion would
+    // have failed the day someone read it.
+    assert_eq!(report.status(), EnvelopeStatus::Degraded);
+    assert!(
+        report.blocking().is_empty(),
+        "a debuggable broker is usable; it must not be reported as blocking: {:?}",
+        report.blocking()
     );
 }
 

@@ -31,6 +31,7 @@ pub mod oauth2;
 pub mod pg_policy;
 pub mod pg_session;
 pub mod recovery;
+pub mod selfreport;
 pub mod surrogate;
 pub mod tls_bridge;
 pub mod vault_port;
@@ -408,6 +409,16 @@ pub struct BrokerState {
     /// `CreateCredential` refuses, for the same fail-closed reason `secrets`
     /// defaults to `None` rather than fabricating a port.
     pub vault_writer: Option<Arc<VaultWritePort>>,
+    /// DX2: what this process knows about itself, for `Request::AgentInfo`.
+    ///
+    /// Populated by `main` from the `harden::install` result it already had in
+    /// hand. Before this field existed that result was logged and dropped, so
+    /// the facts existed for the length of one `tracing::info!` and were gone
+    /// afterwards — which is why `asv doctor` had to answer "unknown" for
+    /// them. The default is fail-closed rather than optimistic: a broker built
+    /// without the harden profile reports the protections as absent, because
+    /// a process that did not set them has not got them.
+    pub self_report: selfreport::SelfReport,
 }
 
 impl Default for BrokerState {
@@ -427,6 +438,7 @@ impl Default for BrokerState {
             audit: audit::AuditLog::default(),
             control_plane: admission::Enrolment::empty(),
             vault_writer: None,
+            self_report: selfreport::SelfReport::default(),
         }
     }
 }
@@ -486,6 +498,7 @@ pub fn handle(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request
 fn request_method_name(_state: &BrokerState, response: &Response) -> String {
     match response {
         Response::Pong { .. } => "ping".into(),
+        Response::BrokerInfo { .. } => "agent_info".into(),
         Response::SessionCreated { .. } => "create_session".into(),
         Response::SessionEnded { .. } => "end_session".into(),
         Response::CredentialMetadata { .. } => "list_credential_metadata".into(),
@@ -535,7 +548,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
     tracing::debug!(%evidence_note, pid = peer.credentials.pid, "authenticated request");
 
     match request {
-        Request::Ping { protocol } => {
+        Request::Ping { protocol } | Request::AgentInfo { protocol } => {
             if protocol != PROTOCOL_VERSION {
                 return Response::Error {
                     code: ErrorCode::VersionMismatch,
@@ -544,8 +557,23 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                     ),
                 };
             }
-            Response::Pong {
-                protocol: PROTOCOL_VERSION,
+            match request {
+                Request::AgentInfo { .. } => {
+                    let r = &state.self_report;
+                    Response::BrokerInfo {
+                        protocol: PROTOCOL_VERSION,
+                        product_version: r.product_version.clone(),
+                        dumpable_disabled: r.dumpable_disabled,
+                        no_new_privs: r.no_new_privs,
+                        landlock_installed: r.landlock_installed,
+                        seccomp_installed: r.seccomp_installed,
+                        cgroup_v2: r.cgroup_v2,
+                        capabilities: r.capabilities.clone(),
+                    }
+                }
+                _ => Response::Pong {
+                    protocol: PROTOCOL_VERSION,
+                },
             }
         }
 

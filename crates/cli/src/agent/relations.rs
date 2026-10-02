@@ -279,19 +279,20 @@ impl AgentRel {
     /// The relations this build actually publishes.
     ///
     /// This is a subset of the enum on purpose, and the subset is the claim.
-    /// `06-CLI-CONTRACT.md` §5 names six core relations; DX1 implements five
-    /// of them. `Capabilities` is declared but withheld because `asv
-    /// capabilities` does not exist yet — it ships with discovery in DX2. The
-    /// other eight are withheld for the reasons in their variant comments.
+    /// `06-CLI-CONTRACT.md` §5 names six core relations; DX2 completes all six
+    /// by shipping `asv capabilities`. The other eight are withheld for the
+    /// reasons in their variant comments.
     ///
     /// A relation is in this list only if the command behind it parses. That
     /// is not a convention: `every_operational_relation_parses_as_a_real_command`
-    /// runs the actual parser.
+    /// runs the actual parser, and it is what caught `status --json` being
+    /// advertised by a CLI that had no such flag.
     pub fn operational() -> &'static [AgentRel] {
         &[
             AgentRel::Status,
             AgentRel::Doctor,
             AgentRel::Setup,
+            AgentRel::Capabilities,
             AgentRel::CredentialList,
             AgentRel::SessionRun,
         ]
@@ -378,10 +379,10 @@ mod tests {
     /// silent break for anything that stored the old string. Pinned against
     /// the five DX1 implements out of the six in `06-CLI-CONTRACT.md` §5.
     ///
-    /// `asv://rels/capabilities` is absent and that is a recorded decision,
-    /// not an oversight: there is no `asv capabilities` command until DX2, and
-    /// the list below is checked against the real parser in the test above, so
-    /// adding the URI here without the command would fail that one instead.
+    /// All six core relations from `06-CLI-CONTRACT.md` §5, spelled as the
+    /// contract spells them. DX1 held `capabilities` back because the command
+    /// did not exist; this is the moment it does, and the list is complete for
+    /// the first time.
     #[test]
     fn the_core_relation_uris_are_pinned() {
         let uris: Vec<&str> = AgentRel::operational().iter().map(|r| r.uri()).collect();
@@ -391,6 +392,7 @@ mod tests {
                 "asv://rels/status",
                 "asv://rels/doctor",
                 "asv://rels/setup",
+                "asv://rels/capabilities",
                 "asv://rels/credentials/list",
                 "asv://rels/session/run",
             ]
