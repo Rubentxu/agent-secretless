@@ -15,10 +15,24 @@ path = "src/main.rs"
 asv-domain.workspace = true
 asv-ipc-protocol.workspace = true
 asv-ssh-agent.workspace = true
+# `asv setup` creates the vault during installation, so the CLI links the
+# encrypted store. This does not give the CLI a retrieval path: the store
+# exposes create/open/persist and no read-a-secret-for-the-caller operation,
+# and `no_subcommand_exposes_a_secret` still holds over the grown surface.
+# The alternative — having setup shell out to `asv-vault-tool` — would mean
+# shipping a binary the distribution manifest classifies as forbidden.
+asv-vault.workspace = true
 clap = { workspace = true }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Derives for the `asv.agent/v1` envelope. `serde_json` alone was enough when
+# the CLI built JSON by hand, and building it by hand is what made every
+# command a slightly different document.
+serde.workspace = true
 serde_json = "1"
+# `SecretString` for the passphrase `asv setup` writes and `asv doctor` reads.
+# Already in the lock via `asv-vault`; this makes an existing entry direct.
+secrecy.workspace = true
 tokio = { workspace = true }
 # `getuid()`, for deriving the default broker socket from the running user.
 # Already in the lock via `asv-identity` and `asv-broker`, so this adds nothing

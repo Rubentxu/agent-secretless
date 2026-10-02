@@ -91,6 +91,15 @@ pipeline {
                 // passing against the real checkout instead of against the
                 // broken tree they had built.
                 sh("python3 tests/release_config_drift.py")
+                // DX1. The bundle gate above asks "what is in the archive".
+                // This asks the question it cannot see: whether anything a
+                // user is *told to run* names a component the manifest
+                // excludes. `install-broker-service.sh` printed three setup
+                // steps whose first was `asv-vault-tool create` — a binary
+                // the manifest classifies test-harness and the bundle does
+                // not contain. Every gate in this file was green while the
+                // installation instructions were unfollowable.
+                sh("python3 tests/install_path_contract.py")
             }
         }
 

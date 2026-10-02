@@ -147,22 +147,22 @@ Created (both 0700):
   ${VAULT_DIR}
   ${CONFIG_DIR}
 
-The service is NOT started. A broker with no vault refuses to start, so
-starting it now would fail in a way that reads as a broken install. Three
-steps finish the setup:
+The vault and the service are NOT created here. One command does both:
 
-  1. create a vault:
-       asv-vault-tool create --vault ${VAULT_PATH} \\
-         --passphrase "\$(head -c 24 /dev/urandom | base64 | tr -d '\\n')" --fast
+       asv setup
 
-  2. write that passphrase to a file the broker can read:
-       install -m 0600 /dev/stdin ${PASSPHRASE_PATH}
-     (the passphrase is never passed on a command line, by rule D9)
+It creates ${VAULT_DIR} and ${CONFIG_DIR}, generates a passphrase and writes
+it to ${PASSPHRASE_PATH} with mode 0600, installs this unit, and starts the
+service. Running it again verifies what is there and changes nothing.
 
-  3. start it:
-       systemctl --user enable --now ${UNIT_NAME}
-       systemctl --user status ${UNIT_NAME}
+This script used to print three steps instead, and the first one was
+`asv-vault-tool create`. That tool is classified test-harness in
+distribution/manifest.toml and is not in the bundle, so the instructions
+could not be followed by anybody who had installed the product. The steps
+were not a shorter route to `asv setup`; they were a route to a binary that
+does not exist on the machine.
 
-Then, from any shell in this session:
-       asv status
+Then check what you have:
+
+       asv doctor
 EOF

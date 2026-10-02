@@ -13,6 +13,17 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
+pub mod agent;
+pub mod doctor;
+pub mod ipc;
+pub mod layout;
+pub mod render;
+pub mod setup;
+pub mod vaultops;
+
+#[cfg(test)]
+mod tests_support;
+
 #[derive(Parser)]
 #[command(
     name = "asv",
@@ -31,7 +42,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Show broker connectivity and protocol version.
-    Status,
+    Status {
+        /// Emit the `asv.agent/v1` envelope instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
     /// Create a bounded session in a workspace. M2 turns this into `asv run`.
     Session {
         /// Workspace path this session is scoped to.
@@ -45,7 +60,32 @@ enum Command {
         command: Vec<String>,
     },
     /// List credential metadata. Never values.
-    Credentials,
+    Credentials {
+        /// Emit the `asv.agent/v1` envelope instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Bring this installation to a working state. Safe to run repeatedly.
+    ///
+    /// Creates the runtime directories, an empty vault and a passphrase the
+    /// first time, installs the systemd user unit, and starts the broker.
+    /// Running it again verifies the existing installation and changes
+    /// nothing: an existing vault and an existing passphrase are never
+    /// rewritten, because the passphrase is the only key to a credential
+    /// store and a tool that "refreshes" it is a tool that can end one.
+    Setup {
+        /// Emit the `asv.agent/v1` envelope instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report what is installed, what is running, and what to fix. Never a
+    /// single `healthy` boolean: every fact is its own check with its own
+    /// remedy, and the overall status is derived from them.
+    Doctor {
+        /// Emit the `asv.agent/v1` envelope instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
     /// Plant a credential in the broker's vault (ADR-0016).
     ///
     /// The secret is read from **stdin**, never from argv and never from the
@@ -99,19 +139,42 @@ async fn main() -> std::io::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let socket = cli.socket.unwrap_or_else(default_socket);
+    let socket = cli.socket.clone().unwrap_or_else(default_socket);
 
     let command = match cli.command {
         Command::Run { command } => return run_command(command),
         command => command,
     };
 
+    // `setup` and `doctor` do not go through the broker. They run when the
+    // broker is stopped, which is most of why they exist, and routing them
+    // through a socket would mean the command that diagnoses a dead broker
+    // dies with it.
+    //
+    // Matched by reference: the arms below consume `command`, and the rest of
+    // `main` still needs it.
+    match &command {
+        Command::Setup { json } => return run_setup(*json),
+        Command::Doctor { json } => return run_doctor(&socket, *json),
+        _ => {}
+    }
+
+    // `status` and `credentials` are the two relations the CLI publishes that
+    // also owe a machine rendering, so they go through the application-result
+    // path: parse, call, result, render. The other broker commands still print
+    // from `print_response` and pick up `--json` in DX2, which is when the
+    // remaining tabular renderers have somewhere to be ported to.
+    let json = match &command {
+        Command::Status { json } | Command::Credentials { json } => *json,
+        _ => false,
+    };
+
     let request = match command {
-        Command::Status => Request::Ping {
+        Command::Status { .. } => Request::Ping {
             protocol: PROTOCOL_VERSION,
         },
         Command::Session { workspace } => Request::CreateSession { workspace },
-        Command::Credentials => Request::ListCredentialMetadata,
+        Command::Credentials { .. } => Request::ListCredentialMetadata,
         Command::AddCredential {
             label,
             kind,
@@ -179,9 +242,22 @@ async fn main() -> std::io::Result<()> {
             Request::AuditQuery { since_secs }
         }
         Command::Run { .. } => unreachable!("run handled before broker IPC"),
+        Command::Setup { .. } | Command::Doctor { .. } => {
+            unreachable!("setup and doctor are handled before broker IPC")
+        }
     };
 
     match call(&socket, &request) {
+        Ok(response) if json => {
+            let result = ipc::from_response(&response);
+            println!(
+                "{}",
+                render::json::envelope(&render::json::for_result(&result))
+            );
+            if result.is_refusal() {
+                std::process::exit(1);
+            }
+        }
         Ok(response) => print_response(&response),
         Err(e) => {
             // Errors are actionable but never echo request payloads, which is
@@ -189,6 +265,154 @@ async fn main() -> std::io::Result<()> {
             eprintln!("ASV_CONNECTION_FAILED: {e}");
             std::process::exit(2);
         }
+    }
+    Ok(())
+}
+
+/// The product version, from the crate metadata.
+///
+/// One function so that the envelope, `doctor` and the human renderers cannot
+/// disagree about it. `env!("CARGO_PKG_VERSION")` at each call site would
+/// work today and would be wrong the day one of them wanted a git describe.
+pub fn build_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Dials the broker and reports what answered.
+///
+/// A connection failure is not an error here. It is the single most common
+/// state a user is in when they run `doctor` — the service is stopped — and
+/// turning it into an `io::Error` would make the one command that exists to
+/// describe that state be the command that cannot run in it.
+pub fn observe_broker_socket() -> doctor::SocketOutcome {
+    observe_broker_socket_at(&default_socket())
+}
+
+/// The same, against an explicit socket, so a test can point it at a broker
+/// that answers whatever the test needs it to.
+pub fn observe_broker_socket_at(socket: &std::path::Path) -> doctor::SocketOutcome {
+    let request = Request::Ping {
+        protocol: PROTOCOL_VERSION,
+    };
+    match call(socket, &request) {
+        Ok(Response::Pong { protocol }) => doctor::SocketOutcome::Answered { protocol },
+        Ok(other) => doctor::SocketOutcome::Unexpected {
+            // The variant name only. A `Display` of the response could carry
+            // request-derived data, and `doctor` output is the most-copied
+            // output this CLI produces.
+            detail: format!("a {} answered instead", response_kind(&other)),
+        },
+        Err(e) => doctor::SocketOutcome::Unreachable {
+            reason: format!("no answer at {}: {}", socket.display(), e),
+        },
+    }
+}
+
+pub fn response_kind(response: &Response) -> &'static str {
+    match response {
+        Response::Pong { .. } => "Pong",
+        Response::SessionCreated { .. } => "SessionCreated",
+        Response::SessionEnded { .. } => "SessionEnded",
+        Response::CredentialMetadata { .. } => "CredentialMetadata",
+        Response::CredentialDeleted { .. } => "CredentialDeleted",
+        Response::CredentialCreated { .. } => "CredentialCreated",
+        Response::Authorization { .. } => "Authorization",
+        Response::ApprovalIssued { .. } => "ApprovalIssued",
+        Response::SurrogateMinted { .. } => "SurrogateMinted",
+        Response::SurrogateRevoked { .. } => "SurrogateRevoked",
+        Response::IssueRead { .. } => "IssueRead",
+        Response::IssueCreated { .. } => "IssueCreated",
+        Response::ReleaseCreated { .. } => "ReleaseCreated",
+        Response::AuditRecords { .. } => "AuditRecords",
+        Response::PostgresConnected { .. } => "PostgresConnected",
+        Response::PostgresResult { .. } => "PostgresResult",
+        Response::PostgresRevoked { .. } => "PostgresRevoked",
+        Response::Error { .. } => "Error",
+    }
+}
+
+fn run_doctor(socket: &std::path::Path, json: bool) -> std::io::Result<()> {
+    let mut layout = layout::for_current_user();
+
+    // `--socket` overrides where the broker is looked for, and only that.
+    // The rest of the layout is the installation's own, so pointing the
+    // command at a different broker does not silently re-point it at a
+    // different vault.
+    if socket != default_socket() {
+        layout.socket_override = Some(socket.to_path_buf());
+    }
+
+    let observation = doctor::Observation::gather(&layout);
+    let report = doctor::DoctorReport::judge(observation);
+
+    if json {
+        println!("{}", render::json::envelope(&report.to_envelope()));
+    } else {
+        print!("{}", render::human::doctor(&report));
+    }
+
+    // A blocked installation exits non-zero so a script can branch on it.
+    // Degraded exits zero: it is usable, and a setup script that treats a
+    // missing Landlock as a failure will be disabled by its users.
+    if report.status() == agent::schema::Status::Blocked {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run_setup(json: bool) -> std::io::Result<()> {
+    let layout = layout::for_current_user();
+    let outcome = setup::run(&layout)?;
+
+    let status = if outcome.is_blocked() {
+        agent::schema::Status::Blocked
+    } else if !outcome.warning_codes.is_empty() {
+        agent::schema::Status::Degraded
+    } else {
+        agent::schema::Status::Ready
+    };
+
+    if json {
+        let data = serde_json::json!({
+            "created_dirs": outcome.created_dirs,
+            "created_vault": outcome.created_vault,
+            "created_passphrase": outcome.created_passphrase,
+            "installed_unit": outcome.installed_unit,
+            "vault_verified": outcome.vault_verified,
+            "service_started": outcome.service_started,
+            "notes": outcome.notes,
+        });
+        let mut envelope = agent::schema::Envelope::new(status, data);
+        for code in &outcome.warning_codes {
+            // The code is the contract; the human text lives in `notes`, which
+            // both renderings carry, so the warning message is not duplicated
+            // into a second place that could drift.
+            envelope = envelope.with_warning(code, "");
+        }
+        if let Some(blocked) = &outcome.blocked {
+            envelope.error = Some(agent::schema::AgentError {
+                code: blocked.code.clone(),
+                message: blocked.message.clone(),
+            });
+        }
+        for rel in agent::relations::AgentRel::publishable_for(!outcome.is_blocked()) {
+            envelope = envelope.with_link(rel.descriptor());
+        }
+        println!("{}", render::json::envelope(&envelope));
+    } else {
+        for line in &outcome.notes {
+            println!("{line}");
+        }
+        if let Some(blocked) = &outcome.blocked {
+            eprintln!();
+            eprintln!("asv setup did not finish: {}", blocked.code);
+            eprintln!("  {}", blocked.message);
+            eprintln!("  next: {}", blocked.remedy);
+        }
+    }
+
+    if outcome.is_blocked() {
+        std::process::exit(1);
     }
     Ok(())
 }
