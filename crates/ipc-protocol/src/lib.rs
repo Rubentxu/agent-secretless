@@ -31,6 +31,11 @@ use asv_policy::{Approval, AuthorizationRequest, ExplainResult};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Where the broker socket lives, derived from the running user rather than
+/// hardcoded. See the module docs for why the rule lives in the protocol crate
+/// and why the broker may not pass an override.
+pub mod socket;
+
 /// Secret material on the wire, carried by [`Request::CreateCredential`].
 ///
 /// It exists because the alternative was worse, and the reasoning belongs next
