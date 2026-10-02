@@ -141,6 +141,39 @@ impl SessionStore {
     }
 }
 
+/// One destination a deployment has declared it will lend a database
+/// credential to (H5).
+///
+/// Both halves are here because they are one decision. An allowlist keyed on
+/// the host alone still lets a request keep the declared name and swap the
+/// address the broker dials, so the credential is lent to the attacker with the
+/// right name attached — and the TLS server name, which is what the certificate
+/// is checked against, is itself a function of the destination.
+///
+/// `host` is stored already canonicalised, so a comparison against it cannot be
+/// defeated by a spelling that only looks like the declared one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgDestination {
+    /// The canonical name the server certificate must match.
+    pub host: Authority,
+    /// The literal address the broker will dial.
+    pub addr: IpAddr,
+}
+
+impl PgDestination {
+    /// Declares a destination, canonicalising the host.
+    ///
+    /// Returns the `AuthorityError` rather than panicking: a deployment with a
+    /// typo in its configuration should fail to start loudly, not at the first
+    /// connect attempt, and the caller decides how loudly.
+    pub fn new(host: &str, addr: IpAddr) -> Result<Self, asv_domain::AuthorityError> {
+        Ok(Self {
+            host: Authority::canonicalize(host)?,
+            addr,
+        })
+    }
+}
+
 /// Builds the GitHub client for one operation.
 ///
 /// Exists as a trait for the same reason [`vault_port::VaultSecretPort`] lives
@@ -183,6 +216,28 @@ pub trait ConnectorFactory {
         None
     }
 
+    /// The destinations this broker will lend a database credential to. Empty
+    /// refuses every connect (H5).
+    ///
+    /// The default is empty rather than "whatever the request says", and that
+    /// is the whole point of the method. `PostgresConnect` carries `host` and
+    /// `host_addr` from the agent; the credential is looked up by
+    /// `(database, role)`; the connector authorises on `(database, role)`; and
+    /// `Resource::Database` has no destination in it. Before this, an operator
+    /// who granted `postgres_read` on `app`/`readonly` had granted it on
+    /// whatever host the agent then named, and the broker dialled it. The
+    /// product's central claim is that the broker decides where a credential
+    /// goes, and a destination the agent picked is not that.
+    ///
+    /// A deployment declares its destinations, a request proposes one, and the
+    /// broker answers with the *declared* entry — so the certificate name and
+    /// the dialled address are the ones the deployment wrote down rather than
+    /// the ones the request supplied. Mirrors `ALLOWED_AUDIENCES` in the policy
+    /// crate, which is the same control for the GitHub audience.
+    fn pg_destinations(&self) -> &[PgDestination] {
+        &[]
+    }
+
     /// Builds a PostgreSQL client for the requested audience, database,
     /// and role. The factory does not authorise the (database, role)
     /// pair; the connector does, before any I/O (M6-R3).
@@ -213,13 +268,24 @@ pub struct LiveConnectorFactory {
     /// connector that goes looking for a trust anchor is a connector whose trust
     /// decision nobody wrote down.
     pub roots: Option<TlsRoots>,
+    /// The destinations this deployment will lend a database credential to
+    /// (H5).
+    ///
+    /// Empty is the default and refuses every `PostgresConnect`, which is the
+    /// fail-closed reading: a deployment that has not said where it lends is
+    /// not a deployment that gets to lend wherever it is asked. A request
+    /// proposing a destination is matched against this list, and the *declared*
+    /// entry is what the broker uses.
+    pub destinations: Vec<PgDestination>,
     /// The name a certificate must match, when the factory has one.
     ///
-    /// `None` means the request's own `host` is the name, which is correct
-    /// for a server whose certificate carries an IP SAN and wrong for one
-    /// that does not. When this is `Some`, it is the factory that decides the
-    /// name and the request's `host` is only the address to connect to —
-    /// otherwise an agent could point a certificate check at a name it chose.
+    /// Superseded for the PostgreSQL path by [`Self::destinations`], which
+    /// carries the name together with the address it belongs to. Kept because
+    /// the trust decision is still worth being able to state on its own, and
+    /// because a factory with a name and no destination cannot reach the
+    /// connector at all — the two are now required together, and a test that
+    /// set only this one would have been a configuration that silently did
+    /// nothing.
     ///
     /// This used to be a public field that nothing read: `postgres_connect`
     /// took the name from the request every time, so a deployment that
@@ -284,6 +350,10 @@ impl ConnectorFactory for LiveConnectorFactory {
     /// The pinned certificate name, when the deployment configured one.
     fn pg_server_name(&self) -> Option<String> {
         self.server_name.clone()
+    }
+
+    fn pg_destinations(&self) -> &[PgDestination] {
+        &self.destinations
     }
 }
 
@@ -1035,10 +1105,26 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             database,
             role,
         } => {
+            // H5: the destination is resolved before anything else, and what
+            // comes back is the deployment's own entry. `server_name` below is
+            // the declared host, not `host` from the request, so the
+            // certificate check and the dialled address cannot both be
+            // attacker-chosen while the pair happens to be declared.
+            let destination = match state.pg_destination(&host, &host_addr) {
+                Ok(destination) => destination.clone(),
+                Err(denial) => return *denial,
+            };
             if let Err(denial) = state.authorize_postgres_connect(session, peer, &database, &role) {
                 return *denial;
             }
-            state.postgres_connect(session, &host, &host_addr, port, database, role)
+            state.postgres_connect(
+                session,
+                &destination.host.to_string(),
+                &destination.addr.to_string(),
+                port,
+                database,
+                role,
+            )
         }
         Request::PostgresQuery { session, sql } => {
             if let Err(denial) = state.authorize_postgres(session, peer) {
@@ -1386,6 +1472,65 @@ impl BrokerState {
                 role: role.to_string(),
             },
         )
+    }
+
+    /// Resolves a requested destination against the deployment's declaration
+    /// (H5), and answers with the *declared* entry rather than the request's.
+    ///
+    /// Order matters and is the guarantee: this runs before the policy and long
+    /// before [`Self::postgres_connect`] asks the vault for anything, so a
+    /// destination the deployment never wrote down costs the agent nothing —
+    /// no policy evaluation, no credential borrow, no socket.
+    ///
+    /// Three things are refused, and the third is why this is not a string
+    /// comparison:
+    ///
+    /// 1. No destinations declared at all. A broker that has not been told where
+    ///    it may lend is not a broker that gets to lend wherever it is asked.
+    /// 2. A host or address that matches no declared pair.
+    /// 3. A spelling that only looks like a declared host — userinfo,
+    ///    percent-encoding, an IP literal in place of a name, a subdomain
+    ///    suffix. [`Authority::canonicalize`] rejects those outright, and the
+    ///    declared hosts went through the same function, so a legitimate
+    ///    alternative spelling of a real host still matches.
+    fn pg_destination(&self, host: &str, host_addr: &str) -> Result<&PgDestination, Box<Response>> {
+        let declared = self.connectors.pg_destinations();
+        if declared.is_empty() {
+            return Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: "this broker has no declared PostgreSQL destinations, \
+                           so it will not lend a credential to any of them"
+                    .into(),
+            }));
+        }
+        // The address is parsed before the host so a malformed literal is
+        // reported as a malformed literal rather than as an unknown host.
+        let addr: IpAddr = host_addr.parse().map_err(|error| {
+            Box::new(Response::Error {
+                code: ErrorCode::InvalidRequest,
+                message: format!("host_addr is not an IP address: {error}"),
+            })
+        })?;
+        let requested = Authority::canonicalize(host).map_err(|error| {
+            Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: format!("host is not a usable server name: {error}"),
+            })
+        })?;
+        declared
+            .iter()
+            .find(|d| d.host == requested && d.addr == addr)
+            .ok_or_else(|| {
+                Box::new(Response::Error {
+                    code: ErrorCode::Denied,
+                    message: format!(
+                        "this broker does not lend database credentials to that \
+                         destination. It lends to {} declared destination(s), and \
+                         the request named one that is not among them.",
+                        declared.len()
+                    ),
+                })
+            })
     }
 
     /// Opens a live PostgreSQL session and records it.

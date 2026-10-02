@@ -46,7 +46,12 @@ use asv_ipc_protocol::{ErrorCode, Request, Response};
 /// The host the deployment declared it would lend to.
 const DECLARED_HOST: &str = "db.internal";
 /// The address it declared for that host.
-const DECLARED_ADDR: &str = "10.0.0.5";
+///
+/// Loopback on purpose. The vault is consulted *before* the socket is opened,
+/// so the control still observes exactly one `lend` — and a refused loopback
+/// connection returns in microseconds, where an unroutable address would sit
+/// through a multi-second TCP timeout on every run of this suite.
+const DECLARED_ADDR: &str = "127.0.0.1";
 /// An address the deployment never declared.
 const FOREIGN_ADDR: &str = "203.0.113.9";
 
@@ -161,19 +166,31 @@ fn assert_never_borrowed(h: &Harness, response: Response, what: &str) {
 
 // --- The control -----------------------------------------------------------
 
+/// A deployment that declared `DECLARED_HOST`/`DECLARED_ADDR`, and nothing
+/// else. This is the whole configuration surface: a list of destinations the
+/// broker is willing to lend to.
+fn declaring_deployment() -> Box<dyn asv_broker::ConnectorFactory> {
+    Box::new(asv_broker::LiveConnectorFactory {
+        destinations: vec![asv_broker::PgDestination::new(
+            DECLARED_HOST,
+            DECLARED_ADDR.parse().expect("a literal address"),
+        )
+        .expect("a canonical host")],
+        ..Default::default()
+    })
+}
+
 /// The declared destination is reached, and the vault is asked.
 ///
 /// Without this, every other case would pass on a fixture that never borrowed
 /// anything at all, and the count would be measuring the fixture rather than the
-/// gate. The broker has no async transport in this test's connector, so the
-/// request cannot actually complete — but it must get far enough to *want* the
-/// password, which is the point.
+/// gate. The broker has no reachable transport in this test, so the connect
+/// cannot complete — but it must get far enough to *want* the password, which is
+/// the point.
 #[test]
 fn the_declared_destination_is_reached() {
     let mut h = harness();
-    // The production factory, as a deployment would build it. Empty until the
-    // fix declares this destination.
-    h.state.connectors = Box::new(asv_broker::LiveConnectorFactory::default());
+    h.state.connectors = declaring_deployment();
 
     let response = h.connect(DECLARED_HOST, DECLARED_ADDR);
 
@@ -182,6 +199,29 @@ fn the_declared_destination_is_reached() {
         1,
         "the declared destination must still reach the vault, or every denial \
          below is vacuous. Response was {response:?}"
+    );
+}
+
+/// The same request against the same deployment, one field changed.
+///
+/// The pairing that makes the whole file mean something: identical fixture,
+/// vault, runtime and `(database, role)`, identical request except the address.
+/// One borrows the password, the other does not, and the only thing that
+/// differs is whether the destination was declared.
+#[test]
+fn a_declared_host_with_a_foreign_address_is_refused_while_the_declared_one_is_not() {
+    let mut allowed = harness();
+    allowed.state.connectors = declaring_deployment();
+    let _ = allowed.connect(DECLARED_HOST, DECLARED_ADDR);
+    assert_eq!(allowed.lends(), 1, "the declared pair must borrow");
+
+    let mut refused = harness();
+    refused.state.connectors = declaring_deployment();
+    let _ = refused.connect(DECLARED_HOST, FOREIGN_ADDR);
+    assert_eq!(
+        refused.lends(),
+        0,
+        "the same host with another address must not"
     );
 }
 
@@ -247,7 +287,7 @@ fn a_host_that_only_looks_like_the_declared_one_is_refused() {
     for (label, host) in [
         ("userinfo", "db.internal@attacker.example"),
         ("percent-encoded", "db%2einternal"),
-        ("ip literal", "10.0.0.5"),
+        ("ip literal", "203.0.113.9"),
         ("subdomain suffix", "evil.db.internal"),
         ("leading dot", ".db.internal"),
     ] {
