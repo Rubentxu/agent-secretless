@@ -21,21 +21,37 @@
 //! # What the mint gate does and does not substitute for
 //!
 //! H2 put one `policy.authorize` call at mint, using the **read** verb as the
-//! representative, and the comment beside it said:
-//!
-//! > The per-verb decisions still happen at the operation itself, where the
-//! > verb is known exactly.
-//!
-//! That is the claim this file falsifies. On the GitHub path the per-verb
-//! decision did not happen at the operation — it did not happen at all. So an
-//! operator who permitted `github_issue_read` and denied `github_issue_create`
-//! got a token and then, with it, an issue creation the policy had refused.
+//! representative. The comment beside that call asserted that the per-verb
+//! decisions still happen at the operation itself, where the verb is known
+//! exactly. That assertion is what this file falsifies. On the GitHub path the
+//! per-verb decision did not happen at the operation — it did not happen at
+//! all. So an operator who permitted `github_issue_read` and denied
+//! `github_issue_create` got a token and then, with it, an issue creation the
+//! policy had refused.
 //!
 //! Under the **default** policy nothing here is observable: the default permits
 //! the GitHub trio and `postgres_connect` unconditionally. The failure is
 //! silent, and it only bites an operator who has tightened the policy — which
 //! is the posture the spec tells them to adopt. That is why every case below
 //! installs a policy that is narrower than the default.
+//!
+//! # Where each verb is evaluated after the fix
+//!
+//! | verb | mint | operation |
+//! |---|---|---|
+//! | `github_issue_read` | yes (representative for the whole family) | no |
+//! | `github_issue_create` | no | **yes** |
+//! | `github_release_create` | no | **yes** |
+//! | `postgres_connect` | no | **yes** |
+//!
+//! The read verb is not re-asked at the operation on purpose: the mint already
+//! asked exactly that question, so a second evaluation inside the token's
+//! lifetime grants no additional authority and costs a Cedar call on every
+//! read. That cost is not hypothetical — `uat_030_perf` times 100 `ReadIssue`
+//! calls against a 6 ms p95 budget, and a per-operation Cedar evaluation on that
+//! path was measured at roughly +12% p95, which puts the gate over budget on
+//! this host. The rule the fix establishes is: **the mint gate is the capability
+//! grant, and anything past it is re-checked where it is used.**
 //!
 //! # The control, and why it is a positive assertion
 //!
@@ -148,17 +164,20 @@ fn harness(kind: CredentialKind) -> Harness {
     .expect("create the vault");
     let key: VaultKey = store.header().unlock(&passphrase).expect("unlock");
 
-    let mut state = BrokerState::default();
-    // A vault is open but empty. Nothing in this file lends a secret: the deny
-    // cases are refused before the vault is consulted, and the permit cases are
-    // answered by the factory, which refuses before it would lend. An empty
-    // vault therefore cannot be the explanation for any assertion here, and a
-    // `None` would have been — which is exactly the vacuous pass to avoid.
-    state.secrets = Some(Arc::new(VaultSecretPort::new(
-        Arc::new(std::sync::Mutex::new(store)),
-        Arc::new(key),
-    )));
-    state.connectors = Box::new(GateProbe);
+    let mut state = BrokerState {
+        // A vault is open but empty. Nothing in this file lends a secret: the
+        // deny cases are refused before the vault is consulted, and the permit
+        // cases are answered by the factory, which refuses before it would
+        // lend. An empty vault therefore cannot be the explanation for any
+        // assertion here, and a `None` would have been — which is exactly the
+        // vacuous pass to avoid.
+        secrets: Some(Arc::new(VaultSecretPort::new(
+            Arc::new(std::sync::Mutex::new(store)),
+            Arc::new(key),
+        ))),
+        connectors: Box::new(GateProbe),
+        ..BrokerState::default()
+    };
 
     let mut peer = WorkloadIdentity::from_peer(PeerCredentials {
         pid: std::process::id() as i32,
@@ -355,20 +374,48 @@ fn a_policy_that_permits_read_only_refuses_release_create() {
     assert_policy_denial(h.create_release(&surrogate), "github.release.create");
 }
 
-/// A `Database`-class token is the one case where the read verb at mint and
-/// the verb at the operation differ, so it is the only way to observe the
-/// `github_issue_read` arm of the operation gate at all.
+/// A `Database`-class token is refused for GitHub, and the refusal is
+/// attributable to the class binding rather than to policy.
 ///
-/// The mint evaluates `postgres_read`, which the policy permits. The operation
-/// evaluates `github_issue_read`, which it does not. Without an evaluation
-/// point at the operation the token would have been accepted and dialled.
+/// This is the control for the two write cases above, and it exists because
+/// the read verb is deliberately **not** re-asked at the operation:
+/// `authorize_surrogate_mint` already evaluated `github_issue_read` for a
+/// `Generic` credential, so asking again inside the token's lifetime grants
+/// nothing and costs a Cedar evaluation on every read — the loop
+/// `uat_030_perf` times 100 times, against NFR-PERF-001.
+///
+/// The mint gate is therefore the capability grant and anything past it is
+/// re-checked where it is used. This case is what a `Database` credential gets
+/// on the GitHub path: no policy question is asked, because the class
+/// `redeem_for` checks is `Database` and the operation family is `GitHub`.
+///
+/// Observed red before the fix, refused by the class binding with
+/// "surrogate stands for a credential of the wrong class" — so the class
+/// binding, not the policy, is what was holding this arm. That is the finding
+/// the test records: on this arm the class check was the only gate that
+/// existed, and it happened to be the right one for an unrelated reason.
 #[test]
-fn a_database_surrogate_cannot_reach_a_verb_the_policy_does_not_permit() {
+fn a_database_surrogate_is_refused_for_github_by_the_class_binding() {
     let mut h = harness(CredentialKind::DatabaseCredential);
     h.policy(READ_ONLY_NO_GITHUB);
     let surrogate = h.mint();
 
-    assert_policy_denial(h.read_issue(&surrogate), "github.issue.read");
+    match h.read_issue(&surrogate) {
+        Response::Error { code, message } => {
+            assert_eq!(
+                code,
+                ErrorCode::Denied,
+                "the refusal must be Denied: {message}"
+            );
+            assert!(
+                message.contains("wrong class"),
+                "the refusal must name the class binding as the reason, or an \
+                 operator would be sent to debug a policy that was never asked. \
+                 Got: {message}"
+            );
+        }
+        other => panic!("a database-class token must not reach GitHub, got {other:?}"),
+    }
 }
 
 // --- PostgreSQL: the permit rule that was never consulted ------------------

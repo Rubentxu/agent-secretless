@@ -914,26 +914,20 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
 
         // The three semantic operations are the only paths from a surrogate to
         // a real credential, so they share one preamble: same ownership check,
-        // same vault requirement, same argument validation, and the surrogate
-        // spent in the same place. Splitting them into three near-copies is how
-        // one of them ends up skipping the ownership check.
+        // same vault requirement, same argument validation, same policy
+        // evaluation, and the surrogate spent in the same place. Splitting them
+        // into three near-copies is how one of them ends up skipping the
+        // ownership check — and H3 is what that looks like when the missing
+        // step is the policy one: the trio ran the first three and never named
+        // the verb they were performing.
         Request::ReadIssue {
             session,
             surrogate,
             repo,
             number,
         } => {
-            if let Err(denial) = state.authorize_github(session, peer) {
+            if let Err(denial) = state.authorize_github(session, peer, &repo) {
                 return *denial;
-            }
-            // Validated before the token is spent. `redeem` consumes a use, and
-            // an agent that sends `owner/repo/../../admin` would otherwise be
-            // charged for a request that was refused on its own argument.
-            if let Err(error) = validate_repo(&repo) {
-                return Response::Error {
-                    code: ErrorCode::InvalidRequest,
-                    message: error.to_string(),
-                };
             }
             match state.surrogates.redeem_for(
                 &surrogate,
@@ -970,14 +964,10 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             title,
             body,
         } => {
-            if let Err(denial) = state.authorize_github(session, peer) {
+            if let Err(denial) =
+                state.authorize_github_write(session, peer, Action::GitHubIssueCreate, &repo)
+            {
                 return *denial;
-            }
-            if let Err(error) = validate_repo(&repo) {
-                return Response::Error {
-                    code: ErrorCode::InvalidRequest,
-                    message: error.to_string(),
-                };
             }
             match state.surrogates.redeem_for(
                 &surrogate,
@@ -1010,14 +1000,10 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             name,
             body,
         } => {
-            if let Err(denial) = state.authorize_github(session, peer) {
+            if let Err(denial) =
+                state.authorize_github_write(session, peer, Action::GitHubReleaseCreate, &repo)
+            {
                 return *denial;
-            }
-            if let Err(error) = validate_repo(&repo) {
-                return Response::Error {
-                    code: ErrorCode::InvalidRequest,
-                    message: error.to_string(),
-                };
             }
             match state.surrogates.redeem_for(
                 &surrogate,
@@ -1049,7 +1035,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             database,
             role,
         } => {
-            if let Err(denial) = state.authorize_postgres(session, peer) {
+            if let Err(denial) = state.authorize_postgres_connect(session, peer, &database, &role) {
                 return *denial;
             }
             state.postgres_connect(session, &host, &host_addr, port, database, role)
@@ -1129,44 +1115,19 @@ impl BrokerState {
             // anything the caller supplied: `ALLOWED_AUDIENCES` in the policy
             // crate is what makes a GitHub call reachable at all, and a
             // policy that could widen it from a mint request would reopen the
-            // hole this closes.
-            CredentialClass::Generic => (
-                Action::GitHubIssueRead,
-                Resource::Api {
-                    audience: Authority::canonicalize(GITHUB_AUTHORITY).map_err(|error| {
-                        Box::new(Response::Error {
-                            code: ErrorCode::Denied,
-                            message: format!("github audience is not canonical: {error}"),
-                        })
-                    })?,
-                },
-            ),
+            // hole this closes. The same reasoning and the same constant as
+            // `Self::github_resource`, which the operations use.
+            CredentialClass::Generic => (Action::GitHubIssueRead, self.github_resource()?),
         };
 
-        let workspace = self
-            .sessions
-            .workspace_of(session)
-            .unwrap_or_default()
-            .to_string();
-        // Formatted before `action` is moved into the request below, so the
-        // denial message can still name the verb it is about.
+        // The verdict, shaped as the mint gate's own refusal. The wording is
+        // the mint gate's because "minting a surrogate" is what an operator is
+        // deciding about, and the bare verb would read as if the GitHub call
+        // had already happened. The reason after the colon is still Cedar's,
+        // so the operator can see which clause fired.
         let verb = action.to_string();
-        let request = AuthorizationRequest {
-            session,
-            action,
-            resource,
-            context: PolicyContext {
-                workspace,
-                protected_ref: None,
-                request_digest: None,
-                peer_uid: peer.credentials.uid,
-            },
-        };
-        match self.policy.authorize(&request, None, None).decision {
+        match self.evaluate(session, peer, action, resource) {
             Decision::Allow => Ok(()),
-            // Cedar's reason, verbatim, for the same reason
-            // `authorize_postgres_statement` forwards it: a policy author
-            // debugging a denial needs to know which clause fired.
             Decision::Deny { reason } => Err(Box::new(Response::Error {
                 code: ErrorCode::Denied,
                 message: format!("policy denied minting a surrogate for {verb}: {reason}"),
@@ -1181,15 +1142,28 @@ impl BrokerState {
     }
 
     /// The checks every brokered GitHub operation shares, before anything is
-    /// spent or sent.
+    /// spent or sent, including the policy decision for the exact verb (H3).
     ///
-    /// Ownership first, then the vault. A session not owned by this peer must
-    /// not even learn whether a vault is open, and a broker with no vault must
-    /// refuse rather than reach GitHub unauthenticated.
+    /// Four steps, in this order, and the order is the contract:
+    ///
+    /// 1. Ownership. A session not owned by this peer must not even learn
+    ///    whether a vault is open.
+    /// 2. A vault. A broker with no vault must refuse rather than reach GitHub
+    ///    unauthenticated.
+    /// 3. `repo`. Validated here rather than at the call site so that its
+    ///    `InvalidRequest` precedence is fixed once: `redeem` consumes a use,
+    ///    and an agent that sends `owner/repo/../../admin` must be refused on
+    ///    its own argument *and* not charged, which also means it must be
+    ///    refused before any policy runs, or a typo would be reported as a
+    ///    permissions problem.
+    ///
+    /// The policy is **not** consulted here. Where it is, and why not here, is
+    /// [`Self::authorize_github_write`].
     fn authorize_github(
         &self,
         session: AgentSessionId,
         peer: &WorkloadIdentity,
+        repo: &str,
     ) -> Result<(), Box<Response>> {
         if !self.sessions.belongs_to(session, peer) {
             return Err(Box::new(Response::Error {
@@ -1207,7 +1181,132 @@ impl BrokerState {
                 message: "no credential store is open, so no brokered operation can run".into(),
             }));
         }
+        if let Err(error) = validate_repo(repo) {
+            return Err(Box::new(Response::Error {
+                code: ErrorCode::InvalidRequest,
+                message: error.to_string(),
+            }));
+        }
         Ok(())
+    }
+
+    /// The policy decision for a GitHub operation that goes **beyond** the
+    /// capability its surrogate was minted for (H3).
+    ///
+    /// # Why the read verb is not re-asked here
+    ///
+    /// `authorize_surrogate_mint` already evaluated `github_issue_read` for a
+    /// `Generic` credential, and that is the same verb `ReadIssue` performs. A
+    /// token that exists was therefore minted under read permission, so asking
+    /// the same question again inside the token's lifetime grants nothing, and
+    /// it costs a Cedar evaluation on every read — which is the loop
+    /// `uat_030_perf` times 100 times, against NFR-PERF-001.
+    ///
+    /// That is also the argument for why the *write* verbs must be asked. The
+    /// mint asked about reading. `POLICY_TEXT` has three separate GitHub verbs
+    /// so an operator can separate reading from writing, and a rule about a
+    /// verb nothing ever asks about is not a control: before H3 an operator who
+    /// permitted `github_issue_read` and said nothing about writing got an
+    /// issue creation and a published release, because the mint's read verdict
+    /// was standing in for a decision nobody had made.
+    ///
+    /// So the rule this function enforces: **the mint gate is the capability
+    /// grant, and anything past it is re-checked where it is used.** A
+    /// consequence worth stating: a policy that permits writing but not
+    /// reading cannot obtain a token at all, because the mint is what mints.
+    fn authorize_github_write(
+        &self,
+        session: AgentSessionId,
+        peer: &WorkloadIdentity,
+        action: Action,
+        repo: &str,
+    ) -> Result<(), Box<Response>> {
+        self.authorize_github(session, peer, repo)?;
+        self.authorize_verb(session, peer, action, self.github_resource()?)
+    }
+
+    /// The policy resource every GitHub operation is evaluated against.
+    ///
+    /// The audience is the compile-time allowlist constant, not anything the
+    /// caller supplied: `ALLOWED_AUDIENCES` in the policy crate is what makes a
+    /// GitHub call reachable at all, and a policy that could widen it from a
+    /// request would reopen the hole `GITHUB_AUTHORITY` closes. Shared with
+    /// [`Self::authorize_surrogate_mint`] so there is one place where that
+    /// argument is written down.
+    fn github_resource(&self) -> Result<Resource, Box<Response>> {
+        Authority::canonicalize(GITHUB_AUTHORITY)
+            .map(|audience| Resource::Api { audience })
+            .map_err(|error| {
+                Box::new(Response::Error {
+                    code: ErrorCode::Denied,
+                    message: format!("github audience is not canonical: {error}"),
+                })
+            })
+    }
+
+    /// Evaluates one `AuthorizationRequest` and turns the decision into the
+    /// refusal shape the IPC contract uses.
+    ///
+    /// A function per call site, because the *wording* of a denial is part of
+    /// the contract for a policy author: Cedar's reason is forwarded verbatim
+    /// in every arm, so the operator can see which clause fired, and the verb
+    /// is named in every arm for the same reason. Two call sites existed with
+    /// their own copies, and the third — the one H3 added — had to be written
+    /// a fourth time to keep the two copies honest.
+    fn authorize_verb(
+        &self,
+        session: AgentSessionId,
+        peer: &WorkloadIdentity,
+        action: Action,
+        resource: Resource,
+    ) -> Result<(), Box<Response>> {
+        let verb = action.to_string();
+        match self.evaluate(session, peer, action, resource) {
+            Decision::Allow => Ok(()),
+            Decision::Deny { reason } => Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: format!("policy denied {verb}: {reason}"),
+            })),
+            Decision::RequireApproval { approval } => Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: format!("policy requires approval {approval} for {verb}"),
+            })),
+        }
+    }
+
+    /// The one place an `AuthorizationRequest` is assembled for a semantic
+    /// operation.
+    ///
+    /// Returns the bare `Decision` so that each gate can word its own refusal;
+    /// the request itself is identical every time, and the three fields below
+    /// are the only per-request inputs. `workspace` and `peer_uid` are
+    /// rebinded from kernel-attested facts by the caller before they arrive
+    /// here, so a policy author reasons about who the peer *is* rather than
+    /// about what the request body claimed.
+    fn evaluate(
+        &self,
+        session: AgentSessionId,
+        peer: &WorkloadIdentity,
+        action: Action,
+        resource: Resource,
+    ) -> Decision {
+        let workspace = self
+            .sessions
+            .workspace_of(session)
+            .unwrap_or_default()
+            .to_string();
+        let request = AuthorizationRequest {
+            session,
+            action,
+            resource,
+            context: PolicyContext {
+                workspace,
+                protected_ref: None,
+                request_digest: None,
+                peer_uid: peer.credentials.uid,
+            },
+        };
+        self.policy.authorize(&request, None, None).decision
     }
 
     /// The checks every brokered PostgreSQL operation shares, before
@@ -1236,6 +1335,57 @@ impl BrokerState {
             }));
         }
         Ok(())
+    }
+
+    /// The gateway verb, gated (H3).
+    ///
+    /// `POLICY_TEXT` has carried `permit (principal, action ==
+    /// Action::"postgres_connect", resource is Database)` since M6, with a
+    /// comment explaining at length why the gateway must stay permitted. It
+    /// was never evaluated: `Request::PostgresConnect` called
+    /// [`Self::authorize_postgres`], which checks ownership and whether a
+    /// vault is open, and then opened the socket. Deleting that permit line
+    /// from the policy changed nothing, which is the test
+    /// `removing_the_connect_permit_stops_the_connect` and which is also why
+    /// the rule's own comment was a description of an intention rather than of
+    /// a behaviour.
+    ///
+    /// This matters more than its size suggests, because the connect is the
+    /// only place the password is materialised: `postgres_connect` lends it to
+    /// the TLS handshake. `postgres_read` and the write verbs gate what the
+    /// socket may then be *used* for, so before this the operator's only lever
+    /// over lending the credential at all was to deny every statement — which
+    /// refuses the connect too, but by a rule that does not say it is doing
+    /// that.
+    ///
+    /// The resource is the pair the *request* names, because there is no
+    /// recorded connection yet — that is what the connect is for. The
+    /// statement path uses [`Self::database_resource`], which reads the
+    /// connection the connect already made, so a query cannot lie about which
+    /// database it is on. Here the request is the only description of the
+    /// pair available, and the credential is looked up by exactly that pair a
+    /// few lines later in `postgres_connect`, so the resource and the
+    /// credential cannot drift apart.
+    fn authorize_postgres_connect(
+        &self,
+        session: AgentSessionId,
+        peer: &WorkloadIdentity,
+        database: &str,
+        role: &str,
+    ) -> Result<(), Box<Response>> {
+        // Ownership and the vault first, for the same reasons as
+        // `authorize_github`: a peer that does not own the session must not
+        // learn anything about the policy.
+        self.authorize_postgres(session, peer)?;
+        self.authorize_verb(
+            session,
+            peer,
+            Action::PostgresConnect,
+            Resource::Database {
+                name: database.to_string(),
+                role: role.to_string(),
+            },
+        )
     }
 
     /// Opens a live PostgreSQL session and records it.
