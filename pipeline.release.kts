@@ -101,6 +101,18 @@ pipeline {
             }
         }
 
+        // Make the archives byte-reproducible before anything pins them:
+        // dist embeds packaging-time mtimes (measured, backlog
+        // bl-bl-01M3YN9BHE000387XAKRC47X00; SOURCE_DATE_EPOCH is ignored),
+        // so the archives are repacked deterministically against the
+        // release commit's timestamp, with checksums and sha256.sum kept
+        // coherent. Verify-artifacts then checks the normalized bytes.
+        stage("normalize") {
+            dir(repo) {
+                sh("scripts/normalize-release-archives.sh")
+            }
+        }
+
         // Sign before upload. sha256.sum (which pins every artifact by
         // digest) and each archive get a minisign signature; the public key
         // is staged so a verifier can check without trusting this repo. The
