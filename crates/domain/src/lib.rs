@@ -68,8 +68,35 @@ macro_rules! opaque_id {
                 write!(f, "{}", self.0)
             }
         }
+
+        /// Parses the wire form back into an identifier.
+        ///
+        /// Added in ADR-0019's cycle, and the reason is that an id nobody can
+        /// read back is not an id. `asv run` hands a child its session id as
+        /// a string in the environment; before this, the only way to get a
+        /// `SessionId` was `new()`, so a child holding the string had no way
+        /// to name its own session in a request. `ASV_SESSION_ID` would have
+        /// been a slightly-more-real string that still resolved to nothing —
+        /// the pid problem again, one layer up.
+        ///
+        /// The parse is strict and total: the wire form is a hyphenated UUID
+        /// and anything else is refused rather than coerced.
+        impl std::str::FromStr for $name {
+            type Err = $crate::OpaqueIdParseError;
+
+            fn from_str(text: &str) -> Result<Self, Self::Err> {
+                Uuid::parse_str(text)
+                    .map(Self)
+                    .map_err(|_| $crate::OpaqueIdParseError)
+            }
+        }
     };
 }
+
+/// What it means to hand back something that is not a wire-form id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("identifier must be a canonical lowercase hyphenated UUID")]
+pub struct OpaqueIdParseError;
 
 opaque_id!(
     /// Stable handle for a stored credential.

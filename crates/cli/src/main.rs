@@ -170,7 +170,11 @@ async fn main() -> std::io::Result<()> {
     let socket = cli.socket.clone().unwrap_or_else(default_socket);
 
     let command = match cli.command {
-        Command::Run { command } => return run_command(command),
+        // `run` opens a real session now (ADR-0019), so it needs the socket
+        // the same as every other broker verb. It used to run entirely on
+        // its own, which is why it could hand out a session id nothing
+        // resolved.
+        Command::Run { command } => return run_command(&socket, command),
         command => command,
     };
 
@@ -354,6 +358,7 @@ pub fn response_kind(response: &Response) -> &'static str {
         Response::BrokerInfo { .. } => "BrokerInfo",
         Response::SessionCreated { .. } => "SessionCreated",
         Response::SessionEnded { .. } => "SessionEnded",
+        Response::SessionKeyRegistered { .. } => "SessionKeyRegistered",
         Response::CredentialMetadata { .. } => "CredentialMetadata",
         Response::CredentialDeleted { .. } => "CredentialDeleted",
         Response::CredentialCreated { .. } => "CredentialCreated",
@@ -578,12 +583,43 @@ const QUARANTINED_ENV_NAMES: &[&str] = &[
     "ANTHROPIC_API_KEY",
 ];
 
-fn run_command(command: Vec<String>) -> std::io::Result<()> {
+/// Launches a command inside a real ASV session.
+///
+/// The session used to be invented. `ASV_SESSION_ID` was set to this
+/// process's pid and **nothing in the repository ever read it** — verified
+/// by grep across every source extension — so the child of every session
+/// was told which session it was, and no party ever checked. That is the
+/// same class of defect as the H2 and H3 findings, and ADR-0019 could not
+/// be built on top of it: a CONNECT client has to resolve to a session
+/// that exists, and the id being handed out named nothing.
+///
+/// So the session is opened here, over the same kernel-authenticated
+/// socket every other verb uses, and the agent's public key is bound to
+/// it. If any of that fails the child is **not** launched: a child with no
+/// real session is exactly the state this function used to create.
+fn run_command(socket: &std::path::Path, command: Vec<String>) -> std::io::Result<()> {
     let Some(program) = command.first() else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "asv run requires a command",
         ));
+    };
+
+    let session = match call(
+        socket,
+        &Request::CreateSession {
+            workspace: std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        },
+    )? {
+        Response::SessionCreated { session } => session,
+        other => {
+            return Err(std::io::Error::other(format!(
+                "asv run could not open a session: {other:?}"
+            )))
+        }
     };
 
     let session_dir = std::env::temp_dir().join(format!(
@@ -597,6 +633,26 @@ fn run_command(command: Vec<String>) -> std::io::Result<()> {
     let agent = asv_ssh_agent::AgentSession::start(&session_dir)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
+    // Bind the agent's public key to the session just opened. Without this
+    // the bridge has nothing to verify a CONNECT proof against, and a
+    // session with no key is a session a CONNECT client can never be
+    // resolved to. Failing here means no child, which is the point: the
+    // alternative is a child that believes it is in a session it is not.
+    match call(
+        socket,
+        &Request::RegisterSessionKey {
+            session,
+            public_key_blob: agent.public_key_blob(),
+        },
+    )? {
+        Response::SessionKeyRegistered { .. } => {}
+        other => {
+            return Err(std::io::Error::other(format!(
+                "asv run could not bind the session key: {other:?}"
+            )))
+        }
+    }
+
     let mut child = std::process::Command::new(program);
     child.args(&command[1..]);
     for name in QUARANTINED_ENV_NAMES {
@@ -604,10 +660,14 @@ fn run_command(command: Vec<String>) -> std::io::Result<()> {
     }
     child
         .env("SSH_AUTH_SOCK", agent.socket_path())
-        .env("ASV_SESSION_ID", std::process::id().to_string())
+        .env("ASV_SESSION_ID", session.to_string())
         .env("ASV_SESSION_MODE", "strict");
 
     let status = child.status()?;
+    // The session is closed before the agent is dropped, so a child that
+    // outlived its own command cannot keep redeeming surrogates against a
+    // session the operator believes has ended.
+    let _ = call(socket, &Request::EndSession { session });
     drop(agent); // revoke and remove the socket before returning to the shell
     if let Some(code) = status.code() {
         std::process::exit(code);
@@ -666,6 +726,11 @@ fn print_response(response: &Response) {
         }
         Response::SessionCreated { session } => {
             println!("session {session} created");
+        }
+        // Reached only if a caller prints the response directly. `asv run`
+        // consumes this one itself and never reaches here.
+        Response::SessionKeyRegistered { session } => {
+            println!("session {session} key registered");
         }
         Response::SessionEnded { session } => {
             println!("session {session} ended");

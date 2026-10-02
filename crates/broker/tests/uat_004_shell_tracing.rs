@@ -51,7 +51,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
-use asv_domain::CredentialKind;
+use asv_domain::{AgentSessionId, CredentialKind};
 use asv_ipc_protocol::{OpaqueSecret, Request, Response};
 use asv_vault::{KdfParams, VaultStore};
 use secrecy::SecretString;
@@ -290,6 +290,8 @@ python3 {probe}
     // The planted secret rides on a quarantined name, so the child must
     // not have it. Nothing in the script text mentions its value.
     let out = Command::new(cargo_bin("asv"))
+        .arg("--socket")
+        .arg(&sock)
         .arg("run")
         .arg("bash")
         .arg(&script_path)
@@ -366,6 +368,46 @@ python3 {probe}
             combined.contains(marker),
             "the child was not a real ASV session; `{marker}` never appeared.\n{combined}"
         );
+    }
+
+    // The id is not just present, it is *resolvable* (ADR-0019). Until this
+    // cycle, `ASV_SESSION_ID` was this process's pid and nothing in the
+    // repository read it, so asserting the marker existed proved only that
+    // a string was set. Reading it back out of the trace and parsing it
+    // turns that into a claim the broker can contradict.
+    let observed = combined
+        .lines()
+        .find_map(|line| line.strip_prefix("ASV_SESSION_ID="))
+        .map(|value| value.trim_end_matches('\r').to_string())
+        .expect("the trace carried no ASV_SESSION_ID line");
+    // The pid of the test process is not the session id; the two used to be
+    // the same value, which is the whole defect.
+    assert_ne!(
+        observed,
+        std::process::id().to_string(),
+        "ASV_SESSION_ID is a pid again, so nothing can resolve it"
+    );
+    let resolved: asv_domain::AgentSessionId = observed
+        .parse()
+        .expect("the session id parses back into a session id");
+
+    // And the session does not outlive its command. `asv run` ends the
+    // session when the child exits, so the broker has already forgotten it.
+    //
+    // This is worth pinning because the alternative is silent: a session
+    // that outlived its child would keep redeeming surrogates long after the
+    // operator believed `asv run` had finished. The assertion is on the
+    // refusal, and it is falsifiable — drop the `EndSession` in
+    // `run_command` and this answers `SessionEnded` instead.
+    match roundtrip(
+        &sock,
+        &asv_ipc_protocol::Request::EndSession { session: resolved },
+    ) {
+        asv_ipc_protocol::Response::Error {
+            code: asv_ipc_protocol::ErrorCode::InvalidRequest,
+            ..
+        } => {}
+        other => panic!("the session outlived its command: {other:?}"),
     }
 
     // The positional parameters really were dumped — the other half of
