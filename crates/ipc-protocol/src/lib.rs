@@ -110,7 +110,13 @@ impl std::fmt::Debug for OpaqueSecret {
 /// find no way to express the request and would fail with an
 /// unknown-method error rather than a version error. Failing at the gate
 /// is the point.
-pub const PROTOCOL_VERSION: u16 = 3;
+/// v4 adds `RegisterSessionKey` (ADR-0019). The bump is required, not
+/// cosmetic: it is the only way a client without kernel peer credentials —
+/// which is every CONNECT client, measured — can be bound to a session, so
+/// a v3 agent talking to a v4 broker would have no way to express the
+/// binding and would fail with an unknown-method error rather than a
+/// version error. Failing at the gate is the point.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Hard ceiling on a single inbound message. Bounded allocation is required for
 /// any IPC that faces an untrusted peer (`docs/17-IMPLEMENTATION-BOOTSTRAP.md` §9).
@@ -142,6 +148,27 @@ pub enum Request {
     AgentInfo { protocol: u16 },
     /// Opens a bounded agent session.
     CreateSession { workspace: String },
+    /// Binds a public signing key to a live session (ADR-0019).
+    ///
+    /// The reason this exists is measured, not assumed: `SO_PEERCRED`
+    /// returns `pid=0 uid=-1 gid=-1` on a connected `AF_INET` socket, so a
+    /// client arriving over TCP — an ordinary HTTP client behind
+    /// `HTTPS_PROXY` — carries no kernel identity at all. Without a key
+    /// bound to its session, a CONNECT client cannot prove which session it
+    /// is, and a surrogate is only redeemable through the session that
+    /// minted it, so substitution on that path is impossible.
+    ///
+    /// The key is public. Binding it proves *ownership* of the session's
+    /// signer, not a secret: the private half never leaves the client and
+    /// is what makes a later proof unforgeable.
+    ///
+    /// A session accepts one key, once, and never a different one. That is
+    /// the property that stops a second registration from silently
+    /// re-pointing an already-issued session at another key.
+    RegisterSessionKey {
+        session: AgentSessionId,
+        public_key_blob: Vec<u8>,
+    },
     /// Closes a session and invalidates its grants.
     EndSession { session: AgentSessionId },
     /// Returns credential *metadata* only. Never values (ADR-0001).
@@ -324,6 +351,14 @@ pub enum Response {
         session: AgentSessionId,
     },
     SessionEnded {
+        session: AgentSessionId,
+    },
+    /// A session's public signing key is bound to it (ADR-0019).
+    ///
+    /// Carries a public key and nothing secret. The caller is the peer
+    /// that created the session, over the same kernel-authenticated socket
+    /// that created it, so the binding is to a session that peer owns.
+    SessionKeyRegistered {
         session: AgentSessionId,
     },
     CredentialMetadata {
@@ -526,6 +561,7 @@ impl Request {
             Request::Ping { .. } => "ping",
             Request::AgentInfo { .. } => "agent_info",
             Request::CreateSession { .. } => "create_session",
+            Request::RegisterSessionKey { .. } => "register_session_key",
             Request::EndSession { .. } => "end_session",
             Request::ListCredentialMetadata => "list_credential_metadata",
             Request::DeleteCredential { .. } => "delete_credential",

@@ -61,6 +61,37 @@ struct SessionRecord {
     /// so minting one for a process we can only weakly attribute is the case
     /// that actually deserves a refusal.
     pinned: bool,
+    /// The session's public signing key, bound once (ADR-0019).
+    ///
+    /// Public material, so it is not a secret and this is not a second
+    /// `SecretPort`. It is here because a CONNECT client has no kernel
+    /// identity to check — measured: `SO_PEERCRED` on `AF_INET` returns the
+    /// unavailable sentinel — and this key is the only thing that lets the
+    /// bridge resolve such a client to a session.
+    ///
+    /// `None` means no key was ever registered, and the bridge refuses
+    /// rather than guessing. Set exactly once: see `register_key`.
+    public_key: Option<Vec<u8>>,
+}
+
+/// Why a key registration was refused.
+///
+/// The variants are distinct because an operator reading the audit log has
+/// to tell "you are not the owner of this session" apart from "this
+/// session already has a key" — the first is an attack, the second is a
+/// bug, and a single `Denied` would erase that difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum KeyRegistrationError {
+    /// No such session, or the caller does not own it.
+    #[error("not the owner of this session")]
+    NotOwner,
+    /// The session already has a key bound.
+    ///
+    /// Re-registration is refused rather than overwritten so a second
+    /// registration cannot re-point a live session at a key the broker has
+    /// already issued proofs against.
+    #[error("session already has a key bound")]
+    AlreadyRegistered,
 }
 
 impl SessionStore {
@@ -77,9 +108,48 @@ impl SessionStore {
                 workspace,
                 peer_pid: peer.credentials.pid,
                 pinned: peer.is_pidfd_pinned(),
+                public_key: None,
             },
         );
         id
+    }
+
+    /// Binds a public signing key to a session the caller owns (ADR-0019).
+    ///
+    /// The ownership check is the same one every other session-scoped verb
+    /// makes, and it runs first: a caller that does not own the session
+    /// must not be able to bind a key to it, because a key it controls is a
+    /// key the bridge will later accept proofs from.
+    ///
+    /// The blob is stored verbatim. It is not validated here on purpose —
+    /// this method answers "does this caller own this session, and has this
+    /// session already answered", and mixing in a parse would make a
+    /// malformed blob look like an ownership problem. A blob that does not
+    /// verify against anything simply never resolves a proof.
+    pub fn register_key(
+        &mut self,
+        id: AgentSessionId,
+        peer: &WorkloadIdentity,
+        public_key_blob: Vec<u8>,
+    ) -> Result<(), KeyRegistrationError> {
+        let Some(record) = self.sessions.get_mut(&id) else {
+            return Err(KeyRegistrationError::NotOwner);
+        };
+        if record.peer_pid != peer.credentials.pid {
+            return Err(KeyRegistrationError::NotOwner);
+        }
+        if record.public_key.is_some() {
+            return Err(KeyRegistrationError::AlreadyRegistered);
+        }
+        record.public_key = Some(public_key_blob);
+        Ok(())
+    }
+
+    /// The key bound to a session, if it has one.
+    pub fn public_key_of(&self, id: AgentSessionId) -> Option<&[u8]> {
+        self.sessions
+            .get(&id)
+            .and_then(|record| record.public_key.as_deref())
     }
 
     /// Whether the session's peer was pidfd-pinned when it was opened (M4 D4).
@@ -501,6 +571,7 @@ fn request_method_name(_state: &BrokerState, response: &Response) -> String {
         Response::BrokerInfo { .. } => "agent_info".into(),
         Response::SessionCreated { .. } => "create_session".into(),
         Response::SessionEnded { .. } => "end_session".into(),
+        Response::SessionKeyRegistered { .. } => "register_session_key".into(),
         Response::CredentialMetadata { .. } => "list_credential_metadata".into(),
         Response::CredentialDeleted { .. } => "delete_credential".into(),
         Response::CredentialCreated { .. } => "create_credential".into(),
@@ -580,6 +651,30 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
         Request::CreateSession { workspace } => {
             let id = state.sessions.create(workspace, peer);
             Response::SessionCreated { session: id }
+        }
+
+        Request::RegisterSessionKey {
+            session,
+            public_key_blob,
+        } => {
+            // A key is what the bridge will later accept a session proof
+            // from, so binding one to a session is a grant of the same
+            // weight as the session itself: whoever controls the key controls
+            // what the bridge resolves a CONNECT client to. The ownership
+            // check is therefore not a formality, and it lives in
+            // `register_key` next to the once-only rule so the two cannot
+            // drift apart.
+            match state.sessions.register_key(session, peer, public_key_blob) {
+                Ok(()) => Response::SessionKeyRegistered { session },
+                Err(KeyRegistrationError::NotOwner) => Response::Error {
+                    code: ErrorCode::Denied,
+                    message: "session key registration refused: not the session owner".into(),
+                },
+                Err(KeyRegistrationError::AlreadyRegistered) => Response::Error {
+                    code: ErrorCode::Denied,
+                    message: "session key registration refused: already registered".into(),
+                },
+            }
         }
 
         Request::EndSession { session } => {
@@ -1988,6 +2083,150 @@ mod tests {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
         })
+    }
+
+    /// A peer that is this process under a different pid — the shape a
+    /// second agent on the same box has.
+    fn stranger() -> WorkloadIdentity {
+        WorkloadIdentity::from_peer(PeerCredentials {
+            pid: std::process::id() as i32 + 1,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+        })
+    }
+
+    /// ADR-0019's binding. These pin the two properties the bridge depends
+    /// on: only the owner may bind, and a live session never changes the
+    /// key it was bound to.
+    #[test]
+    fn the_session_owner_binds_its_key_and_a_stranger_cannot() {
+        let mut state = BrokerState::default();
+        let session = match handle(
+            &mut state,
+            &peer(),
+            Request::CreateSession {
+                workspace: "/tmp/project".into(),
+            },
+        ) {
+            Response::SessionCreated { session } => session,
+            other => panic!("expected a session, got {other:?}"),
+        };
+
+        let refused = handle(
+            &mut state,
+            &stranger(),
+            Request::RegisterSessionKey {
+                session,
+                public_key_blob: b"attacker-key".to_vec(),
+            },
+        );
+        assert!(
+            matches!(
+                refused,
+                Response::Error {
+                    code: ErrorCode::Denied,
+                    ..
+                }
+            ),
+            "a stranger bound a key to a session it does not own: {refused:?}"
+        );
+        assert_eq!(
+            state.sessions.public_key_of(session),
+            None,
+            "the refused registration left a key behind"
+        );
+
+        let accepted = handle(
+            &mut state,
+            &peer(),
+            Request::RegisterSessionKey {
+                session,
+                public_key_blob: b"owner-key".to_vec(),
+            },
+        );
+        assert_eq!(
+            accepted,
+            Response::SessionKeyRegistered { session },
+            "the owner could not bind its own key"
+        );
+        assert_eq!(
+            state.sessions.public_key_of(session),
+            Some(&b"owner-key"[..])
+        );
+    }
+
+    #[test]
+    fn a_live_session_never_changes_the_key_it_was_bound_to() {
+        let mut state = BrokerState::default();
+        let session = match handle(
+            &mut state,
+            &peer(),
+            Request::CreateSession {
+                workspace: "/tmp/project".into(),
+            },
+        ) {
+            Response::SessionCreated { session } => session,
+            other => panic!("expected a session, got {other:?}"),
+        };
+        handle(
+            &mut state,
+            &peer(),
+            Request::RegisterSessionKey {
+                session,
+                public_key_blob: b"first".to_vec(),
+            },
+        );
+
+        // Even the owner cannot re-point a session the bridge has already
+        // issued proofs for.
+        let second = handle(
+            &mut state,
+            &peer(),
+            Request::RegisterSessionKey {
+                session,
+                public_key_blob: b"second".to_vec(),
+            },
+        );
+        assert!(
+            matches!(
+                second,
+                Response::Error {
+                    code: ErrorCode::Denied,
+                    ..
+                }
+            ),
+            "a second registration was accepted: {second:?}"
+        );
+        assert_eq!(
+            state.sessions.public_key_of(session),
+            Some(&b"first"[..]),
+            "the key changed under a live session"
+        );
+    }
+
+    #[test]
+    fn registering_a_key_for_a_session_that_does_not_exist_is_refused() {
+        let mut state = BrokerState::default();
+        let ghost = AgentSessionId::new();
+        let outcome = handle(
+            &mut state,
+            &peer(),
+            Request::RegisterSessionKey {
+                session: ghost,
+                public_key_blob: b"key".to_vec(),
+            },
+        );
+        assert!(
+            matches!(
+                outcome,
+                Response::Error {
+                    code: ErrorCode::Denied,
+                    ..
+                }
+            ),
+            "a key was bound to a session that does not exist: {outcome:?}"
+        );
+        assert_eq!(state.sessions.public_key_of(ghost), None);
     }
 
     #[test]
