@@ -1,0 +1,88 @@
+# Distribution manifest — the single source of truth for what ships.
+#
+# This file exists because the previous arrangement inferred the product from
+# whatever Cargo happened to produce. `dist` packages every `[[bin]]` it finds
+# in a workspace member, which meant `asv-vault-tool` — which its own source
+# describes as a minimal exerciser for the adversarial harness — would have
+# shipped to users as if it were part of the product. A convention is not a
+# property. This file plus `tests/distribution_bundle.py` make the boundary
+# something a gate can fail on.
+#
+# Classes are normative and come from
+# `docs/asv-agent-first-evolution/04-ADR-DISTRIBUTION.md`:
+#
+#   required/public    the only thing a user or agent needs to know exists
+#   required/private   shipped, but never on PATH and never named at a user
+#   optional/ui        packaged separately; not part of the core bundle
+#   test-harness       compiled and tested here, never shipped
+#
+# A new `[[bin]]` anywhere in the workspace fails the bundle gate until it is
+# declared here. That is the intended friction: adding a binary should require
+# a sentence about whether a user should have it.
+
+schema = "asv.distribution/v1"
+product = "agent-secretless"
+
+# How the core archive is named. The version is substituted at build time from
+# the workspace Cargo.toml; it is not written here, because a second copy of
+# the version is a second thing to forget. `tests/distribution_bundle.py` fails
+# if this pattern and the built artifact name disagree.
+archive_format = "tar.zst"
+archive_name = "agent-secretless-v{version}-{target}.tar.zst"
+
+# The install root a user-local installation produces. `bin` is on PATH,
+# `libexec` is not — that difference is the whole reason `asv-brokerd` lives
+# where it does, and UAT-DX-002 asserts it.
+[layout.user]
+root = "~"
+bin = ".local/bin"
+libexec = ".local/libexec/asv"
+unit = ".config/systemd/user/asv-brokerd.service"
+
+[[component]]
+name = "asv"
+class = "required-public"
+crate = "asv-cli"
+shipped = true
+# Installed onto PATH. The single public entry point: P1 in the specification
+# says the user contract is `asv` and nothing else.
+install_as = "bin/asv"
+on_path = true
+
+[[component]]
+name = "asv-brokerd"
+class = "required-private"
+crate = "asv-broker"
+shipped = true
+# Deliberately outside PATH. The broker is the secret-bearing process; putting
+# it on PATH invites running it by hand, which is how a credential broker ends
+# up started with the wrong arguments, or twice. `asv setup` resolves it by
+# path relative to the `asv` executable that invoked it, never by searching
+# PATH (implementation guide §5).
+install_as = "libexec/asv/asv-brokerd"
+on_path = false
+
+[[component]]
+name = "asv-console"
+class = "optional-ui"
+crate = "asv-desktop"
+shipped = false
+# A separate Tauri workspace, distributed by its own bundler. It is declared
+# here so that the gate knows about it and can tell "declared and not shipped"
+# apart from "undeclared", which is the difference between a deliberate
+# exclusion and an oversight.
+install_as = ""
+on_path = false
+
+[[component]]
+name = "asv-vault-tool"
+class = "test-harness"
+crate = "asv-vault"
+shipped = false
+forbidden_in_production = true
+# Kept in the tree, built by the test suite and the adversarial harness. Not
+# removed: SR-006 excludes it from the product, it does not exile it from the
+# repository. The negative test in tests/distribution_bundle.py stages it on
+# purpose to prove the gate catches it.
+install_as = ""
+on_path = false
