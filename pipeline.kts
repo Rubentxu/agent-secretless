@@ -58,6 +58,39 @@ pipeline {
                 // has now found three that could not.
                 sh("python3 scripts/check-project-identity.py")
                 sh("python3 tests/project_identity_drift.py")
+                // The release configuration, checked against the repository.
+                // Same reasoning as the two lines above and the same stage,
+                // because it is the same kind of check: a claim about what
+                // ships, which the repository can contradict. `ci-policy.sh`
+                // fails when a workflow *file* exists, which catches the
+                // outcome but not the cause — dist writes that file only when
+                // somebody runs `dist init` or `dist generate`, so a
+                // `ci = ["github"]` added to dist-workspace.toml sits in the
+                // tree producing no failing test until the command that acts
+                // on it. This guard also compares the systemd unit's ExecStart
+                // against the installer's `install-path`, which is a real
+                // disagreement that already happened once and would have
+                // shipped a service that installs cleanly and never starts.
+                // Cheap: it reads three files and no tool is required.
+                sh("python3 scripts/check-release-config.py")
+                // UAT-DX-001. The product boundary is a gate, not a convention:
+                // `asv-vault-tool` is declared in its own source as an
+                // exerciser for the adversarial harness, and under the previous
+                // arrangement it would have been packaged for users because
+                // dist ships whatever `[[bin]]` the workspace contains. The
+                // archive inspection is skipped here and enforced in
+                // pipeline.release.kts, because there is no built artifact in a
+                // gate run — and a check that reports success because it had
+                // nothing to look at is the failure this repository keeps
+                // finding.
+                sh("python3 tests/distribution_bundle.py")
+                // The falsifiability suite runs beside it for the same reason
+                // it does for the others. It has already earned its place: it
+                // caught a `--root` override that applied to two of the three
+                // paths the guard reads, which had three of these cases
+                // passing against the real checkout instead of against the
+                // broken tree they had built.
+                sh("python3 tests/release_config_drift.py")
             }
         }
 
