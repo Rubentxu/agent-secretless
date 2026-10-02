@@ -16,7 +16,7 @@ agent ──(surrogate / socket)──▶ broker ──(real credential)──�
 
 > **Status: pre-1.0 RC preparation (M13 + gates R2/R3/R5/R6 done).**
 >
-> The workspace compiles with **719 tests green** (`--release`, canonical flakes
+> The workspace compiles with **731 tests green** (`--release`, canonical flakes
 > excluded; the count is re-derived every CI run by the `R11 README test count`
 > gate, so this line cannot go stale again). The vault, SSH signing, HTTP/PostgreSQL brokering, policy, OAuth2
 > framework, TPM sealing and crash recovery exist and are tested. Remaining
