@@ -320,6 +320,89 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// The production substitution port for the CONNECT path (ADR-0019).
+///
+/// This is the piece that connects the bridge's `CredentialSubstituter` to
+/// the registry that already decides what a token means. It exists as its own
+/// type rather than as a blanket `impl` on `SurrogateRegistry` because the
+/// bridge is handed a `&mut dyn CredentialSubstituter`, and the bridge is
+/// handed it as a *declaration* of what it needs — "redeem this in this
+/// session and lend what it stands for" — not as the registry itself, which
+/// would make the bridge's dependency on the token store structural.
+///
+/// What it does **not** do is decide anything. Every refusal comes from
+/// `redeem_for`, and every refusal is flattened to the same
+/// `SubstitutionError::Refused`: a caller that could tell "unknown token" from
+/// "wrong session" would learn whether a token it holds is real, which is the
+/// difference between a client that retries and a client that discovers it
+/// does not own the credential. The detail is still available to the
+/// operator, in the registry's own error and in the audit record's `outcome`.
+pub struct SubstitutionPort<'a> {
+    registry: &'a mut SurrogateRegistry,
+    /// Where the credential bytes come from.
+    ///
+    /// A `&dyn SecretPort` and not the vault: the registry already refuses to
+    /// store a secret, and this type is the same kind of boundary. The
+    /// secret is only ever materialised inside `lend`, straight into the
+    /// bridge's sink.
+    credential_port: &'a dyn asv_connector_http::SecretPort,
+    /// The family this port spends on.
+    ///
+    /// A constant of the deployment, never taken from the request: it is
+    /// what `redeem_for`'s class check is asked, so letting a client name it
+    /// would be handing over the one question that decides whether a
+    /// database token can back a GitHub call.
+    family: OperationFamily,
+    /// The wire name recorded in the audit record for that family.
+    family_name: &'static str,
+}
+
+impl<'a> SubstitutionPort<'a> {
+    pub fn new(
+        registry: &'a mut SurrogateRegistry,
+        credential_port: &'a dyn asv_connector_http::SecretPort,
+        family: OperationFamily,
+        family_name: &'static str,
+    ) -> Self {
+        Self {
+            registry,
+            credential_port,
+            family,
+            family_name,
+        }
+    }
+}
+
+impl crate::tls_bridge::CredentialSubstituter for SubstitutionPort<'_> {
+    fn substitute(
+        &mut self,
+        surrogate: &str,
+        session: AgentSessionId,
+        sink: &mut dyn asv_connector_http::SecretSink,
+    ) -> Result<crate::tls_bridge::Substituted, crate::tls_bridge::SubstitutionError> {
+        use crate::tls_bridge::{Substituted, SubstitutionError};
+
+        // Every `SurrogateError` — unknown, wrong session, wrong class,
+        // expired, exhausted — answers the same way. Not tidiness: see the
+        // type's docs.
+        let credential = self
+            .registry
+            .redeem_for(surrogate, session, self.family, now_secs())
+            .map_err(|_| SubstitutionError::Refused)?;
+
+        asv_connector_http::SecretPort::lend(
+            self.credential_port,
+            &credential.to_wire(),
+            sink,
+        )
+        .map_err(|e| SubstitutionError::Lend(e.to_string()))?;
+
+        Ok(Substituted {
+            family: self.family_name,
+        })
+    }
+}
+
 /// Standard base64url without padding.
 ///
 /// Written out rather than pulled in as a dependency: this is the only

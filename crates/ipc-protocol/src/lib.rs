@@ -551,6 +551,32 @@ pub enum AuditEventDto {
         /// signals, timeouts and refusals.
         exit_code: Option<i32>,
     },
+    /// A credential was substituted on the CONNECT path, or refused there
+    /// (ADR-0019).
+    ///
+    /// Its own variant because `RequestHandled` cannot say the thing that
+    /// matters here: a substitution is not a verb a client invoked, and
+    /// folding it into `RequestHandled` would file it under whatever method
+    /// name the relay happened to be standing in for. What an operator needs
+    /// to read afterwards is *which destination received a real credential,
+    /// on whose authority*.
+    ///
+    /// Metadata only by construction: an opaque session id, a `host:port`
+    /// and a wire name. There is **no field that could hold secret bytes**,
+    /// which is the property this record exists to guarantee — a variant with
+    /// a spare field would stop being safe the first time someone used it.
+    CredentialSubstituted {
+        /// The session whose key signed the proof, resolved by signature.
+        session: String,
+        /// The authorised destination, `host:port`.
+        destination: String,
+        /// The operation family the credential was spent on, or
+        /// `"unresolved"` when the surrogate was refused before the family
+        /// was established.
+        family: String,
+        /// "substituted" or "refused".
+        outcome: String,
+    },
 }
 
 impl Request {

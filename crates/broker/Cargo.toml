@@ -38,6 +38,12 @@ asv-vault.workspace = true
 # still has no vault, no CA key and no way to mint, so a cycle here could not
 # become a path from a connector to the vault even in principle.
 asv-tls-acceptor.workspace = true
+# ADR-0019: the broker has to *verify* a CONNECT client's session proof, and
+# `asv-ssh-agent` owns the key-blob format and the verification over it. The
+# dependency points broker -> agent, and the private key never crosses it: what
+# the broker names is `verify_proof`, which takes a blob, a nonce and a
+# signature. One definition of the format, not two that can drift.
+asv-ssh-agent.workspace = true
 # See the workspace note: rustls is named in `EstablishedTunnel`'s signature.
 rustls.workspace = true
 thiserror.workspace = true

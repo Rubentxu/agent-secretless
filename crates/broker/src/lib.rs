@@ -14,6 +14,7 @@ use asv_domain::{
 use asv_identity::WorkloadIdentity;
 use asv_ipc_protocol::{AuditEventDto, ErrorCode, Request, Response, PROTOCOL_VERSION};
 use asv_policy::{AuthorizationRequest, PolicyContext, PolicyEngine};
+use tls_bridge::SessionProofs;
 // The row renderer is imported from the session module rather than redefined so
 // the wire separator is defined in exactly one place and a client-side renderer
 // cannot drift from it.
@@ -38,7 +39,7 @@ pub mod vault_port;
 pub mod worker;
 
 pub use pg_session::{BorrowedSecret, PgRuntime, PgSessionError, PgSessionMap, StatementOutcome};
-pub use surrogate::{now_secs, SurrogateError, SurrogateRegistry};
+pub use surrogate::{now_secs, SubstitutionPort, SurrogateError, SurrogateRegistry};
 pub use vault_port::{VaultSecretPort, VaultWritePort};
 
 /// In-memory session table. M1 replaces this with persistent, encrypted state;
@@ -202,13 +203,59 @@ impl SessionStore {
     /// This is the UAT-030 zero-live-pin counter. R3 ("PID reuse mitigated
     /// with pidfd/launch record") requires that a broker holding a pin for a
     /// peer cannot outlive the session the pin is bound to: every pin must
-    /// be released when the session ends. `pin_count` is the observable
+    /// releases when the session ends. `pin_count` is the observable
     /// surface that makes that property testable from outside the crate.
     pub fn pin_count(&self) -> usize {
         self.sessions
             .values()
             .filter(|record| record.pinned)
             .count()
+    }
+}
+
+/// Resolves a CONNECT client's session proof (ADR-0019).
+///
+/// This is the piece that makes a client with no kernel identity — an ordinary
+/// `HTTPS_PROXY` CLI — attributable to a session. Measured, not assumed:
+/// `SO_PEERCRED` on a connected `AF_INET` socket returns the unavailable
+/// sentinel (`pid=0 uid=-1 gid=-1`), so there is nothing else to check.
+///
+/// Two independent layers, and the second is the one that carries the
+/// property:
+///
+/// 1. the presented blob **selects** a candidate — the session that
+///    registered exactly those key bytes;
+/// 2. the signature over the nonce is verified against **that session's
+///    registered key**, never against the bytes the client presented.
+///
+/// Layer 1 alone would be an assertion: any client that learned another
+/// session's public blob could claim it. The blobs are public by
+/// construction — the agent hands them to `ssh-add -L` — so "can I present
+/// this blob?" is a question with no security content, and only layer 2
+/// turns it into a fact.
+///
+/// The cost of layer 1 is a linear scan of the live session table. That is
+/// deliberate: an index keyed on the blob would be a second place to keep
+/// session keys, and the table is bounded by concurrent sessions, not by
+/// anything an attacker chooses.
+impl SessionProofs for SessionStore {
+    fn resolve(
+        &self,
+        presented_key: &[u8],
+        nonce: &[u8],
+        signature: &[u8],
+    ) -> Option<AgentSessionId> {
+        self.sessions.iter().find_map(|(id, record)| {
+            let registered = record.public_key.as_deref()?;
+            if registered != presented_key {
+                return None;
+            }
+            // Verified against `registered`, not `presented_key`: the two are
+            // equal today because the lookup demanded it, and the point is
+            // that this line stays correct if that ever stops being the
+            // reason they match.
+            asv_ssh_agent::verify_proof(registered, nonce, signature).then_some(*id)
+        })
     }
 }
 

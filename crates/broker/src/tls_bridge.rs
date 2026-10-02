@@ -17,11 +17,17 @@
 //!   `agent-secretless-vault-spec/docs/06-TRANSPARENT-BRIDGE-EBPF.md`
 //!   sections 5, 6 and 7.
 //!
-//! Still not here: the eBPF redirect that makes the bridge transparent, and the
-//! substitution that turns the surrogate into a real credential upstream. The
-//! first needs kernel privileges this environment does not have; the second is
-//! the next increment, and its absence is why UAT-010 has no suite. The TLS
-//! acceptor is no longer absent: `serve_connect` terminates through it.
+//! Substitution is here (ADR-0019): `EstablishedTunnel::relay_substituted`
+//! redeems the surrogate **in the tunnel's session**, lends the real
+//! credential, rewrites the authorization header on the way upstream, audits
+//! the operation without the secret, and relays the response back. The client
+//! never receives the credential because there is no path from it to the
+//! client side of the relay.
+//!
+//! Still not here: the eBPF redirect that makes the bridge transparent — it
+//! needs kernel privileges this environment does not have, and ADR-0007 gates
+//! it on an M8 GO that was recorded as NO-GO. The TLS acceptor is no longer
+//! absent: `serve_connect` terminates through it.
 
 use std::fmt;
 use std::io::{Read, Write};
@@ -33,6 +39,7 @@ use asv_connector_http::SecretSink;
 use asv_domain::{AgentSessionId, Authority};
 use asv_tls_acceptor::{handshake_once, LeafMaterial};
 use time::OffsetDateTime;
+use zeroize::Zeroize;
 
 /// Default TTL for a session CA: 8 hours.
 pub const DEFAULT_SESSION_CA_TTL: Duration = Duration::from_secs(8 * 3600);
@@ -130,6 +137,14 @@ pub enum BridgeError {
     /// The upstream could not be resolved or reached.
     #[error("upstream unavailable: {0}")]
     Upstream(String),
+    /// A request inside an established tunnel could not be substituted.
+    ///
+    /// Transparent because the tunnel closes either way; what differs is
+    /// only what the operator reads. The *caller* still sees one refusal
+    /// (`SubstitutionError::Refused`) whatever went wrong — this variant is
+    /// the detail the operator gets and the client does not.
+    #[error(transparent)]
+    Substitution(#[from] SubstitutionError),
     /// The TLS handshake with the client failed.
     #[error("client handshake failed: {0}")]
     Handshake(String),
@@ -723,6 +738,20 @@ pub enum SubstitutionError {
     Lend(String),
 }
 
+/// What a successful substitution says about itself, for the audit record.
+///
+/// The family is returned rather than asked for separately because only the
+/// port knows it: it is the credential's class translated into the operation
+/// family the surrogate was minted for. A bridge that guessed it, or that
+/// audited a hard-coded string, would be auditing a fact it had not
+/// established — which is the same defect `WrongSession` is a guard against
+/// on the spending side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Substituted {
+    /// Wire name of the operation family, e.g. `"github"`.
+    pub family: &'static str,
+}
+
 /// Where the bridge gets credential substitution from.
 ///
 /// The third trait for the same reason as `LeafSource`: `tls_bridge` must
@@ -738,12 +767,83 @@ pub trait CredentialSubstituter {
     /// keeps `WrongSession` meaningful: a token minted elsewhere still
     /// fails, because "elsewhere" is now a fact the broker established
     /// rather than a claim it accepted.
+    ///
+    /// `&mut self` because redeeming spends a use: `SurrogateRegistry::
+    /// redeem_for` is `&mut self` because a token has a budget, and a trait
+    /// that hid that behind a `&self` would force every production
+    /// implementation to invent a lock to be honest about it.
     fn substitute(
-        &self,
+        &mut self,
         surrogate: &str,
         session: AgentSessionId,
         sink: &mut dyn SecretSink,
-    ) -> Result<(), SubstitutionError>;
+    ) -> Result<Substituted, SubstitutionError>;
+}
+
+/// One substitution, as the audit log records it.
+///
+/// Metadata only by construction: every field is a wire name, a host or an
+/// opaque id, and there is **no field that could hold secret bytes**. That is
+/// the property R-9.5 asks for, and it is structural rather than a promise
+/// about a caller's discipline — a record that had a field to put the
+/// credential in would stop being safe the first time someone used it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubstitutionRecord {
+    /// The session whose key signed the proof, resolved by `serve_connect`.
+    pub session: AgentSessionId,
+    /// The authorised destination, `host:port`.
+    pub destination: String,
+    /// The operation family the credential was spent on.
+    pub family: &'static str,
+    /// `"substituted"`, or `"refused"` when the tunnel closed instead.
+    pub outcome: &'static str,
+}
+
+/// Where the bridge sends substitution records.
+///
+/// A trait for the same reason `LeafSource` and `CredentialSubstituter` are
+/// ones: the bridge must not depend on the broker's audit store. The
+/// implementation decides durability and chaining; the bridge only states
+/// what happened.
+pub trait SubstitutionAudit {
+    fn record(&mut self, record: SubstitutionRecord) -> Result<(), BridgeError>;
+}
+
+/// Bounds on one relay, so a peer cannot make the bridge hold memory or
+/// block forever.
+///
+/// The response cap is not a politeness limit. A relay that waits for an
+/// upstream EOF will wait forever against an origin that keeps the
+/// connection open, and the tunnel is the broker's to bound, not the peer's
+/// to extend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayLimits {
+    /// Largest inner request head that will be read from the client.
+    pub max_head: usize,
+    /// Largest number of response bytes relayed back to the client.
+    pub max_response: usize,
+}
+
+impl Default for RelayLimits {
+    fn default() -> Self {
+        Self {
+            max_head: 8 * 1024,
+            max_response: 1024 * 1024,
+        }
+    }
+}
+
+/// What one relay accomplished, in numbers.
+///
+/// Deliberately counts only. Returning the forwarded request or the lent
+/// credential would make this struct a second place the secret lives, and a
+/// caller that logged it would have undone the substitution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubstitutionOutcome {
+    /// Bytes written to the upstream, headers included.
+    pub forwarded: usize,
+    /// Bytes relayed back from the upstream to the client.
+    pub returned: usize,
 }
 
 /// The bearer token in a request, if it has one.
@@ -1019,6 +1119,174 @@ impl Bridge {
             upstream,
             target,
             session,
+        })
+    }
+}
+
+/// Reads an inner request head from the decrypted client side.
+///
+/// Same reasoning as `read_connect_head`, and for the same reason: a
+/// `BufReader` would read past the terminator and swallow bytes that belong
+/// to the body or to the next request on the tunnel. Reading stops exactly at
+/// `\r\n\r\n`.
+///
+/// Unlike the CONNECT head this runs *through* TLS, so each byte is a
+/// `StreamOwned` read. That is not a performance claim — it is a head, once
+/// per tunnel.
+fn read_inner_head<R: Read>(stream: &mut R, max: usize) -> Result<Vec<u8>, BridgeError> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        stream
+            .read_exact(&mut byte)
+            .map_err(|e| BridgeError::Io(e.to_string()))?;
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            return Ok(head);
+        }
+        if head.len() > max {
+            return Err(BridgeError::Protocol(
+                "inner request head exceeds the relay limit".into(),
+            ));
+        }
+    }
+}
+
+/// Copies upstream to client until the upstream closes or `max` is reached.
+fn relay_back<R: Read, W: Write>(
+    from: &mut R,
+    to: &mut W,
+    max: usize,
+) -> Result<usize, BridgeError> {
+    let mut buf = [0u8; 8 * 1024];
+    let mut total = 0usize;
+    while total < max {
+        let want = (max - total).min(buf.len());
+        let n = from
+            .read(&mut buf[..want])
+            .map_err(|e| BridgeError::Io(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        to.write_all(&buf[..n])
+            .map_err(|e| BridgeError::Io(e.to_string()))?;
+        total += n;
+    }
+    to.flush().map_err(|e| BridgeError::Io(e.to_string()))?;
+    Ok(total)
+}
+
+/// Holds a lent credential for exactly as long as the rewrite needs it.
+///
+/// The `Drop` is the point, not a nicety: every exit from `relay_substituted`
+/// — success, refusal, a write that failed, an audit that failed — passes
+/// through here, and only one of them is the happy path. A wipe written at the
+/// end of the happy path would leave the credential in the heap on all the
+/// others.
+struct Lending(Vec<u8>);
+
+impl SecretSink for Lending {
+    fn accept(&mut self, secret: &[u8]) -> Result<(), asv_connector_http::SecretError> {
+        self.0.extend_from_slice(secret);
+        Ok(())
+    }
+}
+
+impl Drop for Lending {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl EstablishedTunnel {
+    /// Substitutes the surrogate in the first inner request and relays the
+    /// response back.
+    ///
+    /// The order is `design.md` F5, and it is the contract rather than a
+    /// detail:
+    ///
+    /// 1. the session comes from the tunnel, resolved by signature in
+    ///    `serve_connect` — never from the request;
+    /// 2. the surrogate is redeemed **in that session**, which is what keeps
+    ///    `WrongSession` intact;
+    /// 3. only then is the credential lent and the header rewritten;
+    /// 4. only then is anything written to the upstream;
+    /// 5. and the record is written before the response goes back, so a relay
+    ///    that dies mid-copy still leaves the audit trail of a substitution.
+    ///
+    /// What it refuses to do is the thing the spec calls out: a request that
+    /// cannot be substituted is **not** forwarded with its surrogate intact
+    /// on the theory that the provider will reject it. That would send the
+    /// client's credential to the outside world and report a provider error
+    /// instead of the truth. Here the upstream socket is written zero bytes
+    /// and the tunnel closes.
+    ///
+    /// What it does not do is own the whole connection. This relays the first
+    /// request's head and then the upstream's response; a second request on
+    /// the same tunnel is a later increment. The duplex-copy deadlock that
+    /// kept `serve_connect` from relaying at all is not solved here — the
+    /// two copies run in sequence instead.
+    pub fn relay_substituted(
+        &mut self,
+        substituter: &mut dyn CredentialSubstituter,
+        audit: &mut dyn SubstitutionAudit,
+        limits: RelayLimits,
+    ) -> Result<SubstitutionOutcome, BridgeError> {
+        let session = self.session.ok_or(BridgeError::NoSessionProof)?;
+        let destination = format!("{}:{}", self.target.host(), self.target.port());
+
+        let head = read_inner_head(&mut self.client, limits.max_head)?;
+        let token = bearer_token(&head).ok_or(SubstitutionError::NoCredential)?;
+
+        let mut lent = Lending(Vec::new());
+        let substituted = match substituter.substitute(&token, session, &mut lent) {
+            Ok(s) => s,
+            Err(e) => {
+                // Recorded before returning, and the family is `"unresolved"`
+                // rather than a guess: the port declined before it
+                // established one, and inventing it would put an
+                // unestablished fact in the audit log.
+                audit.record(SubstitutionRecord {
+                    session,
+                    destination,
+                    family: "unresolved",
+                    outcome: "refused",
+                })?;
+                return Err(BridgeError::Substitution(e));
+            }
+        };
+
+        // Borrowed only inside this block, so the credential stops being
+        // reachable the moment the rewritten request exists.
+        let mut rewritten = {
+            let credential =
+                std::str::from_utf8(&lent.0).map_err(|_| SubstitutionError::NoCredential)?;
+            replace_bearer_token(&head, credential)?
+        };
+
+        self.upstream
+            .write_all(&rewritten)
+            .map_err(|e| BridgeError::Io(e.to_string()))?;
+        self.upstream
+            .flush()
+            .map_err(|e| BridgeError::Io(e.to_string()))?;
+        let forwarded = rewritten.len();
+        // The buffer that carried the credential upstream is wiped here, not
+        // left to the allocator's discretion.
+        rewritten.zeroize();
+
+        audit.record(SubstitutionRecord {
+            session,
+            destination,
+            family: substituted.family,
+            outcome: "substituted",
+        })?;
+
+        let returned = relay_back(&mut self.upstream, &mut self.client, limits.max_response)?;
+
+        Ok(SubstitutionOutcome {
+            forwarded,
+            returned,
         })
     }
 }
@@ -1596,11 +1864,11 @@ mod substitution_tests {
 
     impl CredentialSubstituter for Port {
         fn substitute(
-            &self,
+            &mut self,
             surrogate: &str,
             session: AgentSessionId,
             sink: &mut dyn SecretSink,
-        ) -> Result<(), SubstitutionError> {
+        ) -> Result<Substituted, SubstitutionError> {
             if surrogate != SURROGATE {
                 return Err(SubstitutionError::Refused);
             }
@@ -1609,7 +1877,8 @@ mod substitution_tests {
                 return Err(SubstitutionError::Refused);
             }
             sink.accept(REAL)
-                .map_err(|e| SubstitutionError::Lend(e.to_string()))
+                .map_err(|e| SubstitutionError::Lend(e.to_string()))?;
+            Ok(Substituted { family: "github" })
         }
     }
 
@@ -1634,7 +1903,7 @@ mod substitution_tests {
     #[test]
     fn the_upstream_request_carries_the_real_credential_and_not_the_surrogate() {
         let session = AgentSessionId::new();
-        let port = Port { mine: session };
+        let mut port = Port { mine: session };
         let original = request_with(SURROGATE);
         let token = bearer_token(&original).expect("a bearer token");
 
@@ -1661,7 +1930,7 @@ mod substitution_tests {
     fn a_surrogate_from_another_session_is_still_refused() {
         let mine = AgentSessionId::new();
         let theirs = AgentSessionId::new();
-        let port = Port { mine };
+        let mut port = Port { mine };
         let mut sink = Collect(Vec::new());
         let outcome = port.substitute(SURROGATE, theirs, &mut sink);
         assert!(
@@ -1690,7 +1959,7 @@ mod substitution_tests {
         // session", because that is the difference between a client that
         // retries and a client that learns it does not own the credential.
         let mine = AgentSessionId::new();
-        let port = Port { mine };
+        let mut port = Port { mine };
         let mut sink = Collect(Vec::new());
         let unknown = port.substitute("asv_gh_deadbeef", mine, &mut sink);
         let wrong_session = port.substitute(SURROGATE, AgentSessionId::new(), &mut sink);

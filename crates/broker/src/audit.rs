@@ -411,6 +411,48 @@ impl Default for AuditLog {
     }
 }
 
+/// Writes the bridge's substitution port into this chain (ADR-0019).
+///
+/// The adapter exists so the *bridge* never names an audit type — the same
+/// one-way dependency rule `LeafSource` and `CredentialSubstituter` follow —
+/// while the store that already knows how to chain records is the one that
+/// actually does it. A relay wired to a `println!` would satisfy the trait and
+/// leave an operator with nothing to read.
+///
+/// The timestamp is supplied by the caller rather than read from the clock
+/// here, so a test can place a record at a known point in the chain.
+pub struct SubstitutionRecorder<'a> {
+    log: &'a mut AuditLog,
+    ts: u64,
+}
+
+impl<'a> SubstitutionRecorder<'a> {
+    pub fn new(log: &'a mut AuditLog, ts: u64) -> Self {
+        Self { log, ts }
+    }
+}
+
+impl crate::tls_bridge::SubstitutionAudit for SubstitutionRecorder<'_> {
+    fn record(
+        &mut self,
+        record: crate::tls_bridge::SubstitutionRecord,
+    ) -> Result<(), crate::tls_bridge::BridgeError> {
+        // Every field is a wire name, a `host:port` or an opaque id. This is
+        // the structural half of "audited without the secret": the secret has
+        // nowhere to be written even if some future caller wanted to.
+        self.log.append(
+            AuditEventDto::CredentialSubstituted {
+                session: record.session.to_string(),
+                destination: record.destination,
+                family: record.family.to_string(),
+                outcome: record.outcome.to_string(),
+            },
+            self.ts,
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
