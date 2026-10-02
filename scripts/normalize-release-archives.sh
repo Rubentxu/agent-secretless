@@ -77,29 +77,111 @@ for name in "${ARCHIVES[@]}"; do
     | zstd -q -T1 -19 -o "$WORK/$name.new"
 
   if cmp -s "$archive" "$WORK/$name.new"; then
-    echo "normalize-release: $name already normalized"
-    continue
+    # The bytes are already normalized, but sha256.sum may still carry the
+    # digest of an earlier, un-normalized packaging (dist rewrites the whole
+    # file on every build). The coherence repair below is idempotent and
+    # must run either way, so fall through instead of skipping.
+    new_digest="$(sha256sum "$archive" | cut -d' ' -f1)"
+    mv "$WORK/$name.new" "$WORK/$name.discarded"
+  else
+    new_digest="$(sha256sum "$WORK/$name.new" | cut -d' ' -f1)"
+    mv "$WORK/$name.new" "$archive"
+    printf '%s  %s\n' "$new_digest" "$name" > "$DISTRIB/$name.sha256"
   fi
 
-  new_digest="$(sha256sum "$WORK/$name.new" | cut -d' ' -f1)"
-  mv "$WORK/$name.new" "$archive"
-  printf '%s  %s\n' "$new_digest" "$name" > "$DISTRIB/$name.sha256"
-
   # Rewrite this archive's line in sha256.sum, preserving every other
-  # artifact's line exactly as dist wrote it.
+  # artifact's line exactly as dist wrote it. dist writes binary-mode
+  # lines (`<digest>  *<name>`), so the name match must strip the `*` —
+  # the first version of this rewrite matched nothing, reported success,
+  # and the release went out with a checksum file describing the
+  # pre-normalized bytes. Now a rewrite that changes no line is a hard
+  # failure, and the rewritten line is checked against the bytes.
   python3 - "$DISTRIB/sha256.sum" "$name" "$new_digest" <<'PY'
 import pathlib, sys
 sums = pathlib.Path(sys.argv[1])
 name, digest = sys.argv[2], sys.argv[3]
-lines = sums.read_text().splitlines(keepends=True)
-out = []
+lines = sums.read_text().splitlines()
+out, replaced = [], False
 for line in lines:
-    if line.endswith(f"  {name}\n") or line.rstrip("\n").endswith(f"  {name}"):
-        out.append(f"{digest}  {name}\n")
+    parts = line.split(maxsplit=1)
+    # dist's spelling is `<digest> *<name>` - one space, binary-mode star -
+    # but sha256sum accepts one or two spaces with or without the star, so
+    # the match is on the name and the rewrite preserves the rest verbatim.
+    if len(parts) == 2 and parts[1].strip().lstrip("*") == name:
+        out.append(f"{digest} {parts[1]}")
+        replaced = True
     else:
         out.append(line)
-sums.write_text("".join(out))
+if not replaced:
+    sys.exit(f"sha256.sum has no line for {name}; refusing to pretend")
+sums.write_text("".join(f"{l}\n" for l in out) + "\n")
 PY
+
+  actual="$(sha256sum "$archive" | cut -d' ' -f1)"
+  line_digest="$(awk -v n="$name" '{
+      f=$2; sub(/^\*/, "", f); if (f == n) { print $1; exit }
+    }' "$DISTRIB/sha256.sum")"
+  if [[ "$actual" != "$line_digest" ]]; then
+    echo "normalize-release: sha256.sum line for $name does not match the bytes ($line_digest vs $actual)" >&2
+    exit 1
+  fi
+  echo "normalize-release: $name normalized (epoch=$EPOCH, sha256=$new_digest)"
+done
+
+# Same treatment for the source archive: a .tar.gz carries the packaging
+# time in every tar header AND in the gzip header itself, so gzip -n (no
+# timestamp) plus the same deterministic tar is the full recipe.
+mapfile -t SRC_ARCHIVES < <(python3 - "$MANIFEST" <<'PY'
+import json, pathlib, sys
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
+for release in manifest.get("releases", []):
+    for name in release.get("artifacts", []):
+        if name.endswith(".tar.gz"):
+            print(name)
+PY
+)
+
+for name in "${SRC_ARCHIVES[@]}"; do
+  archive="$DISTRIB/$name"
+  [[ -f "$archive" ]] || { echo "normalize-release: $name missing" >&2; exit 1; }
+  stage="$WORK/src-${name%.tar.gz}"
+  mkdir -p "$stage"
+  tar -xzf "$archive" -C "$stage"
+  (cd "$stage" && tar --sort=name --mtime="@$EPOCH" --owner=0 --group=0 \
+      --numeric-owner -cf - .) \
+    | gzip -n -9 > "$WORK/$name.new"
+
+  new_digest="$(sha256sum "$WORK/$name.new" | cut -d' ' -f1)"
+  if ! cmp -s "$archive" "$WORK/$name.new"; then
+    mv "$WORK/$name.new" "$archive"
+    printf '%s  %s\n' "$new_digest" "$name" > "$DISTRIB/$name.sha256"
+  fi
+
+  # Same sha256.sum coherence repair as the zstd archives, and the same
+  # determinism self-check.
+  python3 - "$DISTRIB/sha256.sum" "$name" "$new_digest" <<'PY'
+import pathlib, sys
+sums = pathlib.Path(sys.argv[1])
+name, digest = sys.argv[2], sys.argv[3]
+lines = sums.read_text().splitlines()
+out, replaced = [], False
+for line in lines:
+    parts = line.split(maxsplit=1)
+    if len(parts) == 2 and parts[1].strip().lstrip("*") == name:
+        out.append(f"{digest} {parts[1]}")
+        replaced = True
+    else:
+        out.append(line)
+if not replaced:
+    sys.exit(f"sha256.sum has no line for {name}; refusing to pretend")
+sums.write_text("".join(f"{l}\n" for l in out) + "\n")
+PY
+  actual="$(sha256sum "$archive" | cut -d' ' -f1)"
+  line_digest="$(awk -v n="$name" '{
+      f=$2; sub(/^\*/, "", f); if (f == n) { print $1; exit }
+    }' "$DISTRIB/sha256.sum")"
+  [[ "$actual" == "$line_digest" ]] \
+    || { echo "normalize-release: sha256.sum line for $name does not match the bytes" >&2; exit 1; }
   echo "normalize-release: $name normalized (epoch=$EPOCH, sha256=$new_digest)"
 done
 
