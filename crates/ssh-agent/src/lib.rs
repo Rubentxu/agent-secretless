@@ -19,7 +19,7 @@ use std::sync::{
 };
 use std::thread;
 
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use rand::RngCore;
 use zeroize::Zeroize;
 
@@ -219,6 +219,56 @@ fn public_key_blob(key: VerifyingKey) -> Vec<u8> {
     put_string(&mut out, ED25519_ALGORITHM);
     put_string(&mut out, key.as_bytes());
     out
+}
+
+/// Verifies a session proof: a signature over `nonce` made by the private
+/// key whose public half is `blob`.
+///
+/// Exposed so the broker can resolve a proof without re-implementing the
+/// key format, and so there is exactly one place that decides what a
+/// signature over a session key means. The private key is not involved
+/// and cannot be reached from here.
+///
+/// The proof carries no session id. A valid signature says "some session
+/// owns this key", never "I am this session" — the caller pairs it with
+/// the key it registered for a specific session, and pairing a key with
+/// the wrong session is exactly the mistake this shape makes impossible
+/// to make by accident.
+pub fn verify_proof(blob: &[u8], nonce: &[u8], signature: &[u8]) -> bool {
+    let Ok(verifying) = verifying_key_from_blob(blob) else {
+        return false;
+    };
+    let Ok(sig) = ed25519_dalek::Signature::from_slice(signature) else {
+        return false;
+    };
+    // `from_bytes` is the strict constructor: it rejects a 32-byte seed
+    // presented as a public key rather than reading it as one, so a
+    // registered blob that is actually private material fails here
+    // instead of silently becoming a usable identity.
+    verifying.verify(nonce, &sig).is_ok()
+}
+
+/// Recovers the verifying key from a wire-format blob, refusing anything
+/// that is not exactly `string("ssh-ed25519") string(32 bytes)`.
+fn verifying_key_from_blob(blob: &[u8]) -> Result<VerifyingKey, AgentError> {
+    let mut cursor = Cursor::new(blob);
+    let algorithm = cursor.string()?;
+    if algorithm != ED25519_ALGORITHM {
+        return Err(AgentError::Malformed);
+    }
+    let key = cursor.string()?;
+    // `from_bytes` is the strict constructor: a 32-byte seed presented as a
+    // public key is rejected here rather than read as one, so a registered
+    // blob that is actually private material fails rather than silently
+    // becoming a usable identity.
+    let key: &[u8; 32] = key
+        .as_slice()
+        .try_into()
+        .map_err(|_| AgentError::Malformed)?;
+    if !cursor.done() {
+        return Err(AgentError::Malformed);
+    }
+    VerifyingKey::from_bytes(key).map_err(|_| AgentError::Malformed)
 }
 
 fn failure_response() -> Vec<u8> {
@@ -438,5 +488,124 @@ mod tests {
         );
         session.revoke().expect("revoke");
         assert!(!socket.exists());
+    }
+}
+
+/// The session proof is the whole of ADR-0019's mechanism, so these tests
+/// are the ones that decide whether a CONNECT client can prove anything at
+/// all. Each is written to fail if the check it describes is weakened.
+#[cfg(test)]
+mod proof_tests {
+    use super::*;
+    use ed25519_dalek::Signer;
+
+    fn session_key() -> SigningKey {
+        SigningKey::from_bytes(&[9u8; 32])
+    }
+
+    fn other_key() -> SigningKey {
+        SigningKey::from_bytes(&[10u8; 32])
+    }
+
+    const NONCE: &[u8] = b"per-tunnel nonce, 32 bytes of it";
+
+    #[test]
+    fn a_proof_verifies_against_the_key_that_made_it() {
+        let key = session_key();
+        let sig = key.sign(NONCE).to_bytes();
+        assert!(verify_proof(
+            &public_key_blob(key.verifying_key()),
+            NONCE,
+            &sig
+        ));
+    }
+
+    #[test]
+    fn a_proof_does_not_verify_against_another_sessions_key() {
+        let mine = session_key();
+        let theirs = other_key();
+        let sig = mine.sign(NONCE).to_bytes();
+        // The pair a CONNECT attacker would need: a signature it made for
+        // itself, presented against a key it does not own.
+        assert!(!verify_proof(
+            &public_key_blob(theirs.verifying_key()),
+            NONCE,
+            &sig
+        ));
+    }
+
+    #[test]
+    fn a_tampered_nonce_does_not_verify() {
+        let key = session_key();
+        let sig = key.sign(NONCE).to_bytes();
+        let mut other = NONCE.to_vec();
+        other[0] ^= 0x01;
+        assert!(!verify_proof(
+            &public_key_blob(key.verifying_key()),
+            &other,
+            &sig
+        ));
+    }
+
+    #[test]
+    fn a_signature_over_other_bytes_does_not_verify() {
+        let key = session_key();
+        let sig = key.sign(b"a different message").to_bytes();
+        assert!(!verify_proof(
+            &public_key_blob(key.verifying_key()),
+            NONCE,
+            &sig
+        ));
+    }
+
+    /// A seed is 32 bytes and a public key is 32 bytes, so a blob that
+    /// carries private material is the same *length* as a legitimate one.
+    /// What separates them is that `from_bytes` refuses a curve point, so
+    /// registering a seed cannot turn into a usable identity.
+    #[test]
+    fn a_raw_private_seed_is_not_accepted_as_a_key_blob() {
+        let key = session_key();
+        let sig = key.sign(NONCE).to_bytes();
+        // The bare seed, with no wire framing at all.
+        assert!(!verify_proof(&key.to_bytes(), NONCE, &sig));
+    }
+
+    #[test]
+    fn a_malformed_blob_is_refused_rather_than_guessed() {
+        let key = session_key();
+        let sig = key.sign(NONCE).to_bytes();
+        let good = public_key_blob(key.verifying_key());
+        for bad in [
+            Vec::new(),
+            good[..good.len() - 1].to_vec(),
+            {
+                // Right length, wrong algorithm string.
+                let mut wrong = good.clone();
+                wrong[4] = b'X';
+                wrong
+            },
+            {
+                // Trailing bytes after a complete key.
+                let mut extra = good.clone();
+                extra.push(0);
+                extra
+            },
+        ] {
+            assert!(
+                !verify_proof(&bad, NONCE, &sig),
+                "malformed blob was accepted: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_signature_is_refused() {
+        let key = session_key();
+        let sig = key.sign(NONCE).to_bytes();
+        assert!(!verify_proof(
+            &public_key_blob(key.verifying_key()),
+            NONCE,
+            &sig[..32]
+        ));
     }
 }
