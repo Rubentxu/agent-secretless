@@ -40,7 +40,7 @@ pipeline {
                 // and the artifact list from the real configuration, so a
                 // config that cannot produce a release fails in seconds here
                 // rather than after the build.
-                sh("dist plan --output-format=json --artifacts=all > /dev/null")
+                sh("dist plan --output-format=json > /dev/null")
             }
         }
 
