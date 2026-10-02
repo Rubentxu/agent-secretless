@@ -222,6 +222,7 @@ fn an_unauthorised_target_opens_no_upstream_socket() {
         server_side,
         &leaves,
         &FixedUpstream { addr: origin.addr },
+        None,
         Instant::now(),
     );
 
@@ -265,7 +266,9 @@ fn session_leaf_handshakes_and_the_tunnel_is_live_in_both_directions() {
     let handle = {
         let leaves = SessionLeaves { ca };
         let upstream = FixedUpstream { addr: origin.addr };
-        thread::spawn(move || bridge.serve_connect(server_side, &leaves, &upstream, Instant::now()))
+        thread::spawn(move || {
+            bridge.serve_connect(server_side, &leaves, &upstream, None, Instant::now())
+        })
     };
 
     let ack = read_head(&mut client);
@@ -365,6 +368,7 @@ fn a_leaf_minted_for_another_host_is_refused() {
                 ca: SessionCa::new("wrong-host", 17, Duration::from_secs(3600)),
             },
             &FixedUpstream { addr: origin.addr },
+            None,
             Instant::now(),
         )
         .expect_err("a leaf for another host must be refused");
@@ -408,7 +412,9 @@ fn a_pinning_client_is_refused_and_the_bridge_does_not_patch_it() {
     let handle = {
         let leaves = SessionLeaves { ca: session_ca };
         let upstream = FixedUpstream { addr: origin.addr };
-        thread::spawn(move || bridge.serve_connect(server_side, &leaves, &upstream, Instant::now()))
+        thread::spawn(move || {
+            bridge.serve_connect(server_side, &leaves, &upstream, None, Instant::now())
+        })
     };
 
     assert!(
@@ -545,7 +551,9 @@ fn handshake_through_bridge(
     let handle = {
         let leaves = SessionLeaves { ca };
         let upstream = FixedUpstream { addr: origin.addr };
-        thread::spawn(move || bridge.serve_connect(server_side, &leaves, &upstream, Instant::now()))
+        thread::spawn(move || {
+            bridge.serve_connect(server_side, &leaves, &upstream, None, Instant::now())
+        })
     };
 
     let mut ack_reader = client.try_clone().expect("clone");

@@ -29,7 +29,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use asv_domain::Authority;
+use asv_domain::{AgentSessionId, Authority};
 use asv_tls_acceptor::{handshake_once, LeafMaterial};
 use time::OffsetDateTime;
 
@@ -117,6 +117,15 @@ pub enum BridgeError {
     /// No leaf was available for the requested host.
     #[error("no leaf available for {0}")]
     NoLeaf(String),
+    /// The client presented no session proof, or one that resolved to
+    /// nothing (ADR-0019).
+    ///
+    /// Its own variant rather than `Protocol`, because "you did not prove
+    /// which session you are" and "your CONNECT was malformed" are
+    /// different operator-facing facts and collapsing them would make a
+    /// misconfigured client indistinguishable from a hostile one.
+    #[error("no session proof resolved for this tunnel")]
+    NoSessionProof,
     /// The upstream could not be resolved or reached.
     #[error("upstream unavailable: {0}")]
     Upstream(String),
@@ -637,6 +646,126 @@ pub struct EstablishedTunnel {
     pub upstream: TcpStream,
     /// The authorised target this tunnel is for.
     pub target: AuthorityEndpoint,
+    /// The session this tunnel belongs to (ADR-0019).
+    ///
+    /// Resolved from a signature, not asserted by the client. It is `None`
+    /// only on a path that does not attempt substitution at all; a tunnel
+    /// that is going to carry a credential always has one.
+    pub session: Option<AgentSessionId>,
+}
+
+/// Where the bridge gets session proofs from.
+///
+/// A trait rather than a field for the same reason `LeafSource` is one:
+/// `tls_bridge` must not depend on the broker's state or the vault (D2,
+/// enforced by a test). The bridge only ever sees the answer.
+pub trait SessionProofs {
+    /// Resolves a session proof to the session whose registered key signed
+    /// it, or `None` if no registered key does.
+    ///
+    /// The presented blob only *selects* a candidate. What proves ownership
+    /// is the signature over the nonce, checked by the implementation
+    /// against the key the broker actually registered — never against the
+    /// blob the client presented.
+    fn resolve(
+        &self,
+        presented_key: &[u8],
+        nonce: &[u8],
+        signature: &[u8],
+    ) -> Option<AgentSessionId>;
+}
+
+/// The nonce a session proof is computed over.
+///
+/// It is bound to the destination, not drawn fresh per tunnel. That is a
+/// deliberate trade: a server-issued nonce would be stronger against
+/// replay, but it costs a round trip before the CONNECT, and this path
+/// exists to serve ordinary HTTP clients that do not have one.
+///
+/// What the binding buys is that a proof captured for one destination does
+/// not verify against another, so it cannot be moved to a host the operator
+/// did not authorise. What it does not buy is freshness: a proof replayed
+/// against the *same* destination verifies again. That is not a grant,
+/// because the surrogate it would be spent with is single-use and was
+/// already spent the first time.
+pub fn proof_nonce(presented_key: &[u8], target: &AuthorityEndpoint) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    // Length-prefixed so a key ending in the same bytes as a host cannot
+    // produce the same digest as a shorter key followed by a longer host.
+    hasher.update((presented_key.len() as u64).to_be_bytes());
+    hasher.update(presented_key);
+    hasher.update(target.host().as_bytes());
+    hasher.update((target.port() as u64).to_be_bytes());
+    hasher.finalize().to_vec()
+}
+
+/// The header a CONNECT client presents its session proof in.
+///
+/// Named, not positional, so that a client which does not know about ASV
+/// is unaffected: an absent header means "no proof", and the tunnel is
+/// refused rather than half-authorised.
+pub const SESSION_PROOF_HEADER: &str = "x-asv-session-proof";
+
+/// A session proof as it arrives on the wire: the client's key blob and a
+/// signature over [`proof_nonce`], both unpadded base64 and separated by a
+/// dot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionProof {
+    pub key: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+fn parse_session_proof(head: &str) -> Option<SessionProof> {
+    let raw = head.split("\r\n").find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case(SESSION_PROOF_HEADER) {
+            Some(value.trim())
+        } else {
+            None
+        }
+    })?;
+    let (key, signature) = raw.split_once('.')?;
+    let key = base64_decode(key)?;
+    let signature = base64_decode(signature)?;
+    // An empty half is not a malformed proof, it is *no* proof: accepting
+    // one would hand the resolver an empty signature to fail on later, at
+    // a point where the failure no longer says the client sent nonsense.
+    if key.is_empty() || signature.is_empty() {
+        return None;
+    }
+    Some(SessionProof { key, signature })
+}
+
+/// Standard base64, no padding, no external dependency.
+///
+/// Decoding is strict on purpose: this reads attacker-chosen bytes, and a
+/// decoder that skips unknown characters would let `key` and `signature`
+/// disagree with what was on the wire in a way no later check would notice.
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    // Unpadded base64 cannot have a group of one character: six bits do not
+    // make a byte. Refusing it here means two encodings of the same nonce
+    // cannot both be accepted, one of them truncated.
+    if text.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+    for byte in text.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let value = ALPHABET.iter().position(|c| *c == byte)? as u32;
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 /// Reads a CONNECT request head without reading past its terminator.
@@ -719,12 +848,35 @@ impl Bridge {
         client: TcpStream,
         leaves: &dyn LeafSource,
         upstream: &dyn UpstreamResolver,
+        proofs: Option<&dyn SessionProofs>,
         now: Instant,
     ) -> Result<EstablishedTunnel, BridgeError> {
         let head = read_connect_head(&client)?;
         let target = parse_connect_target(&head)?;
 
         self.handle_connect(&target)?;
+
+        // The destination is authorised before the proof is even looked at.
+        // A target outside the allow-list must not be able to induce a
+        // signature verification, let alone a credential loan.
+        let session = match parse_session_proof(&head) {
+            None => None,
+            Some(proof) => {
+                let Some(proofs) = proofs else {
+                    return Err(BridgeError::NoSessionProof);
+                };
+                let nonce = proof_nonce(&proof.key, &target);
+                match proofs.resolve(&proof.key, &nonce, &proof.signature) {
+                    Some(session) => Some(session),
+                    // A presented proof that does not resolve is a failure,
+                    // not an anonymous tunnel. Forwarding it unsubstituted
+                    // would send the client's credential to the outside
+                    // world and report a provider error instead of the
+                    // truth.
+                    None => return Err(BridgeError::NoSessionProof),
+                }
+            }
+        };
 
         let mut ack = &client;
         ack.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -751,6 +903,7 @@ impl Bridge {
             client,
             upstream,
             target,
+            session,
         })
     }
 }
@@ -1101,5 +1254,205 @@ mod tests {
             ),
             other => panic!("expected HostMismatch, got {other:?}"),
         }
+    }
+}
+
+/// ADR-0019's proof resolution. These pin what a CONNECT client can prove
+/// and, just as importantly, what it cannot.
+#[cfg(test)]
+mod proof_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    /// Stands in for the broker: it knows which key belongs to which
+    /// session, and checks the signature against the **registered** key
+    /// rather than against the blob the client presented.
+    struct FakeProofs {
+        registered: Vec<(AgentSessionId, Vec<u8>)>,
+    }
+
+    impl SessionProofs for FakeProofs {
+        fn resolve(
+            &self,
+            presented_key: &[u8],
+            nonce: &[u8],
+            signature: &[u8],
+        ) -> Option<AgentSessionId> {
+            self.registered
+                .iter()
+                .find(|(_, key)| {
+                    key.len() == presented_key.len()
+                        && bool::from(subtle::ConstantTimeEq::ct_eq(key.as_slice(), presented_key))
+                })
+                .and_then(|(session, key)| {
+                    asv_ssh_agent::verify_proof(key, nonce, signature).then_some(*session)
+                })
+        }
+    }
+
+    fn endpoint(host: &str, port: u16) -> AuthorityEndpoint {
+        AuthorityEndpoint::new(Authority::canonicalize(host).expect("authority"), port)
+            .expect("endpoint")
+    }
+
+    fn encode(bytes: &[u8]) -> String {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            out.push(A[(n >> 18) as usize & 63] as char);
+            out.push(A[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 {
+                A[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                A[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    fn head_with(proof: Option<&str>, host: &str, port: u16) -> String {
+        let mut head = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+        if let Some(p) = proof {
+            head.push_str(&format!("{SESSION_PROOF_HEADER}: {p}\r\n"));
+        }
+        head.push_str("\r\n");
+        head
+    }
+
+    /// A registered session, its key and its public blob.
+    fn fixture() -> (AgentSessionId, SigningKey, Vec<u8>, FakeProofs) {
+        let key = SigningKey::from_bytes(&[21u8; 32]);
+        let blob = public_key_blob_for(&key);
+        let session = AgentSessionId::new();
+        let proofs = FakeProofs {
+            registered: vec![(session, blob.clone())],
+        };
+        (session, key, blob, proofs)
+    }
+
+    fn public_key_blob_for(key: &SigningKey) -> Vec<u8> {
+        asv_ssh_agent::public_key_blob(&key.verifying_key())
+    }
+
+    #[test]
+    fn a_proof_over_the_destination_resolves_to_its_session() {
+        let (session, _key, blob, proofs) = fixture();
+        let target = endpoint("asv.test", 443);
+        let nonce = proof_nonce(&blob, &target);
+        let signature = _key.sign(&nonce).to_bytes();
+        assert_eq!(
+            proofs.resolve(&blob, &nonce, &signature),
+            Some(session),
+            "a valid proof did not resolve"
+        );
+    }
+
+    #[test]
+    fn a_proof_for_one_destination_does_not_resolve_against_another() {
+        let (_session, key, blob, proofs) = fixture();
+        let honest = endpoint("asv.test", 443);
+        let attacker = endpoint("evil.example", 443);
+        let nonce = proof_nonce(&blob, &honest);
+        let signature = key.sign(&nonce).to_bytes();
+        assert_eq!(
+            proofs.resolve(&blob, &proof_nonce(&blob, &attacker), &signature),
+            None,
+            "a proof captured for one host verified against another"
+        );
+    }
+
+    #[test]
+    fn a_proof_made_by_a_key_the_broker_never_registered_does_not_resolve() {
+        let (_session, _key, blob, proofs) = fixture();
+        let other = SigningKey::from_bytes(&[22u8; 32]);
+        let target = endpoint("asv.test", 443);
+        let nonce = proof_nonce(&blob, &target);
+        let signature = other.sign(&nonce).to_bytes();
+        assert_eq!(
+            proofs.resolve(&blob, &nonce, &signature),
+            None,
+            "a stranger's signature resolved against a registered blob"
+        );
+    }
+
+    /// The attack this whole design exists to stop: an attacker presents
+    /// *their own* key and signs with *their own* private key. Nothing they
+    /// send is malformed, and the signature is perfectly valid -- it is
+    /// just valid for a key the broker never registered.
+    ///
+    /// This case was missing, and two falsification attempts found it. The
+    /// earlier tests presented the *registered* blob with a foreign
+    /// signature, which fails for a different reason. Selecting the session
+    /// by verifying against the presented key instead of matching the
+    /// registered one left all seven of them green -- and so did removing
+    /// the match, because the second check against the registered key was
+    /// doing the work. Only with both gone does this one fail.
+    #[test]
+    fn a_stranger_presenting_their_own_key_and_their_own_signature_is_refused() {
+        let (session, _key, blob, proofs) = fixture();
+        let attacker = SigningKey::from_bytes(&[77u8; 32]);
+        let their_blob = public_key_blob_for(&attacker);
+        let target = endpoint("asv.test", 443);
+        let nonce = proof_nonce(&their_blob, &target);
+        let signature = attacker.sign(&nonce).to_bytes();
+        assert_ne!(their_blob, blob, "the fixture keys collided");
+        assert_eq!(
+            proofs.resolve(&their_blob, &nonce, &signature),
+            None,
+            "a stranger's own key resolved to session {session}"
+        );
+    }
+
+    #[test]
+    fn an_absent_header_means_no_proof_rather_than_an_error() {
+        let head = head_with(None, "asv.test", 443);
+        assert_eq!(parse_session_proof(&head), None);
+    }
+
+    #[test]
+    fn a_malformed_proof_header_is_refused_rather_than_guessed() {
+        for bad in ["not-base64.not-base64", "!!!.###", "onlyonepart", "AAAA=."] {
+            let head = head_with(Some(bad), "asv.test", 443);
+            assert_eq!(
+                parse_session_proof(&head),
+                None,
+                "a malformed proof parsed: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_header_is_matched_case_insensitively_like_every_http_header() {
+        let (session, key, blob, proofs) = fixture();
+        let target = endpoint("asv.test", 443);
+        let nonce = proof_nonce(&blob, &target);
+        let signature = key.sign(&nonce).to_bytes();
+        let proof = format!("{}.{}", encode(&blob), encode(&signature));
+        let head = format!("CONNECT asv.test:443 HTTP/1.1\r\nX-ASV-Session-Proof: {proof}\r\n\r\n");
+        let parsed = parse_session_proof(&head).expect("a case-variant header parsed");
+        assert_eq!(
+            proofs.resolve(&parsed.key, &nonce, &parsed.signature),
+            Some(session)
+        );
+    }
+
+    #[test]
+    fn the_nonce_differs_per_destination_and_per_key() {
+        let a = endpoint("asv.test", 443);
+        let b = endpoint("asv.test", 8443);
+        assert_ne!(proof_nonce(b"k", &a), proof_nonce(b"k", &b));
+        assert_ne!(proof_nonce(b"k", &a), proof_nonce(b"kk", &a));
+        assert_eq!(proof_nonce(b"k", &a), proof_nonce(b"k", &a));
     }
 }

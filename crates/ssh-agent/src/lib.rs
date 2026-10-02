@@ -122,7 +122,7 @@ impl AgentSession {
 
     /// Public key blob in the SSH wire format. It contains no private bytes.
     pub fn public_key_blob(&self) -> Vec<u8> {
-        public_key_blob(self.signing_key.verifying_key())
+        public_key_blob(&self.signing_key.verifying_key())
     }
 
     /// Revokes the session, closes the listener and removes the socket.
@@ -184,7 +184,7 @@ pub fn handle_message(payload: &[u8], key: &SigningKey, revoked: &AtomicBool) ->
 }
 
 fn identities_response(verifying: VerifyingKey) -> Vec<u8> {
-    let key_blob = public_key_blob(verifying);
+    let key_blob = public_key_blob(&verifying);
     let mut out = vec![IDENTITIES_ANSWER];
     put_u32(&mut out, 1);
     put_string(&mut out, &key_blob);
@@ -200,7 +200,7 @@ fn sign_request(payload: &[u8], key: &SigningKey) -> Result<Vec<u8>, AgentError>
     if flags != 0 || !cursor.done() {
         return Err(AgentError::Unsupported);
     }
-    if key_blob != public_key_blob(key.verifying_key()) {
+    if key_blob != public_key_blob(&key.verifying_key()) {
         return Err(AgentError::WrongKey);
     }
 
@@ -214,11 +214,22 @@ fn sign_request(payload: &[u8], key: &SigningKey) -> Result<Vec<u8>, AgentError>
     Ok(out)
 }
 
-fn public_key_blob(key: VerifyingKey) -> Vec<u8> {
+fn public_key_blob_inner(key: VerifyingKey) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + ED25519_ALGORITHM.len() + 4 + 32);
     put_string(&mut out, ED25519_ALGORITHM);
     put_string(&mut out, key.as_bytes());
     out
+}
+
+/// The wire-format public key blob for a verifying key.
+///
+/// Public next to [`verify_proof`], and for the same reason: a client that
+/// wants to build a proof needs to know how this crate names a key, and
+/// restating the format in the broker would give the wire shape two
+/// definitions that can drift apart. The bytes it contains are public by
+/// construction — an algorithm name and a 32-byte curve point.
+pub fn public_key_blob(key: &ed25519_dalek::VerifyingKey) -> Vec<u8> {
+    public_key_blob_inner(*key)
 }
 
 /// Verifies a session proof: a signature over `nonce` made by the private
@@ -372,7 +383,7 @@ mod tests {
 
     fn sign_request(key: &SigningKey, data: &[u8], flags: u32) -> Vec<u8> {
         let mut payload = vec![SIGN_REQUEST];
-        put_string(&mut payload, &public_key_blob(key.verifying_key()));
+        put_string(&mut payload, &public_key_blob(&key.verifying_key()));
         put_string(&mut payload, data);
         put_u32(&mut payload, flags);
         payload
@@ -514,7 +525,7 @@ mod proof_tests {
         let key = session_key();
         let sig = key.sign(NONCE).to_bytes();
         assert!(verify_proof(
-            &public_key_blob(key.verifying_key()),
+            &public_key_blob(&key.verifying_key()),
             NONCE,
             &sig
         ));
@@ -528,7 +539,7 @@ mod proof_tests {
         // The pair a CONNECT attacker would need: a signature it made for
         // itself, presented against a key it does not own.
         assert!(!verify_proof(
-            &public_key_blob(theirs.verifying_key()),
+            &public_key_blob(&theirs.verifying_key()),
             NONCE,
             &sig
         ));
@@ -541,7 +552,7 @@ mod proof_tests {
         let mut other = NONCE.to_vec();
         other[0] ^= 0x01;
         assert!(!verify_proof(
-            &public_key_blob(key.verifying_key()),
+            &public_key_blob(&key.verifying_key()),
             &other,
             &sig
         ));
@@ -552,7 +563,7 @@ mod proof_tests {
         let key = session_key();
         let sig = key.sign(b"a different message").to_bytes();
         assert!(!verify_proof(
-            &public_key_blob(key.verifying_key()),
+            &public_key_blob(&key.verifying_key()),
             NONCE,
             &sig
         ));
@@ -574,7 +585,7 @@ mod proof_tests {
     fn a_malformed_blob_is_refused_rather_than_guessed() {
         let key = session_key();
         let sig = key.sign(NONCE).to_bytes();
-        let good = public_key_blob(key.verifying_key());
+        let good = public_key_blob(&key.verifying_key());
         for bad in [
             Vec::new(),
             good[..good.len() - 1].to_vec(),
@@ -603,7 +614,7 @@ mod proof_tests {
         let key = session_key();
         let sig = key.sign(NONCE).to_bytes();
         assert!(!verify_proof(
-            &public_key_blob(key.verifying_key()),
+            &public_key_blob(&key.verifying_key()),
             NONCE,
             &sig[..32]
         ));
