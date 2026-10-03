@@ -327,9 +327,16 @@ fn serve_connection(
         if !response.starts_with(ESTABLISHED) {
             return Ok(());
         }
-        // Inside the tunnel there is no deadline and no framing: the shim is a
-        // pipe and the client is entitled to a connection of whatever length
-        // it negotiated.
+        // Inside the tunnel there is no deadline on the *transfer* and no
+        // framing: the shim is a pipe and the client is entitled to a
+        // connection of whatever length it negotiated. Clearing the head
+        // timeout is what makes that true — the `200` arrived, so the client
+        // owes the shim nothing for an unbounded period.
+        //
+        // What the relay adds back is not a deadline. It is the ability to
+        // notice that one end hung up, which is a different property: an
+        // unbounded tunnel and a tunnel that cannot end are not the same
+        // thing, and only the first of them was being asked for.
         client.set_read_timeout(None).ok();
         upstream.set_read_timeout(None).ok();
         relay(&client, &upstream);
@@ -451,6 +458,22 @@ fn read_head(stream: &mut TcpStream, out: &mut Vec<u8>) -> io::Result<bool> {
 /// After this the shim knows nothing about the stream and never will: what is
 /// inside is a TLS session between the client and the broker, and the only
 /// reason this works is that it does not need to know that.
+/// How long a relay pump blocks before it looks at the other direction again.
+///
+/// **This is not a deadline on the tunnel.** A timeout here never closes a
+/// connection: the pump wakes, finds the other direction still alive, and
+/// blocks again, for as long as the tunnel lasts. What it buys is the ability
+/// to *notice* that the other direction ended — and without noticing, a pump
+/// blocked in `read` on a half that will never speak again waits for the peer
+/// to give up. In the client→upstream direction that peer is the client, which
+/// is waiting for a reply, which is what the hang-up was instead of. Measured
+/// at 241 seconds of a hung `curl` before this existed.
+///
+/// Four wake-ups a second per idle tunnel is the price. The alternative is a
+/// client that cannot learn its tunnel is over, and that is not a trade worth
+/// making.
+const PUMP_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
 fn relay(client: &TcpStream, upstream: &TcpStream) {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -463,20 +486,36 @@ fn relay(client: &TcpStream, upstream: &TcpStream) {
             Ok(w) => w,
             Err(_) => return,
         };
+        // The wake-up, installed before the first block. It is a poll interval
+        // and not a timeout, so `WouldBlock` is a normal event here and must
+        // not be confused with the stream ending.
+        reader
+            .set_read_timeout(Some(PUMP_POLL))
+            .expect("the relay's sockets are always TCP");
         let mut buf = [0u8; 32 * 1024];
         loop {
             if done.load(Ordering::Acquire) {
                 return;
             }
             match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(n) => {
                     if writer.write_all(&buf[..n]).is_err() || writer.flush().is_err() {
                         break;
                     }
                 }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => break,
             }
         }
+        // Set on every exit, including the one the peer caused. The flag is
+        // what the other direction reads to learn it should stop, and the
+        // thread that *cannot* notice its own socket ending is the one that has
+        // to be told.
         done.store(true, Ordering::Release);
     }
 
@@ -522,6 +561,15 @@ mod tests {
         Status(&'static str),
         /// Close without replying at all, as the real broker does on refusal.
         SilentDrop,
+        /// Reply 200, then close once the client's bytes arrive.
+        ///
+        /// This is the real broker's shape when it refuses a substitution
+        /// *after* the tunnel is established: the head was read, the TLS
+        /// handshake completed, and then the broker dropped the connection. The
+        /// `SilentDrop` case above is a different one — that is a refusal
+        /// before the tunnel exists, which the shim answers with a `502` and
+        /// never reaches `relay`.
+        EstablishedThenHangUp,
     }
 
     impl CapturingBroker {
@@ -556,6 +604,17 @@ mod tests {
                             }
                             Behaviour::Status(status) => {
                                 let _ = conn.write_all(status.as_bytes());
+                            }
+                            Behaviour::EstablishedThenHangUp => {
+                                let _ = conn.write_all(ESTABLISHED);
+                                let _ = conn.write_all(b"\r\n\r\n");
+                                let _ = conn.flush();
+                                // Read until the client has actually spoken, so
+                                // the hang-up is a hang-up and not a refusal to
+                                // read: a test that closed first would prove
+                                // nothing about the shim's teardown.
+                                let mut buf = [0u8; 4096];
+                                let _ = conn.read(&mut buf);
                             }
                             Behaviour::SilentDrop => {}
                         }
@@ -802,6 +861,62 @@ mod tests {
         let f = Fixture::new(broker.addr);
         let (reply, _stream) = f.connect(&connect_request("api.example.com:443"));
         assert!(reply.starts_with("HTTP/1.1 407"), "got {reply:?}");
+    }
+
+    /// A broker that accepts the tunnel and then hangs up must end the client's
+    /// connection, not leave it waiting.
+    ///
+    /// This is the real broker's shape when it refuses a substitution *after*
+    /// the tunnel exists, which is every refusal that happens after the head
+    /// is read — a surrogate presented by the wrong session, a credential
+    /// class the destination does not match, a budget already spent. The client
+    /// has sent its request and is waiting for an answer that is never coming.
+    ///
+    /// The shim's relay reads both directions in their own threads and shares
+    /// one flag between them, but a thread blocked in `read` cannot see the
+    /// flag: it only checks before it blocks. So when the broker hung up, the
+    /// pump reading the *broker* ended and set the flag, and the pump reading
+    /// the *client* stayed blocked — waiting for the client to give up, which a
+    /// client with no timeout of its own never does. `curl` hung for 241
+    /// seconds on this, found by the C2.7-D vertical rather than by a unit
+    /// test, which is the argument for having the vertical.
+    ///
+    /// Bounded by the fixture's own read timeout, so a regression fails in
+    /// seconds instead of hanging the suite.
+    #[test]
+    fn an_upstream_that_hangs_up_mid_tunnel_closes_the_client() {
+        let broker = CapturingBroker::new(Behaviour::EstablishedThenHangUp);
+        let f = Fixture::new(broker.addr);
+        let (_reply, mut stream) = f.connect(&connect_request("api.example.com:443"));
+        assert_eq!(
+            broker.captured().len(),
+            1,
+            "the CONNECT never reached the broker"
+        );
+
+        // Speak, so the fake broker reads and then hangs up. This is the client
+        // asking a question that will not be answered.
+        stream
+            .write_all(b"GET /resource HTTP/1.1\r\n\r\n")
+            .expect("write");
+        stream.flush().ok();
+
+        let mut buf = [0u8; 64];
+        match stream.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => panic!("the shim invented {n} bytes for a broker that said nothing"),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                panic!("the shim left the client hanging after the broker hung up: {e}")
+            }
+            // A reset is a hang-up too, and the client cannot tell the
+            // difference. What it must never see is silence.
+            Err(_) => {}
+        }
     }
 
     /// After the 200 the shim is a pipe. It cannot read what goes through and
