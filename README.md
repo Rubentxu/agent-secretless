@@ -16,7 +16,7 @@ agent ──(surrogate / socket)──▶ broker ──(real credential)──�
 
 > **Status: pre-1.0, at v0.28.0. Not certified, and the gates say so.**
 >
-> The workspace compiles and **979 tests are enumerated** (979 pass, 0 ignored,
+> The workspace compiles and **983 tests are enumerated** (983 pass, 0 ignored,
 > 0 fail; the count is re-derived every CI run by the `R11 README test count`
 > gate, so this line cannot go stale again). Vault, SSH signing, the HTTP and
 > PostgreSQL brokers, Cedar policy, the operator console and the CONNECT TLS
@@ -59,7 +59,7 @@ type system:
   format, authenticated headers, owner-only files. Backup/restore under a
   *separate* recovery passphrase. Passphrase **rekey** that re-wraps the same
   data key, so pre-rotation backups keep working (`crates/vault`).
-- **Broker daemon** (`asv-brokerd`) — Unix-socket IPC (protocol v5), `SO_PEERCRED`
+- **Broker daemon** (`asv-brokerd`) — Unix-socket IPC (protocol v6), `SO_PEERCRED`
   identity, Cedar policy with **deny-by-default**, fail-closed startup: it opens
   `--vault`/`--passphrase-file` at boot or refuses every brokered operation.
   Core dumps are disabled via `RLIMIT_CORE=0` before any secret exists.
@@ -146,7 +146,7 @@ Each item says where its detail lives, because none of it is a guess.
 cargo build --release -p asv-broker
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# expected: passed=979 failed=0 ignored=0
+# expected: passed=983 failed=0 ignored=0
 ```
 
 That number was `passed=692` in this file for several milestones, and nothing
@@ -181,7 +181,7 @@ rather than starting half-configured.
 ```text
 crates/
   domain/         core types, SecretBytes, Authority canonicalization
-  ipc-protocol/   versioned, length-bounded request/response (protocol v5)
+  ipc-protocol/   versioned, length-bounded request/response (protocol v6)
   identity/       SO_PEERCRED + pidfd workload identity
   vault/          encrypted envelope, backup/restore, rekey, TPM prototype
   policy/         Cedar integration, deny-by-default decisions

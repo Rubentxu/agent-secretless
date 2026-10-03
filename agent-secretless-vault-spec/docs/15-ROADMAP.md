@@ -1808,6 +1808,82 @@ and all tested — but "tested" meant "tested in process", and the one hop betwe
 a test process and a running broker was broken. The end-to-end vertical is not
 an additional test to write. It is the first test that would have seen this.
 
+### C2.7-D — the vertical, and the two claims it did not measure
+
+`crates/broker/tests/connect_vertical_e2e.rs` is the first test in this path that
+runs nothing in-process. A real `asv-brokerd` with a real vault, a real route
+file and a real policy file; a real `asv run` that opens a real session and
+starts a real shim; a real `curl` that has never heard of Agent Secretless and is
+told nothing but a proxy URL; a real origin on a real socket. The credential is
+planted the way an operator plants one — `asv add-credential` over stdin — and
+the id that verb mints is what the route file names, because the ids are the
+product's and a test cannot invent one.
+
+It found the defect above, and then it found two of its own.
+
+**The audit assertion was a no-op.** It shelled out to
+`asv-brokerd --audit-verify`. There is no such flag — the broker has
+`--audit-file` — and it was never started with one, so there was no file to
+verify. The assertion then sat behind `if command.success()`, which meant it
+would also have passed against a broker writing no audit at all. The one property
+this file exists to certify was a conditional that could not fail. It is now read
+off the file the broker actually wrote, parsed into records rather than grepped as
+text, checked for the substitution that happened and the refusal that did not, and
+given a tamper control: `verify_file` answers `Ok` to an empty file, so a green
+verification means nothing until the same call is shown going red on an altered
+record.
+
+**The replay assertion was not a replay.** It opened a second session and checked
+its output for the secret, under a comment claiming it showed a surrogate could
+not be reused. The second session minted its own token; the two sessions never
+held the same value, and the question was never put. The token is now carried
+from one session into another, with the positive half in the same run so that
+"not yours" is distinguishable from "nothing works at all".
+
+And it is worth recording *why* the first attempt at that was wrong even after
+being rewritten, because the reason is the interesting part. The first version
+took the token from a session that had already finished — and `SessionEnded`
+calls `revoke_session`, which *deletes* a session's surrogates from the registry.
+So the foreign token was refused for being unknown, and the session comparison in
+`redeem_for` was never reached. The assertion was green and wrong. It stayed
+green when the mutation campaign deleted the session comparison outright, which
+is how the difference was found: an assertion satisfied by a refusal of the wrong
+cause is indistinguishable from a working one until the control is taken away. The
+measurement now holds both sessions open at the same time, which is the only state
+in which the binding is reachable.
+
+**A hung client, and a shim that could not be torn down.** When the broker refuses
+a substitution — the wrong session, the wrong class, a spent budget — it has
+already read the head and it drops the connection. The shim relays both directions
+in their own threads behind a shared flag, and a thread blocked in `read` cannot
+see that flag: it only checks before it blocks. So the pump reading the broker
+ended and the pump reading the client stayed blocked, waiting for a client that
+was waiting for a reply. A real `curl` hung for **241 seconds**. The fix is a
+250 ms poll interval in each pump: not a deadline — it never closes a tunnel, and
+an idle tunnel of any length still survives — but the ability to notice that the
+other end went away. "No deadline inside the tunnel" was a correct decision that
+had been over-applied to the teardown; an unbounded tunnel and a tunnel that cannot
+end are not the same thing, and only the first was being asked for.
+
+**What the vertical does not claim.** `curl --insecure`: the session CA is minted
+per broker run and the test has no channel to pin it, so the client's trust
+decision is waived and nothing here is evidence that certificate trust is solved
+for an operator. It also does not show that a *proof* is single-use end to end —
+the shim mints one per connection, so an ordinary client is never in a position
+to replay one; that property is measured in the broker's verifier and in the
+issuer's counter, and claiming it here would be claiming a hop this test does not
+cross. And the bridge dials the destination *before* it can read the head that
+carries the surrogate, so a refused tunnel still leaves an empty connection open
+at the origin. That is written down rather than hidden, and it is why the
+assertions count the requests that carried bytes, and above all the ones that
+carried the real credential, rather than counting connections.
+
+`tests/connect_vertical_falsification.py` deletes the control behind each of those
+assertions — the session comparison, the chain verifier's ability to see a break,
+the recorded outcome, the recorded destination, the surrogate handed to the child
+— and requires the *named* assertion to go red. Five of five, and a run that
+fails for any other reason counts as an escape rather than as a pass.
+
 ## After v1.0 — M14 through M18
 
 Adopted from `docs/asv-agent-first-security-evolution-v2-2026-10-02/`. **This
