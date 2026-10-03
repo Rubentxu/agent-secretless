@@ -909,8 +909,12 @@ window is recorded as a residual rather than dressed up as covered.
   about what a surrogate is worth, not a bug.
 - The destination-derived nonce is **not** freshness. A formal decision is
   still owed.
-- Observability reaches `ListenerReport` and stops there. It is not yet wired to
-  the audit chain.
+- ~~Observability reaches `ListenerReport` and stops there. It is not yet wired
+  to the audit chain.~~ **Delivered** in the third V1-C2 delivery:
+  `SharedSubstitutionAudit` and `ChainReport` append into the broker's own
+  durable chain, so a CONNECT outcome and the request that produced it land in
+  one log and verify against one chain. See below for what the chain is allowed
+  to carry, which is not the same as what the operator's log line carries.
 - The `main.rs` line that hands the listener its `SessionStore` is **not
   covered by a test**, because an integration test does not build the binary.
   What the suite pins is the construction the line performs, and a falsification
@@ -951,6 +955,61 @@ is not a hole — the allow-list is consulted before issuance is ever reached �
 but a security comment that overstates what is rejected is the same defect as a
 document that overstates what is verified, and it is now corrected in place with
 the measurement next to it.
+
+**A third delivery: the CONNECT path and the broker's requests end up in one
+chain.** `BrokerState::audit` is now `Arc<Mutex<AuditLog>>` — the third shared
+lock, and for the same reason as the other two: a listener and a request handler
+that reach *different* logs produce a chain that verifies, because each half
+verifies alone, and a record that is in neither. `SharedSubstitutionAudit`
+records every substitution the tunnel performs, and `ChainReport` records the
+outcome, including the connections that were refused before a destination was
+parseable.
+
+**The chain carries a class, never the error's text.** This is not a style
+preference and it was forced by measurement. `parse_connect_target` builds
+`BridgeError::Protocol(format!("{authority} has no port"))`, and `authority` is
+bytes the client sent. Chaining that verbatim would put attacker-controlled
+bytes into the durable log, so `refusal_class(&BridgeError)` maps an error to a
+fixed vocabulary by **match**, and the full text stays in the operator's log
+line, where it belongs.
+
+**A class derived from a human-readable message changes when somebody improves
+the message.** `ConnectionResult::Cancelled` used to carry a `String`, and the
+test looked for `"head deadline elapsed"` while the code produced `"read
+deadline elapsed"` — the test passed for months on a different string than the
+one it named, and every such cancellation was recorded as `other` without ever
+saying so. It is now `Cancelled(CancelReason)`, a value the type system carries
+from the code that decided it, and renaming the operator-facing message can no
+longer change what is audited.
+
+**Sharing the audit behind a mutex deadlocked the audit read.** `AuditQuery`
+answered a struct literal whose three fields each called `audit_chain!`. A
+struct literal keeps its temporaries until the end of the expression, so the
+second `lock()` blocked a thread forever on a mutex it already held —
+`std::sync::Mutex` is not reentrant, and the fields had been written when
+`audit` was a plain field where the second read was free. The admitted-reader
+test hung the suite; the fix takes one guard and reads all three from it, which
+also makes `records`, `chain_head` and `dropped` one consistent snapshot rather
+than three reads that could straddle an append.
+
+Finding that required a scanner, which required falsifying the scanner first.
+The first two versions of it reported **zero** on the very expression that
+deadlocked: one treated a block's `}` as a statement boundary and then excused
+the finding whenever *any* acquisition in the region was bound to a name, and
+the second split on commas — which is precisely where struct-literal fields
+live, so it separated the simultaneous case into innocent pieces. Only the
+third, which cuts on `;` and on a closing `}` and at `=>` (match arms are
+alternatives, and their temporaries are never both created), fires on the real
+defect and stays quiet on two sibling arms that each take a guard. A guard that
+has never been seen to fail is not evidence of anything, including a guard
+whose subject is a bug that has already happened once.
+
+**Still not delivered.** One request per tunnel — not yet decided, and the
+decision is about what a surrogate is worth. The destination-derived nonce is
+still not freshness, and the formal decision is still owed. The `main.rs` line
+that hands the listener its `SessionStore` is still uncovered, because an
+integration test does not build the binary; the suite pins the construction, not
+the line.
 
 ## After v1.0 — M14 through M18
 

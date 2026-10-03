@@ -273,8 +273,17 @@ fn a_peer_that_is_not_enrolled_can_neither_approve_nor_read_audit() {
     // And the refused attempts are themselves recorded: an agent probing the
     // control plane is auditable evidence, not a silent no-op.
     assert!(
-        state.audit.query(0).len() >= 2,
+        state
+            .audit
+            .lock()
+            .expect("no test holds this")
+            .query(0)
+            .len()
+            >= 2,
         "both refused attempts must be in the log"
     );
-    assert_eq!(state.audit.verify(), Ok(()));
+    assert_eq!(
+        state.audit.lock().expect("no test holds this").verify(),
+        Ok(())
+    );
 }

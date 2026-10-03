@@ -577,6 +577,41 @@ pub enum AuditEventDto {
         /// "substituted" or "refused".
         outcome: String,
     },
+    /// A CONNECT connection reached a terminal state on the proxy path
+    /// (M9 / V1-C2).
+    ///
+    /// Its own variant because `CredentialSubstituted` records the *credential*
+    /// event and this records the *connection*, and an operator debugging a
+    /// proxy needs both. A connection refused before any substitution was
+    /// attempted produces no `CredentialSubstituted` record at all, so a chain
+    /// carrying only that variant shows a gap exactly where the refusal was.
+    ///
+    /// **`detail` is a class, never the error's own text.** `BridgeError` is
+    /// `Display` and several of its variants interpolate bytes the client sent
+    /// — `parse_connect_target` builds `Protocol(format!("{authority} has no
+    /// port"))` from the request line — so writing the rendered reason into a
+    /// hashed, exported chain would let any client place bytes of their
+    /// choosing, a secret-shaped string included, into a durable artefact. The
+    /// class is derived from the error's kind; the full text stays in the
+    /// operator log, which is not the thing that leaves the machine.
+    ///
+    /// Metadata only by construction: a `host:port` taken from the *parsed*
+    /// target rather than the request line, an opaque session id, and two wire
+    /// names. There is no field that could hold secret bytes.
+    ConnectHandled {
+        /// `host:port` from the parsed target, or empty when the client never
+        /// said where it was going. Empty is a fact, not a gap, and is why the
+        /// field is a `String` with a documented empty value rather than an
+        /// `Option` a consumer would have to unwrap.
+        destination: String,
+        /// The session the proof resolved to, when one was proven.
+        session: Option<String>,
+        /// "completed" | "refused" | "cancelled".
+        outcome: String,
+        /// A class ("malformed_request", "destination_not_allowed",
+        /// "session_revoked", …), never the error's text.
+        detail: String,
+    },
 }
 
 impl Request {

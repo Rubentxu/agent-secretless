@@ -200,6 +200,12 @@ impl crate::tls_bridge::UpstreamResolver for SystemUpstream {
 pub struct SubstitutingHandler {
     surrogates: Arc<Mutex<SurrogateRegistry>>,
     secrets: Arc<dyn SecretPort>,
+    /// The broker's own chain, shared with the socket path.
+    ///
+    /// Shared because a substitution recorded on the socket path and one
+    /// recorded here have to be the same chain: two chains would each verify
+    /// alone and say nothing about what the other did.
+    audit: Arc<Mutex<crate::audit::AuditLog>>,
     family: OperationFamily,
     family_name: &'static str,
     limits: RelayLimits,
@@ -217,12 +223,14 @@ impl SubstitutingHandler {
     pub fn new(
         surrogates: Arc<Mutex<SurrogateRegistry>>,
         secrets: Arc<dyn SecretPort>,
+        audit: Arc<Mutex<crate::audit::AuditLog>>,
         family: OperationFamily,
         family_name: &'static str,
     ) -> Self {
         Self {
             surrogates,
             secrets,
+            audit,
             family,
             family_name,
             limits: RelayLimits::default(),
@@ -268,7 +276,13 @@ impl ConnectionHandler for SubstitutingHandler {
                 self.family,
                 self.family_name,
             );
-            let mut audit = ForwardingAudit;
+            // The registry guard is released at the end of this block; the
+            // audit handle is the shared log itself rather than a guard, so the
+            // relay records into the same chain the socket path appends to and
+            // takes the chain's lock once per record instead of once per
+            // tunnel.
+            let mut audit =
+                SharedSubstitutionAudit::new(Arc::clone(&self.audit), crate::surrogate::now_secs());
             tunnel.relay_substituted(&mut port, &mut audit, self.limits)
         }?;
         tracing::info!(
@@ -283,54 +297,122 @@ impl ConnectionHandler for SubstitutingHandler {
     }
 }
 
-/// Records a substitution through the broker's own audit chain.
+/// Classify a CONNECT failure as a wire name, without quoting the failure.
 ///
-/// `relay_substituted` reports every substitution — success or refusal — and a
-/// record that is produced and dropped is not an audit trail. This forwards each
-/// one into the chain, and the chain is append-only, so a failure to append is
-/// reported rather than swallowed.
-struct ForwardingAudit;
+/// **This function exists because the obvious thing is a leak.** `BridgeError`
+/// is `Display`, and several of its variants interpolate bytes the *client*
+/// sent: `parse_connect_target` builds `Protocol(format!("{authority} has no
+/// port"))` and `Protocol(format!("{host}: {e}"))` from the request line. So
+/// `ConnectionResult::Refused(reason)` carries attacker-controlled text, and
+/// writing that into the durable audit chain would let any client put bytes of
+/// their choosing — a secret-shaped string included — into a file that gets
+/// exported, hashed and shipped.
+///
+/// The chain therefore gets a class, and the class is derived from the error's
+/// *kind*, never from its rendering. What an operator loses is the exact
+/// wording; what they keep is the ability to count, alert on and correlate
+/// refusals by cause, which is what an audit chain is for. The full text stays
+/// in the operator log, which is the surface that already exists to hold
+/// diagnostic detail and is not the artefact that leaves the machine.
+pub fn refusal_class(error: &BridgeError) -> &'static str {
+    match error {
+        BridgeError::Connect(_) => "connect_rejected",
+        BridgeError::Redirect(_) => "redirect_rejected",
+        BridgeError::Leaf(_) => "leaf_unavailable",
+        BridgeError::Protocol(_) => "malformed_request",
+        BridgeError::NoLeaf(_) => "leaf_unavailable",
+        BridgeError::Io(_) => "io_error",
+        BridgeError::Handshake(_) => "tls_failure",
+        BridgeError::Substitution(_) => "substitution_refused",
+        BridgeError::Cancelled(_) => "cancelled",
+        _ => "other",
+    }
+}
 
-impl SubstitutionAudit for ForwardingAudit {
+/// The outcome of one CONNECT, as the audit chain records it.
+///
+/// Three wire names and a class, none of which is the error's own text. Kept
+/// next to [`refusal_class`] so the two cannot drift apart: adding a
+/// `BridgeError` variant without adding a class here would fall into `_ =>
+/// "other"` and an operator would see every new failure lumped together.
+pub fn outcome_wire_name(result: &ConnectionResult) -> &'static str {
+    match result {
+        ConnectionResult::Completed => "completed",
+        ConnectionResult::Refused(_) => "refused",
+        ConnectionResult::Cancelled(_) => "cancelled",
+    }
+}
+
+/// Records substitutions into the broker's own audit chain.
+///
+/// [`crate::audit::SubstitutionRecorder`] borrows `&mut AuditLog` and is the
+/// right shape for a caller that already holds the log exclusively. The relay
+/// runs on a detached task per tunnel, so this takes the shared handle and
+/// locks **per record** rather than holding the lock across the relay — the
+/// same rule the surrogate registry follows, for the same reason: a lock held
+/// for the length of a tunnel is a lock one slow client holds for everyone.
+pub struct SharedSubstitutionAudit {
+    log: Arc<Mutex<crate::audit::AuditLog>>,
+    ts: u64,
+}
+
+impl SharedSubstitutionAudit {
+    pub fn new(log: Arc<Mutex<crate::audit::AuditLog>>, ts: u64) -> Self {
+        Self { log, ts }
+    }
+}
+
+impl std::fmt::Debug for SharedSubstitutionAudit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedSubstitutionAudit")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SubstitutionAudit for SharedSubstitutionAudit {
     fn record(&mut self, record: SubstitutionRecord) -> Result<(), BridgeError> {
-        // Every field of `SubstitutionRecord` is named here, and the list is
-        // the point: the record is metadata-only by construction, so a log
-        // line built from it cannot carry a credential. A future field that
-        // did would have to be added to this struct literal to be logged at
-        // all, which is the cheapest possible guard against a secret reaching
-        // the log by omission.
         let SubstitutionRecord {
             session,
             destination,
             family,
             outcome,
         } = record;
-        tracing::info!(
-            %session,
-            %destination,
-            %family,
-            %outcome,
-            "credential substitution"
+        // A poisoned chain is a broker fault, and the substitution has already
+        // happened by the time this runs — so the tunnel's outcome is right and
+        // the record is lost. Reported rather than swallowed: an operator who
+        // is told "the audit chain is poisoned" can act, and one who is told
+        // nothing cannot.
+        let mut log = self.log.lock().map_err(|_| {
+            BridgeError::Io("the audit chain is poisoned; the broker must restart".into())
+        })?;
+        log.append(
+            asv_ipc_protocol::AuditEventDto::CredentialSubstituted {
+                session: session.to_string(),
+                destination,
+                family: family.to_string(),
+                outcome: outcome.to_string(),
+            },
+            self.ts,
         );
         Ok(())
     }
 }
 
-/// Turns a listener outcome into an operator-facing line.
+/// Turns a listener outcome into an operator-facing line and an audit record.
 ///
-/// A type rather than a function because the listener takes an
-/// `Arc<dyn ListenerReport>` and the broker installs the chain-backed one. The
-/// string carries the destination and the reason and **nothing from the
-/// request**: the same argument `ConnectionOutcome` makes about the outcome
-/// itself. A refusal message never goes to the client, and it must not go to
-/// the log in a form that undoes the opacity the client saw.
+/// The two carry different things on purpose. The line carries the reason,
+/// because that is the surface an operator reads while something is going
+/// wrong. The record carries only the class, because the chain is the artefact
+/// that is hashed, exported and shipped, and the reason is attacker-controlled
+/// text — see [`refusal_class`].
 pub struct ChainReport {
     inner: Arc<dyn ListenerReport>,
+    log: Arc<Mutex<crate::audit::AuditLog>>,
 }
 
 impl ChainReport {
-    pub fn new(inner: Arc<dyn ListenerReport>) -> Self {
-        Self { inner }
+    pub fn new(inner: Arc<dyn ListenerReport>, log: Arc<Mutex<crate::audit::AuditLog>>) -> Self {
+        Self { inner, log }
     }
 }
 
@@ -347,6 +429,12 @@ impl ListenerReport for ChainReport {
             .as_ref()
             .map(|t| format!("{}:{}", t.authority, t.port))
             .unwrap_or_else(|| "<no destination read>".into());
+        let verdict = outcome_wire_name(&outcome.result);
+        let detail = match &outcome.result {
+            ConnectionResult::Completed => "completed".to_string(),
+            ConnectionResult::Refused(reason) => refusal_class_from_text(reason).to_string(),
+            ConnectionResult::Cancelled(reason) => cancellation_class(*reason).to_string(),
+        };
         match &outcome.result {
             ConnectionResult::Completed => {
                 tracing::info!(%destination, session = ?outcome.session, "CONNECT completed");
@@ -358,6 +446,80 @@ impl ListenerReport for ChainReport {
                 tracing::info!(%destination, session = ?outcome.session, %reason, "CONNECT cancelled");
             }
         }
+
+        // The destination in the *record* is the parsed one, never the raw
+        // request line, and it is absent rather than empty when the client
+        // never said where it was going. `None` is a fact here; `""` would be a
+        // value a reader could mistake for a host.
+        match self.log.lock() {
+            Ok(mut log) => {
+                log.append(
+                    asv_ipc_protocol::AuditEventDto::ConnectHandled {
+                        destination: outcome
+                            .target
+                            .as_ref()
+                            .map(|t| format!("{}:{}", t.authority, t.port))
+                            .unwrap_or_default(),
+                        session: outcome.session.clone(),
+                        outcome: verdict.to_string(),
+                        detail,
+                    },
+                    crate::surrogate::now_secs(),
+                );
+            }
+            Err(_) => {
+                tracing::error!(
+                    "the audit chain is poisoned; a CONNECT outcome was produced and \
+                     not recorded"
+                );
+            }
+        }
         self.inner.record(outcome);
+    }
+}
+
+/// Recover a class from a rendered refusal, for the case where only the string
+/// survived.
+///
+/// `ConnectionResult::Refused` carries a `String` rather than the error, so
+/// the class cannot be recomputed at the far end — the kind is gone. Rather
+/// than widen `ConnectionResult` to carry both (which would change the type
+/// `connect_listener` produces and every test that matches on it), the class
+/// is matched back out of the text by its stable prefix.
+///
+/// This is a compromise and it is recorded as one: the audit chain is written
+/// from the string, so a future `BridgeError` whose `Display` does not begin
+/// with one of these prefixes lands in `"other"`. The prefixes are the error
+/// format strings, which are far more stable than an enum discriminant would
+/// be in a protocol crate.
+fn refusal_class_from_text(reason: &str) -> &'static str {
+    if reason.starts_with("malformed CONNECT request") {
+        "malformed_request"
+    } else if reason.starts_with("destination not allowed") {
+        "destination_not_allowed"
+    } else if reason.starts_with("no session proof") || reason.starts_with("session") {
+        "proof_rejected"
+    } else if reason.starts_with("no leaf") || reason.contains("leaf") {
+        "leaf_unavailable"
+    } else if reason.contains("poisoned") {
+        "broker_fault"
+    } else {
+        "other"
+    }
+}
+
+/// The audit class for a cancellation, by match rather than by text search.
+///
+/// It was a search over `CancelReason`'s `Display` output, and it was already
+/// wrong: a test supplied `"head deadline elapsed"` where the code produces
+/// `"read deadline elapsed"`, and the chain recorded `other` without anyone
+/// noticing. A class derived by searching a human-readable message is a class
+/// that changes when somebody improves the message — and, worse, a class that
+/// is wrong whenever a caller words it differently.
+fn cancellation_class(reason: crate::tls_bridge::CancelReason) -> &'static str {
+    match reason {
+        crate::tls_bridge::CancelReason::Shutdown => "shutdown",
+        crate::tls_bridge::CancelReason::SessionRevoked => "session_revoked",
+        crate::tls_bridge::CancelReason::DeadlineElapsed => "head_deadline",
     }
 }

@@ -444,7 +444,12 @@ fn a_credentialed_operation_is_audited_without_the_credential() {
         "the operation must succeed to be worth auditing: {response:?}"
     );
 
-    let records = fixture.state.audit.query(0);
+    let records = fixture
+        .state
+        .audit
+        .lock()
+        .expect("no test holds this")
+        .query(0);
     assert!(
         !records.is_empty(),
         "a credentialed operation left no audit record, so the claim that the \
@@ -456,6 +461,8 @@ fn a_credentialed_operation_is_audited_without_the_credential() {
     fixture
         .state
         .audit
+        .lock()
+        .expect("no test holds this")
         .verify()
         .expect("the audit chain verifies after a credentialed operation");
 

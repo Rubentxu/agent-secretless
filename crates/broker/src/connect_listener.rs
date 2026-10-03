@@ -187,7 +187,14 @@ pub enum ConnectionResult {
     Refused(String),
     /// Torn down deliberately: broker shutdown, session revoked, or the head
     /// deadline elapsed.
-    Cancelled(String),
+    ///
+    /// The `CancelReason` itself and not its rendering. It was a `String`, and
+    /// the first thing built on top of it had to recover the reason by matching
+    /// on the *text* of a `Display` impl — a class of coupling where changing
+    /// a human-readable message silently changes what the audit chain records.
+    /// The value is `Copy` and compares, so there was never a reason to lose
+    /// it on the way here.
+    Cancelled(CancelReason),
 }
 
 /// Where a listener sends what happened to each connection.
@@ -454,7 +461,7 @@ fn classify(outcome: Result<(), BridgeError>) -> ConnectionResult {
         // and a refused destination are the same event to the client — the
         // tunnel closes either way — and an operator needs to tell them apart,
         // because one is policy working and the other is a client being rude.
-        Err(BridgeError::Cancelled(reason)) => ConnectionResult::Cancelled(reason.to_string()),
+        Err(BridgeError::Cancelled(reason)) => ConnectionResult::Cancelled(reason),
         Err(e) => ConnectionResult::Refused(e.to_string()),
     }
 }

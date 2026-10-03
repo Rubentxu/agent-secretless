@@ -820,6 +820,26 @@ fn print_response(response: &Response) {
                             outcome,
                             ..
                         } => (format!("connect:{destination}"), outcome.clone()),
+                        // The connection, not the credential. Same reasoning as
+                        // the substitution above and the same prefix, so the
+                        // two kinds of proxy record are distinguishable in this
+                        // three-column view by the `detail` that rides in the
+                        // outcome — a refusal names its class there, which is
+                        // what an operator scanning for "what is being refused"
+                        // actually needs and the only place it appears.
+                        asv_ipc_protocol::AuditEventDto::ConnectHandled {
+                            destination,
+                            outcome,
+                            detail,
+                            ..
+                        } => (
+                            if destination.is_empty() {
+                                "connect:<no destination>".to_string()
+                            } else {
+                                format!("connect:{destination}")
+                            },
+                            format!("{outcome}:{detail}"),
+                        ),
                     };
                     println!("{:<6} {:<12} {:<22} {}", r.seq, outcome, method, r.ts);
                 }

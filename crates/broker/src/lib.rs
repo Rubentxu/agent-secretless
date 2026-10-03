@@ -545,7 +545,16 @@ pub struct BrokerState {
     /// R9: tamper-evident log of every handled request. One record per
     /// `handle` call, appended by the public wrapper (not by the inner
     /// dispatcher), so the audit cannot be bypassed by a new variant.
-    pub audit: audit::AuditLog,
+    /// The audit chain, shared with the CONNECT listener.
+    ///
+    /// `Arc<Mutex<…>>` for the same reason the session store and the surrogate
+    /// registry are: a substitution recorded by `relay_substituted` on the
+    /// proxy path and one recorded by the socket path have to land in the same
+    /// chain, because two chains each verify on their own and say nothing about
+    /// what the other did. An operator asking "who spent this credential" would
+    /// otherwise have to check two files, and the answer would be whichever one
+    /// they happened to open.
+    pub audit: Arc<Mutex<audit::AuditLog>>,
     /// The principals enrolled as the human control plane, per ADR-0015.
     ///
     /// Empty by default, and empty is the state every broker on this machine
@@ -585,7 +594,7 @@ impl Default for BrokerState {
             connectors: Box::new(LiveConnectorFactory::default()),
             postgres: PgSessionMap::default(),
             runtime: None,
-            audit: audit::AuditLog::default(),
+            audit: Arc::new(Mutex::new(audit::AuditLog::default())),
             control_plane: admission::Enrolment::empty(),
             vault_writer: None,
             self_report: selfreport::SelfReport::default(),
@@ -621,6 +630,16 @@ impl std::fmt::Debug for BrokerState {
 macro_rules! surrogates {
     ($state:expr) => {
         match $state.surrogates() {
+            Ok(guard) => guard,
+            Err(poisoned) => return Response::from(poisoned),
+        }
+    };
+}
+
+/// The audit chain, under the same discipline as the registry.
+macro_rules! audit_chain {
+    ($state:expr) => {
+        match $state.audit_chain() {
             Ok(guard) => guard,
             Err(poisoned) => return Response::from(poisoned),
         }
@@ -664,7 +683,7 @@ pub fn handle(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request
         outcome,
         posture: "SERVICE_BROKERED".to_string(),
     };
-    let _ = state.audit.append(event, now_secs());
+    let _ = audit_chain!(state).append(event, now_secs());
     response
 }
 
@@ -1211,12 +1230,21 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                     message: format!("audit query refused: {denial}"),
                 };
             }
+            // One acquisition, three reads. `std::sync::Mutex` is not
+            // reentrant: the three `audit_chain!` temporaries a struct
+            // literal would create stay alive until the end of the
+            // expression, so the second `lock()` blocks this thread forever
+            // on a mutex it already holds. The guard is also what makes the
+            // three fields consistent with each other — records, head and
+            // drop count are one snapshot of one chain, not three reads that
+            // could straddle an append.
+            let chain = audit_chain!(state);
             Response::AuditRecords {
-                records: state.audit.query(since_secs),
                 // The chain head and the eviction count ride along so a
                 // verifier can pin the chain and loss is never silent.
-                chain_head: state.audit.head().to_string(),
-                dropped: state.audit.dropped(),
+                records: chain.query(since_secs),
+                chain_head: chain.head().to_string(),
+                dropped: chain.dropped(),
             }
         }
 
@@ -1472,6 +1500,17 @@ impl BrokerState {
         &self,
     ) -> Result<std::sync::MutexGuard<'_, SessionStore>, RegistryPoisoned> {
         self.sessions.lock().map_err(|_| RegistryPoisoned)
+    }
+
+    /// Borrow the audit chain, with the same poisoning rule as the other two.
+    ///
+    /// A chain that cannot be extended is not a chain: an append that silently
+    /// went nowhere would leave a verified log missing exactly the records an
+    /// incident is looking for.
+    pub fn audit_chain(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, audit::AuditLog>, RegistryPoisoned> {
+        self.audit.lock().map_err(|_| RegistryPoisoned)
     }
 
     /// The one policy consultation on the surrogate path, performed at mint
@@ -2294,6 +2333,15 @@ fn sess(state: &BrokerState) -> std::sync::MutexGuard<'_, SessionStore> {
         .expect("the test poisoned its own session store")
 }
 
+/// The audit chain, for a test. `unwrap`, for the reason `reg` gives.
+#[cfg(test)]
+fn aud(state: &BrokerState) -> std::sync::MutexGuard<'_, audit::AuditLog> {
+    state
+        .audit
+        .lock()
+        .expect("the test poisoned its own audit chain")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2470,11 +2518,11 @@ mod tests {
                 session: AgentSessionId::new(),
             },
         );
-        let records = state.audit.query(0);
+        let records = aud(&state).query(0);
         assert_eq!(records.len(), 3, "one record per handle call");
         assert_eq!(records[0].seq, 0);
         assert_eq!(records[2].seq, 2);
-        assert_eq!(state.audit.verify(), Ok(()));
+        assert_eq!(aud(&state).verify(), Ok(()));
         // Outcome classification: the EndSession on an unknown session is an
         // error and must be audited as such, not as ok.
         match &records[2].event {
@@ -2503,7 +2551,7 @@ mod tests {
             other => panic!("audit query must never succeed for an agent peer: {other:?}"),
         }
         // And the probe itself was recorded: the refused attempt is evidence.
-        assert_eq!(state.audit.query(0).len(), 1);
+        assert_eq!(aud(&state).query(0).len(), 1);
     }
 
     /// The other half of the audit-query contract: an *admitted* control-plane
@@ -2552,7 +2600,7 @@ mod tests {
         // The dispatcher recorded the read itself AFTER the handler queried,
         // so the log now carries it — and the chain still verifies with the
         // read's own event inside.
-        let after = state.audit.query(0);
+        let after = aud(&state).query(0);
         let read_audited = after.iter().any(|r| match &r.event {
             asv_ipc_protocol::AuditEventDto::RequestHandled { method, .. } => {
                 method == "audit_query"
@@ -2560,7 +2608,7 @@ mod tests {
             other => panic!("unexpected audit variant: {other:?}"),
         });
         assert!(read_audited, "the read itself must be audited: {after:?}");
-        assert_eq!(state.audit.verify(), Ok(()));
+        assert_eq!(aud(&state).verify(), Ok(()));
     }
 
     #[test]
@@ -2574,7 +2622,7 @@ mod tests {
                 workspace: CANARY.to_string(),
             },
         );
-        for r in state.audit.query(0) {
+        for r in aud(&state).query(0) {
             let serialized = serde_json::to_string(&r).expect("dto serializes");
             assert!(!serialized.contains(CANARY), "canary leaked into audit");
         }
@@ -3126,7 +3174,7 @@ mod tests {
 
         // And the attempt itself is auditable: an agent probing this verb is
         // exactly the event an operator needs to see.
-        let records = state.audit.query(0);
+        let records = aud(&state).query(0);
         assert_eq!(records.len(), 2, "both refusals are recorded");
         for record in &records {
             match &record.event {

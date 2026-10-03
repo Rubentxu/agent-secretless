@@ -30,7 +30,8 @@ use asv_broker::connect_listener::{
     ListenerConfig, ListenerReport, ShutdownSignal,
 };
 use asv_broker::tls_bridge::{
-    AuthorityEndpoint, BridgeError, EstablishedTunnel, LeafError, LeafSource, VerifiedLeaf,
+    AuthorityEndpoint, BridgeError, CancelReason, EstablishedTunnel, LeafError, LeafSource,
+    VerifiedLeaf,
 };
 use asv_domain::Authority;
 use tokio::io::AsyncWriteExt;
@@ -168,10 +169,16 @@ async fn a_client_that_says_nothing_is_dropped_by_the_head_deadline() {
         .wait_for(1, Duration::from_secs(10))
         .expect("the listener must report the silent client");
     let o = &outcomes[0];
-    assert!(
-        matches!(o.result, ConnectionResult::Cancelled(ref r) if r.contains("deadline")),
-        "a silent client must be cancelled by the head deadline, got {:?}",
-        o.result
+    // Matched on the enum, not on its text. It was `Cancelled(String)` and this
+    // assertion searched the string for "deadline", which meant the test broke
+    // silently the first time somebody reworded the `Display` impl — and the
+    // reason it is worth changing is that the audit chain now classifies a
+    // cancellation by match, so a text-based test and a match-based record
+    // would have drifted into disagreeing about the same event.
+    assert_eq!(
+        o.result,
+        ConnectionResult::Cancelled(CancelReason::DeadlineElapsed),
+        "a silent client must be cancelled by the head deadline"
     );
     // No session was ever proven, and the outcome must not invent one.
     assert!(

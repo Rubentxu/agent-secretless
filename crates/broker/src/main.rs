@@ -322,12 +322,18 @@ fn main() -> std::io::Result<()> {
             );
             std::process::exit(1);
         });
-        tracing::info!(path = %path.display(), restored = log.query(0).len(), dropped = log.dropped(), "durable audit log opened");
-        state.audit = log;
+        let restored = log.query(0).len();
+        let dropped = log.dropped();
+        // Wrapped once, here, and handed to every path that appends: the
+        // socket loop, and — when it is on — the CONNECT listener. One chain,
+        // because two chains each verify on their own and an operator asking
+        // "who spent this credential" would have to check both.
+        state.audit = Arc::new(std::sync::Mutex::new(log));
+        tracing::info!(path = %path.display(), restored, dropped, "durable audit log opened");
     } else if let Some(max) = audit_max_records {
         // Operator-configured retention (R9). 0 = unbounded. Logged so the
         // launch contract is visible in the broker's own output.
-        state.audit = asv_broker::audit::AuditLog::new(max);
+        state.audit = Arc::new(std::sync::Mutex::new(asv_broker::audit::AuditLog::new(max)));
         tracing::info!(max_records = max, "audit retention configured");
     }
 
@@ -472,6 +478,7 @@ fn main() -> std::io::Result<()> {
         let handler = Arc::new(asv_broker::connect_runtime::SubstitutingHandler::new(
             Arc::clone(&state.surrogates),
             secrets,
+            Arc::clone(&state.audit),
             asv_domain::OperationFamily::GitHub,
             "github",
         ));
@@ -508,17 +515,15 @@ fn main() -> std::io::Result<()> {
         });
         tracing::info!(%bind, "CONNECT listener bound");
 
-        runtime_guard.spawn(async move {
-            connect_listener
-                .run(
-                    tcp,
-                    handler,
-                    Arc::new(asv_broker::connect_runtime::ChainReport::new(Arc::new(
-                        asv_broker::connect_listener::DiscardReport,
-                    ))),
-                )
-                .await;
-        });
+        // Cloned before the spawn because the task outlives this scope: moving
+        // `state.audit` in would take a field out of a `BrokerState` the socket
+        // loop is still using for the rest of the process's life.
+        let audit_for_listener = Arc::clone(&state.audit);
+        let report = Arc::new(asv_broker::connect_runtime::ChainReport::new(
+            Arc::new(asv_broker::connect_listener::DiscardReport),
+            audit_for_listener,
+        ));
+        runtime_guard.spawn(async move { connect_listener.run(tcp, handler, report).await });
     }
 
     for incoming in listener.incoming() {

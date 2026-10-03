@@ -525,7 +525,7 @@ fn a_create_is_audited_without_its_secret() {
         create_request(CredentialKind::BearerToken),
     );
 
-    let records = b.state.audit.query(0);
+    let records = b.state.audit.lock().expect("no test holds this").query(0);
     assert!(
         records
             .iter()
