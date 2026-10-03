@@ -316,18 +316,29 @@ impl ConnectionHandler for SubstitutingHandler {
         let mut audit =
             SharedSubstitutionAudit::new(Arc::clone(&self.audit), crate::surrogate::now_secs());
         let mut port = SubstitutionPort::new(
-            self.surrogates.as_ref(),
-            self.secrets.as_ref(),
+            Arc::clone(&self.surrogates)
+                as Arc<dyn crate::surrogate::SurrogateLending + Send + Sync>,
+            Arc::clone(&self.secrets) as Arc<dyn asv_connector_http::SecretPort + Send + Sync>,
             family,
             family_name,
         );
         let outcome = tunnel.relay_substituted(&mut port, &mut audit, self.limits)?;
+        // `requests` is here because a relay that carried one request and a relay
+        // that carried four thousand used to produce the same operator line, and
+        // the difference between them is the difference between a working
+        // keep-alive relay and a client reconnecting four thousand times.
+        //
+        // `request_budget_spent` is the other half: a connection that ended on a
+        // cap is not a client that finished, and an operator watching connections
+        // change needs to know which of the two they are looking at.
         tracing::info!(
             session = %tunnel.session,
             destination = %tunnel.target.authority,
             port = tunnel.target.port,
             forwarded = outcome.forwarded,
             returned = outcome.returned,
+            requests = outcome.requests,
+            request_budget_spent = outcome.request_budget_spent,
             "CONNECT tunnel relayed"
         );
         Ok(())
@@ -366,6 +377,10 @@ pub fn refusal_class(error: &BridgeError) -> &'static str {
         // destination was recorded as a class an operator could not act on.
         // Writing the arm down is cheaper than the incident that finds it.
         BridgeError::Upstream(_) => "upstream_unreachable",
+        // A budget that ran out mid-message. Its own class because the
+        // alternative was `other`, which is the class an operator cannot act on
+        // — and the thing to act on here is a number, not a socket.
+        BridgeError::Limit { .. } => "relay_limit",
     }
 }
 

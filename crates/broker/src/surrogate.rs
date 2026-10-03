@@ -415,15 +415,15 @@ impl SurrogateLending for std::sync::Mutex<SurrogateRegistry> {
 ///
 /// The registry is behind a `&dyn` rather than a borrow — see
 /// [`SurrogateLending`] for the measurement that forced it.
-pub struct SubstitutionPort<'a> {
-    registry: &'a dyn SurrogateLending,
+pub struct SubstitutionPort {
+    registry: std::sync::Arc<dyn SurrogateLending + Send + Sync>,
     /// Where the credential bytes come from.
     ///
     /// A `&dyn SecretPort` and not the vault: the registry already refuses to
     /// store a secret, and this type is the same kind of boundary. The
     /// secret is only ever materialised inside `lend`, straight into the
     /// bridge's sink.
-    credential_port: &'a dyn asv_connector_http::SecretPort,
+    credential_port: std::sync::Arc<dyn asv_connector_http::SecretPort + Send + Sync>,
     /// The family this port spends on.
     ///
     /// A constant of the deployment, never taken from the request: it is
@@ -433,31 +433,50 @@ pub struct SubstitutionPort<'a> {
     family: OperationFamily,
     /// The wire name recorded in the audit record for that family.
     ///
-    /// Borrowed rather than `&'static str` (C2.6): the name now comes from the
-    /// route that authorized this tunnel, and a route is an operator's runtime
+    /// Owned rather than borrowed (C2.6 fixed the name's origin; C2.8 made it a
+    /// `String` so this type has no lifetime). It comes from the route that
+    /// authorized this tunnel, and a route is an operator's runtime
     /// configuration, so it cannot be a compile-time constant. It is still not
     /// taken from the request — only from a table the policy already approved,
     /// which is the property the previous `&'static str` was protecting.
-    family_name: &'a str,
+    family_name: String,
 }
 
-impl<'a> SubstitutionPort<'a> {
+impl SubstitutionPort {
+    /// Takes owned handles, so the port has no lifetime and a relay on a thread
+    /// can own one.
+    ///
+    /// **This is the second time this type's shape has been decided by a defect
+    /// it made expressible, and the fix is the same both times: take the thing
+    /// by `Arc` instead of by reference.** The first version lent
+    /// `&'a mut SurrogateRegistry`, so the `MutexGuard` lived as long as the
+    /// borrow and the lock was held for the whole relay — one established and
+    /// idle tunnel was enough to freeze `EndSession` for every peer in the
+    /// broker. The replacement took `&'a dyn SurrogateLending` and fixed the
+    /// lock, but kept a lifetime, and a lifetime on a thing a background thread
+    /// has to own is a lifetime nothing can satisfy. The test for a multi-request
+    /// relay needs a relay running while a client speaks to it, which is two
+    /// threads, and that is what found the remaining lifetime.
+    ///
+    /// The call sites already hold `Arc`s — `connect_runtime` keeps both — so
+    /// this costs a refcount, and the type it produces is one that cannot be
+    /// tied to a scope it has no business outliving.
     pub fn new(
-        registry: &'a dyn SurrogateLending,
-        credential_port: &'a dyn asv_connector_http::SecretPort,
+        registry: std::sync::Arc<dyn SurrogateLending + Send + Sync>,
+        credential_port: std::sync::Arc<dyn asv_connector_http::SecretPort + Send + Sync>,
         family: OperationFamily,
-        family_name: &'a str,
+        family_name: &str,
     ) -> Self {
         Self {
             registry,
             credential_port,
             family,
-            family_name,
+            family_name: family_name.to_owned(),
         }
     }
 }
 
-impl crate::tls_bridge::CredentialSubstituter for SubstitutionPort<'_> {
+impl crate::tls_bridge::CredentialSubstituter for SubstitutionPort {
     fn substitute(
         &mut self,
         surrogate: &str,
@@ -486,8 +505,12 @@ impl crate::tls_bridge::CredentialSubstituter for SubstitutionPort<'_> {
                 ),
             })?;
 
-        asv_connector_http::SecretPort::lend(self.credential_port, &credential.to_wire(), sink)
-            .map_err(|e| SubstitutionError::Lend(e.to_string()))?;
+        asv_connector_http::SecretPort::lend(
+            self.credential_port.as_ref(),
+            &credential.to_wire(),
+            sink,
+        )
+        .map_err(|e| SubstitutionError::Lend(e.to_string()))?;
 
         Ok(Substituted {
             family: self.family_name.to_owned(),

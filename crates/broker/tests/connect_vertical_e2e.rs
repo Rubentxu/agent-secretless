@@ -1053,39 +1053,44 @@ fn asv_run_curl_reaches_the_origin_with_the_real_credential_and_nobody_else() {
     let _ = f.credential_id;
 }
 
-/// The tunnel serves one request, and the protocol allows more.
+/// One tunnel carries every request the client makes, and the destination
+/// receives the real credential on each of them.
 ///
-/// **This is a characterization, not a claim.** It records the measured
-/// behaviour of a gap that V1-C2 names in its own scope — "more than one
-/// request per tunnel where the protocol allows" — and that is not closed.
-///
-/// The measurement, against the real broker with a real origin that keeps the
-/// connection open:
+/// **This was a characterization and is now a claim, because the loop landed.**
+/// Before, against this same real broker with a real origin that holds the
+/// connection open, the measurement was:
 ///
 /// ```text
 /// CONN=1 CODE=200      the first request, on one connection
 /// CONN=0 CODE=000      the second request, curl reusing that same connection
 /// ```
 ///
-/// `CONN=0` is the load-bearing half. `curl` did not open a second connection;
-/// it reused the tunnel, and got nothing back. So the second request is not
-/// failing because the origin refused it — the origin never saw it.
+/// `CONN=0` was the load-bearing half: curl did not open a second connection, it
+/// reused the tunnel and got nothing back, so the second request never reached
+/// the destination. The cause was in `relay_substituted` — it read one head,
+/// wrote the rewritten one, and then copied the response direction until EOF, so
+/// the request direction was never pumped again. That is now
 ///
-/// The cause is in `relay_substituted`: it reads one head, writes the rewritten
-/// one, and then `relay_back` copies the response direction until EOF or a byte
-/// limit. The request direction is never pumped again, so the second request
-/// sits in a socket buffer that nobody reads. Every real HTTP/1.1 client
-/// reuses its connection, so this is the shape of ordinary traffic and not an
-/// edge case.
+/// ```text
+/// CONN=1 CODE=200
+/// CONN=0 CODE=200
+/// ```
 ///
-/// What still holds, and is asserted here, is the part that would be a security
-/// problem if it did not: the destination never received a second request, so
-/// it never received a second copy of the credential, and nothing forwarded a
-/// surrogate it could not use. The gap is availability and opacity, not
-/// disclosure. That is worth knowing precisely, because "the second request
-/// fails" and "the second request leaks something" call for different work.
+/// and this test asserts it, because a characterization that only fails is not
+/// evidence of anything. Its own message said what to do when it went green:
+/// rewrite both the assertion and the comment. This is both.
+///
+/// What changed the behaviour is not the loop on its own — it is a loop that
+/// frames every message it relays. `Content-Length: 0` occurrences in the relay
+/// was the measurement that named the missing piece: a request head, a body, and
+/// a second request head on one connection cannot be told apart by scanning for
+/// `\r\n\r\n`, because a body may contain the terminator itself, and a relay
+/// that scans for it substitutes a credential into the middle of somebody's form
+/// post. So each head is parsed for its framing, each body is relayed by the
+/// framing the head declared, and the next head is read only where the previous
+/// message ended.
 #[test]
-fn a_tunnel_serves_one_request_and_the_protocol_allows_more() {
+fn one_tunnel_carries_every_request_and_the_destination_sees_the_credential_on_each() {
     let f = Fixture::new_serving("pipelined", 2);
 
     // One `-H`, two URLs: curl applies it to both and reuses the connection,
@@ -1093,10 +1098,10 @@ fn a_tunnel_serves_one_request_and_the_protocol_allows_more() {
     // header twice on every request, and the destination would see two.
     let variable = f.surrogate_env_name();
     let script = format!(
-        "curl -sS -k --max-time 20 -o /dev/null \\
-           -w 'CONN=%{{num_connects}} CODE=%{{http_code}}\\n' \\
-           -H \"Authorization: Bearer ${{{variable}}}\" \\
-           https://{FIXTURE_HOST}:{port}/first \\
+        "curl -sS -k --max-time 20 -o /dev/null \
+           -w 'CONN=%{{num_connects}} CODE=%{{http_code}}\n' \
+           -H \"Authorization: Bearer ${{{variable}}}\" \
+           https://{FIXTURE_HOST}:{port}/first \
            https://{FIXTURE_HOST}:{port}/second",
         port = f.origin.port
     );
@@ -1112,37 +1117,37 @@ fn a_tunnel_serves_one_request_and_the_protocol_allows_more() {
     let stdout = String::from_utf8_lossy(&child.stdout);
     let stderr = String::from_utf8_lossy(&child.stderr);
 
-    // The first request works, on one connection. Without this the rest of the
-    // test would be measuring a broken setup.
-    assert!(
-        stdout.contains("CONN=1 CODE=200"),
-        "the first request did not complete on one connection: {stdout}\n{stderr}"
-    );
-
-    // The measured limit, asserted rather than merely described. If this ever
-    // goes green the gap is closed and the comment above is wrong, which is the
-    // signal to rewrite both.
-    let served = stdout.matches("CODE=200").count();
-    assert_eq!(
-        served, 1,
-        "the tunnel served {served} requests where it is documented to serve one; if \
-         this ever goes green the limit above is stale and both need rewriting: \
-         {stdout}\n{stderr}"
-    );
+    // The connection was reused. Without this the rest of the test would be
+    // measuring a client that quietly opened a second tunnel, which is the easy
+    // way for this property to be satisfied without the loop existing.
     assert!(
         stdout.contains("CONN=0"),
         "curl opened a second connection instead of reusing the tunnel, so this \
          measurement is about something else: {stdout}\n{stderr}"
     );
 
-    // The part that must not move. If the broker ever starts forwarding a
-    // second request without rewriting it, the destination receives a surrogate
-    // it cannot spend, and this assertion is what would notice.
+    // And both requests were served on it. The number is asserted rather than
+    // described: a loop that carried the first request and dropped the second
+    // would satisfy every other assertion in this test.
+    let served = stdout.matches("CODE=200").count();
+    assert_eq!(
+        served, 2,
+        "one tunnel served {served} of the two requests curl made on it: \
+         {stdout}\n{stderr}"
+    );
+
+    // **The re-substitution, which is the part that is a security property and
+    // not an availability one.** The destination has to receive the *real*
+    // credential once per request: one credential for the first request and a
+    // stale, already-spent surrogate for the second would be a tunnel that looks
+    // like it works and quietly fails at the provider.
     let seen = f.origin.saw();
+    f.origin.wait_for_requests(2);
     assert_eq!(
         f.origin.real_credential_requests(),
-        1,
-        "the destination received the credential more than once: \n{seen}"
+        2,
+        "the destination did not receive the credential on both requests, so at \
+         least one was forwarded with something else in the header: \n{seen}"
     );
     assert!(
         !seen.contains(&f.surrogate_env_name()),

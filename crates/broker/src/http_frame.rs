@@ -89,8 +89,43 @@ pub struct Head {
     /// connection that is about to close. A relay that conflated them would stop
     /// reusing connections that are perfectly reusable.
     pub close_after: bool,
+    /// The response's status code, or `None` for a request head.
+    ///
+    /// Carried on the parsed head rather than re-read from the bytes at the call
+    /// site, for the same reason the framing is: the loop that relays these
+    /// messages must not hold a *second* opinion about what a head says. A relay
+    /// that parsed the status once to frame the body and again to decide whether
+    /// to keep reading is a relay with two parsers, and two parsers is the whole
+    /// class of defect this module was written to remove.
+    ///
+    /// Needed for exactly two decisions, both of which a byte count cannot make:
+    /// a `1xx` carries no body and is not the end of the exchange, and a `101`
+    /// is not an HTTP message at all.
+    pub status: Option<u16>,
     /// Bytes this head occupies, terminator included. The body starts here.
     pub len: usize,
+}
+
+/// Which of a message's two bounds was crossed.
+///
+/// A type rather than a `&'static str` in the variant, so that adding a third
+/// bound is a compile error at the match rather than another string somebody has
+/// to remember to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subject {
+    /// The head, and the limit that stops it being accumulated in memory.
+    Head,
+    /// The body, and the limit that stops one message being unbounded.
+    Body,
+}
+
+impl fmt::Display for Subject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Subject::Head => f.write_str("request head"),
+            Subject::Body => f.write_str("request body"),
+        }
+    }
 }
 
 /// Why a head could not be framed.
@@ -101,12 +136,20 @@ pub struct Head {
 /// tolerating them quietly is what the two-parsers disagreement is made of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameError {
-    /// The head is longer than this relay accepts.
+    /// A message is longer than this relay accepts.
     ///
     /// A bound rather than a trust decision, and it exists because the head is
     /// accumulated in memory while it is read. The broker refuses rather than
     /// truncates: a truncated head is a head whose framing this side guessed.
-    TooLarge { limit: usize },
+    ///
+    /// **`subject` is not decoration.** One variant covers two limits that are
+    /// different numbers answering different questions — how long a head may be,
+    /// and how long a body may be — and the message used to name the head for
+    /// both. A body over the limit was therefore reported as "the request head
+    /// exceeds the limit", and an operator reading that goes to look at head
+    /// sizes. The relay's own test caught it by asserting on the *reason* rather
+    /// than on the failure.
+    TooLarge { limit: usize, subject: Subject },
 
     /// The bytes before the terminator are not a head this parser understands.
     Malformed { detail: &'static str },
@@ -129,8 +172,8 @@ pub enum FrameError {
 impl fmt::Display for FrameError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FrameError::TooLarge { limit } => {
-                write!(f, "the request head exceeds the {limit}-byte limit")
+            FrameError::TooLarge { limit, subject } => {
+                write!(f, "the {subject} exceeds the {limit}-byte limit")
             }
             FrameError::Malformed { detail } => write!(f, "malformed HTTP head: {detail}"),
             FrameError::Ambiguous { detail } => write!(f, "ambiguous HTTP framing: {detail}"),
@@ -155,14 +198,20 @@ pub fn find_head_end(buf: &[u8], max: usize) -> Result<Option<usize>, FrameError
         Some(at) => {
             let len = at + HEAD_END.len();
             if len > max {
-                return Err(FrameError::TooLarge { limit: max });
+                return Err(FrameError::TooLarge {
+                    limit: max,
+                    subject: Subject::Head,
+                });
             }
             Ok(Some(len))
         }
         // Checked before returning "not yet", because a head that has not
         // arrived yet and a head that will never be acceptable are different
         // answers and the caller keeps buffering on the first one.
-        None if buf.len() > max => Err(FrameError::TooLarge { limit: max }),
+        None if buf.len() > max => Err(FrameError::TooLarge {
+            limit: max,
+            subject: Subject::Head,
+        }),
         None => Ok(None),
     }
 }
@@ -207,6 +256,7 @@ pub fn parse_request_head(head: &[u8], max_body: u64) -> Result<Head, FrameError
                 if n > max_body {
                     return Err(FrameError::TooLarge {
                         limit: max_body as usize,
+                        subject: Subject::Body,
                     });
                 }
                 Framing::Length(n)
@@ -222,6 +272,7 @@ pub fn parse_request_head(head: &[u8], max_body: u64) -> Result<Head, FrameError
     Ok(Head {
         framing,
         close_after: fields.is_close(),
+        status: None,
         len: head.len(),
     })
 }
@@ -245,6 +296,7 @@ pub fn parse_response_head(head: &[u8], max_body: u64) -> Result<Head, FrameErro
         return Ok(Head {
             framing: Framing::None,
             close_after: fields.is_close(),
+            status: Some(status),
             len: head.len(),
         });
     }
@@ -267,6 +319,7 @@ pub fn parse_response_head(head: &[u8], max_body: u64) -> Result<Head, FrameErro
                 if n > max_body {
                     return Err(FrameError::TooLarge {
                         limit: max_body as usize,
+                        subject: Subject::Body,
                     });
                 }
                 Framing::Length(n)
@@ -283,8 +336,47 @@ pub fn parse_response_head(head: &[u8], max_body: u64) -> Result<Head, FrameErro
     Ok(Head {
         framing,
         close_after: fields.is_close(),
+        status: Some(status),
         len: head.len(),
     })
+}
+
+/// Whether a request head asks for the body to wait for the origin's go-ahead.
+///
+/// `Expect: 100-continue` inverts the ordinary order: the client sends the head,
+/// stops, and does not send the body until the origin answers. A relay that
+/// forwards the head and then reads the body waits for bytes the client is
+/// deliberately withholding, while the origin waits for a body that never
+/// arrives. Nothing times out and nothing is refused — the tunnel simply hangs,
+/// which is the worst of the available outcomes because it looks like a slow
+/// server.
+///
+/// The answer is to *notice*, not to solve it here. Whether the origin accepts,
+/// declines, or never answers is a conversation between the client and the
+/// origin, and a relay that has to hold both directions open to take part in it
+/// is a relay that is no longer a sequential pump. The caller refuses.
+pub fn request_expects_continue(head: &[u8]) -> bool {
+    Fields::of(head, true)
+        .map(|fields| {
+            fields
+                .values("expect")
+                .into_iter()
+                .filter_map(|v| std::str::from_utf8(v).ok())
+                .any(|v| v.trim().eq_ignore_ascii_case("100-continue"))
+        })
+        .unwrap_or(false)
+}
+
+/// Whether a request head asks to switch the connection to another protocol.
+///
+/// A `101` or a `CONNECT`-style upgrade turns the tunnel into a full-duplex byte
+/// pipe for a protocol this relay does not frame and will not claim to. The same
+/// reasoning as [`request_expects_continue`]: notice, and let the caller refuse
+/// rather than half-participate.
+pub fn request_declares_upgrade(head: &[u8]) -> bool {
+    Fields::of(head, true)
+        .map(|fields| fields.has("upgrade"))
+        .unwrap_or(false)
 }
 
 /// A head split into its start line and its headers, with the header lookups the
@@ -545,7 +637,10 @@ mod tests {
         let endless = vec![b'a'; 64];
         assert_eq!(
             find_head_end(&endless, 32),
-            Err(FrameError::TooLarge { limit: 32 })
+            Err(FrameError::TooLarge {
+                limit: 32,
+                subject: Subject::Head,
+            })
         );
     }
 
@@ -563,7 +658,10 @@ mod tests {
         oversized.extend_from_slice(b"\r\n\r\n");
         assert_eq!(
             find_head_end(&oversized, 32),
-            Err(FrameError::TooLarge { limit: 32 })
+            Err(FrameError::TooLarge {
+                limit: 32,
+                subject: Subject::Head,
+            })
         );
     }
 
@@ -776,9 +874,47 @@ mod tests {
     fn a_body_larger_than_the_budget_is_refused_at_the_head() {
         // Refused before a byte is forwarded, not after the relay has already
         // moved the client's claim to the destination.
+        //
+        // **And the subject is `Body`, which is the half this test now pins.**
+        // It used to assert a message that named the head, and the message was
+        // wrong: the head is 60-odd bytes and perfectly within any bound. A body
+        // over the limit reported as an over-long head sends an operator to look
+        // at the wrong number.
         assert_eq!(
             parse_response_head(b"HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n", 1024),
-            Err(FrameError::TooLarge { limit: 1024 })
+            Err(FrameError::TooLarge {
+                limit: 1024,
+                subject: Subject::Body,
+            })
+        );
+    }
+
+    /// The distinction itself, in one place.
+    ///
+    /// The head bound and the body bound are enforced in different functions —
+    /// `find_head_end` while the head is being accumulated, the parsers once it
+    /// is whole — and they used to share one message. A test that asserted each in
+    /// isolation could not tell that they had been confused for one another; this
+    /// one puts them side by side, and the point is that they do not match.
+    #[test]
+    fn the_head_bound_and_the_body_bound_are_reported_differently() {
+        let over_long_head = vec![b'x'; 2048];
+        assert_eq!(
+            find_head_end(&over_long_head, 1024),
+            Err(FrameError::TooLarge {
+                limit: 1024,
+                subject: Subject::Head,
+            }),
+            "an unterminated head over the bound is a head problem"
+        );
+        assert_eq!(
+            parse_response_head(b"HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n", 1024),
+            Err(FrameError::TooLarge {
+                limit: 1024,
+                subject: Subject::Body,
+            }),
+            "a declared length over the bound is a body problem, and it is the \
+             message an operator reads to know which number to go and look at"
         );
     }
 
@@ -850,5 +986,94 @@ mod tests {
         // it would be the one out of step.
         let head = request("POST /x HTTP/1.1\r\nContent-Length:   7  \r\n\r\n").expect("framed");
         assert_eq!(head.framing, Framing::Length(7));
+    }
+
+    // --- what the relay has to notice beyond framing ------------------------
+
+    /// The status is carried on the parsed head so the relay never has a second
+    /// opinion about the bytes it is relaying.
+    #[test]
+    fn the_status_is_carried_by_the_head_that_was_framed() {
+        assert_eq!(
+            response("HTTP/1.1 204 No Content\r\n\r\n")
+                .expect("framed")
+                .status,
+            Some(204)
+        );
+        assert_eq!(
+            response("HTTP/1.1 100 Continue\r\n\r\n")
+                .expect("framed")
+                .status,
+            Some(100)
+        );
+        // A request has no status, and saying so is what stops a caller from
+        // reading `Some(...)` off a request and believing an origin answered.
+        assert_eq!(
+            request("GET /x HTTP/1.1\r\nHost: a.test\r\n\r\n")
+                .expect("framed")
+                .status,
+            None
+        );
+    }
+
+    /// A `1xx` is not the end of the exchange. A relay that stopped reading on
+    /// one would answer a client's `Expect: 100-continue` — and every other
+    /// interim response — with a closed tunnel.
+    #[test]
+    fn an_interim_response_is_framed_as_a_head_with_no_body() {
+        for status in [100u16, 102, 103] {
+            let head = response(&format!("HTTP/1.1 {status} Interim\r\n\r\n")).expect("framed");
+            assert_eq!(head.framing, Framing::None, "status {status}");
+            assert_eq!(head.status, Some(status));
+        }
+    }
+
+    /// The two shapes a sequential pump cannot be transparent to, detected.
+    ///
+    /// The control matters: a detector that never fires is indistinguishable
+    /// from a detector that does not work, so the negative is asserted first and
+    /// the positive is asserted against a head that differs only in the one
+    /// header being looked for.
+    #[test]
+    fn a_plain_request_declares_neither_continue_nor_upgrade() {
+        let head = b"GET /x HTTP/1.1\r\nHost: a.test\r\nConnection: keep-alive\r\n\r\n";
+        assert!(!request_expects_continue(head));
+        assert!(!request_declares_upgrade(head));
+    }
+
+    #[test]
+    fn a_request_that_expects_continue_says_so() {
+        let head = b"POST /x HTTP/1.1\r\nHost: a.test\r\nContent-Length: 4\r\n\
+                    Expect: 100-continue\r\n\r\n";
+        assert!(request_expects_continue(head));
+        // And it is still framed, because the caller needs to know both things.
+        let parsed = parse_request_head(head, 1024).expect("framed");
+        assert_eq!(parsed.framing, Framing::Length(4));
+        assert!(!request_declares_upgrade(head));
+    }
+
+    /// Case-insensitive, because a header name that is matched case-sensitively
+    /// is a detector that fires on `expect` and not on `Expect`, which is the
+    /// failure mode of every hand-written lookup in this codebase so far.
+    #[test]
+    fn the_declarations_are_found_whatever_their_spelling() {
+        let lower = b"POST /x HTTP/1.1\r\nexpect: 100-CONTINUE\r\ncontent-length: 0\r\n\r\n";
+        assert!(request_expects_continue(lower));
+        let upgrade = b"GET /x HTTP/1.1\r\nUPGRADE: websocket\r\n\r\n";
+        assert!(request_declares_upgrade(upgrade));
+    }
+
+    /// A head this parser refused entirely is not a head that declares anything.
+    ///
+    /// The control for both detectors above: a detector that answered `true` for
+    /// input the framing parser has already rejected would have the relay refuse
+    /// a request for the wrong stated reason.
+    #[test]
+    fn a_refused_head_declares_nothing() {
+        let refused =
+            b"POST /x HTTP/1.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert!(parse_request_head(refused, 1024).is_err());
+        assert!(!request_expects_continue(refused));
+        assert!(!request_declares_upgrade(refused));
     }
 }

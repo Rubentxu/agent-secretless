@@ -2228,13 +2228,97 @@ keep-alive round trip makes revocation *faster* than today's 250 ms and costs
 CPU proportional to the number of idle tunnels open. Both numbers are
 decisions, and neither should be a default nobody wrote down.
 
-**Still owed in this block.** More than one request per tunnel where the
-protocol allows — the characterisation above stands and is not yet a fix. Stress
-and cancellation under load beyond the anti-replay property already measured.
-The observability sweep, which is the part most likely to be wrong in a way
-nobody is looking for. And **the broker has no ordered shutdown at all**:
-`main.rs` installs no signal handling, so tunnels dying when the process stops is
-carried entirely by the process dying. That is a real guarantee from the
+**And the multi-request relay is measured working, end to end, with the real
+binaries.** Not a unit test and not a harness: a real `asv-brokerd` with a real
+vault, route and policy file, a real `asv run` opening a real session, a real shim,
+a real `curl` told nothing but a proxy URL, and a real origin on a real socket.
+Before, on one tunnel:
+
+```text
+CONN=1 CODE=200      the first request, on one connection
+CONN=0 CODE=000      the second request, curl reusing that same connection
+```
+
+`CONN=0` was the load-bearing half — curl did not open a second connection, it
+reused the tunnel and got nothing back, so the second request never reached the
+destination. After:
+
+```text
+CONN=1 CODE=200
+CONN=0 CODE=200
+```
+
+and the destination receives the **real credential on both requests**, which is
+the half that is a security property rather than an availability one. One
+credential for the first and a stale surrogate for the second would be a tunnel
+that looks like it works and quietly fails at the provider. The characterisation
+became a claim, and its own message said what to do when it went green: rewrite
+both the assertion and the comment.
+
+**The loop is sequential, and that is the design decision worth writing down.**
+One request in flight at a time: head, frame, substitute, forward, relay the
+body, then read the response. Every real HTTP/1.1 client waits for response *n*
+before sending request *n+1*, so the shape costs nothing — and it removes the
+duplex deadlock outright instead of papering over it with a second thread and a
+poll interval, which is what the previous note here worried about. Both directions
+are cancellable at every read, and a revocation reaches a tunnel that is *inside*
+the loop rather than only one waiting for its first head.
+
+**Three things a sequential pump refuses rather than half-serves**, each one a
+case where the ordinary order would hang rather than fail — both peers waiting,
+nothing timing out, and a log with nothing in it: a request carrying
+`Expect: 100-continue`, which withholds its body until the origin answers; a
+request carrying `Upgrade`; and a `101` from the origin. All three are detected in
+`http_frame`, refused before a byte reaches the origin, and reported as
+`relay_limit` with the reason attached. The client reconnects, which is what an
+HTTP client does anyway.
+
+**A chunked body is relayed byte for byte, framing included.** That is what makes
+it safe to have in the credential path: the client parses the *origin's* framing
+and the relay expresses no opinion about the body beyond where it ends. Where a
+size line is a plain hexadecimal number the relay agrees; where a second parser
+could read it differently — `+1a`, `0x1a`, a list, a sign — it is refused.
+
+**And four defects the measurement found in the new code itself**, which is the
+usual shape of this block and the reason it is worth the increments:
+
+1. `relay_chunked` **read the CRLF that terminates each chunk and dropped it.**
+   26 bytes counted against 22 written, the missing four being the two CRLFs after
+   the chunk data. A client parsing that would have found the next chunk's size
+   line where its data was supposed to end — a relay that corrupted the framing of
+   a message carrying a credential, from a function whose whole contract was not
+   to. It was found by a test asserting the counted bytes equal the written ones,
+   which is a number nobody can check if the two are the same number.
+2. A client hanging up at a message boundary — how **every** keep-alive
+   connection ends — was reported as `Io("unexpected end of stream")`, and rustls
+   reports the same event as `UnexpectedEof`. With one request per tunnel this never
+   surfaced; with a loop it lands on **every ordinary teardown**, so every finished
+   tunnel logged an I/O error and an operator reading a log full of them learns to
+   ignore the class a real fault arrives under. The transport's EOF is now `None`,
+   and the framing layer above it decides whether that was a close or a
+   truncation.
+3. `FrameError::TooLarge` carried one message for two different bounds, so **a
+   body over the per-message limit was reported as "the request head exceeds the
+   limit"** — sending an operator to look at head sizes. The two bounds are now a
+   `Subject`, and a test puts them side by side because a test that asserted each
+   in isolation could not tell they had been confused.
+4. A body over the limit was classified `malformed_request`, telling an operator
+   the peer sent something broken when the peer sent something correct and the
+   answer is a number in this repository. `BridgeError::Limit` exists so a budget
+   can be reported as a budget, and `frame_failure` applies that rule at the point
+   where the mistake was about to be made.
+
+One of them was not in the new code at all. The test fixture for the scripted
+origin waited for its buffer to *end* in `\r\n\r\n` instead of to *contain* it,
+and deadlocked when a head and its body arrived in one read — **the same "scan for
+the terminator" mistake `http_frame` was written to prevent, reproduced in twenty
+lines of test fixture.** It is the better argument for the framing layer that this
+increment produced, and the fixture now says why it searches.
+
+**Still owed in this block.** Stress and cancellation under load beyond the
+anti-replay property already measured. And **the broker has no ordered shutdown at
+all**: `main.rs` installs no signal handling, so tunnels dying when the process
+stops is carried entirely by the process dying. That is a real guarantee from the
 kernel and not one from this product, and it is recorded as owed rather than
 counted as delivered.
 

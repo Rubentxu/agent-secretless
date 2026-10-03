@@ -39,6 +39,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -277,12 +278,156 @@ fn policy() -> Bridge {
     })
 }
 
+/// An origin that answers a **script** of raw responses, one per request, and
+/// keeps the connection open between them.
+///
+/// The existing [`Origin`] is a single-shot that closes after one response,
+/// which is right for proving substitution and wrong for a loop: a relay that
+/// ended after one request and a relay that carried five would both look
+/// identical against an origin that only ever answers one.
+///
+/// `script` is raw bytes rather than a description of a response, because the
+/// cases this needs to stage are the ones no high-level description can express:
+/// a chunked body, a `1xx` before the real answer, a response with no
+/// `Content-Length` that ends when the origin closes, and a `101` that hands the
+/// connection to another protocol. An origin that could only write well-formed
+/// keep-alive responses could not stage any of them.
+struct ScriptedOrigin {
+    addr: SocketAddr,
+    received: Arc<Mutex<Vec<u8>>>,
+    served: Arc<Mutex<usize>>,
+}
+
+impl ScriptedOrigin {
+    /// `script` entries are written in order, one per request read. The last
+    /// entry is followed by a close, which is how a keep-alive origin says it
+    /// has nothing more.
+    fn start(script: Vec<Vec<u8>>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("origin binds");
+        let addr = listener.local_addr().expect("origin addr");
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let served = Arc::new(Mutex::new(0usize));
+        let (r, s) = (Arc::clone(&received), Arc::clone(&served));
+        thread::spawn(move || {
+            while let Ok((mut socket, _)) = listener.accept() {
+                let _ = socket.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut index = 0usize;
+                loop {
+                    if index >= script.len() {
+                        // Nothing left to answer. The relay must treat this as
+                        // an ordinary end, not as a truncation mid-message.
+                        break;
+                    }
+                    if read_one_request(&mut socket, &r).is_none() {
+                        break;
+                    }
+                    if socket.write_all(&script[index]).is_err() {
+                        break;
+                    }
+                    let _ = socket.flush();
+                    *s.lock().expect("served") += 1;
+                    index += 1;
+                }
+            }
+        });
+        Self {
+            addr,
+            received,
+            served,
+        }
+    }
+
+    fn received(&self) -> Vec<u8> {
+        self.received.lock().expect("body").clone()
+    }
+
+    fn served(&self) -> usize {
+        *self.served.lock().expect("served")
+    }
+}
+
+/// Reads exactly one request — head **and** the body its head declares — and
+/// records every byte of it.
+///
+/// **The body is why this is not one `read`, and the terminator search is why it
+/// is not `ends_with`.** Two versions of this fixture were wrong in two different
+/// ways, and both are worth writing down because the second one is the very
+/// defect this increment exists to fix:
+///
+/// - Reading once per request and answering leaves a `POST` whose head and body
+///   arrive in two segments with half a request in the socket, so the origin
+///   answers early and the leftover is read as the *next* request. That is a
+///   race, and a test that fails under load is reporting a race as a product
+///   defect.
+/// - Waiting for the accumulated buffer to *end* in `\r\n\r\n` is the
+///   "scan for the terminator" mistake. A head and its body arriving in one read
+///   leave the buffer ending in the body, so the origin waited for bytes that
+///   would never come — and it deadlocked, because the relay was waiting for the
+///   response the origin had not been asked for yet. It reproduced exactly the
+///   bug `http_frame` was written to prevent, in twenty lines of test fixture,
+///   which is a better argument for the framing layer than any comment.
+///
+/// So: search for the terminator, treat the bytes up to it as the head, and
+/// count anything past it as the start of the body.
+///
+/// `Content-Length` only. A chunked *request* is not staged by any test here, and
+/// an origin that silently mishandled one would be a fixture inventing failures
+/// nobody is looking for; this says so by refusing one rather than by guessing.
+fn read_one_request(socket: &mut TcpStream, record: &Arc<Mutex<Vec<u8>>>) -> Option<()> {
+    let mut buf = [0u8; 4096];
+    let mut raw: Vec<u8> = Vec::new();
+    let terminator = loop {
+        if let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            break at + 4;
+        }
+        let n = socket.read(&mut buf).ok()?;
+        if n == 0 {
+            return None;
+        }
+        record.lock().expect("body").extend_from_slice(&buf[..n]);
+        raw.extend_from_slice(&buf[..n]);
+    };
+
+    let head = String::from_utf8_lossy(&raw[..terminator]).to_string();
+    if head.to_ascii_lowercase().contains("transfer-encoding:") {
+        panic!("this origin stages responses, not chunked requests: {head}");
+    }
+    let declared: usize = head
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .next()
+        .unwrap_or(0);
+
+    let mut body = raw.len() - terminator;
+    while body < declared {
+        let want = (declared - body).min(buf.len());
+        let n = socket.read(&mut buf[..want]).ok()?;
+        if n == 0 {
+            return None;
+        }
+        record.lock().expect("body").extend_from_slice(&buf[..n]);
+        body += n;
+    }
+    Some(())
+}
+
 struct Rig {
     store: Arc<Mutex<SessionStore>>,
-    registry: Mutex<SurrogateRegistry>,
+    registry: Arc<Mutex<SurrogateRegistry>>,
     ca: Arc<SessionCa>,
     root_der: Vec<u8>,
     origin: Origin,
+    /// Present only for the loop tests, which need an origin that answers a
+    /// script instead of closing after one response. `upstream_addr` is the
+    /// only thing that reads it, so nothing else has to know which kind of
+    /// origin a rig was built with.
+    scripted: Option<ScriptedOrigin>,
     session_a: AgentSessionId,
     session_b: AgentSessionId,
     key_a: SigningKey,
@@ -357,10 +502,11 @@ impl Rig {
 
         Self {
             store: Arc::new(Mutex::new(store)),
-            registry: Mutex::new(registry),
+            registry: Arc::new(Mutex::new(registry)),
             ca,
             root_der,
             origin: Origin::start(),
+            scripted: None,
             session_a,
             session_b,
             key_a,
@@ -372,6 +518,68 @@ impl Rig {
             next_b: std::sync::atomic::AtomicU64::new(1),
             next_stranger: std::sync::atomic::AtomicU64::new(1),
         }
+    }
+
+    /// The address the bridge resolves every authorised target to.
+    fn upstream_addr(&self) -> SocketAddr {
+        match &self.scripted {
+            Some(scripted) => scripted.addr,
+            None => self.origin.addr,
+        }
+    }
+
+    /// A rig whose origin answers a **script** and keeps the connection open.
+    ///
+    /// `uses` is the surrogate's budget, and it is a parameter rather than a
+    /// constant for the same reason it exists at all: a single-use surrogate
+    /// cannot carry a second request, so a loop test built on the default rig
+    /// would be measuring the budget rather than the loop. Naming the number at
+    /// every call site means a test that wants a budget it did not ask for has
+    /// to say so.
+    fn with_script(script: Vec<Vec<u8>>, uses: u32) -> Self {
+        let mut rig = Rig::new();
+        rig.surrogate_a = rig.remint(uses);
+        rig.scripted = Some(ScriptedOrigin::start(script));
+        rig
+    }
+
+    /// Re-mints session A's surrogate with a budget the test chose.
+    fn remint(&self, uses: u32) -> String {
+        let mut registry = self.registry.lock().expect("registry");
+        let credential = CredentialId::from_wire(CRED).expect("canonical wire form");
+        let (token, _, _) = registry
+            .mint(
+                self.session_a,
+                credential,
+                CredentialClass::Generic,
+                3600,
+                uses,
+                asv_broker::surrogate::now_secs(),
+            )
+            .expect("mint for session A");
+        token
+    }
+
+    /// A substitution port over session A's registry and the canary store.
+    ///
+    /// Every loop test needs one, and building it inline would put eight lines
+    /// of setup in front of each assertion. The family is `GitHub` because the
+    /// credential's route is a GitHub one and a port that resolved a different
+    /// family would refuse the redemption for a reason no test is about.
+    fn port(&self) -> SubstitutionPort {
+        SubstitutionPort::new(
+            Arc::clone(&self.registry)
+                as Arc<dyn asv_broker::surrogate::SurrogateLending + Send + Sync>,
+            Arc::new(CanaryStore) as Arc<dyn SecretPort + Send + Sync>,
+            OperationFamily::GitHub,
+            "github",
+        )
+    }
+
+    fn scripted(&self) -> &ScriptedOrigin {
+        self.scripted
+            .as_ref()
+            .expect("this rig was built with a script, so it has a scripted origin")
     }
 
     /// The next counter for whoever is signing, in that party's own sequence.
@@ -469,7 +677,7 @@ impl Rig {
             ca: Arc::clone(&self.ca),
         };
         let upstream = FixedUpstream {
-            addr: self.origin.addr,
+            addr: self.upstream_addr(),
         };
 
         let handle = thread::spawn(move || {
@@ -513,7 +721,7 @@ impl Rig {
             ca: Arc::clone(&self.ca),
         };
         let upstream = FixedUpstream {
-            addr: self.origin.addr,
+            addr: self.upstream_addr(),
         };
         let proofs: Arc<dyn SessionProofs + Send + Sync> =
             Arc::new(SharedSessions::new(Arc::clone(&self.store)));
@@ -550,6 +758,25 @@ impl ClientSide {
     fn send(&mut self, bytes: &[u8]) {
         self.0.write_all(bytes).expect("client writes");
         self.0.flush().expect("flush");
+    }
+
+    /// One response head, as text, read a byte at a time to the terminator.
+    ///
+    /// A byte at a time for the same reason the relay does it: anything that
+    /// reads past the terminator swallows the first bytes of the body, or of the
+    /// next response, and a test that cannot tell those apart cannot test a
+    /// relay that has to.
+    fn read_head_str(&mut self) -> String {
+        let _ = self.0.sock.set_read_timeout(Some(Duration::from_secs(10)));
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            self.0
+                .read_exact(&mut byte)
+                .expect("client reads one response head");
+            head.push(byte[0]);
+        }
+        String::from_utf8(head).expect("ascii head")
     }
 
     fn recv(&mut self, n: usize) -> Vec<u8> {
@@ -635,12 +862,7 @@ fn a_valid_proof_resolves_its_session_and_the_origin_receives_the_credential() {
     client.send(request_with(&rig.surrogate_a).as_bytes());
 
     let mut audit = Collected::default();
-    let mut port = SubstitutionPort::new(
-        &rig.registry,
-        &CanaryStore,
-        OperationFamily::GitHub,
-        "github",
-    );
+    let mut port = rig.port();
     let outcome: SubstitutionOutcome = tunnel
         .relay_substituted(&mut port, &mut audit, RelayLimits::default())
         .expect("a redeemable surrogate substitutes");
@@ -696,12 +918,7 @@ fn the_client_receives_the_response_and_neither_the_credential_nor_the_surrogate
     client.send(request_with(&rig.surrogate_a).as_bytes());
 
     let mut audit = Collected::default();
-    let mut port = SubstitutionPort::new(
-        &rig.registry,
-        &CanaryStore,
-        OperationFamily::GitHub,
-        "github",
-    );
+    let mut port = rig.port();
     tunnel
         .relay_substituted(&mut port, &mut audit, RelayLimits::default())
         .expect("substitution");
@@ -723,12 +940,7 @@ fn the_client_receives_the_response_and_neither_the_credential_nor_the_surrogate
     // The relay's own outcome is a number, never a body: returning the
     // forwarded request would make it a second place the secret lives.
     let mut audit = Collected::default();
-    let mut port = SubstitutionPort::new(
-        &rig.registry,
-        &CanaryStore,
-        OperationFamily::GitHub,
-        "github",
-    );
+    let mut port = rig.port();
     let second = tunnel.relay_substituted(&mut port, &mut audit, RelayLimits::default());
     assert!(
         matches!(second, Err(BridgeError::Io(_)) | Err(BridgeError::Substitution(_))),
@@ -761,12 +973,7 @@ fn another_sessions_proof_does_not_resolve_to_this_session() {
     // A's token, spent in B's tunnel.
     client.send(request_with(&rig.surrogate_a).as_bytes());
     let mut audit = Collected::default();
-    let mut port = SubstitutionPort::new(
-        &rig.registry,
-        &CanaryStore,
-        OperationFamily::GitHub,
-        "github",
-    );
+    let mut port = rig.port();
     let outcome = tunnel.relay_substituted(&mut port, &mut audit, RelayLimits::default());
 
     assert!(
@@ -799,12 +1006,7 @@ fn a_surrogate_from_another_session_is_still_refused_and_the_right_one_still_wor
     let (mut client, mut tunnel) = rig.tunnel(Some(proof), 443).expect("an authorised tunnel");
     client.send(request_with(&rig.surrogate_b).as_bytes());
     let mut audit = Collected::default();
-    let mut port = SubstitutionPort::new(
-        &rig.registry,
-        &CanaryStore,
-        OperationFamily::GitHub,
-        "github",
-    );
+    let mut port = rig.port();
     let refused = tunnel.relay_substituted(&mut port, &mut audit, RelayLimits::default());
     assert!(
         matches!(
@@ -825,12 +1027,7 @@ fn a_surrogate_from_another_session_is_still_refused_and_the_right_one_still_wor
     let (mut client, mut tunnel) = rig2.tunnel(Some(proof), 443).expect("an authorised tunnel");
     client.send(request_with(&rig2.surrogate_a).as_bytes());
     let mut audit = Collected::default();
-    let mut port = SubstitutionPort::new(
-        &rig2.registry,
-        &CanaryStore,
-        OperationFamily::GitHub,
-        "github",
-    );
+    let mut port = rig2.port();
     tunnel
         .relay_substituted(&mut port, &mut audit, RelayLimits::default())
         .expect("the matching token must still work, or this test proves nothing");
@@ -1021,12 +1218,7 @@ fn without_a_valid_proof_or_a_credential_the_tunnel_closes_and_nothing_is_forwar
     client.send(b"GET /repos/o/r/issues HTTP/1.1\r\nHost: api.github.test\r\n\r\n");
 
     let mut audit = Collected::default();
-    let mut port = SubstitutionPort::new(
-        &rig.registry,
-        &CanaryStore,
-        OperationFamily::GitHub,
-        "github",
-    );
+    let mut port = rig.port();
     let outcome = tunnel.relay_substituted(&mut port, &mut audit, RelayLimits::default());
     assert!(
         matches!(
@@ -1057,12 +1249,7 @@ fn the_audit_record_names_the_operation_and_carries_no_secret() {
     client.send(request_with(&rig.surrogate_a).as_bytes());
 
     let mut log = AuditLog::new(0);
-    let mut port = SubstitutionPort::new(
-        &rig.registry,
-        &CanaryStore,
-        OperationFamily::GitHub,
-        "github",
-    );
+    let mut port = rig.port();
     {
         let mut recorder = SubstitutionRecorder::new(&mut log, 1_700_000_000);
         tunnel
@@ -1137,12 +1324,7 @@ fn a_refused_substitution_is_audited_without_the_secret() {
     client.send(request_with(&rig.surrogate_b).as_bytes());
 
     let mut log = AuditLog::new(0);
-    let mut port = SubstitutionPort::new(
-        &rig.registry,
-        &CanaryStore,
-        OperationFamily::GitHub,
-        "github",
-    );
+    let mut port = rig.port();
     {
         let mut recorder = SubstitutionRecorder::new(&mut log, 1_700_000_000);
         let outcome = tunnel.relay_substituted(&mut port, &mut recorder, RelayLimits::default());
@@ -1197,12 +1379,7 @@ fn the_substitution_is_observable_from_both_ends_and_not_vacuous() {
     client.send(request_with(&rig.surrogate_a).as_bytes());
 
     let mut audit = Collected::default();
-    let mut port = SubstitutionPort::new(
-        &rig.registry,
-        &CanaryStore,
-        OperationFamily::GitHub,
-        "github",
-    );
+    let mut port = rig.port();
     tunnel
         .relay_substituted(&mut port, &mut audit, RelayLimits::default())
         .expect("substitution");
@@ -1264,9 +1441,10 @@ type RelayVerdict = Result<SubstitutionOutcome, BridgeError>;
 /// ask the question that matters — *has it finished yet?* — at a moment of its
 /// choosing, which is the only way to tell a cancelled relay from one that
 /// failed on its own.
-fn relay_on_worker(
+fn relay_on_worker_with(
     tunnel: EstablishedTunnel,
-    registry: Mutex<SurrogateRegistry>,
+    registry: Arc<Mutex<SurrogateRegistry>>,
+    limits: RelayLimits,
 ) -> (
     std::thread::JoinHandle<RelayVerdict>,
     std::sync::mpsc::Receiver<RelayVerdict>,
@@ -1274,11 +1452,14 @@ fn relay_on_worker(
     let (tx, rx) = std::sync::mpsc::channel();
     let handle = thread::spawn(move || {
         let mut tunnel = tunnel;
-        let registry = registry;
         let mut audit = Collected::default();
-        let mut port =
-            SubstitutionPort::new(&registry, &CanaryStore, OperationFamily::GitHub, "github");
-        let outcome = tunnel.relay_substituted(&mut port, &mut audit, RelayLimits::default());
+        let mut port = SubstitutionPort::new(
+            registry as Arc<dyn asv_broker::surrogate::SurrogateLending + Send + Sync>,
+            Arc::new(CanaryStore) as Arc<dyn SecretPort + Send + Sync>,
+            OperationFamily::GitHub,
+            "github",
+        );
+        let outcome = tunnel.relay_substituted(&mut port, &mut audit, limits);
         let _ = tx.send(outcome.clone());
         outcome
     });
@@ -1325,7 +1506,7 @@ fn revoking_an_established_session_tears_down_its_tunnel() {
         .tunnel_cancellable(Some(proof), 443, signal.clone())
         .expect("an authorised tunnel");
 
-    let (handle, rx) = relay_on_worker(tunnel, rig.registry);
+    let (handle, rx) = relay_on_worker_with(tunnel, rig.registry, RelayLimits::default());
     std::thread::sleep(Duration::from_millis(200));
     assert_still_running(&rx, "the relay");
 
@@ -1366,7 +1547,7 @@ fn shutting_down_tears_down_an_established_tunnel() {
         .tunnel_cancellable(Some(proof), 443, signal.clone())
         .expect("an authorised tunnel");
 
-    let (handle, rx) = relay_on_worker(tunnel, rig.registry);
+    let (handle, rx) = relay_on_worker_with(tunnel, rig.registry, RelayLimits::default());
     std::thread::sleep(Duration::from_millis(200));
     assert_still_running(&rx, "the relay");
 
@@ -1422,7 +1603,7 @@ fn revoking_another_session_leaves_this_tunnel_working() {
         .expect("an authorised tunnel");
 
     // Nothing has been sent, so the relay is parked in the poll.
-    let (handle, rx) = relay_on_worker(tunnel, rig.registry);
+    let (handle, rx) = relay_on_worker_with(tunnel, rig.registry, RelayLimits::default());
     std::thread::sleep(Duration::from_millis(200));
     assert_still_running(&rx, "the relay before any revocation");
 
@@ -1456,4 +1637,585 @@ fn revoking_another_session_leaves_this_tunnel_working() {
         text.contains(REAL),
         "the origin did not receive the credential, so the tunnel did not work: {text}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// C2.8 increment 3b — one tunnel, many requests.
+//
+// Every test below drives a **real** TLS tunnel to a **real** origin over a
+// **real** socket, with a real session proof and a real surrogate redemption per
+// request. Nothing here mocks the relay, because the property under test *is*
+// the relay: which bytes it forwards, which it withholds, and where it decides a
+// message ends.
+//
+// **The relay runs on its own thread, and that is not a convenience.** A
+// one-request relay is called *after* the client has sent its request, so a test
+// can `send` then `relay_substituted`. A loop is the other way round: the relay
+// has to be running *while* the client speaks to it, which is two threads and is
+// also the shape the product has — a broker process and a client process. The
+// first version of these tests called the relay at the end and every one of them
+// hung on a client waiting for an answer from a relay that had not started.
+// ---------------------------------------------------------------------------
+
+/// The relay, running, and a bounded handle on how it ended.
+struct Relaying {
+    handle: std::thread::JoinHandle<RelayVerdict>,
+    ended: std::sync::mpsc::Receiver<RelayVerdict>,
+}
+
+impl Relaying {
+    /// Blocks until the relay returns, bounded, and says what it returned.
+    ///
+    /// The timeout is the important part. A relay that never returns — a
+    /// deadlock, a refusal that forgot to close, a loop that lost track of where
+    /// the next message starts — would otherwise hang the suite, and a suite
+    /// that hangs is worse than one that fails: it says nothing at all about what
+    /// went wrong and stops every other test from running.
+    fn finish(self, what: &str) -> RelayVerdict {
+        let verdict = self
+            .ended
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|e| panic!("{what}: the relay never finished ({e:?})"));
+        // Joined, not dropped. The channel carried the verdict, so a relay that
+        // returned it *and then* panicked would look identical from here, and a
+        // panic inside a background thread is otherwise silent: the test passes
+        // and the reason is on a thread nobody joined.
+        let _ = self
+            .handle
+            .join()
+            .unwrap_or_else(|_| panic!("{what}: the relay thread panicked"));
+        verdict
+    }
+}
+
+fn start_relay(tunnel: EstablishedTunnel, rig: &Rig, limits: RelayLimits) -> Relaying {
+    let (handle, ended) = relay_on_worker_with(tunnel, Arc::clone(&rig.registry), limits);
+    Relaying { handle, ended }
+}
+
+/// The response a keep-alive origin gives a `GET`: a whole message with a
+/// declared length and no reason to close.
+fn ok_body(body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+fn get(path: &str, surrogate: &str) -> Vec<u8> {
+    format!("GET {path} HTTP/1.1\r\nHost: {HOST}\r\nAuthorization: Bearer {surrogate}\r\n\r\n")
+        .into_bytes()
+}
+
+/// **The claim the increment exists for.** Five requests on one connection, five
+/// real credential substitutions, five answers, and the connection closes only
+/// when the client closes it.
+///
+/// The control is the last assertion. An origin that has run out of script closes
+/// the connection, and a relay that quietly gave up after three requests looks
+/// identical from the client — so the test asks the *destination* what it
+/// received, and asks for a number rather than a boolean.
+#[test]
+fn one_tunnel_carries_five_requests_and_substitutes_every_one() {
+    let rig = Rig::with_script(vec![ok_body("one"), ok_body("two"), ok_body("three")], 16);
+    let (mut client, tunnel) = rig
+        .tunnel(Some(rig.proof(Who::A, HOST, 443)), 443)
+        .expect("an authorised tunnel");
+    let relay = start_relay(tunnel, &rig, RelayLimits::default());
+    let surrogate = rig.surrogate_a.clone();
+
+    for (path, answer) in [("/a", "one"), ("/b", "two"), ("/c", "three")] {
+        client.send(&get(path, &surrogate));
+        assert_eq!(
+            client.read_head_str(),
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                answer.len()
+            ),
+            "the answer to {path} did not arrive whole"
+        );
+        assert_eq!(client.recv(answer.len()), answer.as_bytes().to_vec());
+    }
+
+    // The client hangs up at a message boundary, which is how every keep-alive
+    // connection ends. A relay that reported it as a fault would be logging an
+    // ordinary event as an incident.
+    drop(client);
+    let outcome = relay
+        .finish("three requests then a client hang-up")
+        .expect("three well-framed requests on one tunnel");
+    assert_eq!(
+        outcome.requests, 3,
+        "the loop stopped before the client did"
+    );
+    assert!(
+        !outcome.request_budget_spent,
+        "the tunnel ended on a budget with {} requests allowed",
+        RelayLimits::default().max_requests
+    );
+
+    let seen = String::from_utf8_lossy(&rig.scripted().received()).to_string();
+    assert_eq!(
+        seen.matches(REAL).count(),
+        3,
+        "the destination did not receive the credential on every request:\n{seen}"
+    );
+    assert_eq!(
+        seen.matches(&surrogate).count(),
+        0,
+        "a surrogate reached the destination:\n{seen}"
+    );
+}
+
+/// **A request body is relayed by the framing its head declared, and the next
+/// request is read only where the body ended.**
+///
+/// This is the test that says the loop is not "scan for `\r\n\r\n`". The body
+/// here contains that terminator twice, so a relay that scanned for it would
+/// treat the middle of the form post as the next request — and would substitute a
+/// credential into it. The credential count is the assertion: one substitution
+/// per request, whatever the body contained.
+#[test]
+fn a_request_body_is_relayed_by_its_framing_and_the_next_head_is_read_after_it() {
+    let body = "field=a\r\n\r\nfield=b\r\n\r\n&trailer=injected";
+    let rig = Rig::with_script(vec![ok_body("first"), ok_body("second")], 8);
+    let (mut client, tunnel) = rig
+        .tunnel(Some(rig.proof(Who::A, HOST, 443)), 443)
+        .expect("an authorised tunnel");
+    let relay = start_relay(tunnel, &rig, RelayLimits::default());
+    let surrogate = rig.surrogate_a.clone();
+
+    client.send(
+        format!(
+            "POST /submit HTTP/1.1\r\nHost: {HOST}\r\nAuthorization: Bearer {surrogate}\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    );
+    eprintln!("DIAG sent post");
+    client.read_head_str();
+    client.recv(5);
+    client.send(&get("/next", &surrogate));
+    client.read_head_str();
+    client.recv(6);
+    drop(client);
+
+    assert_eq!(
+        relay
+            .finish("a body then a plain request")
+            .expect("a body-carrying request followed by a plain one")
+            .requests,
+        2
+    );
+
+    let seen = String::from_utf8_lossy(&rig.scripted().received()).to_string();
+    assert_eq!(
+        seen.matches(REAL).count(),
+        2,
+        "the credential was not substituted once per request, so the body was \
+         re-read as a request:\n{seen}"
+    );
+    assert!(
+        seen.contains(body),
+        "the body did not arrive whole, so it was not relayed by its length:\n{seen}"
+    );
+}
+
+/// A chunked response is relayed **verbatim**, framing included, and the request
+/// after it still finds the relay at a message boundary.
+///
+/// The assertion is on the exact bytes. A relay that re-framed a chunked body —
+/// buffering it and emitting one `Content-Length` — would also *work*, and it
+/// would also be a relay that rewrote the framing of a message carrying a
+/// credential, which is the one thing this relay does not do.
+#[test]
+fn a_chunked_response_is_relayed_byte_for_byte() {
+    let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let framing = "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+    let rig = Rig::with_script(
+        vec![format!("{head}{framing}").into_bytes(), ok_body("after")],
+        8,
+    );
+    let (mut client, tunnel) = rig
+        .tunnel(Some(rig.proof(Who::A, HOST, 443)), 443)
+        .expect("an authorised tunnel");
+    let relay = start_relay(tunnel, &rig, RelayLimits::default());
+    let surrogate = rig.surrogate_a.clone();
+
+    client.send(&get("/stream", &surrogate));
+    assert_eq!(
+        client.read_head_str(),
+        head,
+        "the chunked head did not arrive"
+    );
+    let body = String::from_utf8(client.recv(framing.len())).expect("ascii body");
+    assert_eq!(
+        body, framing,
+        "the chunked body was re-framed rather than relayed verbatim"
+    );
+    // And the connection is still usable, which is the half a truncating relay
+    // fails and a re-framing one would get right by accident.
+    client.send(&get("/next", &surrogate));
+    client.read_head_str();
+    assert_eq!(client.recv(5), b"after".to_vec());
+    drop(client);
+
+    assert_eq!(
+        relay
+            .finish("a chunked response then a plain one")
+            .expect("a chunked response followed by a plain one")
+            .requests,
+        2
+    );
+    assert_eq!(rig.scripted().served(), 2);
+}
+
+/// An interim response is forwarded and is **not** the end of the exchange.
+///
+/// `100 Continue` is the case that matters: a relay that treated it as the answer
+/// would close the tunnel while the client was still waiting to send its body, and
+/// both peers would be waiting on each other with nothing in the log to explain it.
+#[test]
+fn an_interim_response_is_forwarded_and_the_real_answer_still_arrives() {
+    let rig = Rig::with_script(
+        vec![
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+        ],
+        8,
+    );
+    let (mut client, tunnel) = rig
+        .tunnel(Some(rig.proof(Who::A, HOST, 443)), 443)
+        .expect("an authorised tunnel");
+    let relay = start_relay(tunnel, &rig, RelayLimits::default());
+    client.send(&get("/interim", &rig.surrogate_a.clone()));
+    assert_eq!(client.read_head_str(), "HTTP/1.1 100 Continue\r\n\r\n");
+    assert_eq!(
+        client.read_head_str(),
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"
+    );
+    assert_eq!(client.recv(2), b"ok".to_vec());
+    drop(client);
+
+    let outcome = relay
+        .finish("an interim response")
+        .expect("an interim response is not a failure");
+    assert_eq!(
+        outcome.requests, 1,
+        "the interim response was counted as the answer, so the loop ended one \
+         response early"
+    );
+}
+
+/// A response with no length and no chunking ends when the origin closes, and the
+/// client receives exactly what the origin wrote.
+///
+/// The case that must **not** be refused: a server answering without a
+/// `Content-Length` is common enough that a relay which declined it would break a
+/// large share of real traffic. It is also the only framing whose extent the relay
+/// cannot know in advance — which is why the lifetime budget, not the per-message
+/// one, is the cap that applies to it.
+#[test]
+fn a_close_delimited_response_is_relayed_until_the_origin_closes() {
+    let rig = Rig::with_script(
+        vec![b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nstreamed".to_vec()],
+        8,
+    );
+    let (mut client, tunnel) = rig
+        .tunnel(Some(rig.proof(Who::A, HOST, 443)), 443)
+        .expect("an authorised tunnel");
+    let relay = start_relay(tunnel, &rig, RelayLimits::default());
+    client.send(&get("/stream", &rig.surrogate_a.clone()));
+    assert_eq!(
+        client.read_head_str(),
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"
+    );
+    assert_eq!(client.recv(8), b"streamed".to_vec());
+    drop(client);
+
+    assert_eq!(
+        relay
+            .finish("a close-delimited response")
+            .expect("a close-delimited response is ordinary HTTP")
+            .requests,
+        1,
+        "a close-delimited response is ordinary HTTP and must be counted"
+    );
+}
+
+/// **The two things a sequential pump refuses, and refuses *before* writing a byte
+/// to the origin.**
+///
+/// Each is a case where the ordinary request-then-response order would hang rather
+/// than fail: both peers would be waiting on the other, nothing would time out, and
+/// the only record would be a tunnel that stopped being interesting. The control
+/// is the assertion that the origin received nothing at all — a refusal that got as
+/// far as forwarding the head would have already put a surrogate on the wire.
+#[test]
+fn the_shapes_a_sequential_pump_cannot_carry_are_refused_before_anything_is_forwarded() {
+    for (name, extra) in [
+        (
+            "Expect: 100-continue",
+            "Content-Length: 4\r\nExpect: 100-continue\r\n",
+        ),
+        ("Upgrade", "Upgrade: websocket\r\n"),
+    ] {
+        let rig = Rig::with_script(vec![ok_body("never written")], 8);
+        let (mut client, tunnel) = rig
+            .tunnel(Some(rig.proof(Who::A, HOST, 443)), 443)
+            .expect("an authorised tunnel");
+        let relay = start_relay(tunnel, &rig, RelayLimits::default());
+        client.send(
+            format!(
+                "POST /x HTTP/1.1\r\nHost: {HOST}\r\nAuthorization: Bearer {}\r\n{extra}\r\ndata",
+                rig.surrogate_a
+            )
+            .as_bytes(),
+        );
+        let verdict = relay.finish(name);
+        assert!(
+            matches!(
+                verdict,
+                Err(BridgeError::Limit {
+                    budget: "sequential_pump",
+                    ..
+                })
+            ),
+            "{name} was refused as {verdict:?}, and the reason an operator reads is \
+             the whole point of the variant"
+        );
+        // Give the origin a moment in which it could have received something. A
+        // refusal that raced ahead of the write would satisfy this immediately,
+        // so the wait is what makes it a measurement rather than a hope.
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            rig.scripted().served(),
+            0,
+            "{name} reached the origin before being refused, so the relay wrote to a \
+             protocol it had just said it would not carry"
+        );
+        drop(client);
+    }
+}
+
+/// A `101` is refused by the same rule, and for the same reason: it is not an HTTP
+/// message, and a relay that forwarded it would be asked to carry opaque bytes in
+/// both directions at once.
+#[test]
+fn a_protocol_switch_from_the_origin_is_refused() {
+    let rig = Rig::with_script(
+        vec![b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n".to_vec()],
+        8,
+    );
+    let (mut client, tunnel) = rig
+        .tunnel(Some(rig.proof(Who::A, HOST, 443)), 443)
+        .expect("an authorised tunnel");
+    let relay = start_relay(tunnel, &rig, RelayLimits::default());
+    client.send(&get("/ws", &rig.surrogate_a.clone()));
+    let verdict = relay.finish("a 101");
+    assert!(
+        matches!(
+            verdict,
+            Err(BridgeError::Limit {
+                budget: "sequential_pump",
+                ..
+            })
+        ),
+        "a 101 was refused as {verdict:?}"
+    );
+    drop(client);
+}
+
+/// **Framing the relay will not guess at.** A head that names two different lengths
+/// is refused and the tunnel ends, rather than one of them being picked.
+///
+/// The point is not that the request is refused — it is that the refusal is
+/// *before* anything reaches the origin. A relay that picked the first
+/// `Content-Length` and forwarded the head would have handed the destination a
+/// message the client never sent, and the second length would still be sitting in
+/// the client's buffer waiting to be read as a request.
+#[test]
+fn a_head_with_two_different_lengths_is_refused_before_anything_is_forwarded() {
+    let rig = Rig::with_script(vec![ok_body("never written")], 8);
+    let (mut client, tunnel) = rig
+        .tunnel(Some(rig.proof(Who::A, HOST, 443)), 443)
+        .expect("an authorised tunnel");
+    let relay = start_relay(tunnel, &rig, RelayLimits::default());
+    client.send(
+        format!(
+            "POST /x HTTP/1.1\r\nHost: {HOST}\r\nAuthorization: Bearer {}\r\n\
+             Content-Length: 4\r\nContent-Length: 40\r\n\r\ndata",
+            rig.surrogate_a
+        )
+        .as_bytes(),
+    );
+    let verdict = relay.finish("an ambiguous head");
+    assert!(
+        matches!(verdict, Err(BridgeError::Protocol(_))),
+        "an ambiguous head was refused as {verdict:?}"
+    );
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        rig.scripted().served(),
+        0,
+        "an ambiguous head reached the origin"
+    );
+    drop(client);
+}
+
+/// A tunnel that reaches its request budget ends **at a message boundary** — a
+/// normal end the client recovers from by reconnecting, not a truncation.
+///
+/// The distinction is the whole of `BridgeError::Limit` versus
+/// `SubstitutionOutcome::request_budget_spent`. Ending a connection between two
+/// whole messages is what every relay that limits a connection does; ending one in
+/// the middle of a response is a lie to the client. The test asserts the count, so
+/// a relay that stopped one request early cannot satisfy it.
+#[test]
+fn a_tunnel_that_reaches_its_request_budget_ends_between_two_whole_messages() {
+    let rig = Rig::with_script(
+        vec![
+            ok_body("one"),
+            ok_body("two"),
+            ok_body("three"),
+            ok_body("four"),
+        ],
+        16,
+    );
+    let (mut client, tunnel) = rig
+        .tunnel(Some(rig.proof(Who::A, HOST, 443)), 443)
+        .expect("an authorised tunnel");
+    let relay = start_relay(
+        tunnel,
+        &rig,
+        RelayLimits {
+            max_requests: 2,
+            ..RelayLimits::default()
+        },
+    );
+    let surrogate = rig.surrogate_a.clone();
+    for _ in 0..2 {
+        client.send(&get("/x", &surrogate));
+        client.read_head_str();
+        client.recv(3);
+    }
+    drop(client);
+
+    let verdict = relay.finish("a request budget");
+    let outcome = verdict.expect("a budget spent between messages is a normal end");
+    assert_eq!(outcome.requests, 2, "the loop did not stop at the budget");
+    assert!(
+        outcome.request_budget_spent,
+        "the tunnel ended at the request budget and did not say so, so an operator \
+         watching connections change cannot tell a finished client from a capped one"
+    );
+    assert_eq!(
+        rig.scripted().served(),
+        2,
+        "the origin answered more requests than the tunnel carried"
+    );
+}
+
+/// A per-message body over the limit is refused, and the refusal names the budget
+/// rather than reading as a socket fault.
+///
+/// **The naming is the assertion.** A budget that ran out is a number somebody
+/// chose, and an operator whose only record says `io_error` goes looking at a
+/// socket. The variant exists so the record can say what happened, and this test
+/// is what stops the class from collapsing back into `other`.
+#[test]
+fn a_body_over_the_per_message_limit_is_refused_and_named() {
+    let rig = Rig::with_script(vec![ok_body("never written")], 8);
+    let (mut client, tunnel) = rig
+        .tunnel(Some(rig.proof(Who::A, HOST, 443)), 443)
+        .expect("an authorised tunnel");
+    let relay = start_relay(
+        tunnel,
+        &rig,
+        RelayLimits {
+            max_body: 64,
+            ..RelayLimits::default()
+        },
+    );
+    client.send(
+        format!(
+            "POST /x HTTP/1.1\r\nHost: {HOST}\r\nAuthorization: Bearer {}\r\n\
+             Content-Length: 4096\r\n\r\n",
+            rig.surrogate_a
+        )
+        .as_bytes(),
+    );
+    let verdict = relay.finish("an over-limit body");
+    assert!(
+        matches!(
+            verdict,
+            Err(BridgeError::Limit {
+                budget: "max_body",
+                ..
+            })
+        ),
+        "an over-limit body was refused as {verdict:?}, which reports a deliberate \
+         limit as something else"
+    );
+    drop(client);
+}
+
+/// A revocation reaches a tunnel that is **inside** the loop, not only one that is
+/// waiting for its first request.
+///
+/// This is the test the `relay_back` defect was really about, extended to the
+/// case the loop creates. Before the loop there was exactly one blocking read on
+/// the client side and one on the response side, both of which had to be made
+/// cancellable; now there are as many as the tunnel carries messages, and
+/// cancellation has to be consulted at each one. A loop that only checked at its
+/// first read would be a tunnel that revokes itself exactly when a client is
+/// mid-exchange, which is the state a revocation most often has to interrupt.
+#[test]
+fn a_revocation_reaches_a_tunnel_that_is_inside_the_loop() {
+    use asv_broker::tls_bridge::{Cancel, CancelReason};
+
+    #[derive(Debug)]
+    struct Revoke(Arc<std::sync::atomic::AtomicBool>);
+    impl Cancel for Revoke {
+        fn cancel_reason(&self, session: Option<&AgentSessionId>) -> Option<CancelReason> {
+            if self.0.load(Ordering::SeqCst) {
+                Some(CancelReason::SessionRevoked)
+            } else {
+                let _ = session;
+                None
+            }
+        }
+    }
+
+    let rig = Rig::with_script(vec![ok_body("never written")], 8);
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel: Arc<dyn Cancel + Send + Sync> = Arc::new(Revoke(Arc::clone(&flag)));
+    let (mut client, tunnel) = rig
+        .tunnel_cancellable(Some(rig.proof(Who::A, HOST, 443)), 443, cancel)
+        .expect("an authorised tunnel");
+    let relay = start_relay(tunnel, &rig, RelayLimits::default());
+    let surrogate = rig.surrogate_a.clone();
+
+    // One exchange that completes, so the relay is provably *inside* the loop
+    // rather than still reading its first head — which is the only state from
+    // which this says anything.
+    client.send(&get("/first", &surrogate));
+    client.read_head_str();
+    client.recv(5);
+    // Now the client is idle, waiting for a request to be worth making, and the
+    // relay is blocked reading the next one.
+    assert_still_running(&relay.ended, "the relay");
+    flag.store(true, Ordering::SeqCst);
+
+    let verdict = relay.finish("a revocation inside the loop");
+    assert!(
+        matches!(
+            verdict,
+            Err(BridgeError::Cancelled(CancelReason::SessionRevoked))
+        ),
+        "a revocation inside the loop ended the relay as {verdict:?}, so a revoke \
+         could not reach a tunnel between two messages"
+    );
+    drop(client);
 }

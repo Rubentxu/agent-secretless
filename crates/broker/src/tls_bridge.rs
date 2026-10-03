@@ -41,6 +41,8 @@ use asv_tls_acceptor::{handshake_once, LeafMaterial};
 use time::OffsetDateTime;
 use zeroize::Zeroize;
 
+use crate::http_frame;
+
 /// Default TTL for a session CA: 8 hours.
 pub const DEFAULT_SESSION_CA_TTL: Duration = Duration::from_secs(8 * 3600);
 
@@ -171,6 +173,27 @@ pub enum BridgeError {
     /// A socket operation failed.
     #[error("bridge io: {0}")]
     Io(String),
+    /// A relay budget for this tunnel ran out.
+    ///
+    /// Its own variant because a budget is a *policy* event wearing the
+    /// clothes of an I/O failure, and the two read very differently. `Io` is a
+    /// fault to investigate; this is a number somebody chose. Folding it into
+    /// `Io` would have recorded a deliberate, documented end of tunnel under a
+    /// class that sends an operator looking at a socket.
+    ///
+    /// Only raised for a budget that ran out **mid-message**. A budget that ends
+    /// a tunnel at a message boundary is a normal end and is reported as one,
+    /// through [`SubstitutionOutcome::request_budget_spent`] — because truncating
+    /// a response in the middle is a lie to the client, while ending a connection
+    /// between two whole messages is what every other HTTP relay in the world
+    /// does when it reaches a limit.
+    #[error("relay budget spent: {budget} ({detail})")]
+    Limit {
+        /// Which budget, named for the operator and for the test that bounds it.
+        budget: &'static str,
+        /// What the budget was measured against.
+        detail: String,
+    },
 }
 
 /// Why an in-flight tunnel was torn down.
@@ -261,6 +284,27 @@ impl Cancel for NeverCancelled {
 /// The rule is symmetric: a timeout is ignorable only because this code chose
 /// to arm one. Where no timeout was armed, a timeout is an error, exactly as
 /// before.
+/// Reads one byte, or reports that the transport is finished.
+///
+/// **`Ok(None)` means the transport ended, not that the message did.** That
+/// distinction is the whole reason the answer is `None` rather than an error, and
+/// it was got wrong the first time: a zero-byte read was reported as
+/// `Io("unexpected end of stream")`, so a clean close at a message boundary and a
+/// truncated request were the same event. With one request per tunnel that never
+/// showed, because the relay was not reading a second head. With a loop it shows
+/// on **every** ordinary connection teardown — a client that hangs up at the end
+/// of a keep-alive session is not a fault, it is how HTTP/1.1 connections end —
+/// so every finished tunnel logged an I/O error, and an operator reading a log
+/// full of them learns to ignore the class that a real fault arrives under.
+///
+/// Whether the end was clean is the framing layer's question and it is answered
+/// above: `read_inner_head` knows it had read no bytes (a close) from some (a
+/// truncation), and `relay_bytes` knows how much of a declared body arrived.
+///
+/// `UnexpectedEof` is the same event wearing a TLS coat. rustls reports a peer
+/// that closed the TCP connection without a `close_notify` as `UnexpectedEof`
+/// rather than a zero-byte read, and a test client that drops its stream — and
+/// every real client that closes at the end of a session — does exactly that.
 fn read_byte_cancellable<R: Read>(
     reader: &mut R,
     session: Option<&AgentSessionId>,
@@ -272,9 +316,8 @@ fn read_byte_cancellable<R: Read>(
     loop {
         match reader.read(&mut byte) {
             Ok(1) => return Ok(Some(byte[0])),
-            Ok(_) => {
-                return Err(BridgeError::Io("unexpected end of stream".into()));
-            }
+            Ok(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e)
                 if matches!(
                     e.kind(),
@@ -1089,6 +1132,23 @@ pub struct RelayLimits {
     /// `npm install express` is 93 requests, so this is roughly forty times a
     /// workload that already needs a real client.
     pub max_requests: usize,
+    /// Largest single request or response body, framing included.
+    ///
+    /// A **per-message** bound, and the distinction from the other three is the
+    /// point. `max_forwarded` and `max_response` are lifetime budgets: they bound
+    /// a whole tunnel across every message it carries. This one bounds a single
+    /// message, because a message has to be budgeted *before* it is relayed —
+    /// the parser is handed this number to decide whether a `Content-Length` is
+    /// acceptable at all, and a lifetime budget cannot serve as a per-message
+    /// answer without either refusing every first message or none.
+    ///
+    /// Set to a quarter of the lifetime budgets, which is not a shape somebody
+    /// chose: the two large tarballs in the measured workload are the reason
+    /// `max_response` is 64 MiB, and one tarball has to fit inside a message.
+    /// A `Transfer-Encoding: chunked` body is bounded by this too, counted as it
+    /// is copied, because a chunked body has no declared length to check
+    /// against anything else.
+    pub max_body: usize,
 }
 
 impl Default for RelayLimits {
@@ -1102,6 +1162,7 @@ impl Default for RelayLimits {
             max_response: 64 * 1024 * 1024,
             max_forwarded: 64 * 1024 * 1024,
             max_requests: 4096,
+            max_body: 16 * 1024 * 1024,
         }
     }
 }
@@ -1124,8 +1185,11 @@ impl Default for RelayLimits {
 /// the session was actually handed, so that is the one this compares.
 #[cfg(test)]
 mod relay_limit_tests {
-    use super::RelayLimits;
+    use super::{
+        parse_chunk_size, read_chunk_line, relay_chunked, BridgeError, RelayLimits, NEVER_CANCELLED,
+    };
     use crate::SESSION_SURROGATE_MAX_USES;
+    use asv_domain::AgentSessionId;
 
     #[test]
     fn a_tunnel_is_bounded_below_the_budget_its_own_session_was_handed() {
@@ -1179,6 +1243,155 @@ mod relay_limit_tests {
         );
     }
 
+    // --- the chunked body copy, over cursors --------------------------------
+    //
+    // Driven directly rather than through a tunnel, because a chunked relay has
+    // two failure modes worth telling apart: one where it is wrong, and one
+    // where a test cannot tell. A byte-for-byte assertion on the output and a
+    // refusal for every size line a second parser could read differently are
+    // both properties of this function alone, and neither needs a certificate.
+
+    fn agent() -> AgentSessionId {
+        AgentSessionId::new()
+    }
+
+    fn copy_chunked(input: &[u8]) -> Result<Vec<u8>, BridgeError> {
+        let mut from = std::io::Cursor::new(input.to_vec());
+        let mut to: Vec<u8> = Vec::new();
+        let count = relay_chunked(
+            &mut from,
+            &mut to,
+            1024 * 1024,
+            &agent(),
+            &NEVER_CANCELLED,
+            false,
+        )?;
+        assert_eq!(
+            count,
+            to.len(),
+            "the byte count and the bytes written disagree, so one of the two is a \
+             number nobody can check"
+        );
+        Ok(to)
+    }
+
+    #[test]
+    fn a_chunked_body_is_copied_with_its_framing_untouched() {
+        let out = copy_chunked(b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n").expect("copied");
+        assert_eq!(
+            String::from_utf8(out).expect("ascii"),
+            "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+            "the chunk framing was rewritten rather than relayed"
+        );
+    }
+
+    #[test]
+    fn a_chunked_body_with_trailers_and_extensions_is_copied_untouched() {
+        let scripted = b"3;name=value\r\nabc\r\n0\r\nX-Checksum: 1234\r\nX-Other: y\r\n\r\n";
+        let out = copy_chunked(scripted).expect("copied");
+        assert_eq!(
+            String::from_utf8(out).expect("ascii"),
+            String::from_utf8(scripted.to_vec()).expect("ascii"),
+            "chunk extensions or trailers were dropped or reordered"
+        );
+    }
+
+    /// The line this module draws: tolerate what every parser agrees on, refuse
+    /// what a second parser could read differently. The positive cases are the
+    /// spec's tolerance and the negative ones are the ambiguity; both are
+    /// asserted, because a parser that refuses everything would satisfy the
+    /// second list alone.
+    #[test]
+    fn only_ambiguous_chunk_sizes_are_refused() {
+        // Agreed on by every parser: plain hexadecimal, in either case.
+        for size in ["5", "5A", "aB", "1f"] {
+            let scripted = format!("{size}\r\n");
+            let line = read_chunk_line(
+                &mut std::io::Cursor::new(scripted.into_bytes()),
+                64,
+                &agent(),
+                &NEVER_CANCELLED,
+                false,
+            )
+            .expect("read")
+            .expect("a line");
+            assert_eq!(
+                parse_chunk_size(line.as_slice()).expect("a size"),
+                usize::from_str_radix(size, 16).expect("hex"),
+                "{size} is a size every parser agrees on"
+            );
+        }
+        // Not agreed on by any of them.
+        for size in ["", "+5", "0x5", "5 5", "5,5", " 5", "5x", "5\t", "-5", "zz"] {
+            let mut cursor = std::io::Cursor::new(format!("{size}\r\n").into_bytes());
+            let line = read_chunk_line(&mut cursor, 64, &agent(), &NEVER_CANCELLED, false)
+                .expect("read")
+                .expect("a line");
+            assert!(
+                parse_chunk_size(line.as_slice()).is_err(),
+                "{size:?} was accepted as a chunk size, and a peer that can make this \
+                 relay read a different extent than the origin intended is a peer it \
+                 must decline to carry"
+            );
+        }
+    }
+
+    /// A chunk that is not terminated by CRLF is refused rather than repaired.
+    ///
+    /// The control is the first half: the same bytes with the CRLF present copy
+    /// cleanly, so a green result here could not be explained by the fixture
+    /// being wrong.
+    #[test]
+    fn a_chunk_without_its_terminating_crlf_is_refused() {
+        assert!(
+            copy_chunked(b"5\r\nhello\r\n0\r\n\r\n").is_ok(),
+            "the control: the same body with its CRLF in place"
+        );
+        let error = copy_chunked(b"5\r\nhelloXX0\r\n\r\n")
+            .expect_err("a chunk with no CRLF after its data is not a chunked body");
+        assert!(
+            matches!(error, BridgeError::Io(_)),
+            "a missing chunk terminator was reported as {error:?}"
+        );
+    }
+
+    /// A chunked body over the budget is refused, and the refusal names the
+    /// budget rather than reading as a socket fault.
+    #[test]
+    fn a_chunked_body_over_the_budget_is_refused_and_named() {
+        let mut from = std::io::Cursor::new(b"ff\r\n".to_vec());
+        let mut to: Vec<u8> = Vec::new();
+        let error = relay_chunked(&mut from, &mut to, 16, &agent(), &NEVER_CANCELLED, false)
+            .expect_err("a chunk larger than the budget must be refused");
+        assert!(
+            matches!(
+                error,
+                BridgeError::Limit {
+                    budget: "max_body",
+                    ..
+                }
+            ),
+            "an over-budget chunked body was refused as {error:?}, which reports a \
+             deliberate limit as something else"
+        );
+    }
+
+    /// A size line that never ends is refused rather than buffered.
+    ///
+    /// The reason `read_chunk_line` is bounded at all: it reads one byte at a
+    /// time so it cannot over-read a body, and a peer that sends a gigabyte
+    /// without a newline is a memory growth curve with no end.
+    #[test]
+    fn a_size_line_without_a_terminator_is_refused_at_the_bound() {
+        let mut from = std::io::Cursor::new(vec![b'a'; 4096]);
+        let error = read_chunk_line(&mut from, 64, &agent(), &NEVER_CANCELLED, false)
+            .expect_err("an endless line must be refused");
+        assert!(
+            matches!(error, BridgeError::Io(_)),
+            "an over-long size line was reported as {error:?}"
+        );
+    }
+
     #[test]
     fn the_defaults_cleared_a_measured_workload() {
         // The measurement, kept as an assertion so the numbers cannot drift away
@@ -1206,6 +1419,22 @@ pub struct SubstitutionOutcome {
     pub forwarded: usize,
     /// Bytes relayed back from the upstream to the client.
     pub returned: usize,
+    /// How many requests this tunnel carried.
+    ///
+    /// The count that makes a multi-request tunnel observable at all. Without
+    /// it a tunnel that served one request and a tunnel that served four thousand
+    /// produce the same operator line, and the difference between them is the
+    /// difference between a working relay and a client reconnecting 4096 times.
+    pub requests: usize,
+    /// Whether the tunnel ended because it reached `max_requests`, rather than
+    /// because a peer hung up.
+    ///
+    /// One fact, and it is the difference between "this client is done" and
+    /// "this client will reconnect and the operator should know why the
+    /// connection keeps changing". A budget that ends a tunnel *at a message
+    /// boundary* is a normal end; one that ends it mid-message is an error, and
+    /// it is reported as one.
+    pub request_budget_spent: bool,
 }
 
 /// The bearer token in a request, if it has one.
@@ -1498,21 +1727,36 @@ impl Bridge {
 ///
 /// Unlike the CONNECT head this runs *through* TLS, so each byte is a
 /// `StreamOwned` read. That is not a performance claim — it is a head, once
-/// per tunnel.
+/// per message.
+///
+/// `None` means the peer closed **at a message boundary**, which is how a
+/// client says it is finished and how every keep-alive connection eventually
+/// ends. It is not the same as a head that stopped half way, and the first
+/// version of the loop could not tell them apart: a clean close was reported as
+/// `Io("empty inner head")`, so an ordinary end-of-connection logged as a fault
+/// and a truncated request logged as the same thing.
 fn read_inner_head<R: Read>(
     stream: &mut R,
     max: usize,
     session: &AgentSessionId,
     cancel: &dyn Cancel,
     pollable: bool,
-) -> Result<Vec<u8>, BridgeError> {
+) -> Result<Option<Vec<u8>>, BridgeError> {
     let mut head = Vec::new();
     loop {
-        let byte = read_byte_cancellable(stream, Some(session), cancel, None, pollable)?
-            .ok_or_else(|| BridgeError::Io("empty inner head".into()))?;
+        let Some(byte) = read_byte_cancellable(stream, Some(session), cancel, None, pollable)?
+        else {
+            // Zero bytes at the very start of a message is a clean close. Fewer
+            // than the terminator after some bytes is a truncated request, and
+            // that is a fault worth naming.
+            if head.is_empty() {
+                return Ok(None);
+            }
+            return Err(BridgeError::Io("connection closed mid-request".into()));
+        };
         head.push(byte);
         if head.ends_with(b"\r\n\r\n") {
-            return Ok(head);
+            return Ok(Some(head));
         }
         if head.len() > max {
             return Err(BridgeError::Protocol(
@@ -1522,11 +1766,11 @@ fn read_inner_head<R: Read>(
     }
 }
 
-/// Copies upstream to client until the upstream closes, the cap is reached, or
-/// the tunnel is cancelled.
+/// Copies bytes from one side of the tunnel to the other, stopping at `max`,
+/// at the peer's close, or at a cancellation.
 ///
-/// **The cancellation is the whole reason this takes three more arguments.**
-/// It used to be a plain copy, so a revoke could only ever reach a tunnel that
+/// **The cancellation is the whole reason this takes three more arguments.** It
+/// used to be a plain copy, so a revoke could only ever reach a tunnel that
 /// was still reading its first request head — and the ordinary state of a live
 /// tunnel is *past* that head, sitting in this function. One established and
 /// idle tunnel was therefore immune to the revocation of the session that
@@ -1538,7 +1782,17 @@ fn read_inner_head<R: Read>(
 /// idle origin looks like, and the only news on a tick is a cancel. `pollable`
 /// is false for a bridge with no cancellation source, where a timeout really is
 /// the caller's problem and is reported as one.
-fn relay_back<R: Read, W: Write>(
+///
+/// Renamed from `relay_back` because a loop that carries many requests has to
+/// relay *both* ways, and a function called "back" being called on the request
+/// direction is a name that will be read as a bug next time.
+///
+/// The returned count is how the caller tells the two ends apart: `max` reached
+/// is a complete body, fewer bytes than `max` is the peer closing early. A
+/// caller that knows the body was supposed to be `max` long treats the two
+/// differently, and a function that hid the difference would be the place that
+/// decision got made by accident.
+fn relay_bytes<R: Read, W: Write>(
     from: &mut R,
     to: &mut W,
     max: usize,
@@ -1577,6 +1831,222 @@ fn relay_back<R: Read, W: Write>(
     Ok(total)
 }
 
+/// The longest a chunk-size line or a trailer line may be.
+///
+/// Bounded because the relay reads these a byte at a time to avoid over-reading
+/// a body, and an unbounded byte-at-a-time read against a peer that never sends
+/// a `\r\n` is a memory growth curve with no end. 8 KiB is the same bound the
+/// head gets and is far past any real chunk header.
+const MAX_CHUNK_LINE: usize = 8 * 1024;
+
+/// Copies a chunked body **verbatim**, chunk framing included.
+///
+/// The choice of verbatim is the whole design, and it is what makes this
+/// function safe to have in the credential path. The relay does not re-frame
+/// anything: every byte the origin sent, including each `1a\r\n` and the CRLF
+/// after each chunk, arrives at the client exactly as it was written. So the
+/// client's own parser reads the origin's framing, and the relay has expressed
+/// no opinion about the body beyond where it ends.
+///
+/// What the relay *does* decide is the extent, and that is unavoidable — it has
+/// to know where the body stops to find the next request. A size line that is
+/// not a plain, unambiguous hexadecimal number is therefore **refused** rather
+/// than guessed at, on the same line this module draws everywhere: tolerate what
+/// every parser must agree on, refuse what a second parser could read
+/// differently. `1a`, `1A`, `01a` and `1a;name=value` all say sixteen; `+1a`,
+/// `0x1a`, `1a1b` and an empty line do not say anything, and a peer that can
+/// make this function read a different extent than the origin intended is a peer
+/// this relay declines to carry.
+fn relay_chunked<R: Read, W: Write>(
+    from: &mut R,
+    to: &mut W,
+    max: usize,
+    session: &AgentSessionId,
+    cancel: &dyn Cancel,
+    pollable: bool,
+) -> Result<usize, BridgeError> {
+    let mut total = 0usize;
+    loop {
+        let line = read_chunk_line(from, MAX_CHUNK_LINE, session, cancel, pollable)?;
+        let Some(line) = line else {
+            return Err(BridgeError::Io(
+                "connection closed inside a chunked body".into(),
+            ));
+        };
+        total += line.len() + 2;
+        if total > max {
+            return Err(limit_spent(
+                "max_body",
+                format!("a chunked body of more than {max} bytes, including its framing"),
+            ));
+        }
+        let size = parse_chunk_size(&line)?;
+        to.write_all(&line)
+            .and_then(|()| to.write_all(b"\r\n"))
+            .map_err(|e| BridgeError::Io(e.to_string()))?;
+        if size == 0 {
+            // The last chunk. Whatever follows is trailer fields and a final
+            // CRLF; both are copied and both are bounded, and the loop ends when
+            // it sees an empty line.
+            loop {
+                let trailer = read_chunk_line(from, MAX_CHUNK_LINE, session, cancel, pollable)?;
+                let Some(trailer) = trailer else {
+                    return Err(BridgeError::Io(
+                        "connection closed inside chunked trailers".into(),
+                    ));
+                };
+                total += trailer.len() + 2;
+                if total > max {
+                    return Err(limit_spent(
+                        "max_body",
+                        format!("chunked trailers of more than {max} bytes"),
+                    ));
+                }
+                to.write_all(&trailer)
+                    .and_then(|()| to.write_all(b"\r\n"))
+                    .map_err(|e| BridgeError::Io(e.to_string()))?;
+                if trailer.is_empty() {
+                    break;
+                }
+            }
+            break;
+        }
+        let body_end = total
+            .checked_add(size)
+            .and_then(|t| t.checked_add(2))
+            .ok_or_else(|| {
+                limit_spent(
+                    "max_body",
+                    "a chunk size that overflows the body budget".into(),
+                )
+            })?;
+        if body_end > max {
+            return Err(limit_spent(
+                "max_body",
+                format!("a chunk of {size} bytes would take the body past {max}"),
+            ));
+        }
+        let copied = relay_bytes(from, to, size, session, cancel, pollable)?;
+        if copied != size {
+            return Err(BridgeError::Io("connection closed inside a chunk".into()));
+        }
+        // The CRLF that terminates a chunk's data. Read rather than assumed, so
+        // that a peer which omits it is a peer this relay refuses rather than
+        // one whose framing it silently repairs — and **written**, because this
+        // function's whole contract is that the client sees the origin's framing
+        // unchanged. The first version read it and dropped it: 26 bytes counted
+        // against 22 written, with the missing four being the two CRLFs after
+        // the chunk data. A client parsing that would have found the next
+        // chunk's size line where its data was supposed to end.
+        let terminator = read_chunk_line(from, 2, session, cancel, pollable)?;
+        match terminator {
+            Some(ref t) if t.is_empty() => {
+                to.write_all(b"\r\n")
+                    .map_err(|e| BridgeError::Io(e.to_string()))?;
+            }
+            _ => return Err(BridgeError::Io("a chunk was not terminated by CRLF".into())),
+        }
+        total += copied + 2;
+    }
+    to.flush().map_err(|e| BridgeError::Io(e.to_string()))?;
+    Ok(total)
+}
+
+/// Reads one CRLF-terminated line and returns it without the terminator.
+///
+/// `None` at a clean close before any byte. `max` is a hard bound: a peer that
+/// sends this many bytes without a `\r\n` is refused rather than buffered, which
+/// is the difference between a bounded relay and a memory growth curve.
+fn read_chunk_line<R: Read>(
+    stream: &mut R,
+    max: usize,
+    session: &AgentSessionId,
+    cancel: &dyn Cancel,
+    pollable: bool,
+) -> Result<Option<Vec<u8>>, BridgeError> {
+    let mut line = Vec::new();
+    loop {
+        let Some(byte) = read_byte_cancellable(stream, Some(session), cancel, None, pollable)?
+        else {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Err(BridgeError::Io("connection closed mid-line".into()))
+            };
+        };
+        if byte == b'\n' {
+            // The CR of a CRLF is part of the terminator, not the value, so it
+            // is dropped here rather than left for the caller to strip. A lone LF
+            // is accepted because the origin wrote it, and rewriting a peer's
+            // line endings inside a credential path is not this relay's job.
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return Ok(Some(line));
+        }
+        if line.len() >= max {
+            return Err(BridgeError::Io(format!(
+                "a line of more than {max} bytes inside a chunked body"
+            )));
+        }
+        line.push(byte);
+    }
+}
+
+/// The size in a chunk-size line, or `None` if the line does not say one thing.
+///
+/// Strict on purpose; see [`relay_chunked`] for the line this draws. Extensions
+/// after `;` are accepted and ignored, because they are part of the chunked
+/// grammar and every parser agrees on where the size ends. Everything the
+/// grammar does not fix — a sign, a `0x` prefix, embedded whitespace, a
+/// trailing digit run that overflows — is refused rather than resolved.
+fn parse_chunk_size(line: &[u8]) -> Result<usize, BridgeError> {
+    let digits = match line.iter().position(|b| *b == b';') {
+        Some(at) => &line[..at],
+        None => line,
+    };
+    if digits.is_empty() || !digits.iter().all(|b| b.is_ascii_hexdigit()) {
+        return Err(BridgeError::Io(
+            "a chunk size that is not a plain hexadecimal number".into(),
+        ));
+    }
+    let text = std::str::from_utf8(digits)
+        .map_err(|_| BridgeError::Io("a chunk size that is not text".into()))?;
+    usize::from_str_radix(text, 16)
+        .map_err(|_| BridgeError::Io("a chunk size too large for this platform".into()))
+}
+
+/// Classifies a framing refusal, and **a budget is not a malformed request**.
+///
+/// The distinction is the whole of this function. Everything the framing parser
+/// refuses for being *ambiguous* or *unrecognised* is the client's or the
+/// origin's doing, and `malformed_request` is the right class. But a body whose
+/// declared `Content-Length` is over `max_body` is a well-formed message that
+/// **this broker** declined to carry, and recording it as `malformed_request`
+/// tells an operator the peer sent something broken when the peer sent something
+/// correct and the answer is a number in this repository.
+///
+/// So `TooLarge` becomes a `Limit`, carrying the budget's name — the same rule
+/// `BridgeError::Limit`'s own docs give, applied at the point where the mistake
+/// was about to be made.
+fn frame_failure(error: http_frame::FrameError, what: &str) -> BridgeError {
+    match error {
+        http_frame::FrameError::TooLarge { limit, subject } => BridgeError::Limit {
+            budget: match subject {
+                http_frame::Subject::Head => "max_head",
+                http_frame::Subject::Body => "max_body",
+            },
+            detail: format!("{what} whose {subject} is over the {limit}-byte limit"),
+        },
+        other => BridgeError::Protocol(format!("{what} this relay will not frame: {other}")),
+    }
+}
+
+/// A budget that ran out, as the error the operator and the client see.
+fn limit_spent(budget: &'static str, detail: String) -> BridgeError {
+    BridgeError::Limit { budget, detail }
+}
+
 /// Holds a lent credential for exactly as long as the rewrite needs it.
 ///
 /// The `Drop` is the point, not a nicety: every exit from `relay_substituted`
@@ -1600,8 +2070,8 @@ impl Drop for Lending {
 }
 
 impl EstablishedTunnel {
-    /// Substitutes the surrogate in the first inner request and relays the
-    /// response back.
+    /// Substitutes the surrogate in every request on this tunnel, and relays each
+    /// exchange back.
     ///
     /// The order is `design.md` F5, and it is the contract rather than a
     /// detail:
@@ -1622,131 +2092,351 @@ impl EstablishedTunnel {
     /// instead of the truth. Here the upstream socket is written zero bytes
     /// and the tunnel closes.
     ///
-    /// What it does not do is own the whole connection. This relays the first
-    /// request's head and then the upstream's response; a second request on
-    /// the same tunnel is a later increment. The duplex-copy deadlock that
-    /// kept `serve_connect` from relaying at all is not solved here — the
-    /// two copies run in sequence instead.
+    /// **The loop is sequential, and that is a decision rather than a limitation
+    /// of imagination.** One request is in flight at a time: the head is read,
+    /// framed, substituted and forwarded, its body is relayed, and only then is
+    /// the response read. Every real HTTP/1.1 client behaves this way — it waits
+    /// for response *n* before sending request *n+1* — so the shape costs
+    /// nothing, and it removes the duplex deadlock entirely rather than papering
+    /// over it with a second thread.
+    ///
+    /// The two cases a sequential pump cannot be transparent to are **refused,
+    /// not half-served**: a request carrying `Expect: 100-continue`, which
+    /// withholds its body until the origin answers, and a request carrying
+    /// `Upgrade`, which turns the tunnel into a full-duplex pipe for a protocol
+    /// this relay does not frame. Both are detected in `http_frame`, both end the
+    /// tunnel with a reason an operator can read, and the alternative in each
+    /// case is a hang that looks like a slow server and that nobody reading the
+    /// log can tell apart from one.
     pub fn relay_substituted(
         &mut self,
         substituter: &mut dyn CredentialSubstituter,
         audit: &mut dyn SubstitutionAudit,
         limits: RelayLimits,
     ) -> Result<SubstitutionOutcome, BridgeError> {
-        let session = self.session;
-        let destination = format!("{}:{}", self.target.host(), self.target.port());
-
-        // Re-arm the poll timeout for the inner read. `serve_connect` disarmed
-        // it before handing the socket to rustls, and without it a revoke could
-        // not interrupt a client that connected, proved its session and then
-        // said nothing — which is the exact shape a revoked agent produces.
         let cancellable = self.cancel.is_some();
+
+        // Both read deadlines are armed once for the whole relay and disarmed
+        // once after it, rather than around each read. `set_read_timeout` is
+        // `SO_RCVTIMEO`, which bounds reads and leaves writes alone, so there is
+        // nothing to disarm before a write; the arm/disarm-around-one-read shape
+        // was noise that a loop would have copied eight times.
+        //
+        // The disarm is a single statement after the call rather than a `Drop`
+        // guard because the loop needs `&mut self` on both sockets for its whole
+        // length, and a guard holding them would be a borrow the loop cannot
+        // outlive. One line after the call is enough: every exit from
+        // `exchange_loop` *returns here*, including every `?` inside it, so
+        // there is no path that skips it.
         if cancellable {
+            // `serve_connect` disarmed the poll before handing the socket to
+            // rustls, and without it a revoke could not interrupt a client that
+            // connected, proved its session and then said nothing — the exact
+            // shape a revoked agent produces. Both sockets need it: the request
+            // direction and the response direction are both places this relay
+            // blocks indefinitely.
             self.client
                 .sock
                 .set_read_timeout(Some(CANCEL_POLL))
                 .map_err(|e| BridgeError::Io(e.to_string()))?;
+            self.upstream
+                .set_read_timeout(Some(CANCEL_POLL))
+                .map_err(|e| BridgeError::Io(e.to_string()))?;
         }
-        // The cancellation source is cloned out before the mutable borrow, so
-        // the tunnel is not borrowed twice in one call.
-        let cancel = self.cancel.clone();
-        let read = {
-            let source: &dyn Cancel = match &cancel {
-                Some(c) => c.as_ref(),
-                None => &NEVER_CANCELLED,
-            };
-            read_inner_head(
-                &mut self.client,
-                limits.max_head,
-                &session,
-                source,
-                cancellable,
-            )
-        };
+        let outcome = self.exchange_loop(substituter, audit, limits, cancellable);
         if cancellable {
             // Best effort, for the same reason as in `serve_connect`: a tunnel
             // that dies with a timeout armed surfaces as a dropped connection
             // rather than as silence, which is the safer of the two failures.
             let _ = self.client.sock.set_read_timeout(None);
+            let _ = self.upstream.set_read_timeout(None);
         }
-        let head = read?;
-        let token = bearer_token(&head).ok_or(SubstitutionError::NoCredential)?;
+        outcome
+    }
 
-        let mut lent = Lending(Vec::new());
-        let substituted = match substituter.substitute(&token, session, &mut lent) {
-            Ok(s) => s,
-            Err(e) => {
-                // Recorded before returning, and the family is `"unresolved"`
-                // rather than a guess: the port declined before it
-                // established one, and inventing it would put an
-                // unestablished fact in the audit log.
-                audit.record(SubstitutionRecord {
-                    session,
-                    destination,
-                    family: "unresolved".to_owned(),
-                    outcome: "refused",
-                })?;
-                return Err(BridgeError::Substitution(e));
+    /// One request in flight at a time, until a peer hangs up or a budget is
+    /// spent at a message boundary.
+    fn exchange_loop(
+        &mut self,
+        substituter: &mut dyn CredentialSubstituter,
+        audit: &mut dyn SubstitutionAudit,
+        limits: RelayLimits,
+        cancellable: bool,
+    ) -> Result<SubstitutionOutcome, BridgeError> {
+        let session = self.session;
+        let destination = format!("{}:{}", self.target.host(), self.target.port());
+        // Cloned out before the loop borrows the tunnel, so the cancellation
+        // source is one value rather than a borrow of `self`.
+        let cancel = self.cancel.clone();
+        let source: &dyn Cancel = match &cancel {
+            Some(c) => c.as_ref(),
+            None => &NEVER_CANCELLED,
+        };
+
+        let mut forwarded = 0usize;
+        let mut returned = 0usize;
+        let mut requests = 0usize;
+        let mut request_budget_spent = false;
+
+        // `while let` rather than `loop` with a `break`: the condition *is* the
+        // client's hang-up, and a client that hung up between two whole messages
+        // is how every keep-alive connection ends. An ordinary end, not a fault —
+        // and written as the absence of a next request rather than as a `break`
+        // that reads like one of the failure exits.
+        'exchange: while let Some(head) = read_inner_head(
+            &mut self.client,
+            limits.max_head,
+            &session,
+            source,
+            cancellable,
+        )? {
+            // ---- the request -------------------------------------------------
+
+            if http_frame::request_expects_continue(&head) {
+                return Err(BridgeError::Limit {
+                    budget: "sequential_pump",
+                    detail: "the client asked to withhold its body until the origin \
+                             answers, which a one-request-at-a-time relay cannot carry"
+                        .into(),
+                });
             }
-        };
+            if http_frame::request_declares_upgrade(&head) {
+                return Err(BridgeError::Limit {
+                    budget: "sequential_pump",
+                    detail: "the client asked to change protocol, and a relay that \
+                             does not frame the new one must not pretend to"
+                        .into(),
+                });
+            }
 
-        // Borrowed only inside this block, so the credential stops being
-        // reachable the moment the rewritten request exists.
-        let mut rewritten = {
-            let credential =
-                std::str::from_utf8(&lent.0).map_err(|_| SubstitutionError::NoCredential)?;
-            replace_bearer_token(&head, credential)?
-        };
+            // Framed by the same parser that framed the head, so the two cannot
+            // disagree about where this request ends.
+            let request = http_frame::parse_request_head(&head, limits.max_body as u64)
+                .map_err(|e| frame_failure(e, "a request"))?;
 
-        self.upstream
-            .write_all(&rewritten)
-            .map_err(|e| BridgeError::Io(e.to_string()))?;
-        self.upstream
-            .flush()
-            .map_err(|e| BridgeError::Io(e.to_string()))?;
-        let forwarded = rewritten.len();
-        // The buffer that carried the credential upstream is wiped here, not
-        // left to the allocator's discretion.
-        rewritten.zeroize();
-
-        audit.record(SubstitutionRecord {
-            session,
-            destination,
-            family: substituted.family.clone(),
-            outcome: "substituted",
-        })?;
-
-        // The upstream socket is what this relay blocks on, so it is the one
-        // that needs the poll deadline armed — the same reasoning as the client
-        // side above, and the same `CANCEL_POLL`. Disarmed again before the
-        // bytes are counted, for the same reason it is disarmed there.
-        if cancellable {
-            self.upstream
-                .set_read_timeout(Some(CANCEL_POLL))
-                .map_err(|e| BridgeError::Io(e.to_string()))?;
-        }
-        let returned = {
-            let source: &dyn Cancel = match &cancel {
-                Some(c) => c.as_ref(),
-                None => &NEVER_CANCELLED,
+            let token = bearer_token(&head).ok_or(SubstitutionError::NoCredential)?;
+            let mut lent = Lending(Vec::new());
+            let substituted = match substituter.substitute(&token, session, &mut lent) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Recorded before returning, and the family is `"unresolved"`
+                    // rather than a guess: the port declined before it
+                    // established one, and inventing it would put an
+                    // unestablished fact in the audit log.
+                    audit.record(SubstitutionRecord {
+                        session,
+                        destination: destination.clone(),
+                        family: "unresolved".to_owned(),
+                        outcome: "refused",
+                    })?;
+                    return Err(BridgeError::Substitution(e));
+                }
             };
-            let copied = relay_back(
-                &mut self.upstream,
-                &mut self.client,
-                limits.max_response,
-                &session,
-                source,
-                cancellable,
-            );
-            if cancellable {
-                let _ = self.upstream.set_read_timeout(None);
+
+            // Borrowed only inside this block, so the credential stops being
+            // reachable the moment the rewritten request exists.
+            let mut rewritten = {
+                let credential =
+                    std::str::from_utf8(&lent.0).map_err(|_| SubstitutionError::NoCredential)?;
+                replace_bearer_token(&head, credential)?
+            };
+            self.upstream
+                .write_all(&rewritten)
+                .map_err(|e| BridgeError::Io(e.to_string()))?;
+            self.upstream
+                .flush()
+                .map_err(|e| BridgeError::Io(e.to_string()))?;
+            forwarded += rewritten.len();
+            // The buffer that carried the credential upstream is wiped here, not
+            // left to the allocator's discretion.
+            rewritten.zeroize();
+
+            audit.record(SubstitutionRecord {
+                session,
+                destination: destination.clone(),
+                family: substituted.family.clone(),
+                outcome: "substituted",
+            })?;
+
+            // The request body, framed by the same parser. Counting bytes the
+            // head never mentioned is how a relay substitutes a credential into
+            // the middle of somebody's form post, so a body this relay cannot
+            // delimit is refused before a single byte of it is forwarded.
+            let body = match request.framing {
+                http_frame::Framing::None => 0,
+                http_frame::Framing::Length(n) => {
+                    let want = n as usize;
+                    let copied = relay_bytes(
+                        &mut self.client,
+                        &mut self.upstream,
+                        want,
+                        &session,
+                        source,
+                        cancellable,
+                    )?;
+                    if copied != want {
+                        return Err(BridgeError::Io(
+                            "the client closed part way through its request body".into(),
+                        ));
+                    }
+                    copied
+                }
+                http_frame::Framing::Chunked => relay_chunked(
+                    &mut self.client,
+                    &mut self.upstream,
+                    limits
+                        .max_body
+                        .min(limits.max_forwarded.saturating_sub(forwarded)),
+                    &session,
+                    source,
+                    cancellable,
+                )?,
+                // `parse_request_head` does not produce this, so the arm is a
+                // refusal rather than an `unreachable!`. A panic in the
+                // credential path is worse than an error, and the two must not be
+                // the same decision.
+                http_frame::Framing::UntilClose => {
+                    return Err(BridgeError::Protocol(
+                        "a request whose body ends when the client closes cannot be framed".into(),
+                    ))
+                }
+            };
+            if forwarded + body > limits.max_forwarded {
+                return Err(limit_spent(
+                    "max_forwarded",
+                    format!("this tunnel forwarded {forwarded} bytes plus a {body}-byte body"),
+                ));
             }
-            copied?
-        };
+            forwarded += body;
+
+            // ---- the response ------------------------------------------------
+            loop {
+                let Some(response_head) = read_inner_head(
+                    &mut self.upstream,
+                    limits.max_head,
+                    &session,
+                    source,
+                    cancellable,
+                )?
+                else {
+                    // The origin hung up between messages. The client sees a
+                    // closed connection and reconnects, which is what an HTTP
+                    // client does anyway.
+                    break 'exchange;
+                };
+
+                let response =
+                    http_frame::parse_response_head(&response_head, limits.max_body as u64)
+                        .map_err(|e| frame_failure(e, "a response"))?;
+
+                // A `101` is not an HTTP message: it hands the connection to
+                // another protocol, and a relay that has just been asked to
+                // relay opaque bytes in both directions is the hang this whole
+                // design exists to avoid.
+                if response.status == Some(101) {
+                    return Err(BridgeError::Limit {
+                        budget: "sequential_pump",
+                        detail: "the origin switched protocol, which a relay that does \
+                                 not frame the new one must not pretend to"
+                            .into(),
+                    });
+                }
+
+                // A head reaches the client before its body, always — including
+                // an interim one. Forwarding the `1xx` and reading again is what
+                // keeps an interim response from looking like the end of the
+                // exchange, which is the mistake that turns a `100 Continue` into
+                // a tunnel that closes while both peers wait for the other.
+                self.client
+                    .write_all(&response_head)
+                    .map_err(|e| BridgeError::Io(e.to_string()))?;
+                self.client
+                    .flush()
+                    .map_err(|e| BridgeError::Io(e.to_string()))?;
+                returned += response_head.len();
+
+                if response.status.is_some_and(|s| (100..200).contains(&s)) {
+                    continue;
+                }
+
+                let body = match response.framing {
+                    http_frame::Framing::None => 0,
+                    http_frame::Framing::Length(n) => {
+                        let want = n as usize;
+                        let copied = relay_bytes(
+                            &mut self.upstream,
+                            &mut self.client,
+                            want,
+                            &session,
+                            source,
+                            cancellable,
+                        )?;
+                        if copied != want {
+                            return Err(BridgeError::Io(
+                                "the origin closed part way through its response body".into(),
+                            ));
+                        }
+                        copied
+                    }
+                    http_frame::Framing::Chunked => relay_chunked(
+                        &mut self.upstream,
+                        &mut self.client,
+                        limits
+                            .max_body
+                            .min(limits.max_response.saturating_sub(returned)),
+                        &session,
+                        source,
+                        cancellable,
+                    )?,
+                    // Close-delimited, and therefore unbounded until the origin
+                    // closes — which is the only thing that ends it, and is why
+                    // the lifetime budget rather than the per-message one is the
+                    // cap that applies here.
+                    http_frame::Framing::UntilClose => relay_bytes(
+                        &mut self.upstream,
+                        &mut self.client,
+                        limits.max_response.saturating_sub(returned),
+                        &session,
+                        source,
+                        cancellable,
+                    )?,
+                };
+                if returned + body > limits.max_response {
+                    return Err(limit_spent(
+                        "max_response",
+                        format!("this tunnel returned {returned} bytes plus a {body}-byte body"),
+                    ));
+                }
+                returned += body;
+                requests += 1;
+
+                // Either peer having said `close` ends the tunnel here, between
+                // two whole messages. Keeping the flag separate from the framing
+                // is the parser's decision and this is where it is spent: a
+                // `Content-Length: 0` on a `Connection: close` response is a
+                // complete message, and it is the `close` that ends the
+                // connection.
+                if request.close_after || response.close_after {
+                    break 'exchange;
+                }
+                if requests >= limits.max_requests {
+                    // At a message boundary, so a normal end rather than an error:
+                    // the client reconnects, exactly as it would against any
+                    // relay that limits a connection. Ending it mid-message would
+                    // be a lie to the client, so `BridgeError::Limit` is raised
+                    // only for the budgets that can do that.
+                    request_budget_spent = true;
+                    break 'exchange;
+                }
+                break;
+            }
+        }
 
         Ok(SubstitutionOutcome {
             forwarded,
             returned,
+            requests,
+            request_budget_spent,
         })
     }
 }
