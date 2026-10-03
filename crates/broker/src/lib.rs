@@ -41,7 +41,10 @@ pub mod vault_port;
 pub mod worker;
 
 pub use pg_session::{BorrowedSecret, PgRuntime, PgSessionError, PgSessionMap, StatementOutcome};
-pub use surrogate::{now_secs, SubstitutionPort, SurrogateError, SurrogateRegistry};
+pub use surrogate::{
+    now_secs, SubstitutionPort, SurrogateError, SurrogateLendError, SurrogateLending,
+    SurrogateRegistry,
+};
 pub use vault_port::{VaultSecretPort, VaultWritePort};
 
 /// In-memory session table. M1 replaces this with persistent, encrypted state;

@@ -337,8 +337,86 @@ pub fn now_secs() -> u64 {
 /// difference between a client that retries and a client that discovers it
 /// does not own the credential. The detail is still available to the
 /// operator, in the registry's own error and in the audit record's `outcome`.
+/// Why a surrogate could not be lent through [`SurrogateLending`].
+///
+/// Two shapes, and the second is not a refusal. Collapsing them would report a
+/// broker fault — a poisoned lock, which means some *other* tunnel panicked —
+/// as a client that presented a bad token, and that is the reading which sends
+/// an operator to look at the wrong thing entirely.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SurrogateLendError {
+    #[error("the surrogate registry is poisoned; the broker must restart")]
+    Poisoned,
+
+    #[error(transparent)]
+    Refused(#[from] SurrogateError),
+}
+
+/// The one operation [`SubstitutionPort`] needs from the store.
+///
+/// **This trait exists because the port used to borrow the registry, and the
+/// borrow was the defect.** `SubstitutionPort<'a>` held `&'a mut
+/// SurrogateRegistry`, so the caller's `MutexGuard` had to outlive the port,
+/// and the port had to outlive the relay that used it. The lock was therefore
+/// held for the whole length of every tunnel — which the type's own doc comment
+/// said it never was, in two places, correctly stating the intent and
+/// incorrectly describing the code.
+///
+/// What that cost, measured rather than argued: with one established and idle
+/// tunnel open, the broker could not `EndSession` for *any* peer, so `asv run`
+/// blocked forever in its own teardown and the operator's command never
+/// returned. The same lock is what `CreateSession` mints through and what
+/// revocation deletes through, so one client holding a tunnel open froze the
+/// session lifecycle for the whole broker.
+///
+/// A `&dyn` that takes the lock itself is not a stylistic preference. It is
+/// what makes "held for one registry operation" the only thing the type can
+/// express: there is no borrow to extend, so there is nothing to accidentally
+/// keep.
+pub trait SurrogateLending: Send + Sync {
+    /// Redeem `surrogate` in `session` for an operation of `family`.
+    ///
+    /// `&self`, not `&mut self`, and the interior mutability is the point: the
+    /// implementer is responsible for scoping the exclusive access to this one
+    /// call, and a caller cannot hold it any longer than that.
+    fn redeem(
+        &self,
+        surrogate: &str,
+        session: AgentSessionId,
+        family: OperationFamily,
+        now: u64,
+    ) -> Result<CredentialId, SurrogateLendError>;
+}
+
+impl SurrogateLending for std::sync::Mutex<SurrogateRegistry> {
+    fn redeem(
+        &self,
+        surrogate: &str,
+        session: AgentSessionId,
+        family: OperationFamily,
+        now: u64,
+    ) -> Result<CredentialId, SurrogateLendError> {
+        let mut registry = self.lock().map_err(|_| SurrogateLendError::Poisoned)?;
+        Ok(registry.redeem_for(surrogate, session, family, now)?)
+    }
+}
+
+/// The credential an agent presents instead of the credential itself — "ask
+/// the session that lent it what it stands for" — not the registry itself,
+/// which would make the bridge's dependency on the token store structural.
+///
+/// What it does **not** do is decide anything. Every refusal comes from
+/// `redeem_for`, and every refusal is flattened to the same
+/// `SubstitutionError::Refused`: a caller that could tell "unknown token" from
+/// "wrong session" would learn whether a token it holds is real, which is the
+/// difference between a client that retries and a client that discovers it
+/// does not own the credential. The detail is still available to the
+/// operator, in the registry's own error and in the audit record's `outcome`.
+///
+/// The registry is behind a `&dyn` rather than a borrow — see
+/// [`SurrogateLending`] for the measurement that forced it.
 pub struct SubstitutionPort<'a> {
-    registry: &'a mut SurrogateRegistry,
+    registry: &'a dyn SurrogateLending,
     /// Where the credential bytes come from.
     ///
     /// A `&dyn SecretPort` and not the vault: the registry already refuses to
@@ -365,7 +443,7 @@ pub struct SubstitutionPort<'a> {
 
 impl<'a> SubstitutionPort<'a> {
     pub fn new(
-        registry: &'a mut SurrogateRegistry,
+        registry: &'a dyn SurrogateLending,
         credential_port: &'a dyn asv_connector_http::SecretPort,
         family: OperationFamily,
         family_name: &'a str,
@@ -388,13 +466,25 @@ impl crate::tls_bridge::CredentialSubstituter for SubstitutionPort<'_> {
     ) -> Result<crate::tls_bridge::Substituted, crate::tls_bridge::SubstitutionError> {
         use crate::tls_bridge::{Substituted, SubstitutionError};
 
+        // The lock is taken here, for this call, and released on the next line.
+        // Nothing above this point holds it and nothing below this point needs
+        // it, which is the whole of what the port's type now guarantees.
+        //
         // Every `SurrogateError` — unknown, wrong session, wrong class,
         // expired, exhausted — answers the same way. Not tidiness: see the
         // type's docs.
         let credential = self
             .registry
-            .redeem_for(surrogate, session, self.family, now_secs())
-            .map_err(|_| SubstitutionError::Refused)?;
+            .redeem(surrogate, session, self.family, now_secs())
+            .map_err(|e| match e {
+                SurrogateLendError::Refused(_) => SubstitutionError::Refused,
+                // A broker fault, and it is reported as one: the tunnel's
+                // outcome and an operator's next action both depend on it not
+                // reading as a client with a bad token.
+                SurrogateLendError::Poisoned => SubstitutionError::Lend(
+                    "the surrogate registry is poisoned; the broker must restart".into(),
+                ),
+            })?;
 
         asv_connector_http::SecretPort::lend(self.credential_port, &credential.to_wire(), sink)
             .map_err(|e| SubstitutionError::Lend(e.to_string()))?;

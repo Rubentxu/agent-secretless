@@ -203,6 +203,12 @@ impl crate::tls_bridge::UpstreamResolver for SystemUpstream {
 /// budget decrement; holding this lock across a relay would let one client that
 /// is slow to send its request freeze minting and revoking for every other
 /// agent.
+///
+/// That sentence used to be a description of a different design. The lock used
+/// to be taken by the caller and pinned by a borrow, and the measurement is in
+/// `SubstitutionPort`'s docs: one idle tunnel froze `EndSession` broker-wide.
+/// It is now enforced by the port taking the lock itself — see
+/// [`crate::surrogate::SurrogateLending`].
 pub struct SubstitutingHandler {
     surrogates: Arc<Mutex<SurrogateRegistry>>,
     secrets: Arc<dyn SecretPort>,
@@ -295,31 +301,27 @@ impl ConnectionHandler for SubstitutingHandler {
         // kept out of an operator's reach to stay harmless.
         let family_name = family.wire_name();
 
-        // One lock, one registry operation, released before any I/O. The
-        // borrow cannot outlive this block: `SubstitutionPort` holds `&mut`,
-        // and holding the guard across `relay_substituted` would serialise
-        // every tunnel in the broker behind whichever one is slowest to speak.
-        let outcome = {
-            let mut registry = self.surrogates.lock().map_err(|_| {
-                // A poisoned registry is a broker fault, not a client one, and
-                // the reason an operator needs is the panic that poisoned it —
-                // not a message about the connection they happened to be
-                // holding at the time.
-                BridgeError::Io(
-                    "the surrogate registry is poisoned; the broker must restart".into(),
-                )
-            })?;
-            let mut port =
-                SubstitutionPort::new(&mut registry, self.secrets.as_ref(), family, family_name);
-            // The registry guard is released at the end of this block; the
-            // audit handle is the shared log itself rather than a guard, so the
-            // relay records into the same chain the socket path appends to and
-            // takes the chain's lock once per record instead of once per
-            // tunnel.
-            let mut audit =
-                SharedSubstitutionAudit::new(Arc::clone(&self.audit), crate::surrogate::now_secs());
-            tunnel.relay_substituted(&mut port, &mut audit, self.limits)
-        }?;
+        // The registry is handed over as the lock itself, and the port takes it
+        // for one `redeem_for` per request. Nothing here holds it across the
+        // relay.
+        //
+        // The first version of this block took the guard itself, built a port
+        // that *borrowed* the registry, and passed the pair into the relay —
+        // which pinned the lock for the whole tunnel, in a comment that said
+        // twice that it would not. One established and idle tunnel was then
+        // enough to freeze `EndSession` for every peer in the broker, and an
+        // `asv run` whose child exited with its tunnel still open never
+        // returned. The type change is in `surrogate.rs`; this is the seam that
+        // makes it usable from here.
+        let mut audit =
+            SharedSubstitutionAudit::new(Arc::clone(&self.audit), crate::surrogate::now_secs());
+        let mut port = SubstitutionPort::new(
+            self.surrogates.as_ref(),
+            self.secrets.as_ref(),
+            family,
+            family_name,
+        );
+        let outcome = tunnel.relay_substituted(&mut port, &mut audit, self.limits)?;
         tracing::info!(
             session = %tunnel.session,
             destination = %tunnel.target.authority,

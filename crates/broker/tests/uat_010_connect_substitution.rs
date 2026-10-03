@@ -279,7 +279,7 @@ fn policy() -> Bridge {
 
 struct Rig {
     store: Arc<Mutex<SessionStore>>,
-    registry: SurrogateRegistry,
+    registry: Mutex<SurrogateRegistry>,
     ca: Arc<SessionCa>,
     root_der: Vec<u8>,
     origin: Origin,
@@ -357,7 +357,7 @@ impl Rig {
 
         Self {
             store: Arc::new(Mutex::new(store)),
-            registry,
+            registry: Mutex::new(registry),
             ca,
             root_der,
             origin: Origin::start(),
@@ -623,7 +623,7 @@ impl asv_broker::tls_bridge::SubstitutionAudit for Collected {
 /// substituted, or one that substituted under an id it invented.
 #[test]
 fn a_valid_proof_resolves_its_session_and_the_origin_receives_the_credential() {
-    let mut rig = Rig::new();
+    let rig = Rig::new();
     let proof = rig.proof(Who::A, HOST, 443);
 
     let (mut client, mut tunnel) = rig.tunnel(Some(proof), 443).expect("an authorised tunnel");
@@ -636,7 +636,7 @@ fn a_valid_proof_resolves_its_session_and_the_origin_receives_the_credential() {
 
     let mut audit = Collected::default();
     let mut port = SubstitutionPort::new(
-        &mut rig.registry,
+        &rig.registry,
         &CanaryStore,
         OperationFamily::GitHub,
         "github",
@@ -689,7 +689,7 @@ fn a_valid_proof_resolves_its_session_and_the_origin_receives_the_credential() {
 /// is the same assertion A1 makes about the origin, pointed the other way.
 #[test]
 fn the_client_receives_the_response_and_neither_the_credential_nor_the_surrogate() {
-    let mut rig = Rig::new();
+    let rig = Rig::new();
     let proof = rig.proof(Who::A, HOST, 443);
     let (mut client, mut tunnel) = rig.tunnel(Some(proof), 443).expect("an authorised tunnel");
 
@@ -697,7 +697,7 @@ fn the_client_receives_the_response_and_neither_the_credential_nor_the_surrogate
 
     let mut audit = Collected::default();
     let mut port = SubstitutionPort::new(
-        &mut rig.registry,
+        &rig.registry,
         &CanaryStore,
         OperationFamily::GitHub,
         "github",
@@ -724,7 +724,7 @@ fn the_client_receives_the_response_and_neither_the_credential_nor_the_surrogate
     // forwarded request would make it a second place the secret lives.
     let mut audit = Collected::default();
     let mut port = SubstitutionPort::new(
-        &mut rig.registry,
+        &rig.registry,
         &CanaryStore,
         OperationFamily::GitHub,
         "github",
@@ -749,7 +749,7 @@ fn the_client_receives_the_response_and_neither_the_credential_nor_the_surrogate
 /// redeem in B's tunnel and this test would go red.
 #[test]
 fn another_sessions_proof_does_not_resolve_to_this_session() {
-    let mut rig = Rig::new();
+    let rig = Rig::new();
     let proof = rig.proof(Who::B, HOST, 443);
     let (mut client, mut tunnel) = rig.tunnel(Some(proof), 443).expect("an authorised tunnel");
 
@@ -762,7 +762,7 @@ fn another_sessions_proof_does_not_resolve_to_this_session() {
     client.send(request_with(&rig.surrogate_a).as_bytes());
     let mut audit = Collected::default();
     let mut port = SubstitutionPort::new(
-        &mut rig.registry,
+        &rig.registry,
         &CanaryStore,
         OperationFamily::GitHub,
         "github",
@@ -792,7 +792,7 @@ fn another_sessions_proof_does_not_resolve_to_this_session() {
 /// with the right session, so the test cannot pass by refusing everything.
 #[test]
 fn a_surrogate_from_another_session_is_still_refused_and_the_right_one_still_works() {
-    let mut rig = Rig::new();
+    let rig = Rig::new();
 
     // Wrong session first, on its own tunnel.
     let proof = rig.proof(Who::A, HOST, 443);
@@ -800,7 +800,7 @@ fn a_surrogate_from_another_session_is_still_refused_and_the_right_one_still_wor
     client.send(request_with(&rig.surrogate_b).as_bytes());
     let mut audit = Collected::default();
     let mut port = SubstitutionPort::new(
-        &mut rig.registry,
+        &rig.registry,
         &CanaryStore,
         OperationFamily::GitHub,
         "github",
@@ -820,13 +820,13 @@ fn a_surrogate_from_another_session_is_still_refused_and_the_right_one_still_wor
     rig.origin.assert_nothing_received();
 
     // Control: the same port, the matching session, the matching token.
-    let mut rig2 = Rig::new();
+    let rig2 = Rig::new();
     let proof = rig2.proof(Who::A, HOST, 443);
     let (mut client, mut tunnel) = rig2.tunnel(Some(proof), 443).expect("an authorised tunnel");
     client.send(request_with(&rig2.surrogate_a).as_bytes());
     let mut audit = Collected::default();
     let mut port = SubstitutionPort::new(
-        &mut rig2.registry,
+        &rig2.registry,
         &CanaryStore,
         OperationFamily::GitHub,
         "github",
@@ -1015,14 +1015,14 @@ fn without_a_valid_proof_or_a_credential_the_tunnel_closes_and_nothing_is_forwar
     assert_eq!(rig.origin.accepted(), 0);
 
     // (3) A valid tunnel, but the request carries nothing to substitute.
-    let mut rig = Rig::new();
+    let rig = Rig::new();
     let proof = rig.proof(Who::A, HOST, 443);
     let (mut client, mut tunnel) = rig.tunnel(Some(proof), 443).expect("an authorised tunnel");
     client.send(b"GET /repos/o/r/issues HTTP/1.1\r\nHost: api.github.test\r\n\r\n");
 
     let mut audit = Collected::default();
     let mut port = SubstitutionPort::new(
-        &mut rig.registry,
+        &rig.registry,
         &CanaryStore,
         OperationFamily::GitHub,
         "github",
@@ -1050,7 +1050,7 @@ fn without_a_valid_proof_or_a_credential_the_tunnel_closes_and_nothing_is_forwar
 /// that only proves somebody called an audit function.
 #[test]
 fn the_audit_record_names_the_operation_and_carries_no_secret() {
-    let mut rig = Rig::new();
+    let rig = Rig::new();
     let proof = rig.proof(Who::A, HOST, 443);
     let (mut client, mut tunnel) = rig.tunnel(Some(proof), 443).expect("an authorised tunnel");
 
@@ -1058,7 +1058,7 @@ fn the_audit_record_names_the_operation_and_carries_no_secret() {
 
     let mut log = AuditLog::new(0);
     let mut port = SubstitutionPort::new(
-        &mut rig.registry,
+        &rig.registry,
         &CanaryStore,
         OperationFamily::GitHub,
         "github",
@@ -1130,7 +1130,7 @@ fn the_audit_record_names_the_operation_and_carries_no_secret() {
 /// something here" is the interesting record.
 #[test]
 fn a_refused_substitution_is_audited_without_the_secret() {
-    let mut rig = Rig::new();
+    let rig = Rig::new();
     let proof = rig.proof(Who::A, HOST, 443);
     let (mut client, mut tunnel) = rig.tunnel(Some(proof), 443).expect("an authorised tunnel");
 
@@ -1138,7 +1138,7 @@ fn a_refused_substitution_is_audited_without_the_secret() {
 
     let mut log = AuditLog::new(0);
     let mut port = SubstitutionPort::new(
-        &mut rig.registry,
+        &rig.registry,
         &CanaryStore,
         OperationFamily::GitHub,
         "github",
@@ -1190,7 +1190,7 @@ fn a_refused_substitution_is_audited_without_the_secret() {
 /// the check survives a refactor that renames the constant.
 #[test]
 fn the_substitution_is_observable_from_both_ends_and_not_vacuous() {
-    let mut rig = Rig::new();
+    let rig = Rig::new();
     let proof = rig.proof(Who::A, HOST, 443);
     let (mut client, mut tunnel) = rig.tunnel(Some(proof), 443).expect("an authorised tunnel");
 
@@ -1198,7 +1198,7 @@ fn the_substitution_is_observable_from_both_ends_and_not_vacuous() {
 
     let mut audit = Collected::default();
     let mut port = SubstitutionPort::new(
-        &mut rig.registry,
+        &rig.registry,
         &CanaryStore,
         OperationFamily::GitHub,
         "github",
@@ -1266,7 +1266,7 @@ type RelayVerdict = Result<SubstitutionOutcome, BridgeError>;
 /// failed on its own.
 fn relay_on_worker(
     tunnel: EstablishedTunnel,
-    registry: SurrogateRegistry,
+    registry: Mutex<SurrogateRegistry>,
 ) -> (
     std::thread::JoinHandle<RelayVerdict>,
     std::sync::mpsc::Receiver<RelayVerdict>,
@@ -1274,14 +1274,10 @@ fn relay_on_worker(
     let (tx, rx) = std::sync::mpsc::channel();
     let handle = thread::spawn(move || {
         let mut tunnel = tunnel;
-        let mut registry = registry;
+        let registry = registry;
         let mut audit = Collected::default();
-        let mut port = SubstitutionPort::new(
-            &mut registry,
-            &CanaryStore,
-            OperationFamily::GitHub,
-            "github",
-        );
+        let mut port =
+            SubstitutionPort::new(&registry, &CanaryStore, OperationFamily::GitHub, "github");
         let outcome = tunnel.relay_substituted(&mut port, &mut audit, RelayLimits::default());
         let _ = tx.send(outcome.clone());
         outcome
