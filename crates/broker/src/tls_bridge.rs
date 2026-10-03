@@ -977,10 +977,16 @@ pub enum SubstitutionError {
 /// audited a hard-coded string, would be auditing a fact it had not
 /// established — which is the same defect `WrongSession` is a guard against
 /// on the spending side.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Substituted {
     /// Wire name of the operation family, e.g. `"github"`.
-    pub family: &'static str,
+    ///
+    /// Owned rather than `&'static str` (C2.6). The name is the route's, and a
+    /// route is operator configuration loaded at runtime, so it cannot be a
+    /// compile-time constant. Owned also keeps this record self-contained: the
+    /// audit entry names the family that actually ran, and cannot be left
+    /// pointing into a table that has since been reloaded.
+    pub family: String,
 }
 
 /// Where the bridge gets credential substitution from.
@@ -1025,7 +1031,12 @@ pub struct SubstitutionRecord {
     /// The authorised destination, `host:port`.
     pub destination: String,
     /// The operation family the credential was spent on.
-    pub family: &'static str,
+    ///
+    /// Owned rather than `&'static str` (C2.6): the family is the route's, and
+    /// a route is operator configuration loaded at runtime. The record is
+    /// serialized into the audit chain here rather than holding a borrow into a
+    /// table that a reload may already have replaced.
+    pub family: String,
     /// `"substituted"`, or `"refused"` when the tunnel closed instead.
     pub outcome: &'static str,
 }
@@ -1521,7 +1532,7 @@ impl EstablishedTunnel {
                 audit.record(SubstitutionRecord {
                     session,
                     destination,
-                    family: "unresolved",
+                    family: "unresolved".to_owned(),
                     outcome: "refused",
                 })?;
                 return Err(BridgeError::Substitution(e));
@@ -1550,7 +1561,7 @@ impl EstablishedTunnel {
         audit.record(SubstitutionRecord {
             session,
             destination,
-            family: substituted.family,
+            family: substituted.family.clone(),
             outcome: "substituted",
         })?;
 
@@ -2292,7 +2303,9 @@ mod substitution_tests {
             }
             sink.accept(REAL)
                 .map_err(|e| SubstitutionError::Lend(e.to_string()))?;
-            Ok(Substituted { family: "github" })
+            Ok(Substituted {
+                family: "github".to_owned(),
+            })
         }
     }
 

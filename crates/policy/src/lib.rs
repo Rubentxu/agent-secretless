@@ -56,6 +56,21 @@ permit (
 // writable.
 permit (principal, action == Action::"postgres_connect", resource is Database);
 permit (principal, action == Action::"postgres_read", resource is Database);
+
+// C2.6: `connect_route` has NO permit rule, and the omission is the point.
+//
+// A route file is a *declaration* that a host may be CONNECT-ed; this action
+// is the *permission*. An operator who wants `api.github.com:443` reachable
+// writes both the route and a rule here. There is no blanket permit because a
+// blanket permit would make the cross-check vacuous: every route would pass,
+// and a file that cannot fail is not a control -- it is the same defect M6-R5
+// exists to prevent for the database verbs, where permitting every verb would
+// make the five Cedar actions decorative.
+//
+// So a stock broker refuses every declared route. That is the truthful posture
+// for a surface that was not there before, and widening it is an explicit
+// policy edit an operator can see in a diff, rather than a side effect of
+// writing a JSON file.
 "#;
 
 /// Audiences a semantic HTTP action may ever target (D6; the design v2 open
@@ -229,6 +244,20 @@ const SCHEMA_JSON: &str = r#"{
         }
       },
       "http_request": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Host"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
+      "connect_route": {
         "memberOf": [],
         "appliesTo": {
           "principalTypes": ["AgentSession"],
@@ -808,6 +837,7 @@ fn action_name(action: &Action) -> &'static str {
         Action::GitHubIssueRead => "github_issue_read",
         Action::GitHubIssueCreate => "github_issue_create",
         Action::GitHubReleaseCreate => "github_release_create",
+        Action::ConnectRoute => "connect_route",
     }
 }
 

@@ -25,7 +25,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use asv_connector_http::SecretPort;
-use asv_domain::OperationFamily;
 
 use crate::surrogate::{SubstitutionPort, SurrogateRegistry};
 use crate::tls_bridge::{
@@ -213,8 +212,18 @@ pub struct SubstitutingHandler {
     /// recorded here have to be the same chain: two chains would each verify
     /// alone and say nothing about what the other did.
     audit: Arc<Mutex<crate::audit::AuditLog>>,
-    family: OperationFamily,
-    family_name: &'static str,
+    /// Which family and credential this tunnel may spend, per destination.
+    ///
+    /// C2.6. This used to be a pair of constants on the handler
+    /// (`OperationFamily::GitHub`, `"github"`), which meant the bridge held the
+    /// policy: every tunnel through one listener substituted a GitHub
+    /// credential, and the destination had no say in it. A route declares its
+    /// own family and credential and the policy authorized the route at load,
+    /// so the family follows the destination instead of the process.
+    ///
+    /// Shared and immutable. The reload path swaps a whole table rather than
+    /// mutating one, so no tunnel can observe a half-applied change.
+    routes: Arc<crate::connect_routes::ConnectRouteSet>,
     limits: RelayLimits,
 }
 
@@ -231,15 +240,13 @@ impl SubstitutingHandler {
         surrogates: Arc<Mutex<SurrogateRegistry>>,
         secrets: Arc<dyn SecretPort>,
         audit: Arc<Mutex<crate::audit::AuditLog>>,
-        family: OperationFamily,
-        family_name: &'static str,
+        routes: Arc<crate::connect_routes::ConnectRouteSet>,
     ) -> Self {
         Self {
             surrogates,
             secrets,
             audit,
-            family,
-            family_name,
+            routes,
             limits: RelayLimits::default(),
         }
     }
@@ -253,8 +260,7 @@ impl SubstitutingHandler {
 impl std::fmt::Debug for SubstitutingHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SubstitutingHandler")
-            .field("family", &self.family)
-            .field("family_name", &self.family_name)
+            .field("routes", &self.routes)
             .field("limits", &self.limits)
             .field("secrets", &"<a secret port>")
             .finish()
@@ -263,6 +269,28 @@ impl std::fmt::Debug for SubstitutingHandler {
 
 impl ConnectionHandler for SubstitutingHandler {
     fn run(&self, mut tunnel: EstablishedTunnel) -> Result<(), BridgeError> {
+        // Which family and credential this tunnel may spend is the *route's*
+        // answer, looked up by the destination the CONNECT actually named. Not
+        // a handler constant, and not anything the client supplied: the target
+        // came from the parsed CONNECT head and the table is what the policy
+        // authorized at load.
+        //
+        // The lookup is a second gate rather than a formality. The bridge's own
+        // `ConnectPolicy` already refused a destination with no route, so this
+        // arm should be unreachable — and it is written to fail closed anyway,
+        // because the alternative is a handler that substitutes a default family
+        // for a destination it does not recognise. If the two gates ever
+        // disagree, this one is the one that holds.
+        let route = self.routes.route_for(&tunnel.target).ok_or_else(|| {
+            BridgeError::Io(
+                "no authorized route for this destination; the broker's policy and its \
+                 route table disagree"
+                    .into(),
+            )
+        })?;
+        let family = route.operation_family();
+        let credential = route.credential();
+
         // One lock, one registry operation, released before any I/O. The
         // borrow cannot outlive this block: `SubstitutionPort` holds `&mut`,
         // and holding the guard across `relay_substituted` would serialise
@@ -277,12 +305,8 @@ impl ConnectionHandler for SubstitutingHandler {
                     "the surrogate registry is poisoned; the broker must restart".into(),
                 )
             })?;
-            let mut port = SubstitutionPort::new(
-                &mut registry,
-                self.secrets.as_ref(),
-                self.family,
-                self.family_name,
-            );
+            let mut port =
+                SubstitutionPort::new(&mut registry, self.secrets.as_ref(), family, credential);
             // The registry guard is released at the end of this block; the
             // audit handle is the shared log itself rather than a guard, so the
             // relay records into the same chain the socket path appends to and

@@ -644,6 +644,20 @@ pub enum Action {
     PostgresCreateTable,
     PostgresDropTable,
     PostgresAlterTable,
+    /// Declare that a `(authority, port)` may be `CONNECT`-ed at all, and under
+    /// which operation family the substitution runs (C2.6).
+    ///
+    /// This is the action a `ConnectRoute` is authorized against when the
+    /// route file is loaded, so the file is a *declaration* and this action is
+    /// the *permission*. Keeping them separate is the whole point: a route file
+    /// that names a host the policy does not permit is refused at load, so
+    /// editing the config cannot widen what the policy allows.
+    ///
+    /// The default policy text deliberately has **no** `permit` for it, which
+    /// means a stock broker refuses every declared route. That is the
+    /// fail-closed reading, and widening it is an operator's explicit policy
+    /// edit rather than a side effect of writing a config file.
+    ConnectRoute,
 }
 
 impl fmt::Display for Action {
@@ -662,6 +676,7 @@ impl fmt::Display for Action {
             Self::PostgresCreateTable => "postgres.create_table",
             Self::PostgresDropTable => "postgres.drop_table",
             Self::PostgresAlterTable => "postgres.alter_table",
+            Self::ConnectRoute => "connect.route",
         };
         f.write_str(s)
     }

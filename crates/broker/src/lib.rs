@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 pub mod admission;
 pub mod audit;
 pub mod connect_listener;
+pub mod connect_routes;
 pub mod connect_runtime;
 pub mod harden;
 pub mod inventory;

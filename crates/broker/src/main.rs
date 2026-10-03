@@ -79,6 +79,17 @@ fn main() -> std::io::Result<()> {
     // with their own allow-list in hand rather than something a shipped default
     // should do on their behalf.
     let mut connect_listen: Option<String> = None;
+    // C2.6: the CONNECT route table. A file, not an environment variable, for
+    // the same reason as every other operator setting above: the broker's
+    // env-quarantine invariant (uat_017) scans production sources for env reads,
+    // and a destination an operator cannot see in the launch contract is a
+    // destination they cannot audit.
+    let mut connect_routes: Option<PathBuf> = None;
+    // C2.6: Cedar policy text. A route file declares what should be reachable;
+    // this is the permission that makes it so. They are separate flags on
+    // purpose — a route with no policy rule is refused, and that refusal is the
+    // default, so widening CONNECT is two deliberate edits rather than one.
+    let mut policy_file: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         let arg = match arg.into_string() {
             Ok(s) => s,
@@ -153,6 +164,20 @@ fn main() -> std::io::Result<()> {
                     }
                 };
             }
+            "--connect-routes" => {
+                connect_routes = args.next().map(PathBuf::from);
+                if connect_routes.is_none() {
+                    eprintln!("asv: --connect-routes requires a path argument");
+                    std::process::exit(1);
+                }
+            }
+            "--policy" => {
+                policy_file = args.next().map(PathBuf::from);
+                if policy_file.is_none() {
+                    eprintln!("asv: --policy requires a path argument");
+                    std::process::exit(1);
+                }
+            }
             "-h" | "--help" => {
                 eprintln!(
                     "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH] [--audit-max-records N] [--audit-file PATH] [--enrol-principal PATH] [--harden] [--connect-listen ADDR]"
@@ -161,6 +186,17 @@ fn main() -> std::io::Result<()> {
                 eprintln!("  --connect-listen ADDR  serve the CONNECT proxy on ADDR. Needs a");
                 eprintln!("                         --vault: a tunnel with no credential behind");
                 eprintln!("                         it is refused, so there is nothing to serve.");
+                eprintln!("  --connect-routes PATH  the CONNECT route table. Every route is");
+                eprintln!("                         authorized against the policy at load, so a");
+                eprintln!("                         route the policy does not permit fails the");
+                eprintln!("                         whole file rather than being dropped.");
+                eprintln!(
+                    "  --policy PATH          Cedar policy text. The built-in policy permits"
+                );
+                eprintln!(
+                    "                         no CONNECT route at all, so a route file alone"
+                );
+                eprintln!("                         authorizes nothing.");
                 std::process::exit(0);
             }
             other if other.starts_with("--") || other.starts_with('-') => {
@@ -307,6 +343,31 @@ fn main() -> std::io::Result<()> {
     tracing::info!(path = %socket_path.display(), protocol = asv_ipc_protocol::PROTOCOL_VERSION, "broker listening");
 
     let mut state = BrokerState::default();
+
+    // C2.6: the operator's Cedar text, if they supplied one. Loaded before the
+    // route table, because the route table is authorized *by* this engine and
+    // asking the question in the other order would authorize routes against a
+    // policy the operator is about to replace.
+    if let Some(path) = policy_file.as_deref() {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("asv: cannot read --policy {}: {e}", path.display());
+            std::process::exit(1);
+        });
+        state.policy = asv_policy::PolicyEngine::from_policy_text(&text).unwrap_or_else(|e| {
+            // A policy that does not parse is not a policy this broker can run
+            // with. Exiting is the fail-closed answer; falling back to the
+            // built-in text would start a broker whose effective policy nobody
+            // wrote, and every decision it made afterwards would be attributed
+            // to a file the operator does not have.
+            eprintln!(
+                "asv: --policy {} is not valid Cedar policy: {e}",
+                path.display()
+            );
+            std::process::exit(1);
+        });
+        tracing::info!(path = %path.display(), "Cedar policy loaded");
+    }
+
     if let Some(report) = self_report {
         state.self_report = report;
     }
@@ -470,17 +531,54 @@ fn main() -> std::io::Result<()> {
             "session CA generated for the CONNECT path"
         );
 
-        // The allow-list is the same shape the bridge already enforces and is
-        // empty by default: a proxy with no destinations refuses everything,
-        // which is the correct starting posture for a surface that was not
-        // there before. Widening it is M14's adapter work, where the
-        // destinations are known.
+        // C2.6: the route table, loaded from the operator's file and authorized
+        // against the policy engine one step above. Absent a file the table is
+        // empty, which is the same closed posture this listener shipped with —
+        // but now it is *closed by declaration* rather than by a hardcoded
+        // empty `Vec`, and an operator can open it without a rebuild.
+        //
+        // A file that fails to load is fatal, and deliberately so. The
+        // alternative — start with an empty table and log — is a broker that
+        // looks healthy while authorizing nothing, which is the one reading an
+        // operator cannot distinguish from "my routes are in force".
+        let routes = match connect_routes.as_deref() {
+            Some(path) => {
+                let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+                    eprintln!("asv: cannot read --connect-routes {}: {e}", path.display());
+                    std::process::exit(1);
+                });
+                let set = asv_broker::connect_routes::ConnectRouteSet::load(&text, &state.policy)
+                    .unwrap_or_else(|e| {
+                        eprintln!("asv: --connect-routes {} refused: {e}", path.display());
+                        std::process::exit(1);
+                    });
+                tracing::info!(
+                    path = %path.display(),
+                    routes = set.len(),
+                    "CONNECT route table loaded and authorized"
+                );
+                Arc::new(set)
+            }
+            None => {
+                tracing::warn!(
+                    "no --connect-routes given; the CONNECT listener will refuse every \
+                     destination. This is the closed default, not a policy decision about \
+                     any particular host."
+                );
+                Arc::new(asv_broker::connect_routes::ConnectRouteSet::default())
+            }
+        };
+
+        // The handler takes the table rather than a family and a credential
+        // name, so which credential a tunnel may spend is the route's answer and
+        // not a constant of this process. The old constant pair would have
+        // substituted a GitHub credential for every host the first allow-list
+        // let through.
         let handler = Arc::new(asv_broker::connect_runtime::SubstitutingHandler::new(
             Arc::clone(&state.surrogates),
             secrets,
             Arc::clone(&state.audit),
-            asv_domain::OperationFamily::GitHub,
-            "github",
+            Arc::clone(&routes),
         ));
 
         // The session store and the surrogate registry are the broker's own,
@@ -497,7 +595,7 @@ fn main() -> std::io::Result<()> {
             Arc::new(asv_broker::connect_runtime::SystemUpstream),
             Arc::new(asv_broker::connect_runtime::SharedSessions::new(sessions)),
             Arc::clone(&shutdown),
-            Vec::new(),
+            routes.to_connect_policy().allowed,
             asv_broker::connect_listener::ListenerConfig::default(),
         );
 

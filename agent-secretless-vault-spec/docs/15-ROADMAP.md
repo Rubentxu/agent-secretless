@@ -1627,6 +1627,88 @@ its reason rather than left failing forever. The C2.5-S2 measurement agrees:
 `curl` did not multiplex, and there is no portable way for it to learn that it
 could.
 
+## C2.6 — CONNECT policy and configuration
+
+### Status: applied
+
+`ConnectRoute` exists, each route is authorized by Cedar at load, and the bridge
+holds no rule. The allow-list is no longer `Vec::new()` and the handler is no
+longer carrying `OperationFamily::GitHub` as a constant.
+
+**Two decisions, both taken by the owner rather than inferred.**
+
+*Where the allow-list comes from.* A declarative route file, authorized by Cedar
+when it loads. The alternative considered and rejected was deriving the list from
+the policy engine alone: it needs the schema extended for port and family, and
+`ALLOWED_AUDIENCES` would still have been a `const` of compilation — the same
+`if github.com` moved to another crate. The second alternative, a config file
+with no cross-check, was rejected because it makes the file a second policy
+engine able to permit anything, which is the reuse law's own prohibition.
+
+*How the family is bound.* Each route declares its own family and credential.
+Resolving it from the session's existing surrogate was considered and rejected:
+it couples policy to inventory and has no answer for a session that has not
+minted a surrogate yet.
+
+**One trap, found and closed rather than walked into.** The obvious
+implementation of "authorized by Cedar at load" is a `permit` for
+`connect_route`. That makes the cross-check *vacuous* — every route passes, so
+the file cannot fail and the check is not a control. It is the same defect M6-R5
+exists to prevent for the database verbs. So the built-in policy text has **no**
+`permit` for `connect_route`, and a stock broker refuses every declared route.
+Widening CONNECT is now two visible edits — a route file and a rule — rather
+than one, and both show up in a diff.
+
+**What the loader refuses, and why each refusal is a control.**
+
+| refused | the attack it closes |
+|---|---|
+| surrounding whitespace | a loader that trims first reinstates the textual allowlist bypass `canonicalize` exists to prevent |
+| a single-label host | `localhost` as a routing shortcut |
+| an IP literal | the direct-address trick: no name to pin, and a route that outlives whatever the operator thought the number meant |
+| port 0 | not a service |
+| an empty credential alias | a route with nothing to substitute |
+| two routes for one endpoint | a coin flip decided by file order |
+| an unknown field | a typo'd field silently defaulting |
+| a route the policy does not permit | the config widening what the policy allows |
+
+**`Authority` deserializes without canonicalizing.** It is
+`#[serde(transparent)]` over a `String`, so a route file is exactly the path by
+which an uncanonical spelling reaches the table. The loader canonicalizes on the
+way in for that reason, and `deny_unknown_fields` is on because a typo'd
+`operation_family` would otherwise deserialize into a route with no family.
+
+**The `git_hub` spelling.** `OperationFamily` derives
+`rename_all = "snake_case"`, so serde splits `GitHub` at the internal capital and
+the wire form is `git_hub`. `github` is a *different* variant and is refused.
+Measured, not assumed: the first version of the unknown-field test was passing
+for the wrong reason and this is how it surfaced.
+
+**What a route does not pin.** A route pins an identity — a canonical name and a
+port — not an address. Resolution happens later against whatever resolver the
+host has, so a hostile answer can still point a permitted name at an attacker's
+address. The table's contribution is bounded and now written down: the proof
+nonce, the authorization and the audit record all name the *authority*, never
+the resolved address, so a rebind cannot change what was authorized. Pinning the
+address is a separate control that does not exist yet.
+
+**Evidence.** 17 tests in `crates/broker/src/connect_routes.rs`, one per property
+the objective names. 10/10 mutations turn the suite red: IP-literal refusal
+removed, Cedar cross-check removed, unknown fields ignored, port dropped from the
+match, host trimmed before canonicalizing, lookalike accepted, duplicate endpoint
+silently kept, port 0 accepted, a denied route no longer failing the file, and
+`withdraw` turned into a no-op. One of those ten initially **escaped** — the
+unknown-field test omitted a required field, so serde reported the missing field
+and the test kept passing with `deny_unknown_fields` deleted. Fixed by supplying
+every required field and adding a control that must load, so the only thing wrong
+with the document is the extra field.
+
+**Still owed, and not claimed by this delivery.** No route is reachable in a
+shipped build, because no shipped policy permits one. That is deliberate and
+fail-closed, and it means C2.7 needs an operator configuration to demonstrate
+anything: a route file *and* a policy file. The end-to-end vertical, the
+adversarial campaign and the concurrency work are C2.7 and C2.8, not this block.
+
 ## After v1.0 — M14 through M18
 
 Adopted from `docs/asv-agent-first-security-evolution-v2-2026-10-02/`. **This

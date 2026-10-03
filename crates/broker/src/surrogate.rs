@@ -354,7 +354,13 @@ pub struct SubstitutionPort<'a> {
     /// database token can back a GitHub call.
     family: OperationFamily,
     /// The wire name recorded in the audit record for that family.
-    family_name: &'static str,
+    ///
+    /// Borrowed rather than `&'static str` (C2.6): the name now comes from the
+    /// route that authorized this tunnel, and a route is an operator's runtime
+    /// configuration, so it cannot be a compile-time constant. It is still not
+    /// taken from the request — only from a table the policy already approved,
+    /// which is the property the previous `&'static str` was protecting.
+    family_name: &'a str,
 }
 
 impl<'a> SubstitutionPort<'a> {
@@ -362,7 +368,7 @@ impl<'a> SubstitutionPort<'a> {
         registry: &'a mut SurrogateRegistry,
         credential_port: &'a dyn asv_connector_http::SecretPort,
         family: OperationFamily,
-        family_name: &'static str,
+        family_name: &'a str,
     ) -> Self {
         Self {
             registry,
@@ -394,7 +400,7 @@ impl crate::tls_bridge::CredentialSubstituter for SubstitutionPort<'_> {
             .map_err(|e| SubstitutionError::Lend(e.to_string()))?;
 
         Ok(Substituted {
-            family: self.family_name,
+            family: self.family_name.to_owned(),
         })
     }
 }
