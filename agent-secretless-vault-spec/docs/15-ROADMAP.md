@@ -1235,11 +1235,12 @@ worse than no counter at all: it is a denial of service wearing a security
 costume, which is the same shape as the "strict highest counter seen" rule the
 window deliberately avoids.
 
-**Status: the emitter is built; the shim around it is not.** `ProofIssuer` is
-the "one emitter per session" this section argues for, and it holds the only
-counter the session spends — see *C2.5-b*. The proxy that receives the
-ordinary client's CONNECT and hands it to the emitter is not built, so the
-shape above is still only half real.
+**Status: built, but not yet in a session.** `ProofIssuer` is the "one emitter
+per session" this section argues for and it holds the only counter the session
+spends; `SessionShim` is the proxy that takes an ordinary client's CONNECT and
+mints the proof for the destination it named. See *C2.5-b* and *C2.5-c*. What
+is missing is the last inch: `asv run` does not start the shim or point its
+child at it, so nothing in the product invokes any of this yet.
 
 #### C2.5-S1 — measured: only one client can carry the proof
 
@@ -1549,6 +1550,82 @@ counter back on failure was first written as `store(counter + 1)` followed by
 `fetch_add(1)`, which is *exactly what the original does*. A mutation that
 changes nothing is indistinguishable from one that changes something and is not
 caught, so reading the mutation is part of falsifying it.
+
+#### C2.5-c — the shim exists, and it is as dumb as the measurement said it could be
+
+`crates/cli/src/session_shim.rs`. It binds loopback, takes a CONNECT from a
+client that has never heard of Agent Secretless, asks the session's one issuer
+for a proof bound to the destination that CONNECT named, injects the header,
+and hands the request to the broker. After the `200` it is `recv`/`sendall`.
+
+**The destination had to become a shared type before any of this worked.**
+The proof's nonce is a hash over a *canonical* host and port, and the shim has
+to derive the same one the broker will. The broker had a private
+`parse_connect_target`; the shim would have needed a second one, and two
+parsers do not fail loudly — they produce proofs that verify nowhere, which
+reads as a broken signer rather than as a disagreement. So the parse moved to
+`asv_domain::ConnectTarget`, beside `Authority::canonicalize`, which is already
+the declared single source of truth for "the same host" in this codebase. The
+broker now delegates to it and keeps `AuthorityEndpoint` as its own
+authorisation vocabulary; the shim and the broker share the *reading* and
+nothing else.
+
+**The shim is not a policy engine and is written so it cannot become one
+casually.** It authorises nothing, resolves nothing, substitutes nothing, and
+does not know the allowlist. When the broker drops a refused CONNECT — which
+is what the real one does, writing no HTTP error at all — the shim answers
+`502 Bad Gateway` and nothing more: a bare status line with no header, no
+reason, no hint. A client that learned *why* its proof could not be minted
+would be learning something about the session's signing state that it has no
+business knowing, and the refusal's real reason belongs in the audit chain,
+for the operator, not in a string this process invented.
+
+**It replaces a client-supplied proof rather than adding to it.** The broker
+reads the *first* `x-asv-session-proof` it finds, so a shim that merely
+appended would hand a client the race. A forged proof would be refused anyway
+— it cannot be signed by the session's key — but the design must not make
+which header wins a race.
+
+**Both heads are read one byte at a time.** A `BufReader` is the obvious
+choice and it is wrong in both directions: it may buffer past `\r\n\r\n` and
+swallow the first bytes of the client's TLS ClientHello, and on the other side
+it would eat the start of the broker's first record.
+
+**Falsification: 9 mutations, 9 killed, control green**
+(`tests/session_shim_falsification.py`) — plus one **removed**, and the removal
+is the finding. The first run killed 4 of 10, and every survivor was a hole in
+a test rather than a strength in the shim:
+
+- **The destination test only ever named one host.** With every request naming
+  `api.example.com:443`, "minted for the requested destination" and "minted
+  for a hardcoded one" are the same observation, and a mutation that hardcoded
+  the destination changed nothing. The test now opens two tunnels to different
+  hosts and checks each proof against its own destination *and* against the
+  other's.
+- **The refusal test used the very status a mutation rewrote to**, so
+  "restated by the shim" and "forwarded verbatim" were indistinguishable. The
+  fixture now answers `407`, a status the shim would never invent.
+- **The `502` was only checked for its status line**, which left the shim free
+  to attach an explanation. The assertion is now on the whole reply, byte for
+  byte.
+- **The head bound had no test at all**, so removing it was invisible. There is
+  now one that sends a head past the bound and asserts nothing reaches the
+  broker.
+
+**And the branch I deleted rather than tested.** The shim originally looped,
+serving a second CONNECT on the same client socket. The test for it opened a
+*second connection*, so it proved nothing about the loop. When the test was
+rewritten to actually use one socket, it failed — and the reason is the
+finding: after the `200` the shim is a pipe, so bytes the client sends next are
+tunnel payload, which is the correct reading of them, and the client has no
+way to learn the tunnel ended. **No client can reach that loop.** Reaching it
+in a test needed a `sleep`, and a branch that needs a sleep to reach is a
+branch no client can reach. So the loop is gone, the test is replaced by the
+property that is actually true and observable — post-`200` bytes travel as
+payload and are not intercepted — and the mutation against it is removed with
+its reason rather than left failing forever. The C2.5-S2 measurement agrees:
+`curl` did not multiplex, and there is no portable way for it to learn that it
+could.
 
 ## After v1.0 — M14 through M18
 

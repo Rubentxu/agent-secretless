@@ -21,6 +21,7 @@ pub mod installrecord;
 pub mod ipc;
 pub mod layout;
 pub mod render;
+pub mod session_shim;
 pub mod setup;
 pub mod vaultops;
 

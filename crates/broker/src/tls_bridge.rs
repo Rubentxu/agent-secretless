@@ -1239,31 +1239,19 @@ fn read_connect_head(
 
 /// Parses `CONNECT host:port HTTP/1.1`.
 fn parse_connect_target(head: &str) -> Result<AuthorityEndpoint, BridgeError> {
+    // The parse lives in `asv_domain::ConnectTarget` because a session-local
+    // shim has to reach the same host and port to mint a proof the broker will
+    // accept, and the proof's nonce is a hash over exactly these two values.
+    // Two parsers would not fail loudly; they would produce proofs that verify
+    // nowhere, which reads as a broken signer rather than a disagreement.
     let request_line = head
         .split("\r\n")
         .next()
         .ok_or_else(|| BridgeError::Protocol("empty request".into()))?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| BridgeError::Protocol("no method".into()))?;
-    if method != "CONNECT" {
-        return Err(BridgeError::Protocol(format!(
-            "method {method} is not CONNECT"
-        )));
-    }
-    let authority = parts
-        .next()
-        .ok_or_else(|| BridgeError::Protocol("no authority".into()))?;
-    let (host, port) = authority
-        .rsplit_once(':')
-        .ok_or_else(|| BridgeError::Protocol(format!("{authority} has no port")))?;
-    let port: u16 = port
-        .parse()
-        .map_err(|_| BridgeError::Protocol(format!("{authority} has a non-numeric port")))?;
-    let authority =
-        Authority::canonicalize(host).map_err(|e| BridgeError::Protocol(format!("{host}: {e}")))?;
-    AuthorityEndpoint::new(authority, port).map_err(|e| BridgeError::Protocol(e.to_string()))
+    let target = asv_domain::ConnectTarget::from_request_line(request_line)
+        .map_err(|e| BridgeError::Protocol(e.to_string()))?;
+    AuthorityEndpoint::new(target.authority().clone(), target.port())
+        .map_err(|e| BridgeError::Protocol(e.to_string()))
 }
 
 impl Bridge {

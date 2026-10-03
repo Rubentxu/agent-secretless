@@ -293,6 +293,100 @@ impl AsRef<str> for Authority {
     }
 }
 
+/// A CONNECT destination: a canonical host and a port, parsed from a request
+/// line the way the broker will read it.
+///
+/// This is the *one* reading of a CONNECT request line. The broker needs it to
+/// authorise a destination and to know which destination a session proof is
+/// bound to; a session-local shim needs it to know which destination to mint
+/// that proof for. Those two must agree byte for byte, because the proof's
+/// nonce is a hash over the canonical host and port, and a parser that
+/// disagreed by so much as a trailing dot would not fail loudly — it would
+/// fail as "no proof ever verifies", which is the same error a dozen unrelated
+/// mistakes produce.
+///
+/// So the parse lives beside [`Authority::canonicalize`], which is already the
+/// single source of truth for "the same host" in this codebase, rather than
+/// being restated by each side that needs an answer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConnectTarget {
+    authority: Authority,
+    port: u16,
+}
+
+impl ConnectTarget {
+    /// Parses `CONNECT host:port HTTP/1.1`.
+    ///
+    /// Only a bare `host:port`. A bracketed IPv6 literal is refused rather
+    /// than unbracketed, because `rsplit_once(':')` on `[::1]:443` leaves a
+    /// host that `Authority::canonicalize` rejects anyway, and pretending to
+    /// understand it would only mean the two sides could disagree about it.
+    pub fn from_request_line(line: &str) -> Result<Self, ConnectTargetError> {
+        let mut parts = line.split_whitespace();
+        let method = parts.next().unwrap_or_default();
+        if method != "CONNECT" {
+            return Err(ConnectTargetError::NotConnect {
+                method: method.to_string(),
+            });
+        }
+        let authority = parts.next().ok_or(ConnectTargetError::NoAuthority)?;
+        let (host, port) =
+            authority
+                .rsplit_once(':')
+                .ok_or_else(|| ConnectTargetError::NoPort {
+                    authority: authority.to_string(),
+                })?;
+        let port: u16 = port
+            .parse()
+            .map_err(|_| ConnectTargetError::NonNumericPort {
+                authority: authority.to_string(),
+            })?;
+        if port == 0 {
+            return Err(ConnectTargetError::ZeroPort);
+        }
+        let authority = Authority::canonicalize(host).map_err(ConnectTargetError::Authority)?;
+        Ok(Self { authority, port })
+    }
+
+    /// The canonical host.
+    pub fn host(&self) -> &str {
+        self.authority.as_str()
+    }
+
+    /// The port.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The canonical [`Authority`].
+    pub fn authority(&self) -> &Authority {
+        &self.authority
+    }
+}
+
+impl fmt::Display for ConnectTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.authority, self.port)
+    }
+}
+
+/// Why a CONNECT request line did not name a destination.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConnectTargetError {
+    #[error("request method is {method:?}, not CONNECT")]
+    NotConnect { method: String },
+    #[error("CONNECT request names no authority")]
+    NoAuthority,
+    #[error("CONNECT authority {authority:?} carries no port")]
+    NoPort { authority: String },
+    #[error("CONNECT authority {authority:?} has a non-numeric port")]
+    NonNumericPort { authority: String },
+    #[error("CONNECT authority has port 0, which is not a service")]
+    ZeroPort,
+    #[error("CONNECT host is not a usable authority: {0}")]
+    Authority(#[from] AuthorityError),
+}
+
 /// Why an authority could not be canonicalized. Every variant names a shape
 /// that is either ambiguous or unsupported, never a secret.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -900,5 +994,125 @@ mod tests {
         assert_ne!(surrogate.to_string(), credential.to_string());
         let _typed: SurrogateId = surrogate;
         let _typed: CredentialId = credential;
+    }
+}
+
+#[cfg(test)]
+mod connect_target_tests {
+    use super::*;
+
+    fn target(line: &str) -> Result<ConnectTarget, ConnectTargetError> {
+        ConnectTarget::from_request_line(line)
+    }
+
+    /// The whole point of the type: the shim and the broker must read the same
+    /// destination, and the destination is a *canonical* host.
+    #[test]
+    fn a_plain_connect_line_yields_a_canonical_host_and_port() {
+        let t = target("CONNECT api.example.com:443 HTTP/1.1").expect("parses");
+        assert_eq!(t.host(), "api.example.com");
+        assert_eq!(t.port(), 443);
+        assert_eq!(t.to_string(), "api.example.com:443");
+    }
+
+    #[test]
+    fn case_and_a_trailing_dot_reach_the_same_destination() {
+        let plain = target("CONNECT api.example.com:443 HTTP/1.1").expect("parses");
+        for spelling in [
+            "CONNECT API.Example.COM:443 HTTP/1.1",
+            "CONNECT api.example.com.:443 HTTP/1.1",
+            "CONNECT API.EXAMPLE.COM.:443 HTTP/1.1",
+        ] {
+            let other = target(spelling).expect("parses");
+            assert_eq!(other, plain, "{spelling} must reach the same destination");
+        }
+    }
+
+    /// A host that differs only in case must produce the *same* nonce, or a
+    /// proof minted for one spelling is refused for the other and the symptom
+    /// is a signature that verifies nowhere.
+    #[test]
+    fn the_spelling_of_a_host_cannot_change_the_nonce() {
+        let a = target("CONNECT API.Example.COM:443 HTTP/1.1").expect("parses");
+        let b = target("CONNECT api.example.com:443 HTTP/1.1").expect("parses");
+        assert_eq!(a.host(), b.host());
+    }
+
+    #[test]
+    fn a_request_that_is_not_a_connect_is_refused() {
+        for line in [
+            "GET / HTTP/1.1",
+            "get / HTTP/1.1",
+            "POST http://example.com/ HTTP/1.1",
+            "",
+        ] {
+            assert!(
+                matches!(target(line), Err(ConnectTargetError::NotConnect { .. })),
+                "{line:?} must not name a destination"
+            );
+        }
+    }
+
+    #[test]
+    fn a_connect_without_a_usable_port_is_refused() {
+        assert!(matches!(
+            target("CONNECT api.example.com HTTP/1.1"),
+            Err(ConnectTargetError::NoPort { .. })
+        ));
+        assert!(matches!(
+            target("CONNECT api.example.com:https HTTP/1.1"),
+            Err(ConnectTargetError::NonNumericPort { .. })
+        ));
+        assert!(matches!(
+            target("CONNECT api.example.com:0 HTTP/1.1"),
+            Err(ConnectTargetError::ZeroPort)
+        ));
+        let too_wide = "CONNECT api.example.com:99999 HTTP/1.1";
+        assert!(
+            matches!(
+                target(too_wide),
+                Err(ConnectTargetError::NonNumericPort { .. })
+            ),
+            "a port that does not fit in u16 is not a port: {too_wide:?}"
+        );
+    }
+
+    /// The last colon wins, so a host carrying a colon cannot smuggle a port
+    /// past the reader. A bracketed IPv6 literal lands here and is refused
+    /// rather than half-understood.
+    #[test]
+    fn a_host_carrying_a_colon_cannot_smuggle_a_port() {
+        // `rsplit_once(':')` takes the *last* colon, so this splits into host
+        // `api.example.com:443` and port `extra`. The port is rejected first,
+        // which is the right order: a non-numeric port is not a host question.
+        let smuggled = "CONNECT api.example.com:443:extra HTTP/1.1";
+        assert!(
+            matches!(
+                target(smuggled),
+                Err(ConnectTargetError::NonNumericPort { .. })
+            ),
+            "a host carrying a colon must not smuggle a port past the reader: {smuggled:?}"
+        );
+        let bracketed = "CONNECT [::1]:443 HTTP/1.1";
+        assert!(
+            matches!(target(bracketed), Err(ConnectTargetError::Authority(_))),
+            "a bracketed literal is refused, not unbracketed: {bracketed:?}"
+        );
+    }
+
+    #[test]
+    fn a_connect_with_no_authority_is_refused() {
+        // A bare `CONNECT` with nothing after it. `CONNECT HTTP/1.1` is *not*
+        // this case: the next whitespace-separated token is the version, and
+        // it is refused as a portless authority, which is a different
+        // rejection. The first version of this test assumed otherwise.
+        assert!(matches!(
+            target("CONNECT"),
+            Err(ConnectTargetError::NoAuthority)
+        ));
+        assert!(matches!(
+            target("CONNECT HTTP/1.1"),
+            Err(ConnectTargetError::NoPort { .. })
+        ));
     }
 }

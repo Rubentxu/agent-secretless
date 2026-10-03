@@ -38,3 +38,10 @@ tokio = { workspace = true }
 # Already in the lock via `asv-identity` and `asv-broker`, so this adds nothing
 # new to the dependency graph — it only makes an existing entry direct.
 libc = "0.2"
+
+[dev-dependencies]
+# `tempfile` is how the shim tests get a private session directory and a
+# private listener socket. Already in the lock through `asv-ssh-agent`'s own
+# dev-dependency, so this promotes an existing entry rather than adding to
+# the dependency graph.
+tempfile = "3"
