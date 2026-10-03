@@ -869,21 +869,7 @@ split, because M9's gate row listed three limits and only one of them moved.
   is not auditable; the first version returned nothing for those, which is how a
   dropped connection became invisible rather than recorded.
 
-**Not delivered — M9's third limit stands unchanged.**
-
-- Nothing in `asv-brokerd` starts this listener. The module is a capability with
-  a network surface that production does not yet call, which is the same
-  sentence M9's row said, one layer up. The flag is to be read from `argv`, not
-  the environment, because D9 forbids `std::env::var*` in broker production
-  sources.
-- One request per tunnel. Not yet decided, and the decision is a design question
-  about what a surrogate is worth, not a bug.
-- The destination-derived nonce is **not** freshness. A formal decision is
-  still owed.
-- Observability reaches `ListenerReport` and stops there. It is not yet wired to
-  the audit chain.
-
-**Two claims this delivery had to withdraw after falsifying itself.**
+**Two claims the first delivery had to withdraw after falsifying itself.**
 
 1. The `head_deadline` arm of `Bridge::is_pollable` and `arm_read_timeout` was
    **dead code**: `with_head_deadline` was called from exactly one place, and
@@ -893,13 +879,13 @@ split, because M9's gate row listed three limits and only one of them moved.
    *nothing else* to interrupt its read.
 2. The reciprocal revocation test was **blind to a global kill**, which is the
    mutation that mattered most. It revoked session B and then sent session A's
-   request — so the request was already in the socket buffer, `read_byte_cancellable`
-   returned on its first successful read, and the branch that consults
-   `cancel_reason` was never reached. A relay that consults nothing, and one
-   that is told "cancelled" for somebody else's session, are indistinguishable
-   from outside a tunnel that never has to wait. The revocation now lands while
-   the tunnel is parked on the poll, and the test asserts it is *still running*
-   afterwards.
+   request — so the request was already in the socket buffer,
+   `read_byte_cancellable` returned on its first successful read, and the branch
+   that consults `cancel_reason` was never reached. A relay that consults
+   nothing, and one that is told "cancelled" for somebody else's session, are
+   indistinguishable from outside a tunnel that never has to wait. The
+   revocation now lands while the tunnel is parked on the poll, and the test
+   asserts it is *still running* afterwards.
 
 **One claim that could not be made deterministically, and is not claimed.**
 `ShutdownSignal::wait_stopped` calls `notified.enable()` before checking the
@@ -908,6 +894,63 @@ check and the `await`. Closing that window requires a yield between two
 statements *inside a single poll*, which cannot be provoked from a test, so
 there is no deterministic test for it. The `enable()` is correct and stays; the
 window is recorded as a residual rather than dressed up as covered.
+
+**Not delivered — M9's third limit stands unchanged.**
+
+- ~~Nothing in `asv-brokerd` starts this listener.~~ **Delivered** in the second
+  V1-C2 delivery: `--connect-listen ADDR`, read from `argv` because D9 forbids
+  `std::env::var*` in broker production sources, and refused without `--vault`
+  because a tunnel with no credential behind it can only ever be a refusal.
+  The allow-list ships **empty**, so the listener refuses every destination
+  until an operator widens it. That is the correct posture for a surface that
+  did not exist a milestone ago, and widening it is M14's work where the
+  destinations are known.
+- One request per tunnel. Not yet decided, and the decision is a design question
+  about what a surrogate is worth, not a bug.
+- The destination-derived nonce is **not** freshness. A formal decision is
+  still owed.
+- Observability reaches `ListenerReport` and stops there. It is not yet wired to
+  the audit chain.
+- The `main.rs` line that hands the listener its `SessionStore` is **not
+  covered by a test**, because an integration test does not build the binary.
+  What the suite pins is the construction the line performs, and a falsification
+  run showed that pinning it is what catches the mistake: see below.
+
+**A third finding, and the one this delivery nearly shipped.** The first wiring
+gave the listener a fresh `SessionStore::new()`. It compiled, bound the port,
+accepted, resolved no proof, and refused — and every one of those behaviours is
+what a *correct* listener does when a stranger connects. A test asserting "the
+listener answers" passes on it. That is M11's shape exactly: a prototype with
+tests, calling nothing real, and the difference is invisible from outside.
+
+The fix was to share the broker's own state. `BrokerState::sessions` and
+`BrokerState::surrogates` are now `Arc<Mutex<…>>`, because two stores would mean
+a session opened over the socket is unknown to the CONNECT path and a surrogate
+minted by `MintSurrogate` is un-redeemable there. That is a correctness
+requirement, not a convenience, and it is the decision `connect_listener`
+deliberately declined to make.
+
+**A control can be two halves that each look redundant.** Proof resolution
+compares the presented key blob against the one the session registered, and
+verifies the signature against the *registered* key. A falsification run found
+that removing the comparison alone leaves the suite **green** — the signature is
+still checked against each session's own key — and that verifying against the
+*presented* key alone also leaves it green, because the comparison still pins
+them equal. Neither half is load-bearing on its own, and a mutation run that
+only ever breaks one of them reports a suite with no hole in it. Breaking both
+together is the fatal one: a stranger's own key and signature inheriting
+whichever session is first in the table, which is the option ADR-0019
+discarded. The harness now expresses multi-site mutations for exactly this
+reason, and the surviving test fails with `Some(AgentSessionId(…))` where it
+should have `None`.
+
+**One more false claim, this time in a comment.** `issue_leaf`'s own doc said it
+rejects bare IP literals. A probe printing what each host form actually does
+says otherwise: `127.0.0.1` is accepted, and a trailing dot is accepted too. It
+is not a hole — the allow-list is consulted before issuance is ever reached —
+but a security comment that overstates what is rejected is the same defect as a
+document that overstates what is verified, and it is now corrected in place with
+the measurement next to it.
 
 ## After v1.0 — M14 through M18
 

@@ -61,7 +61,11 @@ fn harness(kind: CredentialKind) -> Harness {
         gid: unsafe { libc::getgid() },
     });
     peer.pin_pidfd().expect("the test pins its own process");
-    let session = state.sessions.create("/repo".to_string(), &peer);
+    let session = state
+        .sessions
+        .lock()
+        .expect("no test holds this")
+        .create("/repo".to_string(), &peer);
 
     let metadata = CredentialMetadata::new("h2-issuance", kind);
     let credential = metadata.id;
@@ -161,7 +165,7 @@ fn a_refused_mint_leaves_no_token_behind() {
         "the fixture must refuse, or this test proves nothing"
     );
     assert_eq!(
-        h.state.surrogates.len(),
+        h.state.surrogates.lock().expect("no test holds this").len(),
         0,
         "a refused mint must not leave a live surrogate in the registry"
     );
@@ -232,7 +236,11 @@ fn the_harness_really_does_have_a_credential() {
     let h = harness(CredentialKind::GenericSecret);
     assert_eq!(h.state.credentials.len(), 1, "exactly one credential");
     assert!(
-        h.state.sessions.is_pinned(h.session),
+        h.state
+            .sessions
+            .lock()
+            .expect("no test holds this")
+            .is_pinned(h.session),
         "the session is pinned"
     );
     let _ = PathBuf::new();

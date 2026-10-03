@@ -161,7 +161,11 @@ fn live() -> (Fixture, AgentSessionId, String) {
         gid: unsafe { libc::getgid() },
     });
     peer.pin_pidfd().expect("pin self");
-    let session = state.sessions.create("/repo".into(), &peer);
+    let session = state
+        .sessions
+        .lock()
+        .expect("no test holds this")
+        .create("/repo".into(), &peer);
 
     let minted = handle(
         &mut state,
@@ -198,6 +202,8 @@ fn a_surrogate_copied_into_another_session_buys_nothing() {
     let other = fixture
         .state
         .sessions
+        .lock()
+        .expect("no test holds this")
         .create("/other".into(), &fixture.peer);
 
     let response = handle(
@@ -328,6 +334,8 @@ fn no_replay_path_exposes_the_real_credential() {
     let other = fixture
         .state
         .sessions
+        .lock()
+        .expect("no test holds this")
         .create("/other".into(), &fixture.peer);
 
     let response = handle(

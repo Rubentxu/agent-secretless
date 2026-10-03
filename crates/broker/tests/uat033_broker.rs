@@ -174,7 +174,11 @@ fn brokered(
     });
 
     let peer = self_peer();
-    let session = state.sessions.create("/repo".to_string(), &peer);
+    let session = state
+        .sessions
+        .lock()
+        .expect("no test holds this")
+        .create("/repo".to_string(), &peer);
     (state, peer, session, dir)
 }
 

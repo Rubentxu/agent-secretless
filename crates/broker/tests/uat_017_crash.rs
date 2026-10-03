@@ -114,7 +114,11 @@ fn state_with_session_id() -> (
     );
 
     let peer = pinned_peer();
-    let session = state.sessions.create("uat017".into(), &peer);
+    let session = state
+        .sessions
+        .lock()
+        .expect("no test holds this")
+        .create("uat017".into(), &peer);
 
     let minted = handle(
         &mut state,
@@ -406,7 +410,11 @@ fn state_loss_does_not_resurrect_a_session_or_surrogate() {
          got {response:?}"
     );
     assert!(
-        !restarted.sessions.is_pinned(session),
+        !restarted
+            .sessions
+            .lock()
+            .expect("no test holds this")
+            .is_pinned(session),
         "the session must not reappear in a fresh state"
     );
     // The denial above is ambiguous on its own: an unknown session and a
@@ -414,7 +422,7 @@ fn state_loss_does_not_resurrect_a_session_or_surrogate() {
     // test mean what its name says — the *session* is what the restarted
     // broker is missing, and the broker's own copy of that store is empty.
     assert_eq!(
-        restarted.sessions.len(),
+        restarted.sessions.lock().expect("no test holds this").len(),
         0,
         "the restarted broker must start with no sessions at all; a non-zero count would \
          mean state was carried across the crash and the previous denial was proving \

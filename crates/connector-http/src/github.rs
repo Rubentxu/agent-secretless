@@ -42,7 +42,16 @@ use crate::transport::{
 /// keeps `asv-vault` out of this crate's dependency graph: a connector that
 /// could open the vault itself would be a second place where secret material
 /// can be reached for, and D2's one-way dependency would be a lie.
-pub trait SecretPort {
+/// `Send + Sync` because the broker now hands this port to the CONNECT
+/// listener, which runs one tunnel per `spawn_blocking` thread.
+///
+/// The bounds are not decoration: without them `Arc<dyn SecretPort>` is neither
+/// `Send` nor `Sync`, and the only ways to satisfy a `ConnectionHandler` would
+/// be to wrap every implementation in a lock at the edge or to run tunnels on
+/// one thread. Every implementation in the tree already holds `Arc`s and
+/// `Mutex`es, so the bound describes what the port has always been in
+/// practice; it is written down now that something requires it.
+pub trait SecretPort: Send + Sync {
     /// Lends the credential named by `credential` to `sink`, and takes it back.
     ///
     /// The `sink` shape is what makes this a trait object. A method returning

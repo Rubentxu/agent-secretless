@@ -105,6 +105,17 @@ pub enum LeafError {
     /// The requested host is not a bare, canonical DNS name.
     #[error("{0}")]
     InvalidHost(String),
+    /// The leaf certificate was minted but its presenting material could not
+    /// be assembled from it.
+    ///
+    /// Separate from every other variant because the others mean "this host
+    /// gets no leaf" and this one means "the leaf was issued and cannot be
+    /// used". An operator reading the first would look at the allow-list; the
+    /// second is a broker fault, and the bridge used to report it as an
+    /// `Io`/`Handshake` error rather than a `LeafError` at all, which is how a
+    /// minting fault became indistinguishable from a TLS one.
+    #[error("leaf material for {0} could not be assembled: {1}")]
+    LeafMaterial(String, String),
 }
 
 /// Errors that the bridge dispatcher returns.
@@ -651,11 +662,26 @@ pub fn issue_leaf(ca: &SessionCa, host: &str, now: Instant) -> Result<LeafCertif
     if ca.root_der.is_empty() {
         return Err(LeafError::NoRoot(ca.session_id.clone()));
     }
-    // Canonicalize before doing anything else with the host. This rejects the
-    // empty string, surrounding whitespace, embedded `:port`, userinfo,
-    // percent-encoding, bare IP literals and single labels, and it lowercases
-    // the rest. A leaf bound to `"API.Example.COM"` would never be matched by
-    // an allowlist that spells the host in canonical form.
+    // Canonicalize before doing anything else with the host. Measured against
+    // `Authority::canonicalize`, this rejects the empty string, surrounding
+    // whitespace, an embedded `:port`, userinfo, percent-encoding, malformed
+    // labels and single labels, and it lowercases the rest. A leaf bound to
+    // `"API.Example.COM"` would never be matched by an allowlist that spells
+    // the host in canonical form.
+    //
+    // **Two things this comment used to claim, and the measurement says
+    // otherwise, so they are corrected rather than repeated.** It said bare IP
+    // literals are rejected: `127.0.0.1` is accepted, and a probe over the
+    // forms printed the full split rather than trusting this sentence. It also
+    // implied a trailing dot is cleaned up — it is accepted, which is the DNS
+    // root form of the same name and what a resolver hands back.
+    //
+    // Accepting an IP is not a hole. `issue_for` is only ever called with
+    // `target.host()` from a CONNECT the allow-list already accepted, so an IP
+    // is reachable only if the operator put one in the allow-list. The claim
+    // was wrong, though, and a security comment that overstates what is
+    // rejected is the same defect as a document that overstates what is
+    // verified: it tells the next reader a control exists where there is none.
     let host = Authority::canonicalize(host)
         .map_err(|e| LeafError::InvalidHost(e.to_string()))?
         .as_str()

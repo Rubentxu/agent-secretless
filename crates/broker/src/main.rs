@@ -73,6 +73,12 @@ fn main() -> std::io::Result<()> {
     // on their own machine, and the broker is simply the program that owns the
     // record's format and the directory discipline it needs.
     let mut enrol_principal: Option<PathBuf> = None;
+    // M9/V1-C2: the CONNECT proxy's bind address. Absent means the listener is
+    // not started, which is the default for now: turning it on makes the broker
+    // answer on a second socket, and that is an operator's decision to make
+    // with their own allow-list in hand rather than something a shipped default
+    // should do on their behalf.
+    let mut connect_listen: Option<String> = None;
     while let Some(arg) = args.next() {
         let arg = match arg.into_string() {
             Ok(s) => s,
@@ -127,10 +133,34 @@ fn main() -> std::io::Result<()> {
                 }
                 enrol_principal = path;
             }
+            "--connect-listen" => {
+                // From `argv`, never the environment: D9 forbids
+                // `std::env::var*` in broker production sources, and the
+                // reason is not tidiness. An address a parent process can set
+                // silently is an address an operator cannot see, and this one
+                // decides which sockets the broker answers on.
+                connect_listen = match args.next() {
+                    Some(os) => match os.into_string() {
+                        Ok(s) => Some(s),
+                        Err(_) => {
+                            eprintln!("asv: --connect-listen address must be valid UTF-8");
+                            std::process::exit(1);
+                        }
+                    },
+                    None => {
+                        eprintln!("asv: --connect-listen requires an ADDR:PORT argument");
+                        std::process::exit(1);
+                    }
+                };
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH] [--audit-max-records N] [--audit-file PATH] [--enrol-principal PATH] [--harden]"
+                    "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH] [--audit-max-records N] [--audit-file PATH] [--enrol-principal PATH] [--harden] [--connect-listen ADDR]"
                 );
+                eprintln!();
+                eprintln!("  --connect-listen ADDR  serve the CONNECT proxy on ADDR. Needs a");
+                eprintln!("                         --vault: a tunnel with no credential behind");
+                eprintln!("                         it is refused, so there is nothing to serve.");
                 std::process::exit(0);
             }
             other if other.starts_with("--") || other.starts_with('-') => {
@@ -385,8 +415,111 @@ fn main() -> std::io::Result<()> {
     // The handle is kept alive for the whole loop below. Dropping the runtime
     // while a session task still holds a socket would close that socket without
     // the broker having observed a teardown, which is the one outcome M6-R4
-    // exists to prevent.
-    let _runtime = runtime;
+    // exists to prevent. It is also what the CONNECT listener is spawned on, so
+    // the binding is named rather than `_`: a reader seeing `_runtime` next to
+    // a `runtime.spawn` further down would have to check whether the two were
+    // the same value.
+    let runtime_guard = runtime;
+
+    // M9 / V1-C2: the CONNECT proxy, if the operator asked for one.
+    //
+    // Gated on a vault for a reason that is not a convenience: a tunnel with no
+    // credential behind it is refused, so a broker with no vault could only
+    // ever report a refusal. Starting it there would mean a second socket that
+    // answers "no" to everything, and an operator would have to work out
+    // whether that was a policy decision or a misconfiguration.
+    let shutdown = Arc::new(asv_broker::connect_listener::ShutdownSignal::new());
+    if let Some(addr) = connect_listen.as_deref() {
+        let Some(secrets) = state.secrets.clone() else {
+            eprintln!("asv: --connect-listen needs --vault; a tunnel with no credential behind it is refused");
+            std::process::exit(1);
+        };
+
+        let bind: std::net::SocketAddr = addr.parse().unwrap_or_else(|e| {
+            eprintln!("asv: --connect-listen address {addr:?} is not a valid ADDR:PORT: {e}");
+            std::process::exit(1);
+        });
+        // Loopback only unless the operator says otherwise, and *not* silently:
+        // this socket carries a proxy, and a proxy bound to 0.0.0.0 is a
+        // decision with consequences that belongs in the launch contract rather
+        // than in a default.
+        if !bind.ip().is_loopback() {
+            tracing::warn!(
+                %bind,
+                "the CONNECT listener is bound to a non-loopback address; every host that can \
+                 reach it can open a tunnel, subject to the allow-list"
+            );
+        }
+
+        let ca = Arc::new(asv_broker::tls_bridge::SessionCa::new(
+            format!("connect-{}", asv_broker::surrogate::now_secs()),
+            0,
+            std::time::Duration::from_secs(3600),
+        ));
+        let leaves = Arc::new(asv_broker::connect_runtime::SessionLeafSource::new(
+            Arc::clone(&ca),
+        ));
+        tracing::info!(
+            root_len = ca.root_der.len(),
+            "session CA generated for the CONNECT path"
+        );
+
+        // The allow-list is the same shape the bridge already enforces and is
+        // empty by default: a proxy with no destinations refuses everything,
+        // which is the correct starting posture for a surface that was not
+        // there before. Widening it is M14's adapter work, where the
+        // destinations are known.
+        let handler = Arc::new(asv_broker::connect_runtime::SubstitutingHandler::new(
+            Arc::clone(&state.surrogates),
+            secrets,
+            asv_domain::OperationFamily::GitHub,
+            "github",
+        ));
+
+        // The session store and the surrogate registry are the broker's own,
+        // shared with the socket path — *not* fresh instances. A fresh
+        // `SessionStore::new()` here compiles, binds, serves and refuses every
+        // proof, which is a proxy that looks alive and can never establish a
+        // tunnel; a fresh registry would mean a surrogate minted over the socket
+        // is unknown to this path. Both are the same failure wearing two
+        // different hats, and both are invisible until someone runs a real
+        // CONNECT.
+        let sessions = Arc::clone(&state.sessions);
+        let connect_listener = asv_broker::connect_listener::ConnectListener::new(
+            leaves,
+            Arc::new(asv_broker::connect_runtime::SystemUpstream),
+            Arc::new(asv_broker::connect_runtime::SharedSessions::new(sessions)),
+            Arc::clone(&shutdown),
+            Vec::new(),
+            asv_broker::connect_listener::ListenerConfig::default(),
+        );
+
+        let tcp = std::net::TcpListener::bind(bind).unwrap_or_else(|e| {
+            eprintln!("asv: cannot bind the CONNECT listener on {bind}: {e}");
+            std::process::exit(1);
+        });
+        tcp.set_nonblocking(true).unwrap_or_else(|e| {
+            eprintln!("asv: the CONNECT listener must be non-blocking: {e}");
+            std::process::exit(1);
+        });
+        let tcp = tokio::net::TcpListener::from_std(tcp).unwrap_or_else(|e| {
+            eprintln!("asv: cannot adopt the CONNECT listener: {e}");
+            std::process::exit(1);
+        });
+        tracing::info!(%bind, "CONNECT listener bound");
+
+        runtime_guard.spawn(async move {
+            connect_listener
+                .run(
+                    tcp,
+                    handler,
+                    Arc::new(asv_broker::connect_runtime::ChainReport::new(Arc::new(
+                        asv_broker::connect_listener::DiscardReport,
+                    ))),
+                )
+                .await;
+        });
+    }
 
     for incoming in listener.incoming() {
         match incoming {

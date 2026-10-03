@@ -229,7 +229,11 @@ impl Fixture {
             gid: unsafe { libc::getgid() },
         });
         peer.pin_pidfd().expect("pin self");
-        let session = state.sessions.create("/repo".to_string(), &peer);
+        let session = state
+            .sessions
+            .lock()
+            .expect("no test holds this")
+            .create("/repo".to_string(), &peer);
 
         let minted = handle(
             &mut state,
@@ -404,7 +408,12 @@ fn a_teardown_leaves_no_sessions_no_surrogates_and_no_grants() {
 
     // Before teardown: the session is live.
     assert!(
-        fixture.state.sessions.is_pinned(fixture.session),
+        fixture
+            .state
+            .sessions
+            .lock()
+            .expect("no test holds this")
+            .is_pinned(fixture.session),
         "the session must be live before teardown, or the leak check proves nothing"
     );
 
@@ -421,26 +430,61 @@ fn a_teardown_leaves_no_sessions_no_surrogates_and_no_grants() {
     );
 
     assert_eq!(
-        fixture.state.sessions.len(),
+        fixture
+            .state
+            .sessions
+            .lock()
+            .expect("no test holds this")
+            .len(),
         0,
         "sessions leaked after teardown: {}",
-        fixture.state.sessions.len()
+        fixture
+            .state
+            .sessions
+            .lock()
+            .expect("no test holds this")
+            .len()
     );
     assert!(
-        !fixture.state.sessions.is_pinned(fixture.session),
+        !fixture
+            .state
+            .sessions
+            .lock()
+            .expect("no test holds this")
+            .is_pinned(fixture.session),
         "the ended session is still pinned"
     );
     assert_eq!(
-        fixture.state.sessions.pin_count(),
+        fixture
+            .state
+            .sessions
+            .lock()
+            .expect("no test holds this")
+            .pin_count(),
         0,
         "R3 zero-live-pin violation: {} pinned sessions after teardown",
-        fixture.state.sessions.pin_count()
+        fixture
+            .state
+            .sessions
+            .lock()
+            .expect("no test holds this")
+            .pin_count()
     );
     assert_eq!(
-        fixture.state.surrogates.len(),
+        fixture
+            .state
+            .surrogates
+            .lock()
+            .expect("no test holds this")
+            .len(),
         0,
         "surrogates leaked after teardown: {}",
-        fixture.state.surrogates.len()
+        fixture
+            .state
+            .surrogates
+            .lock()
+            .expect("no test holds this")
+            .len()
     );
 }
 
@@ -465,7 +509,12 @@ fn a_hundred_brokered_reads_leave_zero_live_pins_after_teardown() {
     // The session is live before teardown; this is the precondition for
     // the post-teardown count to mean anything.
     assert!(
-        fixture.state.sessions.is_pinned(fixture.session),
+        fixture
+            .state
+            .sessions
+            .lock()
+            .expect("no test holds this")
+            .is_pinned(fixture.session),
         "the session must be pinned before teardown, or the leak check proves nothing"
     );
 
@@ -484,18 +533,38 @@ fn a_hundred_brokered_reads_leave_zero_live_pins_after_teardown() {
     // The structural claim: zero live pins, zero live sessions, zero live
     // surrogates. Any non-zero value is R3 violation.
     assert_eq!(
-        fixture.state.sessions.pin_count(),
+        fixture
+            .state
+            .sessions
+            .lock()
+            .expect("no test holds this")
+            .pin_count(),
         0,
         "R3 zero-live-pin violation: {} pinned sessions survived teardown",
-        fixture.state.sessions.pin_count()
+        fixture
+            .state
+            .sessions
+            .lock()
+            .expect("no test holds this")
+            .pin_count()
     );
     assert_eq!(
-        fixture.state.sessions.len(),
+        fixture
+            .state
+            .sessions
+            .lock()
+            .expect("no test holds this")
+            .len(),
         0,
         "session entry survived teardown"
     );
     assert_eq!(
-        fixture.state.surrogates.len(),
+        fixture
+            .state
+            .surrogates
+            .lock()
+            .expect("no test holds this")
+            .len(),
         0,
         "surrogates leaked after teardown"
     );

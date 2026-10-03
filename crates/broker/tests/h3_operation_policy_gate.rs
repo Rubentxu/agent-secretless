@@ -209,7 +209,11 @@ fn harness(kind: CredentialKind) -> Harness {
         gid: unsafe { libc::getgid() },
     });
     peer.pin_pidfd().expect("the test pins its own process");
-    let session = state.sessions.create("/repo".to_string(), &peer);
+    let session = state
+        .sessions
+        .lock()
+        .expect("no test holds this")
+        .create("/repo".to_string(), &peer);
 
     let metadata = CredentialMetadata::new("h3-gate", kind);
     let credential = metadata.id;

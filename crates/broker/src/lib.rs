@@ -21,11 +21,12 @@ use tls_bridge::SessionProofs;
 use pg_session::render_row;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub mod admission;
 pub mod audit;
 pub mod connect_listener;
+pub mod connect_runtime;
 pub mod harden;
 pub mod inventory;
 pub mod isolated_exec;
@@ -255,6 +256,16 @@ impl SessionProofs for SessionStore {
             // equal today because the lookup demanded it, and the point is
             // that this line stays correct if that ever stops being the
             // reason they match.
+            //
+            // The comparison above is therefore defence in depth, not the
+            // control. Removing it does not weaken resolution — the signature
+            // is checked against each session's *own* registered key, so a
+            // stranger's key fails everywhere — and a falsification run
+            // confirmed that by mutating the comparison away and watching the
+            // suite stay green. The line is kept because it makes the intent
+            // legible and because a linear scan that verifies every key
+            // against a signature is more work than one that skips; it is not
+            // kept on a claim that it decides anything.
             asv_ssh_agent::verify_proof(registered, nonce, signature).then_some(*id)
         })
     }
@@ -479,11 +490,32 @@ impl ConnectorFactory for LiveConnectorFactory {
 /// Broker-side state. M0 has no vault, so credential metadata is an in-memory
 /// list seeded by tests; M1 makes it encrypted and persistent.
 pub struct BrokerState {
-    pub sessions: SessionStore,
+    /// The agent sessions, shared with the CONNECT listener.
+    ///
+    /// `Arc<Mutex<…>>` for the same reason `surrogates` is: the listener
+    /// resolves a CONNECT proof against this store, and a second store would
+    /// answer "no such session" for every session the socket path had just
+    /// opened. The first version of the wiring handed the listener a fresh
+    /// `SessionStore::new()`, which compiled, bound, served and refused
+    /// everything — a proxy that looks alive and can never establish a tunnel.
+    pub sessions: Arc<Mutex<SessionStore>>,
     pub credentials: Vec<CredentialMetadata>,
     pub policy: PolicyEngine,
     /// M4: the tokens an agent holds instead of credentials (D3).
-    pub surrogates: SurrogateRegistry,
+    ///
+    /// `Arc<Mutex<…>>` rather than owned, and the reason is correctness rather
+    /// than convenience. `relay_substituted` redeems a surrogate in the *same*
+    /// registry `MintSurrogate` mints into, so the CONNECT listener and this
+    /// socket path must not hold two registries: a token minted over the socket
+    /// would simply be unknown to the CONNECT path, and the product would fail
+    /// in a way no test describes and no log line explains.
+    ///
+    /// The lock is the decision `connect_listener` deliberately declined to
+    /// make. It is a coarse one, taken for the length of one registry
+    /// operation and never for the length of a tunnel — holding it across a
+    /// relay would let one slow client freeze minting and revoking for every
+    /// other agent.
+    pub surrogates: Arc<Mutex<SurrogateRegistry>>,
     /// M4 CU-2.2: the secret-bearing side of the broker. `None` means no vault
     /// is open, and every semantic operation then refuses. That is the
     /// fail-closed reading: a broker that cannot reach a credential must not
@@ -542,10 +574,10 @@ pub struct BrokerState {
 impl Default for BrokerState {
     fn default() -> Self {
         Self {
-            sessions: SessionStore::default(),
+            sessions: Arc::new(Mutex::new(SessionStore::default())),
             credentials: Vec::new(),
             policy: PolicyEngine::default(),
-            surrogates: SurrogateRegistry::default(),
+            surrogates: Arc::new(Mutex::new(SurrogateRegistry::default())),
             // Fail-closed by construction: the only way a semantic operation
             // can run is for something to have opened a vault and said so.
             // There is no `Default` that fabricates a port.
@@ -572,11 +604,37 @@ impl std::fmt::Debug for BrokerState {
         f.debug_struct("BrokerState")
             .field("sessions", &self.sessions)
             .field("credentials", &self.credentials.len())
-            .field("surrogates", &self.surrogates)
+            .field("surrogates", &self.surrogates.lock().ok().map(|r| r.len()))
             .field("vault_open", &self.secrets.is_some())
             .field("postgres_open", &self.postgres.len())
             .finish_non_exhaustive()
     }
+}
+
+/// Borrow the surrogate registry inside `handle_inner`, or return the poison
+/// response.
+///
+/// A macro rather than seven hand-written three-line matches, because the
+/// alternative is the failure this refactor exists to prevent: one
+/// `.lock().unwrap()` added in a hurry by someone who did not read the
+/// poisoning note on the accessor.
+macro_rules! surrogates {
+    ($state:expr) => {
+        match $state.surrogates() {
+            Ok(guard) => guard,
+            Err(poisoned) => return Response::from(poisoned),
+        }
+    };
+}
+
+/// The session store, under the same discipline as the registry.
+macro_rules! sessions {
+    ($state:expr) => {
+        match $state.sessions_store() {
+            Ok(guard) => guard,
+            Err(poisoned) => return Response::from(poisoned),
+        }
+    };
 }
 
 /// Handles one authenticated request and audits the outcome (R9).
@@ -697,7 +755,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
         }
 
         Request::CreateSession { workspace } => {
-            let id = state.sessions.create(workspace, peer);
+            let id = sessions!(state).create(workspace, peer);
             Response::SessionCreated { session: id }
         }
 
@@ -712,7 +770,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             // check is therefore not a formality, and it lives in
             // `register_key` next to the once-only rule so the two cannot
             // drift apart.
-            match state.sessions.register_key(session, peer, public_key_blob) {
+            match sessions!(state).register_key(session, peer, public_key_blob) {
                 Ok(()) => Response::SessionKeyRegistered { session },
                 Err(KeyRegistrationError::NotOwner) => Response::Error {
                     code: ErrorCode::Denied,
@@ -742,7 +800,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             // denial. Checking ownership first would answer "not owned" to an
             // owner who simply revoked twice, which is both wrong and a
             // misleading thing to audit.
-            let Some(owner_pid) = state.sessions.peer_pid_of(session) else {
+            let Some(owner_pid) = sessions!(state).peer_pid_of(session) else {
                 // Fail closed: an unknown session is an error, not a no-op.
                 return Response::Error {
                     code: ErrorCode::InvalidRequest,
@@ -755,12 +813,12 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                     message: "session is not owned by the authenticated peer".into(),
                 };
             }
-            if state.sessions.end(session) {
+            if sessions!(state).end(session) {
                 state.policy.revoke_session(session);
                 // The session's surrogates die with it. Leaving them live would
                 // make the session lifetime advisory: an agent could keep
                 // spending a token after the session that authorized it is gone.
-                state.surrogates.revoke_session(session);
+                surrogates!(state).revoke_session(session);
                 Response::SessionEnded { session }
             } else {
                 // Unreachable while the session is known to exist, kept so a
@@ -964,7 +1022,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             // would have made them useless; this is what stops the registry
             // from still reporting them as live, and the count is what tells
             // the operator how much was in flight when they pulled the plug.
-            let revoked = state.surrogates.revoke_credential(id);
+            let revoked = surrogates!(state).revoke_credential(id);
             if revoked > 0 {
                 tracing::info!(%revoked, "surrogates revoked with their credential");
             }
@@ -977,7 +1035,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             capability,
             approval,
         } => {
-            if !state.sessions.belongs_to(request.session, peer) {
+            if !sessions!(state).belongs_to(request.session, peer) {
                 return Response::Error {
                     code: ErrorCode::Denied,
                     message: "session is not owned by the authenticated peer".into(),
@@ -990,7 +1048,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
         }
 
         Request::ExplainAuthorization { mut request } => {
-            if !state.sessions.belongs_to(request.session, peer) {
+            if !sessions!(state).belongs_to(request.session, peer) {
                 return Response::Error {
                     code: ErrorCode::Denied,
                     message: "session is not owned by the authenticated peer".into(),
@@ -1044,7 +1102,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             max_uses,
             ttl_secs,
         } => {
-            if !state.sessions.belongs_to(session, peer) {
+            if !sessions!(state).belongs_to(session, peer) {
                 return Response::Error {
                     code: ErrorCode::Denied,
                     message: "session is not owned by the authenticated peer".into(),
@@ -1054,7 +1112,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             // unpinned peer as a weaker-but-usable connection, but minting a
             // credential-shaped token for a process we can only weakly
             // attribute is the case worth refusing.
-            if !state.sessions.is_pinned(session) {
+            if !sessions!(state).is_pinned(session) {
                 return Response::Error {
                     code: ErrorCode::Denied,
                     message: "surrogate minting requires a pidfd-pinned session".into(),
@@ -1089,10 +1147,14 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                 return *response;
             }
 
-            match state
-                .surrogates
-                .mint(session, credential, class, ttl_secs, max_uses, now_secs())
-            {
+            match surrogates!(state).mint(
+                session,
+                credential,
+                class,
+                ttl_secs,
+                max_uses,
+                now_secs(),
+            ) {
                 Ok((surrogate, expires_at, granted)) => {
                     // The token is never logged. Only its budget and its
                     // lifetime, which are the facts an operator needs.
@@ -1116,13 +1178,13 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
         }
 
         Request::RevokeSurrogate { session, surrogate } => {
-            if !state.sessions.belongs_to(session, peer) {
+            if !sessions!(state).belongs_to(session, peer) {
                 return Response::Error {
                     code: ErrorCode::Denied,
                     message: "session is not owned by the authenticated peer".into(),
                 };
             }
-            if state.surrogates.revoke(&surrogate, session) {
+            if surrogates!(state).revoke(&surrogate, session) {
                 Response::SurrogateRevoked { surrogate }
             } else {
                 Response::Error {
@@ -1175,7 +1237,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             if let Err(denial) = state.authorize_github(session, peer, &repo) {
                 return *denial;
             }
-            match state.surrogates.redeem_for(
+            match surrogates!(state).redeem_for(
                 &surrogate,
                 session,
                 OperationFamily::GitHub,
@@ -1215,7 +1277,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             {
                 return *denial;
             }
-            match state.surrogates.redeem_for(
+            match surrogates!(state).redeem_for(
                 &surrogate,
                 session,
                 OperationFamily::GitHub,
@@ -1251,7 +1313,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             {
                 return *denial;
             }
-            match state.surrogates.redeem_for(
+            match surrogates!(state).redeem_for(
                 &surrogate,
                 session,
                 OperationFamily::GitHub,
@@ -1351,7 +1413,67 @@ const GITHUB_AUTHORITY: &str = "api.github.com";
 /// deliberately out of scope — see the `SubmitApproval` handler.
 const APPROVAL_REMAINING_USES: u32 = 1;
 
+/// The surrogate registry's lock was poisoned by a panic in another thread.
+///
+/// A distinct type rather than a `String` so no call site can turn it into a
+/// plausible-looking message by accident, and so the two questions — "did the
+/// operation fail" and "is the broker's own state trustworthy" — cannot be
+/// collapsed into one `io::Error` at the bottom of a long function.
+#[derive(Debug, thiserror::Error)]
+#[error("the surrogate registry is poisoned; a previous operation panicked mid-update and the broker must restart")]
+pub struct RegistryPoisoned;
+
+/// What an authorisation helper returns when the session store cannot be read.
+///
+/// A `const fn` returning a value rather than a constant, because `Response` is
+/// not a const-constructible type here; named so the two failure sites say the
+/// same thing in the same words.
+fn poison_response() -> asv_ipc_protocol::Response {
+    asv_ipc_protocol::Response::Error {
+        code: asv_ipc_protocol::ErrorCode::Upstream,
+        message: "the broker's session store is poisoned; restart required".into(),
+    }
+}
+
+impl From<RegistryPoisoned> for asv_ipc_protocol::Response {
+    fn from(_: RegistryPoisoned) -> Self {
+        asv_ipc_protocol::Response::Error {
+            code: asv_ipc_protocol::ErrorCode::Upstream,
+            message: "the broker's surrogate registry is poisoned; restart required".into(),
+        }
+    }
+}
+
 impl BrokerState {
+    /// Borrow the surrogate registry.
+    ///
+    /// A poisoned lock is an **error, not a recovery**. The tempting
+    /// `unwrap_or_else(PoisonError::into_inner)` says "the data may be
+    /// half-updated but let us carry on", and for a registry that is the wrong
+    /// trade: a panic between decrementing a token's budget and returning can
+    /// leave a surrogate already spent and still reported as live, and
+    /// "sometimes deny" beats "occasionally hand out a token that should have
+    /// been spent".
+    ///
+    /// There is no third option that keeps the availability: recovering from
+    /// poison would need the registry to be rebuildable from the audit chain,
+    /// which it is not. So the broker refuses, loudly, until it is restarted —
+    /// and an operator is told it was restarted.
+    pub fn surrogates(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, SurrogateRegistry>, RegistryPoisoned> {
+        self.surrogates.lock().map_err(|_| RegistryPoisoned)
+    }
+
+    /// Borrow the session store, with the same poisoning rule as the registry
+    /// and for the same reason: a store updated halfway through a `create` or a
+    /// `register_key` is not a store to keep answering questions from.
+    pub fn sessions_store(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, SessionStore>, RegistryPoisoned> {
+        self.sessions.lock().map_err(|_| RegistryPoisoned)
+    }
+
     /// The one policy consultation on the surrogate path, performed at mint
     /// time rather than at every operation (H2).
     ///
@@ -1434,7 +1556,16 @@ impl BrokerState {
         peer: &WorkloadIdentity,
         repo: &str,
     ) -> Result<(), Box<Response>> {
-        if !self.sessions.belongs_to(session, peer) {
+        // Read through an explicit guard rather than `self.sessions.belongs_to`:
+        // a poisoned store must not answer this question at all, and the
+        // tempting collapse — treat it as "not owned" — is only correct by
+        // accident. It would also be wrong for a *different* caller that
+        // wanted the inverse, which is exactly how a fail-closed check turns
+        // into an open one.
+        let Ok(store) = self.sessions_store() else {
+            return Err(Box::new(poison_response()));
+        };
+        if !store.belongs_to(session, peer) {
             return Err(Box::new(Response::Error {
                 code: ErrorCode::Denied,
                 message: "session is not owned by the authenticated peer".into(),
@@ -1559,11 +1690,18 @@ impl BrokerState {
         action: Action,
         resource: Resource,
     ) -> Decision {
-        let workspace = self
-            .sessions
-            .workspace_of(session)
-            .unwrap_or_default()
-            .to_string();
+        // An unreadable store is a **denial**, not an empty workspace. The
+        // difference matters: this function returns a `Decision`, and a
+        // workspace of `""` is a value the policy engine is entitled to allow
+        // for some resources. A store that cannot be read must not be able to
+        // produce an allow, so the refusal is made here rather than being
+        // left to a downstream default.
+        let Ok(store) = self.sessions_store() else {
+            return Decision::Deny {
+                reason: "the broker's session store is poisoned; restart required".into(),
+            };
+        };
+        let workspace = store.workspace_of(session).unwrap_or_default().to_string();
         let request = AuthorizationRequest {
             session,
             action,
@@ -1591,7 +1729,16 @@ impl BrokerState {
         session: AgentSessionId,
         peer: &WorkloadIdentity,
     ) -> Result<(), Box<Response>> {
-        if !self.sessions.belongs_to(session, peer) {
+        // Read through an explicit guard rather than `self.sessions.belongs_to`:
+        // a poisoned store must not answer this question at all, and the
+        // tempting collapse — treat it as "not owned" — is only correct by
+        // accident. It would also be wrong for a *different* caller that
+        // wanted the inverse, which is exactly how a fail-closed check turns
+        // into an open one.
+        let Ok(store) = self.sessions_store() else {
+            return Err(Box::new(poison_response()));
+        };
+        if !store.belongs_to(session, peer) {
             return Err(Box::new(Response::Error {
                 code: ErrorCode::Denied,
                 message: "session is not owned by the authenticated peer".into(),
@@ -1858,11 +2005,13 @@ impl BrokerState {
                 ),
             }));
         };
-        let workspace = self
-            .sessions
-            .workspace_of(session)
-            .unwrap_or_default()
-            .to_string();
+        let Ok(store) = self.sessions_store() else {
+            return Err(Box::new(poison_response()));
+        };
+        // `unwrap_or_default` is kept for the *absent session* case, which is
+        // the broker's existing behaviour; the unreadable case never reaches
+        // it, because the guard above has already returned.
+        let workspace = store.workspace_of(session).unwrap_or_default().to_string();
         let request = AuthorizationRequest {
             session,
             action: action.as_policy_action(),
@@ -2116,6 +2265,35 @@ pub fn register_inventory_credential(
     id
 }
 
+/// The registry, for a test that wants to look at it.
+///
+/// `unwrap`, and deliberately so: production treats a poisoned lock as a hard
+/// failure (see `BrokerState::surrogates`), but a poisoned lock in a test means
+/// a test panicked while holding it, and the panic that follows is the one
+/// that names the real culprit. Carrying the production discipline into the
+/// tests would replace a clear message with "the broker's surrogate registry is
+/// poisoned".
+///
+/// At the crate root rather than inside `mod tests` because `mod
+/// surrogate_tests` is a sibling, not a child, and both reach it through their
+/// own `use super::*`.
+#[cfg(test)]
+fn reg(state: &BrokerState) -> std::sync::MutexGuard<'_, SurrogateRegistry> {
+    state
+        .surrogates
+        .lock()
+        .expect("the test poisoned its own registry")
+}
+
+/// The session store, for a test. `unwrap`, for the reason `reg` gives.
+#[cfg(test)]
+fn sess(state: &BrokerState) -> std::sync::MutexGuard<'_, SessionStore> {
+    state
+        .sessions
+        .lock()
+        .expect("the test poisoned its own session store")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2179,7 +2357,7 @@ mod tests {
             "a stranger bound a key to a session it does not own: {refused:?}"
         );
         assert_eq!(
-            state.sessions.public_key_of(session),
+            sess(&state).public_key_of(session),
             None,
             "the refused registration left a key behind"
         );
@@ -2197,10 +2375,7 @@ mod tests {
             Response::SessionKeyRegistered { session },
             "the owner could not bind its own key"
         );
-        assert_eq!(
-            state.sessions.public_key_of(session),
-            Some(&b"owner-key"[..])
-        );
+        assert_eq!(sess(&state).public_key_of(session), Some(&b"owner-key"[..]));
     }
 
     #[test]
@@ -2246,7 +2421,7 @@ mod tests {
             "a second registration was accepted: {second:?}"
         );
         assert_eq!(
-            state.sessions.public_key_of(session),
+            sess(&state).public_key_of(session),
             Some(&b"first"[..]),
             "the key changed under a live session"
         );
@@ -2274,7 +2449,7 @@ mod tests {
             ),
             "a key was bound to a session that does not exist: {outcome:?}"
         );
-        assert_eq!(state.sessions.public_key_of(ghost), None);
+        assert_eq!(sess(&state).public_key_of(ghost), None);
     }
 
     #[test]
@@ -2447,13 +2622,13 @@ mod tests {
             Response::SessionCreated { session } => session,
             other => panic!("expected session creation, got {other:?}"),
         };
-        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(sess(&state).len(), 1);
 
         assert_eq!(
             handle(&mut state, &peer(), Request::EndSession { session }),
             Response::SessionEnded { session }
         );
-        assert!(state.sessions.is_empty());
+        assert!(sess(&state).is_empty());
 
         // Second revoke must report honestly instead of pretending.
         match handle(&mut state, &peer(), Request::EndSession { session }) {
@@ -2478,7 +2653,7 @@ mod tests {
             uid: owner.credentials.uid,
             gid: owner.credentials.gid,
         });
-        let session = state.sessions.create("/repo".into(), &owner);
+        let session = sess(&state).create("/repo".into(), &owner);
 
         match handle(&mut state, &intruder, Request::EndSession { session }) {
             Response::Error { code, message } => {
@@ -2493,15 +2668,15 @@ mod tests {
 
         // The denial must not have half-applied: the session is still live,
         // so its grants and surrogates still work.
-        assert_eq!(state.sessions.len(), 1, "the session survived the denial");
-        assert!(state.sessions.belongs_to(session, &owner));
+        assert_eq!(sess(&state).len(), 1, "the session survived the denial");
+        assert!(sess(&state).belongs_to(session, &owner));
 
         // And the rightful owner can still end it.
         assert_eq!(
             handle(&mut state, &owner, Request::EndSession { session }),
             Response::SessionEnded { session }
         );
-        assert!(state.sessions.is_empty());
+        assert!(sess(&state).is_empty());
     }
 
     #[test]
@@ -3160,15 +3335,14 @@ mod tests {
             &mut state,
             CredentialMetadata::new("never-written", CredentialKind::BearerToken),
         );
-        let session = state.sessions.create("/repo".to_string(), &peer);
+        let session = sess(&state).create("/repo".to_string(), &peer);
         let (surrogate, _) = {
-            let (token, _, _) = state
-                .surrogates
+            let (token, _, _) = reg(&state)
                 .mint(session, ghost, CredentialClass::Generic, 60, 2, now_secs())
                 .expect("mint");
             (token, ())
         };
-        assert_eq!(state.surrogates.len(), 1, "a token is in flight");
+        assert_eq!(reg(&state).len(), 1, "a token is in flight");
 
         match handle(&mut state, &peer, Request::DeleteCredential { id: ghost }) {
             Response::Error { code, message } => {
@@ -3183,14 +3357,12 @@ mod tests {
             "a write that never happened must not change the mirror"
         );
         assert_eq!(
-            state.surrogates.len(),
+            reg(&state).len(),
             1,
             "a write that never happened must not revoke a live token"
         );
         assert_eq!(
-            state
-                .surrogates
-                .redeem_for(&surrogate, session, OperationFamily::GitHub, now_secs()),
+            reg(&state).redeem_for(&surrogate, session, OperationFamily::GitHub, now_secs()),
             Ok(ghost),
             "the token must still work: nothing was actually revoked"
         );
@@ -3209,12 +3381,11 @@ mod tests {
         let (_dir, _path, mut state, id) = wired_vault();
         let peer = admitted_peer();
 
-        let session = state.sessions.create("/repo".to_string(), &peer);
-        let (surrogate, _, _) = state
-            .surrogates
+        let session = sess(&state).create("/repo".to_string(), &peer);
+        let (surrogate, _, _) = reg(&state)
             .mint(session, id, CredentialClass::Generic, 60, 5, now_secs())
             .expect("mint");
-        assert_eq!(state.surrogates.len(), 1, "the token is live before");
+        assert_eq!(reg(&state).len(), 1, "the token is live before");
 
         // The secret really is reachable through the port before the delete,
         // so the assertion after it is about the delete and not about a
@@ -3245,14 +3416,12 @@ mod tests {
 
         // Half two: the registry stopped calling it live.
         assert_eq!(
-            state.surrogates.len(),
+            reg(&state).len(),
             0,
             "the registry still reports a token for a credential that is gone"
         );
         assert_eq!(
-            state
-                .surrogates
-                .redeem_for(&surrogate, session, OperationFamily::GitHub, now_secs()),
+            reg(&state).redeem_for(&surrogate, session, OperationFamily::GitHub, now_secs()),
             Err(SurrogateError::Unknown)
         );
     }
@@ -3470,7 +3639,7 @@ mod surrogate_tests {
     }
 
     fn mint(state: &mut BrokerState, peer: &WorkloadIdentity) -> (AgentSessionId, String) {
-        let session = state.sessions.create("/repo".to_string(), peer);
+        let session = sess(state).create("/repo".to_string(), peer);
         let credential = state.credentials[0].id;
         match handle(
             state,
@@ -3535,7 +3704,7 @@ mod surrogate_tests {
         );
 
         let peer = pinned_peer();
-        let session = state.sessions.create("/repo".to_string(), &peer);
+        let session = sess(&state).create("/repo".to_string(), &peer);
         let credential = state.credentials[0].id;
         assert_eq!(
             credential.to_wire(),
@@ -3565,7 +3734,7 @@ mod surrogate_tests {
     fn minting_still_refuses_a_credential_the_broker_does_not_hold() {
         let mut state = BrokerState::default();
         let peer = pinned_peer();
-        let session = state.sessions.create("/repo".to_string(), &peer);
+        let session = sess(&state).create("/repo".to_string(), &peer);
         let unknown = CredentialId::new();
         let unknown_wire = unknown.to_wire();
 
@@ -3611,7 +3780,7 @@ mod surrogate_tests {
             other => panic!("expected creation, got {other:?}"),
         };
         assert!(
-            !state.sessions.is_pinned(session),
+            !sess(&state).is_pinned(session),
             "the fixture session is unpinned"
         );
         assert_eq!(
@@ -3626,7 +3795,7 @@ mod surrogate_tests {
     fn an_unpinned_peer_cannot_mint_a_surrogate() {
         let (mut state, credential) = state_with_credential();
         let peer = unpinned_peer();
-        let session = state.sessions.create("/repo".to_string(), &peer);
+        let session = sess(&state).create("/repo".to_string(), &peer);
         match handle(
             &mut state,
             &peer,
@@ -3641,7 +3810,7 @@ mod surrogate_tests {
             other => panic!("an unpinned peer must be refused, got {other:?}"),
         }
         assert!(
-            state.surrogates.is_empty(),
+            reg(&state).is_empty(),
             "a refused mint must leave no token behind"
         );
     }
@@ -3654,7 +3823,7 @@ mod surrogate_tests {
         let peer = pinned_peer();
         let (session, token) = mint(&mut state, &peer);
         assert!(token.starts_with("asv1_"), "{token}");
-        assert_eq!(state.surrogates.len(), 1);
+        assert_eq!(reg(&state).len(), 1);
 
         // The session ends, the token dies with it. This is the property that
         // makes the session a real boundary rather than bookkeeping.
@@ -3663,7 +3832,7 @@ mod surrogate_tests {
             Response::SessionEnded { session }
         );
         assert_eq!(
-            state.surrogates.len(),
+            reg(&state).len(),
             0,
             "ending a session must revoke its surrogates"
         );
@@ -3677,7 +3846,7 @@ mod surrogate_tests {
     fn a_session_cannot_be_used_by_a_stranger() {
         let (mut state, credential) = state_with_credential();
         let owner = pinned_peer();
-        let session = state.sessions.create("/repo".to_string(), &owner);
+        let session = sess(&state).create("/repo".to_string(), &owner);
 
         // A different PID, so `belongs_to` is false.
         let stranger = WorkloadIdentity::from_peer(PeerCredentials {
@@ -3698,7 +3867,7 @@ mod surrogate_tests {
             Response::Error { code, .. } => assert_eq!(code, ErrorCode::Denied),
             other => panic!("a stranger must be refused, got {other:?}"),
         }
-        assert!(state.surrogates.is_empty());
+        assert!(reg(&state).is_empty());
     }
 
     /// Minting against a credential the broker does not hold would produce a
@@ -3708,7 +3877,7 @@ mod surrogate_tests {
     fn an_unknown_credential_is_refused_at_mint_time() {
         let mut state = BrokerState::default();
         let peer = pinned_peer();
-        let session = state.sessions.create("/repo".to_string(), &peer);
+        let session = sess(&state).create("/repo".to_string(), &peer);
         match handle(
             &mut state,
             &peer,
@@ -3722,7 +3891,7 @@ mod surrogate_tests {
             Response::Error { code, .. } => assert_eq!(code, ErrorCode::InvalidRequest),
             other => panic!("an unknown credential must be refused, got {other:?}"),
         }
-        assert!(state.surrogates.is_empty());
+        assert!(reg(&state).is_empty());
     }
 
     /// A client asking for an absurd budget is clamped, and the clamped value
@@ -3732,7 +3901,7 @@ mod surrogate_tests {
     fn a_client_cannot_widen_its_own_surrogate_budget() {
         let (mut state, credential) = state_with_credential();
         let peer = pinned_peer();
-        let session = state.sessions.create("/repo".to_string(), &peer);
+        let session = sess(&state).create("/repo".to_string(), &peer);
         match handle(
             &mut state,
             &peer,
@@ -3765,7 +3934,7 @@ mod surrogate_tests {
         let (session, token) = mint(&mut state, &peer);
 
         // A stranger's revoke, under their own session, must not touch it.
-        let other_session = state.sessions.create("/other".to_string(), &peer);
+        let other_session = sess(&state).create("/other".to_string(), &peer);
         match handle(
             &mut state,
             &peer,
@@ -3777,7 +3946,7 @@ mod surrogate_tests {
             Response::Error { code, .. } => assert_eq!(code, ErrorCode::InvalidRequest),
             other => panic!("a cross-session revoke must fail, got {other:?}"),
         }
-        assert_eq!(state.surrogates.len(), 1, "the token is untouched");
+        assert_eq!(reg(&state).len(), 1, "the token is untouched");
 
         // The owner can.
         assert_eq!(
@@ -3791,7 +3960,7 @@ mod surrogate_tests {
             ),
             Response::SurrogateRevoked { surrogate: token }
         );
-        assert!(state.surrogates.is_empty());
+        assert!(reg(&state).is_empty());
     }
 
     /// A broker with no vault open refuses all three semantic operations, and
@@ -3848,7 +4017,7 @@ mod surrogate_tests {
             }
         }
         // And crucially, an unattempted call must not have spent the budget.
-        assert_eq!(state.surrogates.len(), 1, "the token is still live");
+        assert_eq!(reg(&state).len(), 1, "the token is still live");
     }
 
     /// A minted token is the only credential-shaped string the broker emits,
@@ -3860,7 +4029,7 @@ mod surrogate_tests {
         let metadata = CredentialMetadata::new(CANARY, CredentialKind::BearerToken);
         let credential = register_inventory_credential(&mut state, metadata);
         let peer = pinned_peer();
-        let session = state.sessions.create("/repo".to_string(), &peer);
+        let session = sess(&state).create("/repo".to_string(), &peer);
 
         let response = handle(
             &mut state,
@@ -3891,10 +4060,10 @@ mod surrogate_tests {
         let (mut state, _) = state_with_credential();
         let peer = pinned_peer();
         let (session, _) = mint(&mut state, &peer);
-        assert_eq!(state.surrogates.len(), 1, "one token is live");
+        assert_eq!(reg(&state).len(), 1, "one token is live");
         handle(&mut state, &peer, Request::EndSession { session });
-        assert!(state.surrogates.is_empty(), "and none after teardown");
-        assert!(state.sessions.is_empty(), "and no session either");
+        assert!(reg(&state).is_empty(), "and none after teardown");
+        assert!(sess(&state).is_empty(), "and no session either");
     }
 }
 
@@ -4053,7 +4222,7 @@ mod e2e {
             gid: unsafe { libc::getgid() },
         });
         peer.pin_pidfd().expect("pidfd_open on self");
-        let session = state.sessions.create("/repo".to_string(), &peer);
+        let session = sess(&state).create("/repo".to_string(), &peer);
         let token = match handle(
             &mut state,
             &peer,
@@ -4187,7 +4356,7 @@ mod e2e {
     #[test]
     fn a_surrogate_from_another_session_of_the_same_peer_is_refused() {
         let (mut state, peer, _session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
-        let other = state.sessions.create("/other".to_string(), &peer);
+        let other = sess(&state).create("/other".to_string(), &peer);
 
         let response = handle(
             &mut state,
@@ -4233,7 +4402,7 @@ mod e2e {
             gid: unsafe { libc::getgid() },
         });
         stranger.pin_pidfd().ok();
-        let foreign = state.sessions.create("/theirs".to_string(), &stranger);
+        let foreign = sess(&state).create("/theirs".to_string(), &stranger);
 
         let response = handle(
             &mut state,
@@ -4280,7 +4449,7 @@ mod e2e {
         let (mut state, peer, session, _token, origin, _dir) = brokered(Reply::Json(issue_json()));
         // Re-mint with a single use. `brokered` grants two so other tests can
         // make two calls; here one is the whole point.
-        state.surrogates = SurrogateRegistry::default();
+        state.surrogates = Arc::new(Mutex::new(SurrogateRegistry::default()));
         let credential = state.credentials[0].id;
         let token = match handle(
             &mut state,
@@ -4578,7 +4747,7 @@ mod e2e {
         let mut state = bare();
         declares_db_example(&mut state);
         let peer = self_peer();
-        let session = state.sessions.create("/repo".into(), &peer);
+        let session = sess(&state).create("/repo".into(), &peer);
         state.secrets = Some(Arc::new(RefusingPort));
         let response = handle(
             &mut state,
@@ -4629,7 +4798,7 @@ mod e2e {
         // nothing.
         let mut state = bare();
         let peer = self_peer();
-        let session = state.sessions.create("/repo".into(), &peer);
+        let session = sess(&state).create("/repo".into(), &peer);
         let response = handle(
             &mut state,
             &peer,
@@ -4651,7 +4820,7 @@ mod e2e {
         // asserts it saw none.
         let mut state = bare();
         let peer = self_peer();
-        let session = state.sessions.create("/repo".into(), &peer);
+        let session = sess(&state).create("/repo".into(), &peer);
         let port = Arc::new(CountingPort::default());
         state.secrets = Some(port.clone());
         let response = handle(
@@ -4688,7 +4857,7 @@ mod e2e {
         // no backend to observe.
         let mut state = bare();
         let peer = self_peer();
-        let session = state.sessions.create("/repo".into(), &peer);
+        let session = sess(&state).create("/repo".into(), &peer);
         state.secrets = Some(Arc::new(RefusingPort));
         let response = handle(&mut state, &peer, Request::PostgresRevoke { session });
         assert_eq!(
@@ -4704,7 +4873,7 @@ mod e2e {
     fn a_query_on_a_session_that_was_never_open_is_denied() {
         let mut state = bare();
         let peer = self_peer();
-        let session = state.sessions.create("/repo".into(), &peer);
+        let session = sess(&state).create("/repo".into(), &peer);
         state.secrets = Some(Arc::new(RefusingPort));
         state.runtime = Some(test_runtime());
         let response = handle(

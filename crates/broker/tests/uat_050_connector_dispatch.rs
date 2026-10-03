@@ -50,7 +50,7 @@ impl SecretPort for OpenVault {
 /// at the gate and these tests would pass without ever observing the routing
 /// they are about. `db.example` at loopback is declared for exactly that reason.
 fn broker_with_session(peer: &WorkloadIdentity) -> (BrokerState, AgentSessionId) {
-    let mut state = BrokerState {
+    let state = BrokerState {
         connectors: Box::new(LiveConnectorFactory {
             destinations: vec![asv_broker::PgDestination::new(
                 "db.example",
@@ -62,7 +62,11 @@ fn broker_with_session(peer: &WorkloadIdentity) -> (BrokerState, AgentSessionId)
         secrets: Some(Arc::new(OpenVault)),
         ..Default::default()
     };
-    let session = state.sessions.create("/repo".into(), peer);
+    let session = state
+        .sessions
+        .lock()
+        .expect("no test holds this")
+        .create("/repo".into(), peer);
     (state, session)
 }
 
