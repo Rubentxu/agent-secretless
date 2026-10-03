@@ -28,6 +28,7 @@ pub mod connect_listener;
 pub mod connect_routes;
 pub mod connect_runtime;
 pub mod harden;
+pub mod http_frame;
 pub mod inventory;
 pub mod isolated_exec;
 pub mod oauth2;
