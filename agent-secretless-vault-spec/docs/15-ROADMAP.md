@@ -1229,11 +1229,17 @@ asv-brokerd CONNECT listener
 This is the shell-first requirement applied to the replay fix. The
 alternative — teaching each client to manufacture an ASV header — is M14's
 work, and it would put the protocol inside every toolchain, which is the
-opposite of what M14 is for. **Nothing of this is built.** It is recorded
-because the counter is worthless without it, and a counter that refuses a
-client's second legitimate tunnel is worse than no counter at all: it is a
-denial of service wearing a security costume, which is the same shape as the
-"strict highest counter seen" rule the window deliberately avoids.
+opposite of what M14 is for. It is recorded because the counter is worthless
+without it, and a counter that refuses a client's second legitimate tunnel is
+worse than no counter at all: it is a denial of service wearing a security
+costume, which is the same shape as the "strict highest counter seen" rule the
+window deliberately avoids.
+
+**Status: the emitter is built; the shim around it is not.** `ProofIssuer` is
+the "one emitter per session" this section argues for, and it holds the only
+counter the session spends — see *C2.5-b*. The proxy that receives the
+ordinary client's CONNECT and hands it to the emitter is not built, so the
+shape above is still only half real.
 
 #### C2.5-S1 — measured: only one client can carry the proof
 
@@ -1468,6 +1474,81 @@ stops, so a padded and an unpadded spelling of the same proof would both parse.
 Closing that is a behaviour change to a security path, and mixing it into a
 move makes the move unverifiable: the vector cannot tell "the move was
 faithful" from "the move was also a change". It is a separate delivery.
+
+#### C2.5-b — the counter has exactly one owner, and that owner can now sign
+
+This section answers the question left open by *Who owns the counter* above.
+That one said the shape before it was built; this one is the build.
+
+**`ProofIssuer`: one per session, holding the only counter that session
+spends.** `issue(host, port)` takes the next counter from a `SeqCst` atomic
+and returns a signed `SessionProof`. A second issuer is constructible, and that
+is why `next_counter` is exposed: the duplication is *observable* rather than
+silent, so a shim that somehow held two would be caught instead of quietly
+splitting the counter space. A counter per child is not merely discouraged, it
+is not expressible as the intended design — the thing that increments it is a
+named object with one atomic inside it.
+
+**The crate had a server and no client.** `AgentSession` signs, and nothing in
+the tree could ask it to. `AgentClient` speaks the bounded 11/13 subset over
+the `SSH_AUTH_SOCK` path and nothing else: it does not read `~/.ssh`, and a
+missing socket is an error rather than an occasion to find another identity.
+
+Three decisions in the client are about refusing rather than about working:
+
+- **It names the key it wants signed**, instead of asking "sign this" and
+  taking whatever comes back. A socket pointed somewhere else then produces a
+  signature the broker refuses, rather than one it might accept.
+- **It takes the key blob from the agent**, not from the caller, because the
+  agent is the authority on which key it signs with. `discover` refuses an
+  agent offering more than one identity rather than picking the first, which
+  would be choosing a key on no evidence.
+- **`Refused` is a distinct error from `Io`.** A session that declined to sign
+  and a socket that is not there are different facts, and only one of them is
+  worth retrying.
+
+**A failed signing still spends its counter, and that is deliberate.** A counter
+handed back after a failure is one an attacker can walk backwards by making the
+agent slow. The window is 128 wide, so a few lost counters cost nothing; a
+*reusable* counter costs the property it exists to provide.
+
+**Falsification: 14 mutations, 14 killed, control green**
+(`tests/proof_issuer_falsification.py`). Every client test goes through a real
+`AgentSession` socket, because the thing under test is that two halves of one
+crate agree across a length-prefixed frame. Six of the mutations need an agent
+that misbehaves — a wrong algorithm name, two identities, a length field that
+lies — which a real session cannot produce and only an adversarial one can.
+
+**Four things the run found, three of them in the tests or the harness.**
+
+1. **The identity reader was a misreading of the protocol, and the real socket
+   caught it on the first run.** Every SSH-agent identity is a blob *and* a
+   comment; the reader took the blob and then asserted the frame was exhausted,
+   which it never is. An in-process fake would have agreed with the mistake,
+   because the fake would have been written from the same misreading. The
+   adversarial fixture exists to *attack* the client, which is the opposite of
+   standing in for the server.
+2. **A test aimed at the wrong layer.** `two_identities_are_refused…` called
+   `identities()` and expected a refusal. But `identities()` is a faithful
+   reader — refusing a well-formed response would be the bug — and the
+   "exactly one identity" rule is policy that lives in `discover`. The test now
+   asserts both: the reader reports two, and `discover` refuses.
+3. **A size check that exists in two places is pinned by naming which copy is
+   under test.** The oversized-payload test pointed at a live agent, so deleting
+   the check in `sign` changed nothing observable: the frame writer refused the
+   same value independently. Against an absent socket the layers separate — a
+   refusal before connecting is `Malformed`, a deleted check becomes `Io`.
+4. **A test made only of negative assertions proves nothing on its own.** Every
+   assertion in `a_proof_is_refused_for_a_destination_it_was_not_minted_for` was
+   "this signature does not verify there", and a signature over the wrong nonce
+   does not verify *anywhere*, so all of them held for a completely broken
+   issuer. It now asserts the positive half first.
+
+And one expectation of mine was wrong twice: a mutation meant to hand the
+counter back on failure was first written as `store(counter + 1)` followed by
+`fetch_add(1)`, which is *exactly what the original does*. A mutation that
+changes nothing is indistinguishable from one that changes something and is not
+caught, so reading the mutation is part of falsifying it.
 
 ## After v1.0 — M14 through M18
 

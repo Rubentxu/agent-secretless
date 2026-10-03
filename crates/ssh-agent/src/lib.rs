@@ -14,9 +14,16 @@
 //! `asv-broker` when a *producer* for it appeared. It sits beside
 //! [`verify_proof`] and [`public_key_blob`] for the same reason: this crate is
 //! the one place that decides what a signature over a session key means.
+//!
+//! [`client`] is the other half: the side that asks this crate to sign. The
+//! crate had a server and no client for long enough that every proof on the
+//! wire was assembled by a test, and [`client::ProofIssuer`] is where the
+//! session's single proof counter now lives.
 
+pub mod client;
 pub mod proof;
 
+pub use client::{AgentClient, ProofIssuer};
 pub use proof::{proof_nonce, SessionProof, PROOF_DOMAIN, SESSION_PROOF_HEADER};
 
 use std::io::{self, Read, Write};
@@ -59,6 +66,16 @@ pub enum AgentError {
     /// The session has been revoked.
     #[error("session revoked")]
     Revoked,
+    /// The agent answered, and the answer was "no".
+    ///
+    /// Separate from [`AgentError::Io`] on purpose: a caller has to be able to
+    /// tell a session that declined to sign from a socket that is not there,
+    /// because only one of those is worth retrying.
+    #[error("agent refused the request")]
+    Refused,
+    /// The agent is reachable but holds no identity to sign with.
+    #[error("agent holds no identities")]
+    NoIdentities,
 }
 
 /// A broker-owned Ed25519 signer bound to one local session.
