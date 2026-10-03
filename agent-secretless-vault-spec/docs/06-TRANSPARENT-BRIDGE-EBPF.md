@@ -1,5 +1,23 @@
 # Transparent Credential Bridge and eBPF Research
 
+> **Outcome, recorded 2026-10-01: the transparent socket redirect did not ship.**
+>
+> This document is the research that produced the decision; it is kept as the
+> record of *how* the decision was reached and is not a description of the
+> product. The formal NO-GO lives in `15-ROADMAP.md` (M8) and its verifiable
+> form in `16-SECURITY-RELEASE-GATES.md`; the two legs of evidence are that
+> `cgroup_attach_skeleton` performs no syscall and no BPF object was ever
+> written, and that this build host cannot load one
+> (`docs/receipts/m9-ebpf-capability-block.md`).
+>
+> What shipped instead is this document's **explicit-proxy** path, not its
+> transparent one: the CONNECT bridge in `crates/broker/src/tls_bridge.rs`,
+> with credential substitution on the CONNECT path. Sections 1, 3 and 4 below
+> are unaffected — the rejection of `bpf_probe_write_user` and the
+> egress/telemetry role are both still the design. What changed is §4.1 and §5's
+> transparent branch, which describe a mechanism that will not exist, and the
+> `ACCEPT advanced` cell in §12.
+
 ## 1. Question
 
 Can eBPF transparently replace a placeholder with a real token/credential at runtime so arbitrary shell/CLI tools can authenticate without ever receiving the secret?
@@ -243,13 +261,33 @@ Measure p50/p95 latency and throughput overhead for explicit proxy vs eBPF redir
 | eBPF writes real secret into CLI memory | Narrowly | No | No | REJECT |
 | uprobe TLS-library patching | Narrowly | No | No | REJECT |
 | seccomp user-notify rewrite of buffers | Narrowly | No/fragile | No | REJECT |
-| eBPF cgroup socket redirect to broker | Yes | Yes as routing/enforcement | Linux | ACCEPT advanced |
-| explicit local proxy | Yes | Yes with strict audience binding | Broad HTTP | ACCEPT core/early |
-| session TLS bridge + surrogate | Yes | Strong with stated limits | Broad HTTP | ACCEPT optional |
+| eBPF cgroup socket redirect to broker | Yes | Yes as routing/enforcement | Linux | **NOT SHIPPED — superseded by the M8 NO-GO.** Viable in principle; the research produced no program and the build host cannot load one. The transparent *UX* it promised is delivered instead by the explicit CONNECT bridge |
+| explicit local proxy | Yes | Yes with strict audience binding | Broad HTTP | ACCEPT core/early — **this is the path that shipped** |
+| session TLS bridge + surrogate | Yes | Strong with stated limits | Broad HTTP | ACCEPT optional — **shipped, as the CONNECT path** |
 | protocol-specific proxy | Yes | Strong | Per protocol | ACCEPT core |
+
+Two rows changed after 2026-09-28 and are annotated rather than rewritten: the
+redirect, which was `ACCEPT advanced` and is not shipping, and the two rows
+below it, which were correctly marked and turned out to be what the product is
+actually built on. A decision matrix that is edited to agree with the outcome
+stops being evidence, so the original verdict is left in place next to what
+happened to it.
 
 ## 13. Bottom line
 
-Use eBPF to make the **path** transparent, not to make the **secret bytes** magically appear inside an untrusted process.
+Use eBPF to make the **path** transparent, not to make the **secret bytes**
+magically appear inside an untrusted process.
 
-That keeps the central invariant intact and still delivers the UX benefit: the agent runs familiar commands while the kernel transparently steers eligible traffic into a credential broker.
+That keeps the central invariant intact and still delivers the UX benefit: the
+agent runs familiar commands while the kernel transparently steers eligible
+traffic into a credential broker.
+
+**The invariant half held; the mechanism half did not.** The first sentence is
+the design and it survived the research intact — no secret bytes in an untrusted
+process, which is the property everything else serves. The second sentence was
+the promise eBPF was supposed to keep, and it is delivered by something else: an
+ordinary `HTTPS_PROXY` and a CONNECT bridge, with the client configuring its
+proxy explicitly. A CLI that ignores proxy settings is not covered by anything
+in this repository, and that limitation is stated rather than engineered around,
+because the alternative — a mechanism that does not exist — cannot be stated
+honestly at all.

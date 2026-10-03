@@ -1,6 +1,38 @@
 # ROADMAP — Planning Authority
 
-This file is the single planning authority for the initial product line. Specifications and ADRs define intent/decisions; this roadmap defines sequence and exit criteria.
+This file is the single planning authority for the initial product line and for
+its continuation. Specifications and ADRs define intent/decisions; this roadmap
+defines sequence and exit criteria.
+
+**Verifiable status does not live here.** This file says what is planned and in
+what order. Whether something is actually true today is asserted in
+`16-SECURITY-RELEASE-GATES.md`, which is checked against the repository by
+`scripts/check-gate-status.py` and `tools/check-gates.py`. A milestone in this
+file is not a claim about the world; a row in that file is.
+
+## Status vocabulary
+
+Every capability named in this roadmap carries exactly one of these four
+states. They are not a maturity gradient — they answer four different
+questions, and a capability is routinely in one of them while being absent
+from another.
+
+| State | Means | Closing condition |
+|---|---|---|
+| **verified** | An exit UAT is claimed by a test file in this repository and that test runs green. | The claim is machine-checked: `tools/check-gates.py` resolves the UAT id to a file, and the test passes. |
+| **implemented** | The code exists and is exercised, but the property that matters is not yet proven adversarially. | Needs a test that can be shown to fail when the property is removed. |
+| **host-dependent** | The capability is decided in code but its guarantee cannot be established on the machine that builds it — it needs a TPM, a live provider, or a physical host. | Only a different host can close it. No repository check asserts it, because nothing in a repository can decide it. |
+| **prototype** | A shape, an interface and a reference implementation exist. Nothing depends on them at runtime. | Needs a real caller before it can be anything else. |
+
+A **prototype** is not a smaller **implemented**. The M11 OAuth2 module has ten
+unit tests and a reference issuer, and it is still a prototype, because no
+production path calls it and a unit test on an uncalled function proves only
+that the function agrees with itself.
+
+A milestone closes only when its exit UAT is green — that is, only when its
+capabilities reach **verified**. `host-dependent` and `prototype` are honest
+places to stop; what is not acceptable is a milestone marked closed while its
+capabilities are in either of them.
 
 ## Release strategy
 
@@ -17,7 +49,7 @@ R3 Tauri operator UX
    ↓
 R4 Linux hardened sessions
    ↓
-R5 Transparent bridge/eBPF
+R5 TLS bridge (CONNECT path)      ← not eBPF; see M8 NO-GO
    ↓
 R6 Connector expansion
    ↓
@@ -25,6 +57,11 @@ R7 Security stabilization RC
    ↓
 v1.0 certified
 ```
+
+R5 was specified as a transparent eBPF socket redirect. It shipped as the
+explicit CONNECT/TLS bridge instead, because M8 decided NO-GO. The stage kept
+its position in the sequence and lost its mechanism; the ordering was never the
+thing in doubt.
 
 A milestone closes only when its exit UAT is green.
 
@@ -206,6 +243,30 @@ local authorization under 5 ms. Measuring it is M4 work.
 - UAT-020,
 - end-to-end add credential -> grant -> agent use -> revoke.
 
+### Status: closed — 2 of 3 exits machine-asserted, 1 host-dependent
+
+This milestone **shipped**, and both READMEs said otherwise for several
+milestones. The console is `apps/desktop/ui/` and it is not a placeholder; the
+claims that it was "not started" and that it was "remaining before 1.0" were
+both false, and both are now removed.
+
+- **E2E add → grant → use → revoke** is `verified` against a real broker
+  process, a real vault file and a real control-plane enrolment
+  (`crates/broker/tests/m5_console_e2e.rs`).
+- **UAT-019 / UAT-020** are checked against a real WebKit engine by
+  `apps/desktop/tests/uat019_probe.c`, which drives the *shipped* `ui/index.html`
+  and `ui/app.js`. That is `host-dependent` in the sense that matters to a
+  pipeline: the probe needs a display and `webkit2gtk-devel`, neither of which
+  the CI container has, so it runs on the release host.
+- The console **policy surface** (8 tests) and the CSP are machine-asserted
+  with no GUI toolchain at all, as R12.
+
+**Known gap, carried forward and not claimed closed:** the console has no
+indicator that a TLS bridge is active. `apps/desktop/ui/` contains no
+reference to interception, the bridge, TLS or surrogates. An operator cannot
+see from the UI that an intercepting path exists, which is a real
+observability gap even though it is not a security one.
+
 ---
 
 ## M6 — Non-HTTP protocol proxy
@@ -231,6 +292,41 @@ local authorization under 5 ms. Measuring it is M4 work.
 - UAT-033.
 - UAT-039,
 - UAT-050,
+
+### Status: closed — two exits verified in any run, one only with a substrate
+
+M6 had **no row at all** in `16-SECURITY-RELEASE-GATES.md`, so "M6 is closed"
+was asserted by this roadmap and by a receipt and contradicted by nothing. The
+row now exists. The three exits are not equivalent to each other, and the
+distinction is the interesting part:
+
+- **UAT-050** (`crates/broker/tests/uat_050_connector_dispatch.rs`) is
+  `verified` on any machine: it proves the broker dispatches on the request
+  type rather than a provider string.
+- **UAT-039** (`crates/broker/tests/uat_039_pg.rs`) is `verified` on any
+  machine: the five M6 scenarios run end to end against a fake origin, so the
+  broker's decision logic is exercised without a database.
+- **UAT-033** is the milestone's actual claim — *`psql` connects to a real
+  server and the password appears in no file, no process and no environment* —
+  and it is the one that needs a substrate. Two suites prove it,
+  `crates/connector-pg/tests/uat033_live.rs` (the transport) and
+  `crates/broker/tests/uat033_broker.rs` (the broker reaching a real server
+  with the password borrowed from a vault), and both are `host-dependent` on a
+  disposable PostgreSQL described by `ASV_UAT033_PG_*`.
+
+**The caveat is stated because it is the kind that bites.** In the pipeline,
+`scripts/uat033-pg-substrate.sh run` brings the substrate up and sets
+`ASV_UAT033_REQUIRE=1`, so a substrate that fails to start is a hard failure —
+that run is `verified`. In a bare `cargo test --workspace`, both suites **skip
+with a message and pass**. A local run therefore reports the suite green with
+UAT-033's real-transport assertions never executed, and a reader of that
+summary is entitled to assume they ran. `uat033_live.rs` says this about
+itself in its own header; it is repeated here because the roadmap is what
+someone reads before trusting a green suite.
+
+This also resolves a contradiction the READMEs carried simultaneously:
+"live transport pending" and "UAT-033 runs against a real PostgreSQL in CI"
+were both present, and the second was true only of the pipeline.
 
 ---
 
@@ -268,6 +364,31 @@ Isolated worker exfiltration is likewise **not** an M7 gate: it requires the
 registered worker templates and separate-identity workers, which are M10's
 scope. M10 claims it.
 
+### Status: closed on its UAT, with one residual that matters more than it did
+
+M7's exit UAT are claimed and green. The residual is the first item in its own
+scope list — *"dedicated broker UID production packaging"* — and it is the only
+scope item not delivered.
+
+- **The broker still runs as the invoking user.** A separate uid was specified
+  and is not shipped. `PR_SET_DUMPABLE=0` and Landlock are what stand in the
+  way of a same-uid process reading broker memory, and both are *policy*
+  enforcement that a same-uid process with the right privileges can defeat.
+  The README has said this plainly for several milestones; it remains true.
+- **UAT-003's strongest clause is `#[ignore]`d.**
+  `uat_003_open_proc_self_mem_returns_eacces_when_undumpable` in
+  `crates/broker/tests/uat_003_proc_inspection.rs` is ignored with the reason
+  *"structural: requires a child process to attempt the open; the in-process
+  check is dumpable_is_zero"*. That is the only ignored test in the workspace's
+  866. The clause that proves the *kernel* refuses the read is therefore not
+  executed by a default run; what is executed is the weaker in-process check
+  that the dumpable flag is zero.
+
+This is carried as the first item of the v1.0 continuation (V1-C1) rather than
+left implicit, because "M7 closed" and "a same-uid process can read the
+broker's memory" are both true and only the second one is the one an attacker
+cares about.
+
 ---
 
 ## M8 — Transparent eBPF bridge R&D gate
@@ -296,7 +417,48 @@ Surrogate works, real token absent from client, host/redirect attacks denied.
 
 Stress long-running agent sessions, high socket churn and map cleanup.
 
-### Go criteria
+### Decision: **NO-GO** (recorded 2026-10-01)
+
+M8 is decided, not deferred. The verdict has two independent legs and either
+one alone is sufficient.
+
+**Leg 1 — the research produced no program.** `cgroup_attach_skeleton`
+(`crates/ebpfd/src/verbs.rs:239`) is documented as performing *"no syscall"* and
+returns `Ok(AttachHandle(0))`. `crates/ebpfd` contains no BPF source, no ELF
+object and no build step. `ProgramId::Connect4RedirectV1` is annotated as *"one
+shipped ELF object in the broker's M9 deliverable"* — an object that does not
+exist. A no-op that returns success cannot satisfy "reliable cleanup and
+fail-closed behavior", so the go criteria were unreachable by construction
+rather than by a shortfall in effort.
+
+**Leg 2 — the build host cannot load a BPF object.** Measured directly rather
+than read from `/proc/self/status`: `BPF_MAP_CREATE` returns `-1 errno=1
+(EPERM)`. `CapBnd` does include `CAP_SYS_ADMIN`, so the kernel is not refusing
+to grant the capability; the process was simply never given it, with
+`unprivileged_bpf_disabled=2` and `/sys/fs/bpf` unreadable. Recorded in
+`docs/receipts/m9-ebpf-capability-block.md`.
+
+**The three negative criteria pass,** which is why this is a NO-GO and not a
+rejection of the approach in principle: `bpf_probe_write_user` appears 0 times
+in `crates/`, uprobe patching 0 times, and there is no system-wide CA.
+`SSL_CERT_FILE` is a *per-session* env binding written by `tls_bridge.rs:398`
+into that session's own environment, and `harden.rs:154` mounts `/etc`
+read-only rather than installing into it. `crates/ebpfd` is a closed
+eight-verb vocabulary that by construction accepts no arbitrary BPF bytecode.
+
+### Consequence
+
+The **No-go fallback is the shipped path.** "Keep explicit proxy + service
+shims; eBPF remains egress/telemetry only" is not a contingency awaiting a
+better experiment — it is what the repository already does, and `asv-ebpfd`
+remains the egress/telemetry helper its own module doc describes. Because
+ADR-0007 conditions the production feature on M8 GO, that feature is not
+coming.
+
+This is what M9 turned out to be. `eBPF transparent routing` left M9's scope
+and the explicit CONNECT bridge stayed.
+
+### Go criteria (not met, retained for the record)
 
 - no direct `bpf_probe_write_user`,
 - no generic uprobe patching,
@@ -304,36 +466,51 @@ Stress long-running agent sessions, high socket churn and map cleanup.
 - explicit list of supported client/runtime combinations,
 - reliable cleanup and fail-closed behavior.
 
+The first three are met. The fourth was published as `docs/tls-compatibility-matrix.md`
+on the CONNECT path, which is not the same measurement. The fifth is not met,
+and cannot be: there is no program to clean up.
+
 This is a go/no-go research gate, not a shipped connector: its experiments
 reuse the surrogate and hardened session delivered by earlier milestones, so it
 re-runs their acceptance set rather than owning any of its own. It is
 therefore DELEGATED to `16-SECURITY-RELEASE-GATES` and is not gated on UAT.
 
-### No-go fallback
-
-Keep explicit proxy + service shims; eBPF remains egress/telemetry only.
-
 ---
 
-## M9 — Transparent TLS bridge
+## M9 — TLS bridge on the CONNECT path
 
-**Conditional on M8 GO.**
+**Not conditional on M8 GO. This is M8's fallback, and it is what shipped.**
 
 ### Scope
+
+Shipped:
 
 - per-session ephemeral CA,
 - local trust injection adapters,
 - leaf issuance for exact hosts,
-- eBPF transparent routing,
-- HTTP/1.1 + HTTP/2 compatibility where proxy stack supports it,
 - strict CONNECT/redirect controls,
-- UI indicator that TLS interception is active,
-- credential substitution on the CONNECT path, in a separate increment.
+- credential substitution on the CONNECT path,
+- a TLS compatibility matrix published from tests.
+
+Dropped with the M8 NO-GO:
+
+- ~~eBPF transparent routing~~ — the mechanism that gave this milestone the
+  word "transparent" in its original title,
+- HTTP/2 on the bridge, as a supported product feature. The bridge selects no
+  ALPN protocol, so HTTP/1.1 only; see the matrix for why that is deliberate,
+- a UI indicator that TLS interception is active. There is no interception
+  indicator because M5 shipped without one, and that gap is real: an operator
+  cannot see from the console that a bridge exists. It is carried forward, not
+  claimed closed.
 
 ### Exit UAT
 
 - UAT-010, 011, 012, 013,
 - TLS compatibility matrix published from tests.
+
+UAT-012 and UAT-013 are **superseded by the M8 NO-GO**, not blocked: they gate
+the transparent redirect, which will not ship, so the question they posed has
+an answer.
 
 ### The TLS compatibility matrix is published
 
@@ -489,6 +666,34 @@ No new broad connector families.
 
 All release gates in `16-SECURITY-RELEASE-GATES.md` pass.
 
+### Status: **partial** — and it is not close to the freeze being satisfiable
+
+M13's work list is a certification checklist, and the honest reading is that
+most of it is still open. `16-SECURITY-RELEASE-GATES.md` has a row for M13 now
+(it had none, which is how both READMEs came to carry `M13 ✅`).
+
+Done, and verified in the pipeline:
+
+- dependency/advisory audit — 0 advisories over 338 deps, one yanked
+  transitive recorded as a finding,
+- crash/recovery — UAT-035, a journal replay that never advances past a torn
+  write,
+- docs, SBOM, ops manual.
+
+Not done:
+
+- **third-party security review** — not performed, and not performable from a
+  developer's machine. It is preparation for a review, not the review.
+- **signed reproducible artifacts** (R0) — no signing pipeline,
+- **full UAT matrix green** — 29 of 40 ids claimed, and the 11 unclaimed are
+  grouped by cause, with 2 superseded rather than outstanding,
+- **upgrade/migration across releases** — the rekey and vault-format migration
+  tests exist; a release-to-release upgrade and rollback test does not.
+
+The freeze is therefore not yet a constraint anyone has had to respect,
+because the certification work that would justify it has not been done. Saying
+so is cheaper than a v1.0 tag that a release host immediately contradicts.
+
 ---
 
 ## v1.0 — Certified product line
@@ -505,7 +710,8 @@ Minimum supported story:
 - policy/approvals,
 - audit,
 - Linux hardened mode,
-- transparent eBPF bridge only if M8/M9 passed,
+- ~~transparent eBPF bridge only if M8/M9 passed~~ — **withdrawn**: M8 is
+  NO-GO, so the v1.0 story is the explicit CONNECT bridge of M9,
 - compatibility worker clearly labelled,
 - CLI + optional MCP control surface.
 
@@ -513,6 +719,100 @@ Minimum supported story:
 
 Release aggregation, not an independent gate: it is the union of the milestones
 above. Completion is DELEGATED to `16-SECURITY-RELEASE-GATES`.
+
+### The path from v0.28.0 to v1.0
+
+M8 is decided and M9 is closed, so the remaining work to v1.0 is not a matter of
+finishing the transparent bridge. It is the sequence below. The ordering is
+deliberate: C0 first, because writing more code on top of an authority that
+misdescribes the product compounds the error.
+
+```text
+CURRENT: v0.28.0
+│
+├─ V1-C0  Rebaseline / truthfulness        ← this document, this cycle
+├─ V1-C1  M7 residual: agent uid != broker uid
+├─ V1-C2  M9 productionization residuals
+├─ V1-C3  M11 against a real OAuth2 provider
+├─ V1-C4  M12 against real TPM hardware
+│
+├─ V1-C5  M13 final certification
+│
+└────────────── v1.0
+```
+
+- **V1-C1** closes the M7 residual recorded above: `asv-brokerd` under a
+  separate OS identity, correct service ownership, and an adversarial test
+  that a process under the agent's uid cannot read or ptrace the broker's
+  memory. It also un-ignores UAT-003's dropped clause. No new sandbox
+  framework: seccomp, Landlock and cgroups are already M7's.
+- **V1-C2** productionizes what M9 verified but did not ship as a network
+  surface: a production listener wiring `relay_substituted` into a running
+  `asv-brokerd`, real CONNECT lifecycle, more than one request per tunnel where
+  the protocol allows, a formal decision on freshness and replay, shutdown and
+  revoke mid-tunnel, stress and cancellation, and observability that carries no
+  sensitive material. The three limits recorded on M9's gate row are its scope.
+- **V1-C3** turns M11 from a prototype into a vertical. The `ClientCredentialsIssuer`
+  becomes a *reference implementation* rather than the evidence of closure, and
+  the closure is an HTTPS POST to a real token endpoint producing a short-lived
+  credential that reaches an operation and is then revoked, expired and audited.
+  M15's strategy selection is only meaningful over provider-backed strategies,
+  so this is a prerequisite and not a parallel.
+- **V1-C4** does the same for M12 with a real TPM: a hardware adapter,
+  enrollment, recovery before any destructive step, PCR and device-state change,
+  a theft test, software ↔ device-bound migration, and `Unsupported` rather than
+  simulated success on hardware that cannot do it. `SoftwareTpm` stays for fast
+  tests and is never the evidence. This also unblocks M17.
+- **V1-C5** is the freeze. No adapters, no planners, no new providers — only the
+  M13 checklist above, done properly, against a release host.
+
+**V1-C3 and V1-C4 are host-dependent.** Neither can be closed on a machine with
+no OAuth2 provider to point at and no TPM. That is a property of the work, not
+a blocker to route around, and it is why the two are late in the sequence
+rather than early: everything executable on an ordinary machine is executed
+first.
+
+## After v1.0 — M14 through M18
+
+Adopted from `docs/asv-agent-first-security-evolution-v2-2026-10-02/`. **This
+section is the integration point, and it is the only one.** The pack remains
+where it was written, as research, with its own baseline and its own
+`00-README.md`; it does not become a second planning authority, and nothing
+above this line is superseded by it. What is adopted here is its *sequence* and
+its *invariants*; its work-unit identifiers are referenced from here so that a
+reader has one place to look.
+
+```text
+              v1.0
+                 │
+                 ▼
+M14  Credential Workflow Adapters (npm, Maven, Gradle, curl)
+                 │
+                 ▼
+M15  Authority Planning & Plan-Bound Execution
+                 │
+          ┌──────┴──────┐
+          ▼             ▼
+       M16             M17
+ Durable automation  Attested Authority
+          │             │
+          └──────┬──────┘
+                 ▼
+M18  v1.1 stabilization
+```
+
+The rule that governs all five: **reuse, do not rebuild.** M14 must not create a
+second vault, an OAuth framework, an HTTP proxy or an isolated executor — those
+are M4, M10 and M11, and M15 plans *over* the capabilities that exist rather
+than re-deriving them. M16 puts PipelineK outside the broker's TCB entirely:
+ASV keeps ownership of rotate, adopt, switch, revoke, freeze, logical bindings
+and reconciliation, while PipelineK owns sequencing, wait/resume, retry and
+durable workflow state. The boundary is a law, not a preference —
+`asv-brokerd -X-> PipelineK`.
+
+M17 depends on M7 hardening, M12 real TPM evidence and M15's plan object, in
+that order. TDX/SEV-SNP stays conditional research and is not a requirement to
+close M17.
 
 ## Prioritization rule after v1
 

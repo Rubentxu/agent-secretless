@@ -14,15 +14,22 @@ agent ──(surrogate / socket)──▶ broker ──(real credential)──�
         no secret material                the only holder
 ```
 
-> **Status: pre-1.0 RC preparation (M13 + gates R2/R3/R5/R6 done).**
+> **Status: pre-1.0, at v0.28.0. Not certified, and the gates say so.**
 >
-> The workspace compiles with **866 tests green** (`--release`, canonical flakes
-> excluded; the count is re-derived every CI run by the `R11 README test count`
-> gate, so this line cannot go stale again). The vault, SSH signing, HTTP/PostgreSQL brokering, policy, OAuth2
-> framework, TPM sealing and crash recovery exist and are tested. Remaining
-> before a 1.0 that the maintainer has not yet approved: signed reproducible
-> artifacts (R0), full certification pass (R11), and the M5 operator dashboard.
-> `agent-secretless-vault-spec/docs/15-ROADMAP.md` is the planning authority.
+> The workspace compiles and **866 tests are enumerated** (865 pass, 1 ignored,
+> 0 fail; the count is re-derived every CI run by the `R11 README test count`
+> gate, so this line cannot go stale again). Vault, SSH signing, the HTTP and
+> PostgreSQL brokers, Cedar policy, the operator console and the CONNECT TLS
+> bridge exist and are exercised. The OAuth2 framework and TPM sealing are
+> **prototypes**, and no production path calls them.
+>
+> **Verifiable status lives in
+> [`16-SECURITY-RELEASE-GATES.md`](agent-secretless-vault-spec/docs/16-SECURITY-RELEASE-GATES.md),
+> not in this file.** A status table in a README is a claim nothing checks; the
+> one that had drifted was here, and it is now a table in the gates document
+> that `scripts/check-gate-status.py` verifies against the repository.
+> [`15-ROADMAP.md`](agent-secretless-vault-spec/docs/15-ROADMAP.md) is the
+> planning authority, including the sequence from here to v1.0.
 
 ## Why this exists
 
@@ -52,15 +59,34 @@ type system:
   format, authenticated headers, owner-only files. Backup/restore under a
   *separate* recovery passphrase. Passphrase **rekey** that re-wraps the same
   data key, so pre-rotation backups keep working (`crates/vault`).
-- **Broker daemon** (`asv-brokerd`) — Unix-socket IPC (protocol v2), `SO_PEERCRED`
+- **Broker daemon** (`asv-brokerd`) — Unix-socket IPC (protocol v4), `SO_PEERCRED`
   identity, Cedar policy with **deny-by-default**, fail-closed startup: it opens
   `--vault`/`--passphrase-file` at boot or refuses every brokered operation.
   Core dumps are disabled via `RLIMIT_CORE=0` before any secret exists.
+- **Operator console** — a Tauri 2 control plane over a local web view: no remote
+  origin, a strict CSP, and no way for the front-end to request a stored secret
+  value. The full add → grant → agent use → revoke flow is proven against a real
+  broker process in CI. *(This README said for several milestones that the
+  dashboard was "not started" and "remaining before 1.0". Both were false: M5
+  shipped.)*
 - **Connectors** — GitHub (HTTP, semantic authority), PostgreSQL (full decision
-  logic; live transport pending), SSH (the agent requests *signatures*, never
-  the private key).
-- **OAuth2 client-credentials framework** for short-lived surrogate issuance
-  (prototype, M11).
+  logic, plus a live transport proven against a real server when the pipeline
+  brings the substrate up), SSH (the agent requests *signatures*, never the
+  private key). `LiveConnectorFactory::postgres` returns a real client, not
+  `UnsupportedInThisBuild`; the enum variant still exists, but it is the *trait
+  default* at `crates/broker/src/lib.rs:191` and the production override is at
+  `:257`. *(This README previously reported the trait default as production
+  behaviour, and said "live transport pending" and "UAT-033 runs against a real
+  PostgreSQL in CI" in the same breath. The first was true of a local `cargo
+  test` and the second true only of the pipeline.)*
+- **TLS bridge on the CONNECT path** — per-session ephemeral CA, strict
+  destination authorization, and the real credential substituted inside the
+  tunnel while the client holds only a single-use surrogate.
+  **Not** an eBPF socket redirect: that research gate returned NO-GO and the
+  explicit-proxy path is what shipped.
+- **OAuth2 client-credentials framework** for short-lived surrogate issuance —
+  a **prototype**. The reference issuer synthesises a token instead of talking
+  to a token endpoint, and nothing in production calls it (M11).
 - **TPM sealing prototype** — PCR policy binding and an offline recovery blob
   (M12; `SoftwareTpm` is a placeholder, no real hardware path yet).
 - **Crash recovery** — append-only journal with length prefixes and CRC32;
@@ -70,30 +96,35 @@ type system:
 
 ## What it does *not* do (yet)
 
-Stated plainly, because a security project that oversells itself is worthless:
+Stated plainly, because a security project that oversells itself is worthless.
+Each item says where its detail lives, because none of it is a guess.
 
-- **No operator dashboard.** The Tauri 2 UI is M5, not started.
-- **`LiveConnectorFactory::postgres` returns a real client, not
-  `UnsupportedInThisBuild`.** The enum variant still exists, but it is the
-  *trait default* at `crates/broker/src/lib.rs:191`; the production override
-  is at `:257`. UAT-033 runs against a real PostgreSQL in CI. *(This line
-  said the opposite for several milestones: it was reading the trait default
-  and reporting it as production behaviour.)*
+- **A dedicated broker uid is not used, so same-uid memory reads succeed.** The
+  broker runs as you, which means a process running as you can read its memory;
+  only `PR_SET_DUMPABLE=0` and Landlock stand in the way, and both are policy
+  enforcement a same-uid process can defeat. A separate uid (M7) is what makes
+  the denial unconditional. This is the first item in the sequence to v1.0.
+  *(The strongest clause of UAT-003 — the one that would show the kernel refusing
+  the read — is `#[ignore]`d, and is the only ignored test here. That is V1-C1.)*
 - **The M7 hardening profile is opt-in, not unwired.** `harden::install_with`
   is called from `crates/broker/src/main.rs:195` behind `--harden`; the broker
   ships with `RLIMIT_CORE=0` only when it is not passed. *(This line previously
   said it was "not wired into the binary", which was false.)*
-- **A dedicated broker uid is not used.** The broker runs as you, so a process
-  running as you can read its memory; only `PR_SET_DUMPABLE=0` and Landlock
-  stand in the way. A separate uid (M7) is what makes that denial
-  unconditional.
 - **No signed artifacts yet (R0).** Reproducible-build and signing tooling
   (cosign/sigstore) is the next gate.
 - **TPM support is a prototype.** `SoftwareTpm` stands in for hardware; do not
   trust it as hardware-bound.
-- **Same-uid memory reads succeed.** A process running as you can read the
-  broker's memory, because the broker runs as you. Only a dedicated broker uid
-  (M7) makes denial unconditional.
+- **No eBPF socket redirection.** The M8 research gate is NO-GO: no BPF program
+  was ever written, and this build host cannot load one. `asv-ebpfd` is the
+  egress/telemetry helper, which is a different job and is unaffected.
+- **The CONNECT bridge has no production listener yet.** The substitution
+  capability is verified end to end and is not wired into a running
+  `asv-brokerd`, one request is served per tunnel, and the proof's nonce is
+  derived from the destination — which resists a proof being transferred to
+  another destination but is not freshness. That is V1-C2, and the M9 row in the
+  gates document says the same thing with the receipts behind it.
+- **The console has no TLS-interception indicator.** An operator cannot see from
+  the UI that an intercepting path exists. Carried forward, not closed.
 - **1.0 has not been declared.** The maintainer gates it explicitly; iteration
   continues below 1.0.
 
@@ -103,8 +134,13 @@ Stated plainly, because a security project that oversells itself is worthless:
 cargo build --release -p asv-broker
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# expected: passed=692 failed=0 ignored=1
+# expected: passed=865 failed=0 ignored=1
 ```
+
+That number was `passed=692` in this file for several milestones, and nothing
+checked it — a stale count in a README is a claim like any other, and this
+guard (`scripts/check-doc-claims.py`) now re-derives it instead of leaving it
+to memory.
 
 Try the broker with a vault:
 
@@ -133,7 +169,7 @@ rather than starting half-configured.
 ```text
 crates/
   domain/         core types, SecretBytes, Authority canonicalization
-  ipc-protocol/   versioned, length-bounded request/response (protocol v2)
+  ipc-protocol/   versioned, length-bounded request/response (protocol v4)
   identity/       SO_PEERCRED + pidfd workload identity
   vault/          encrypted envelope, backup/restore, rekey, TPM prototype
   policy/         Cedar integration, deny-by-default decisions
@@ -142,7 +178,7 @@ crates/
   connector-http/ GitHub connector with semantic authority binding
   connector-pg/   PostgreSQL connector (decision logic complete)
   ssh-agent/      signature service: the key never leaves the broker
-  ebpfd/          eBPF / privilege separation research (M8/M9)
+  ebpfd/          egress/telemetry helper (8-verb vocabulary, no BPF program)
 tools/
   check-gates.py  audits the UAT -> milestone gate map in the spec pack
 ```
@@ -182,20 +218,23 @@ python3 tools/check-gates.py                        # spec gate-map audit
 Actions immediately found two defects that every local run had missed. A
 security project that only its author's machine can break is not verified.
 
-## Recent milestone history
+## Milestone status
 
-| Milestone | Scope | Evidence |
-|---|---|---|
-| M11 ✅ | OAuth2 client-credentials framework prototype | tag `m11-oauth2-framework` |
-| M12 ✅ | TPM sealing + recovery blob prototype | tag `m12-tpm-vault` |
-| M13 ✅ | Crash/recovery journal, audit baseline, SBOM, ops manual | tag `m13-rc-stabilization` |
-| R3 ✅ | Zero-live-pin session leak check (UAT-030) | `3e5c42c` |
-| R5 ✅ | Vault wired into the broker binary, fail-closed | `e2a6f65` |
-| R6/R11 ✅ | Fuzz evidence: 2×30s runs, ~460k execs, 0 crashes | `8d3a7b5` |
-| R2 ✅ | Passphrase rekey + migration tests, core dumps disabled | `dba2e73`, `82e08fd` |
+**This section used to be a table here, and it was wrong.** It marked M11, M12
+and M13 as complete with a tick glyph while the gates document — the authority
+— had M11 and M12 as **NOT MET** and M13 **partial**. A second copy of the
+status in the most-read file in the repository is a second authority, which is
+the one thing this project does not need.
 
-Remaining toward a (maintainer-approved) 1.0: **R0** signed reproducible
-artifacts, **R11** final certification, M5 dashboard, live PostgreSQL transport.
+Milestone status now lives in exactly one place:
+[`16-SECURITY-RELEASE-GATES.md`](agent-secretless-vault-spec/docs/16-SECURITY-RELEASE-GATES.md).
+It is checked against the repository by `scripts/check-gate-status.py`, so it
+fails the build when a row stops matching reality.
+
+What is left here is the sequence, because a reader who wants to know what
+happens next does not need a table of what already happened:
+[`15-ROADMAP.md`](agent-secretless-vault-spec/docs/15-ROADMAP.md) carries the
+path from v0.28.0 to v1.0 and then to v1.1.
 
 ## Security posture is stated, never implied
 
@@ -206,9 +245,10 @@ to signing or proxying, because that is how "secretless" quietly becomes a lie.
 
 ## Specification
 
-`agent-secretless-vault-spec/` holds the full pack: 20 documents, 15 ADRs, and a
-`SHA256SUMS` manifest (verified intact). It is imported verbatim and is not
-edited in place.
+`agent-secretless-vault-spec/` holds the full pack: 20 documents, 19 ADRs, and a
+`SHA256SUMS` manifest (verified intact). It is imported as research and is not
+edited in place except where a decision it records has since been made — each
+such edit carries its date and its reason.
 
 ## Security
 

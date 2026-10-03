@@ -14,17 +14,23 @@ agente ──(sustituto / socket)──▶ broker ──(credencial real)──�
         sin material secreto              único poseedor
 ```
 
-> **Estado: preparación RC pre-1.0 (M13 + gates R2/R3/R5/R6 completados).**
+> **Estado: pre-1.0, en v0.28.0. Sin certificar, y los gates lo dicen.**
 >
-> El workspace compila con **866 tests en verde** (`--release`, flakes
-> canónicos excluidos; el conteo lo vuelve a derivar el gate `R11 README test count`
-> en cada corrida de CI, así que esta línea ya no puede quedarse vieja). El vault, la firma SSH, el brokering HTTP/PostgreSQL,
-> la política, el framework OAuth2, el sellado TPM y la recuperación ante
-> crashes existen y están testeados. Pendiente antes de un 1.0 que el
-> mantenedor aún no ha aprobado: artefactos reproducibles firmados (R0),
-> pasada de certificación completa (R11) y el dashboard de operador (M5).
-> `agent-secretless-vault-spec/docs/15-ROADMAP.md` es la autoridad de
-> planificación.
+> El workspace compila y hay **866 tests enumerados** (865 pasan, 1 ignorado, 0
+> fallan; el conteo lo vuelve a derivar el gate `R11 README test count` en cada
+> corrida de CI, así que esta línea ya no puede quedarse vieja). El vault, la
+> firma SSH, los brokers HTTP y PostgreSQL, la política Cedar, la consola de
+> operador y el puente TLS sobre CONNECT existen y se ejercitan. El framework
+> OAuth2 y el sellado TPM son **prototipos**, y nada en producción los llama.
+>
+> **El estado verificable vive en
+> [`16-SECURITY-RELEASE-GATES.md`](agent-secretless-vault-spec/docs/16-SECURITY-RELEASE-GATES.md),
+> no en este fichero.** Una tabla de estado en un README es una afirmación que
+> nadie comprueba; la que se había quedado vieja estaba aquí, y ahora es una
+> tabla en el documento de gates que `scripts/check-gate-status.py` verifica
+> contra el repositorio.
+> [`15-ROADMAP.md`](agent-secretless-vault-spec/docs/15-ROADMAP.md) es la
+> autoridad de planificación, incluida la secuencia de aquí a v1.0.
 
 ## Por qué existe esto
 
@@ -55,16 +61,37 @@ imposición es del sistema de tipos:
   una passphrase de recuperación *separada*. **Rekey** de passphrase que
   re-envuelve la misma clave de datos, de modo que los backups previos a la
   rotación siguen funcionando (`crates/vault`).
-- **Daemon broker** (`asv-brokerd`) — IPC por socket Unix (protocolo v2),
+- **Daemon broker** (`asv-brokerd`) — IPC por socket Unix (protocolo v4),
   identidad `SO_PEERCRED`, política Cedar con **deny-by-default**, arranque
   fail-closed: abre `--vault`/`--passphrase-file` al arrancar o niega toda
   operación brokered. Los core dumps se desactivan con `RLIMIT_CORE=0` antes
   de que exista cualquier secreto.
+- **Consola de operador** — un plano de control Tauri 2 sobre un web view
+  local: sin origen remoto, con CSP estricto y sin forma de que el front-end
+  pida el valor de una credencial almacenada. El flujo completo añadir →
+  conceder → uso por el agente → revocar está probado contra un proceso de
+  broker real en CI. *(Este README dijo durante varios milestones que el
+  dashboard estaba "sin empezar" y "pendiente antes del 1.0". Ambas eran
+  falsas: M5 se entregó.)*
 - **Conectores** — GitHub (HTTP, autoridad semántica), PostgreSQL (lógica de
-  decisión completa; transporte real pendiente), SSH (el agente pide
-  *firmas*, nunca la clave privada).
+  decisión completa, más un transporte real probado contra un servidor de
+  verdad cuando el pipeline levanta el sustrato), SSH (el agente pide *firmas*,
+  nunca la clave privada). `LiveConnectorFactory::postgres` devuelve un cliente
+  real, no `UnsupportedInThisBuild`; la variante del enum sigue existiendo,
+  pero es el *default del trait* en `crates/broker/src/lib.rs:191` y el
+  override de producción está en `:257`. *(Este README antes reportaba el
+  default del trait como comportamiento de producción, y decía "transporte
+  real pendiente" y "UAT-033 corre contra un PostgreSQL real en CI" en la
+  misma frase. La primera era cierta en un `cargo test` local y la segunda
+  sólo en el pipeline.)*
+- **Puente TLS sobre CONNECT** — CA efímera por sesión, autorización estricta
+  del destino, y la credencial real sustituida dentro del túnel mientras el
+  cliente solo sostiene un sustituto de un solo uso.
+  **No** es una redirección de socket eBPF: ese gate de investigación
+  devolvió NO-GO y lo que se entregó fue el camino de proxy explícito.
 - **Framework OAuth2 client-credentials** para emisión de sustitutos de corta
-  vida (prototipo, M11).
+  vida — es un **prototipo**. El emisor de referencia sintetiza un token en
+  vez de hablar con un token endpoint, y nada en producción lo llama (M11).
 - **Prototipo de sellado TPM** — política de PCR y blob de recuperación offline
   (M12; `SoftwareTpm` es un placeholder, aún no hay camino de hardware real).
 - **Recuperación ante crashes** — journal append-only con prefijos de longitud
@@ -76,31 +103,39 @@ imposición es del sistema de tipos:
 ## Qué NO hace (todavía)
 
 Dicho sin adornos, porque un proyecto de seguridad que se sobrevende a sí
-mismo no vale nada:
+mismo no vale nada. Cada punto dice dónde vive su detalle, porque nada de eso
+es una suposición:
 
-- **Sin dashboard de operador.** La UI Tauri 2 es M5, sin empezar.
-- **`LiveConnectorFactory::postgres` devuelve un cliente real**, no
-  `UnsupportedInThisBuild`. La variante del enum sigue existiendo, pero es el
-  *default del trait* en `crates/broker/src/lib.rs:191`; el override de
-  producción está en `:257`. UAT-033 corre contra un PostgreSQL real en CI.
-  *(Esta línea decía lo contrario durante varios milestones: leía el default
-  del trait y lo reportaba como comportamiento de producción.)*
+- **No se usa un uid dedicado para el broker, así que las lecturas de memoria
+  del mismo uid tienen éxito.** El broker corre como tú, luego un proceso que
+  corre como tú puede leerle la memoria; sólo se interponen
+  `PR_SET_DUMPABLE=0` y Landlock, y ambos son imposición de política que un
+  proceso del mismo uid puede derrotar. Un uid aparte (M7) es lo que hace que
+  esa negación sea incondicional. Es el primer punto de la secuencia hacia
+  v1.0. *(La cláusula más fuerte de UAT-003 —la que mostraría al kernel
+  rechazando la lectura— está marcada `#[ignore]`, y es el único test ignorado
+  aquí. Eso es V1-C1.)*
 - **El perfil de hardening M7 es opt-in, no está desconectado.**
   `harden::install_with` se llama desde `crates/broker/src/main.rs:195` tras
   `--harden`; el broker se envía solo con `RLIMIT_CORE=0` cuando no se pasa.
   *(Antes decía que no estaba cableado al binario, y era falso.)*
-- **No se usa un uid dedicado para el broker.** El broker corre como tú, así
-  que un proceso con tu uid puede leerle la memoria; sólo se interponen
-  `PR_SET_DUMPABLE=0` y Landlock. Un uid aparte (M7) es lo que hace que esa
-  negación sea incondicional.
 - **Sin artefactos firmados todavía (R0).** El tooling de build reproducible y
   firma (cosign/sigstore) es el siguiente gate.
 - **El soporte TPM es un prototipo.** `SoftwareTpm` suplanta al hardware; no
   lo consideres ligado a hardware.
-- **Lecturas de memoria del mismo uid tienen éxito.** Un proceso corriendo
-  como tu usuario puede leer la memoria del broker, porque el broker corre
-  como tú. Solo un uid dedicado para el broker (M7) hace la denegación
-  incondicional.
+- **Sin redirección de socket eBPF.** El gate de investigación M8 es NO-GO: no
+  se escribió ningún programa BPF, y este host de build no puede cargar uno.
+  `asv-ebpfd` es el helper de egress/telemetría, que es otro trabajo y no le
+  afecta.
+- **El puente CONNECT no tiene todavía un listener de producción.** La
+  capacidad de sustitución está verificada de extremo a extremo y no está
+  cableada en un `asv-brokerd` en marcha, se sirve una petición por túnel, y el
+  nonce de la prueba se deriva del destino —lo que resiste que una prueba se
+  transfiera a otro destino, pero no es frescura—. Eso es V1-C2, y la fila de
+  M9 en el documento de gates dice lo mismo con los recibos detrás.
+- **La consola no tiene indicador de interceptación TLS.** Un operador no
+  puede ver desde la UI que existe un camino que intercepta. Queda abierto, no
+  cerrado.
 - **El 1.0 no ha sido declarado.** El mantenedor lo puerta explícitamente; la
   iteración continúa por debajo de 1.0.
 
@@ -110,8 +145,13 @@ mismo no vale nada:
 cargo build --release -p asv-broker
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# esperado: passed=692 failed=0 ignored=1
+# esperado: passed=865 failed=0 ignored=1
 ```
+
+Ese número era `passed=692` en este fichero durante varios milestones, y nada
+lo comprobaba: un conteo viejo en un README es una afirmación como cualquier
+otra, y este guard (`scripts/check-doc-claims.py`) ahora lo vuelve a derivar en
+lugar de dejarlo a la memoria.
 
 Prueba el broker con un vault:
 
@@ -140,7 +180,7 @@ pisar una instancia en marcha. Si solo se pasa una de `--vault` /
 ```text
 crates/
   domain/         tipos core, SecretBytes, canonicalización de Authority
-  ipc-protocol/   request/response versionado y acotado por longitud (protocolo v2)
+  ipc-protocol/   request/response versionado y acotado por longitud (protocolo v4)
   identity/       identidad de carga de trabajo SO_PEERCRED + pidfd
   vault/          envelope cifrado, backup/restore, rekey, prototipo TPM
   policy/         integración Cedar, decisiones deny-by-default
@@ -149,7 +189,7 @@ crates/
   connector-http/ conector GitHub con binding semántico de autoridad
   connector-pg/   conector PostgreSQL (lógica de decisión completa)
   ssh-agent/      servicio de firmas: la clave nunca sale del broker
-  ebpfd/          investigación eBPF / separación de privilegios (M8/M9)
+  ebpfd/          helper de egress/telemetría (8 verbos, sin programa BPF)
 tools/
   check-gates.py  audita el mapa de gates UAT -> milestone del spec pack
 ```
@@ -194,21 +234,23 @@ GitHub Actions encontró inmediatamente dos defectos que toda ejecución local
 había pasado por alto. Un proyecto de seguridad que solo la máquina de su
 autor puede romper no está verificado.
 
-## Historial reciente de hitos
+## Estado de los hitos
 
-| Hito | Alcance | Evidencia |
-|---|---|---|
-| M11 ✅ | Prototipo del framework OAuth2 client-credentials | tag `m11-oauth2-framework` |
-| M12 ✅ | Prototipo de sellado TPM + blob de recuperación | tag `m12-tpm-vault` |
-| M13 ✅ | Journal de crash/recovery, baseline de auditoría, SBOM, manual de ops | tag `m13-rc-stabilization` |
-| R3 ✅ | Chequeo de fuga zero-live-pin en sesiones (UAT-030) | `3e5c42c` |
-| R5 ✅ | Vault cableado al binario del broker, fail-closed | `e2a6f65` |
-| R6/R11 ✅ | Evidencia de fuzz: 2×30s, ~460k execs, 0 crashes | `8d3a7b5` |
-| R2 ✅ | Rekey de passphrase + migration tests, core dumps desactivados | `dba2e73`, `82e08fd` |
+**Esta sección era una tabla aquí, y estaba mal.** Marcaba M11, M12 y M13 como
+completados con un glifo de tick mientras el documento de gates —la autoridad—
+tenía M11 y M12 como **NOT MET** y M13 como **partial**. Una segunda copia del
+estado en el fichero más leído del repositorio es una segunda autoridad, que es
+justo lo que este proyecto no necesita.
 
-Pendiente hacia un 1.0 (aprobado por el mantenedor): **R0** artefactos
-reproducibles firmados, **R11** certificación final, dashboard M5, transporte
-PostgreSQL real.
+El estado de los hitos vive ahora en un único sitio:
+[`16-SECURITY-RELEASE-GATES.md`](agent-secretless-vault-spec/docs/16-SECURITY-RELEASE-GATES.md).
+Se comprueba contra el repositorio con `scripts/check-gate-status.py`, así que
+rompe el build cuando una fila deja de coincidir con la realidad.
+
+Lo que queda aquí es la secuencia, porque quien quiere saber qué viene ahora no
+necesita una tabla de lo que ya pasó:
+[`15-ROADMAP.md`](agent-secretless-vault-spec/docs/15-ROADMAP.md) lleva el
+camino de v0.28.0 a v1.0 y de ahí a v1.1.
 
 ## La postura de seguridad se declara, nunca se implica
 
@@ -220,9 +262,10 @@ convierte silenciosamente en una mentira.
 
 ## Especificación
 
-`agent-secretless-vault-spec/` contiene el pack completo: 20 documentos, 15
-ADRs y un manifiesto `SHA256SUMS` (verificado intacto). Se importa
-literalmente y no se edita in situ.
+`agent-secretless-vault-spec/` contiene el pack completo: 20 documentos, 19
+ADRs y un manifiesto `SHA256SUMS` (verificado intacto). Se importa como
+investigación y no se edita in situ salvo donde una decisión que registra ya se
+ha tomado — cada una de esas ediciones lleva su fecha y su motivo.
 
 ## Seguridad
 
