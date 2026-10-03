@@ -531,6 +531,19 @@ pub const MAX_SURROGATE_TTL_SECS: u64 = 3600;
 /// below it. The reverse — a per-tunnel cap tighter than the session ceiling —
 /// would mean a tunnel failing for a reason that has nothing to do with the
 /// session it belongs to.
+///
+/// **And that paragraph was reasoning about a number the session did not get.**
+/// It says "the session budget is what bounds a session", as though the session
+/// minting through `CreateSession` received this ceiling. It did not: that path
+/// mints what `SESSION_SURROGATE_MAX_USES` says, and the constant was 32. So the
+/// ceiling was raised correctly and the product was still refused at request 33
+/// of a measured 93, and the tunnel's own cap of 4096 was a number no connection
+/// could ever reach. The ceiling here was never the bound; it was the bound's
+/// ceiling. `SESSION_SURROGATE_MAX_USES` is now this constant, and
+/// `a_session_surrogate_pays_for_a_workload_that_was_actually_run` in
+/// `crates/broker/src/lib.rs` spends the grant so the two cannot drift apart
+/// again — a comparison of constants would not have caught it, because 32 was
+/// not wrong against this constant.
 pub const MAX_SURROGATE_USES: u32 = 8192;
 
 /// Serializable view of credential metadata.

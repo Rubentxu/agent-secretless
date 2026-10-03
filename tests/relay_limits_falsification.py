@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Falsification campaign for the C2.8 relay limits (increment 2).
+"""Falsification campaign for the C2.8 relay limits (increments 2 and 3a).
 
-Four numbers were changed in this increment, and every one of them is a value
-somebody could lower again without a test noticing:
+Five numbers are in scope here, and every one of them is a value somebody could
+lower again without a test noticing:
 
 *   `MAX_SURROGATE_TTL_SECS` was 900 while the broker asked for 3600, and the
     gap was invisible because `mint` clamps **silently**. That is the third
@@ -10,10 +10,19 @@ somebody could lower again without a test noticing:
     and fixed, the TTL clamp had nobody looking at it and stayed live.
 *   `MAX_SURROGATE_USES` was 32 against a measured 93 requests for a trivial
     `npm install express`, so the product refused a third of the way through.
+*   `SESSION_SURROGATE_MAX_USES` was 32 against that same 93 — the **fourth**
+    clamp, and the one that actually killed the product. Fixing the protocol
+    ceiling to 8192 changed nothing, because `asv run` does not mint through
+    `MintSurrogate`; it goes through `CreateSession`, which mints whatever this
+    constant says. Raising the ceiling fixed the clamp and left the limit, and
+    the tunnel's own `max_requests` of 4096 was a number no connection could
+    reach. L8 is the row for it.
 *   `RelayLimits` grew a `max_forwarded` because it had a bound on one direction
     and none on the other.
-*   `max_requests` had to stay *below* the session ceiling, or a connection dies
-    for a reason that has nothing to do with the session holding it.
+*   `max_requests` had to stay *below* the budget its own session was handed, or
+    a connection dies for a reason that has nothing to do with the session
+    holding it. That check used to compare against the protocol ceiling — a
+    grant `asv run` never receives — and passed for the wrong reason.
 
 Each row below moves one number back or breaks one relationship and requires a
 **named** assertion to notice. A row where the suite stays green is a limit
@@ -39,6 +48,7 @@ TIMEOUT = 300
 PROTOCOL = ROOT / "crates/ipc-protocol/src/lib.rs"
 BRIDGE = ROOT / "crates/broker/src/tls_bridge.rs"
 REGISTRY = ROOT / "crates/broker/src/surrogate.rs"
+BROKER = ROOT / "crates/broker/src/lib.rs"
 
 
 @dataclass(frozen=True)
@@ -60,20 +70,18 @@ MUTATIONS: list[Mutation] = [
         binary="--lib",
         expect="silently cut the surrogate lifetime",
     ),
-    # **Lowering both numbers together is invisible to the divergence test.**
-    # `session_mint_survives_the_protocol_ceiling` compares the protocol ceiling
-    # against the broker's own intent, so when they move together it is happy.
-    # What holds the floor is a *relationship*: `max_requests` stays at 4096
-    # while the ceiling it must fit under drops to 32. A limit that nobody
-    # anchored to a measurement is caught by the measurement's own test, and by
-    # nothing else.
+    # **The protocol ceiling is no longer what holds the floor.** It used to be
+    # assumed that lowering the ceiling to 32 would be caught by the divergence
+    # test alone; it is not, and the comment above this row used to say so. What
+    # holds the floor now is two things the fourth clamp forced into being: the
+    # budget the session is actually handed, and the workload it has to pay for.
     Mutation(
         name="L2 the use ceiling goes back to a third of a trivial install",
         path=PROTOCOL,
         before="pub const MAX_SURROGATE_USES: u32 = 8192;",
         after="pub const MAX_SURROGATE_USES: u32 = 32;",
         binary="--lib",
-        expect="a_tunnel_is_bounded_below_its_sessions_own_ceiling",
+        expect="a_session_surrogate_pays_for_a_workload_that_was_actually_run",
     ),
     Mutation(
         name="L3 mint stops clamping and honours whatever it is asked for",
@@ -90,7 +98,7 @@ MUTATIONS: list[Mutation] = [
         before="            max_requests: 4096,",
         after="            max_requests: 1_000_000,",
         binary="--lib",
-        expect="a_tunnel_is_bounded_below_its_sessions_own_ceiling",
+        expect="a_tunnel_is_bounded_below_the_budget_its_own_session_was_handed",
     ),
     Mutation(
         name="L5 the request direction goes unbudgeted",
@@ -115,6 +123,23 @@ MUTATIONS: list[Mutation] = [
         after="            max_response: 1024 * 1024,",
         binary="--lib",
         expect="the_defaults_cleared_a_measured_workload",
+    ),
+    # **The row that would have caught the defect this increment fixed.**
+    #
+    # The session's budget is defined as the protocol's ceiling, so L2 lowers
+    # both at once — and `session_mint_survives_the_protocol_ceiling`, which
+    # exists to catch a silent clamp, is perfectly happy, because no clamp
+    # happened. The product was broken by a constant that was *not* wrong on
+    # its own terms: 32 against a measured 93. The two rows that catch it are
+    # the one that spends the token and the one that compares the tunnel's cap
+    # against the grant, and neither of them is the clamp test.
+    Mutation(
+        name="L8 the session budget goes back under a measured workload",
+        path=BROKER,
+        before="pub(crate) const SESSION_SURROGATE_MAX_USES: u32 = asv_ipc_protocol::MAX_SURROGATE_USES;",
+        after="pub(crate) const SESSION_SURROGATE_MAX_USES: u32 = 32;",
+        binary="--lib",
+        expect="a_session_surrogate_pays_for_a_workload_that_was_actually_run",
     ),
 ]
 

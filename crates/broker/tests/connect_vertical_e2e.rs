@@ -1176,11 +1176,16 @@ fn a_tunnel_serves_one_request_and_the_protocol_allows_more() {
 ///   asked for raises nothing and logs nothing. The wire reported the clamped
 ///   value, so every reader believed it.
 ///
-/// Measured after both: 32 of 64 complete, and the 32 that do not are refused
-/// for the budget that is *documented* — which is a budget doing its job, not
-/// a defect. The property asserted here is the one that must not regress: the
-/// anti-replay window refuses nothing, and every request is accounted for by a
-/// reason the operator can read.
+/// Measured after both: **64 of 64 complete and nothing is refused.** The
+/// surrogate budget was still 32 at that point, so the 32 that could not
+/// complete were refused for the budget that was *documented* — a budget doing
+/// its job, and the wrong job: `npm install express` needs 93. The budget is
+/// now the protocol's ceiling, and a test that demanded a refusal at 64 would be
+/// demanding the defect back.
+///
+/// The property asserted here is the one that must not regress: the anti-replay
+/// window refuses nothing, every request is accounted for by a reason the
+/// operator can read, and no session spends more than it was granted.
 #[test]
 fn the_anti_replay_window_refuses_no_honest_proof_under_load() {
     const PARALLEL: usize = 64;
@@ -1243,10 +1248,25 @@ fn the_anti_replay_window_refuses_no_honest_proof_under_load() {
         proof_refusals + surrogate_refusals
     );
     // Whatever is left is the budget, doing what a budget is for.
+    //
+    // **This assertion used to pin the number 32 and cannot any more.** Sixty-four
+    // CONNECTs exceeded a budget of 32, so "something was refused" doubled as
+    // evidence that the budget is enforced. The session's budget is now the
+    // protocol's own ceiling — 64 is nowhere near it, every tunnel completes, and
+    // a test that demanded a refusal would be demanding the defect back.
+    //
+    // What replaces it is the same property stated without a magic number: no
+    // session may spend more than it was granted. Enforcement at the point of
+    // spending is witnessed where it can actually be witnessed, by
+    // `a_session_surrogate_pays_for_a_workload_that_was_actually_run` and by the
+    // registry's own exhaustion cases — a budget can be checked by spending it to
+    // zero in a unit test, and cannot be checked by a workload too small to reach
+    // it.
     assert!(
-        surrogate_refusals > 0,
-        "sixty-four requests exceeded the documented budget of 32 and nothing was \
-         refused, so the budget is not a bound:\n{log}"
+        ok <= asv_broker::session_surrogate_budget() as usize,
+        "{ok} of {PARALLEL} tunnels completed and the session was granted {} operations, \
+         so more were spent than were granted",
+        asv_broker::session_surrogate_budget()
     );
 
     // What a concurrency fix must not break: the destination saw the credential

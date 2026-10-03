@@ -1112,21 +1112,56 @@ impl Default for RelayLimits {
 /// per-tunnel cap above the session's own ceiling is redundant; one below it
 /// means a connection dies for a reason that has nothing to do with the session
 /// holding it, and the failure looks like a tunnel bug.
+///
+/// **The ceiling this is checked against was the wrong one.** It read
+/// `MAX_SURROGATE_USES` — the protocol's 8192 — and passed, because 4096 ≤ 8192.
+/// But `asv run` does not mint through `MintSurrogate`, where a session may ask
+/// for up to the protocol ceiling: it goes through `CreateSession`, which mints
+/// what `SESSION_SURROGATE_MAX_USES` says. The test therefore compared the
+/// tunnel's budget against a grant the tunnel's own client never receives, and
+/// the tunnel could carry 4096 requests on a surrogate that died at 32. Nothing
+/// about the tunnel's limit was enforceable. The ceiling that binds is the one
+/// the session was actually handed, so that is the one this compares.
 #[cfg(test)]
 mod relay_limit_tests {
     use super::RelayLimits;
-    use asv_ipc_protocol::MAX_SURROGATE_USES;
+    use crate::SESSION_SURROGATE_MAX_USES;
 
     #[test]
-    fn a_tunnel_is_bounded_below_its_sessions_own_ceiling() {
+    fn a_tunnel_is_bounded_below_the_budget_its_own_session_was_handed() {
         let limits = RelayLimits::default();
+        let budget = SESSION_SURROGATE_MAX_USES as usize;
         assert!(
-            limits.max_requests <= MAX_SURROGATE_USES as usize,
-            "one tunnel may carry {} requests and a session may only pay for {}; the \
-             connection would then be refused for a reason that has nothing to do \
-             with the session it belongs to",
+            limits.max_requests <= budget,
+            "one tunnel may carry {} requests and the session holding it may only pay \
+             for {}; the connection would then be refused at request {} for a reason \
+             that has nothing to do with the tunnel — it is the surrogate running out, \
+             and it reads as a tunnel bug",
             limits.max_requests,
-            MAX_SURROGATE_USES
+            budget,
+            budget + 1
+        );
+    }
+
+    /// The budget a session is handed has to clear a workload that was
+    /// actually run, for the same reason the per-tunnel limits do.
+    ///
+    /// The measurement: `npm install --loglevel=http express`, 65 packages, 93
+    /// requests over one tunnel. At 32 uses the session's surrogate died at
+    /// request 33 of a *trivial* install, with the client seeing a refused
+    /// token and no indication that the budget — not the provider — had run
+    /// out. This test is the number's reason to exist; without it the budget is
+    /// whatever the last person typed.
+    #[test]
+    fn a_sessions_budget_clears_a_workload_that_was_actually_run() {
+        const MEASURED_REQUESTS: usize = 93;
+        let budget = SESSION_SURROGATE_MAX_USES as usize;
+        assert!(
+            budget >= MEASURED_REQUESTS * 10,
+            "a session may pay for {budget} operations and a trivial `npm install \
+             express` needs {MEASURED_REQUESTS}; the same tenfold headroom the \
+             per-tunnel limits are held to, applied to the budget that is \
+             actually spent"
         );
     }
 

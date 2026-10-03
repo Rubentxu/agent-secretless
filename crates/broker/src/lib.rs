@@ -1045,7 +1045,39 @@ const SESSION_SURROGATE_TTL_SECS: u64 = 3600;
 /// concurrency measurement found it: 64 CONNECTs from one session completed
 /// exactly eight. `session_mint_survives_the_protocol_ceiling` is the test that
 /// makes the two numbers unable to drift apart again.
-const SESSION_SURROGATE_MAX_USES: u32 = 32;
+///
+/// **Raising it from 8 to 32 fixed the clamp and not the limit.** The 93-request
+/// measurement — the one that says what a client actually spends — was already
+/// in the tree, and 32 is a third of it. A trivial `npm install express` died at
+/// request 33 with the client's own token refused, which reads as a replay
+/// attack or a routing bug and is neither: it is the budget. Nothing in the
+/// product could carry 93 requests, so the per-tunnel limit of 4096 was a number
+/// no connection could ever reach.
+///
+/// The grant is now the protocol's own ceiling, and not as a way of saying
+/// "unlimited": `MAX_SURROGATE_USES` is already what a session may obtain
+/// through `MintSurrogate` over the socket, so this removes a discrepancy
+/// between two paths to the same grant rather than opening a new one. What
+/// still bounds a session is unchanged and is what always was — its TTL, its
+/// own revocability, and `EndSession`, which drops every token it holds.
+///
+/// `pub(crate)` so `tls_bridge`'s limit tests can compare the tunnel's budget
+/// against the one that is actually granted. The comparison spans two modules
+/// and a private constant would have left it unwriteable, which is how the
+/// previous version ended up checking the wrong ceiling.
+pub(crate) const SESSION_SURROGATE_MAX_USES: u32 = asv_ipc_protocol::MAX_SURROGATE_USES;
+
+/// How many operations a session opened through `CreateSession` is granted.
+///
+/// A function rather than only a constant because the number is already public
+/// information — `SessionSurrogate::max_uses` and `SurrogateMinted::max_uses`
+/// both report it to the client that asked — and a fact the wire carries is a
+/// fact an integration test is entitled to check against. A test that hard-codes
+/// the number instead would be asserting its own copy of the policy, which is
+/// how the previous version of this assertion came to pin 32 forever.
+pub fn session_surrogate_budget() -> u32 {
+    SESSION_SURROGATE_MAX_USES
+}
 
 pub fn handle(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request) -> Response {
     let response = handle_inner(state, peer, request);
@@ -2921,6 +2953,53 @@ mod tests {
              no more, which is a product limit wearing the clothes of a backstop",
             SESSION_SURROGATE_MAX_USES
         );
+    }
+
+    /// The same claim, spent rather than compared: a session's surrogate has to
+    /// survive a workload that was actually run.
+    ///
+    /// The two tests above compare numbers, which is the right shape for a
+    /// clamp — a clamp changes a number without changing behaviour until
+    /// something spends it. This one spends it. It redeems the token the way
+    /// `SubstitutionPort` does, once per request, and counts.
+    ///
+    /// The measurement is `npm install --loglevel=http express`: 65 packages, 93
+    /// requests, 2.1 MiB. At the budget this used to carry (32) that workload
+    /// died at request 33, and the client saw its own token refused — which
+    /// reads as a replay or a routing fault and is neither. The headroom is
+    /// tenfold, the same ratio the per-tunnel limits are held to, because the
+    /// measurement is a *trivial* install and the trivial one is the floor.
+    #[test]
+    fn a_session_surrogate_pays_for_a_workload_that_was_actually_run() {
+        const MEASURED_REQUESTS: usize = 93;
+        let (store, session, _key) = session_with_key("workload-budget", 3);
+        let _ = store;
+        let mut registry = SurrogateRegistry::default();
+        let (token, _, _) = registry
+            .mint(
+                session,
+                CredentialId::from_wire("00000000-0000-4000-8000-000000000001").expect("wire id"),
+                CredentialClass::Generic,
+                SESSION_SURROGATE_TTL_SECS,
+                SESSION_SURROGATE_MAX_USES,
+                0,
+            )
+            .expect("mint");
+
+        let wanted = MEASURED_REQUESTS * 10;
+        let mut funded = 0usize;
+        for request in 0..wanted {
+            match registry.redeem_for(&token, session, OperationFamily::GitHub, 0) {
+                Ok(_) => funded += 1,
+                Err(error) => panic!(
+                    "request {request} of a workload measured at {MEASURED_REQUESTS} \
+                     requests was refused ({error:?}); the session's surrogate paid for \
+                     {funded} of them. The client sees its own token refused and has no \
+                     way to tell a budget from a replay",
+                ),
+            }
+        }
+        assert_eq!(funded, wanted, "the budget is not the one it claims to be");
     }
 
     /// The same property for the **TTL**, which had none.

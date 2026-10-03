@@ -2120,7 +2120,7 @@ were set when a tunnel served one request, and both are accidental limiters
 today. Measured on a real workload — `npm install --loglevel=http express` on a
 throwaway package, a 65-package tree:
 
-| | measured | today's limit | ratio |
+| | measured | limit at the time | ratio |
 |---|---|---|---|
 | HTTPS requests | **93** | 32 surrogate uses per session | 0.34 |
 | content installed | **2.1 MiB** | 1 MiB `max_response` per tunnel | 0.48 |
@@ -2133,11 +2133,70 @@ looking like a policy. They were the reason the concurrency measurement found
 8-of-64 and read it as the budget "doing its job" — it was doing its job, and
 the job was the wrong one.
 
+**The re-derivation owed here has now been done, and the number that was wrong
+was a different one from the one that looked wrong.** The protocol's
+`MAX_SURROGATE_USES` was raised from 32 to 8192 against that table, and the
+product was still refused at request 33. The reason is the same shape as the
+`mint` clamp one level up: the session does not mint through `MintSurrogate`,
+it goes through `CreateSession`, and that path mints what
+`SESSION_SURROGATE_MAX_USES` says. The constant was **also 32**, and nothing had
+put those two numbers in front of each other.
+
+So the fourth clamp was not a clamp — it was a constant that was never wrong on
+its own terms. `MAX_SURROGATE_USES = 8192` is the protocol's ceiling, which
+bounds what a session may *ask for* over the socket; it never bounded what a
+session was *given*, and no test compared the two. Worse, the invariant that
+should have caught it, `a_tunnel_is_bounded_below_its_sessions_own_ceiling`,
+passed — because it compared the tunnel's `max_requests` of 4096 against the
+protocol's 8192, a grant `asv run` never receives. A limit checked against a
+ceiling nobody is held to is not a check.
+
+The measured consequence, before the fix, spent rather than argued:
+
+```text
+request 32 of a workload measured at 93 requests was refused (Exhausted);
+the session's surrogate paid for 32 of them.
+```
+
+**A client sees its own token refused and has no way to tell a budget from a
+replay.** That is the sentence that mattered. Every other signal in the system
+says a credential was tampered with, and the honest reading here is that
+nothing was tampered with — the grant simply ran out. It would have been read as
+an attack, and the correct response to an attack is not to raise a limit.
+
+What it is now: `SESSION_SURROGATE_MAX_USES` **is** `MAX_SURROGATE_USES`. That
+is not "unbounded" dressed up — 8192 is already what a session may obtain
+through `MintSurrogate` over the socket, so this removes a discrepancy between
+two paths to the same grant rather than opening a third. What bounds a session is
+unchanged and is what always was: its TTL, its revocability, and `EndSession`,
+which drops every token it holds. The tunnel keeps its own `max_requests` below
+that grant, so a connection still cannot spend a whole session, and the check
+that says so now compares against the grant.
+
+Two tests hold the numbers, and they are deliberately **not** comparisons of
+constants, because a comparison of constants is what passed for the wrong reason
+last time:
+
+* `a_session_surrogate_pays_for_a_workload_that_was_actually_run` **spends** the
+  grant 930 times — the measured 93 with the same tenfold headroom the per-tunnel
+  limits are held to — and fails with the request index and the number paid.
+* `a_tunnel_is_bounded_below_the_budget_its_own_session_was_handed` compares the
+  tunnel's cap against `SESSION_SURROGATE_MAX_USES`, which is the number the
+  session was actually handed.
+
+Falsified **8 of 8** (`tests/relay_limits_falsification.py`). The row worth
+naming is the second-to-last: mutating the protocol ceiling down to 32 lowers
+*both* numbers together, and `session_mint_survives_the_protocol_ceiling` — the
+test that exists precisely to catch a silent clamp — is perfectly happy, because
+no clamp happened. Two tests catch it, and neither is the clamp test. The last
+row sets the session budget back to 32 directly, which is the same product
+defect reached by a different road, and is caught by the same test.
+
 This is the answer to the question this block has carried since C2.7-D: no, 32
-uses per session do not come close to a real `npm`, `Maven` or `Gradle` run. Any
-multi-request relay has to re-derive both numbers from a measurement like the
-table above rather than from a round power of two, and the re-derivation is
-work that is **owed, not done** — the relay itself is still the next increment.
+uses per session do not come close to a real `npm`, `Maven` or `Gradle` run. The
+loop is still the next increment — but a loop over a budget that dies at request
+33 would have been a loop that a real client could not finish, which is the same
+lesson as the third clamp wearing different clothes.
 
 **And the increment is bigger than "add a loop", which is worth writing down
 before anyone starts it.** The obvious design is a loop: read the next
