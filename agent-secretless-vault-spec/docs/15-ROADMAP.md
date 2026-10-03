@@ -1890,7 +1890,7 @@ fails for any other reason counts as an escape rather than as a pass.
 
 ## C2.8 — CONNECT in production, and the first thing that is not
 
-### Status: open. Three measurements in; the third found three defects, and every one of them sat under a green test
+### Status: open. Four measurements in. The third found three defects and the fourth found a fourth — all of them sat under a green test, and all four are fixed
 
 V1-C2's scope, written when the block was opened and not narrowed since: *a
 production listener wiring `relay_substituted` into a running `asv-brokerd`,
@@ -2065,6 +2065,54 @@ assertion no mutation can reach, which is the decoration this repository keeps
 finding. A campaign that scored a killed run as "the test did not fail" would
 also have scored the worst defect in the slice as the mildest, so a hang counts
 as a detection.
+
+**The observability sweep, and the surface nobody had checked.** The vertical
+already proved the child's `argv`, its environment, its output and the durable
+chain carry no credential. The operator's log is the surface an operator
+actually reads while something is going wrong, and it had never been looked at
+by a single assertion.
+
+Checked in two halves, because they are two different questions. One asks
+whether anything the broker *holds* reaches a surface: it does not, and that is
+now a test with a control, so a sweep that only reports the defect it found
+cannot be re-run against a future change to the surface it did not find. The
+other asks whether something the *client* chooses can be made to appear there,
+and it could:
+
+```text
+WARN CONNECT refused destination=<no destination read> session=None
+     reason=malformed CONNECT request: CONNECT authority "gho_ASVclientWrote…" carries no port
+```
+
+A bare socket wrote that. No proof, no surrogate, not even a well-formed
+CONNECT — because `parse_connect_target` runs before the session proof is
+authenticated, and `ConnectTargetError::NoPort` carries the request line's
+authority verbatim. The durable chain recorded the same connection as
+`detail: "malformed_request"`: a class, no client bytes. The two surfaces were
+also **two different functions**, and the kind-based one existed, was correct,
+and had no production caller while the chain searched the rendered message for
+a prefix — the failure `cancellation_class` already documents in its own
+comment. They answered differently for most variants.
+
+`ConnectionResult::Refused` is now a class and an optional detail, derived from
+the error's *kind* where the error is in hand, so the two surfaces read one
+field and cannot drift. `refusal_detail` drops the text for exactly the
+variants that quote the client and keeps it for everything that is a fact about
+this broker: a canonicalised host, an I/O error, a handshake failure, a
+constant message. The rule is about **provenance**, not about length or about
+looking sensitive — which is why a refusal with no detail is still recorded,
+and that has its own test, because a reporter that treated "no detail" as "no
+record" would leave the chain with a gap and a chain with gaps fails
+verification for everybody after it.
+
+Making the match exhaustive caught the last thing: `_ => "other"` had been
+swallowing `BridgeError::Upstream`, so a `Connect` that could not reach its
+destination was recorded under a class an operator could not act on. A new
+variant is a compile error now instead of a silent fallthrough. Falsified
+**5 of 5** (`tests/connect_observability_falsification.py`), two of them
+mutating the *clean* surface rather than the leaky one — a careless `tracing`
+of the forwarded request, and a careful-looking trace of the redemption — so
+the assertion that the log is clean is falsifiable in both directions.
 
 **Still owed in this block.** More than one request per tunnel where the
 protocol allows — the characterisation above stands and is not yet a fix. Stress
