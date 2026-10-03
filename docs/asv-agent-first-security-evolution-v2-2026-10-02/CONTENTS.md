@@ -1,0 +1,30 @@
+# Contents — ASV v2
+
+- `00-README.md`
+- `01-PRODUCT-EVOLUTION-SPEC.md`
+- `02-ARCHITECTURE.md`
+- `03-AGENT-HYPERMEDIA-CLI.md`
+- `04-CREDENTIAL-WORKFLOW-ADAPTERS.md`
+- `05-IDENTITY-AUTHORITY-PLAN-BOUND.md`
+- `06-ATTESTATION-TRUSTED-EXECUTION.md`
+- `07-DISTRIBUTION-AND-SKILLS.md`
+- `08-PIPELINEK-INTEGRATION.md`
+- `09-ROTATION-AND-AUTOMATION.md`
+- `10-SECURITY-OBSERVABILITY-SUPPLY-CHAIN.md`
+- `11-BASELINE-AND-ADOPTION.md`
+- `12-CAPABILITY-OWNERSHIP-AND-NO-OVERLAP.md`
+- `90-RESEARCH-DIRECTIONS.md`
+- `aat/30-AAT-UAT-MATRIX.md`
+- `adrs/0019-agent-hypermedia-protocol.md`
+- `adrs/0020-credential-workflow-adapters.md`
+- `adrs/0021-prefer-credential-elimination.md`
+- `adrs/0022-plan-bound-action-intent.md`
+- `adrs/0023-workload-identity-proof-of-possession.md`
+- `adrs/0024-attestation-policy-input.md`
+- `adrs/0025-pipelinek-automation-boundary.md`
+- `adrs/0026-rotation-logical-binding.md`
+- `adrs/0027-product-distribution-manifest.md`
+- `adrs/0028-skills-external-protocol-clients.md`
+- `roadmap/20-ROADMAP-CONTINUATION.md`
+- `roadmap/31-WORK-UNITS.md`
+- `workflows/40-ROTATION-STATE-MACHINE.md`
