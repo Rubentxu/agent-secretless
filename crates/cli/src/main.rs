@@ -584,6 +584,56 @@ const QUARANTINED_ENV_NAMES: &[&str] = &[
     "ANTHROPIC_API_KEY",
 ];
 
+/// Start this session's shim, if the broker is serving a CONNECT listener.
+///
+/// `None` is a legitimate answer and not a failure: the CONNECT listener is
+/// opt-in (`--connect-listen`), so a broker without one has no address to
+/// publish and there is nothing for a shim to forward to. Starting a shim
+/// anyway would give the child a proxy that answers `502` for every request,
+/// which looks like a broken network rather than an absent feature — so the
+/// child is launched with no proxy variables at all, and `asv doctor` is how an
+/// operator finds out why.
+///
+/// The address comes from the broker rather than from a flag on this side. Two
+/// sources of truth for "where the CONNECT listener is" can disagree, and the
+/// disagreement is silent: the shim would forward every CONNECT somewhere that
+/// is not a broker and the session would simply never tunnel.
+fn start_session_shim(
+    socket: &std::path::Path,
+    agent: &asv_ssh_agent::AgentSession,
+) -> Option<crate::session_shim::ShimHandle> {
+    let facts = crate::ipc::fetch_broker_facts(socket)?;
+    let address = facts.connect_listen?;
+
+    let parsed: std::net::SocketAddr = address.parse().ok().or_else(|| {
+        eprintln!("asv: the broker reports a CONNECT address it cannot bind: {address:?}");
+        None
+    })?;
+
+    let client = asv_ssh_agent::AgentClient::new(agent.socket_path());
+    let issuer = match asv_ssh_agent::ProofIssuer::discover(client) {
+        Ok(issuer) => issuer,
+        Err(e) => {
+            eprintln!("asv: this session's agent refused to issue proofs: {e}");
+            return None;
+        }
+    };
+
+    match crate::session_shim::SessionShim::bind(issuer, parsed) {
+        Ok(shim) => match shim.spawn() {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                eprintln!("asv: could not start the session shim: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("asv: could not bind the session shim: {e}");
+            None
+        }
+    }
+}
+
 /// Launches a command inside a real ASV session.
 ///
 /// The session used to be invented. `ASV_SESSION_ID` was set to this
@@ -664,7 +714,62 @@ fn run_command(socket: &std::path::Path, command: Vec<String>) -> std::io::Resul
         .env("ASV_SESSION_ID", session.to_string())
         .env("ASV_SESSION_MODE", "strict");
 
-    let status = child.status()?;
+    // C2.7: the session-local shim — the "last inch" the roadmap recorded as
+    // missing. Everything above this line mints the material a CONNECT proof
+    // needs; nothing pointed a client at the thing that uses it. So a session
+    // could prove who it was and had no way to say so to `curl`.
+    //
+    // The shim is started here rather than by the child because it owns the
+    // session's *only* counter. Three children of one `asv run` each minting
+    // their own would present 1, 1, 1 and the second would be refused as a
+    // replay of the first — indistinguishable from an attack. One shim per
+    // session is the only shape where the counter means anything.
+    let shim = start_session_shim(socket, &agent);
+
+    if let Some(handle) = shim.as_ref() {
+        let url = format!("http://{}", handle.local_addr());
+        {
+            // Only the variables that produce a CONNECT. `HTTP_PROXY` is
+            // deliberately not set: it makes a client send a plain proxy
+            // request, the shim refuses anything that is not a CONNECT, and the
+            // result would be a mysterious failure for a request the broker
+            // was never going to see. Plain HTTP to an external host is outside
+            // the CONNECT path entirely and is recorded as owed, not papered
+            // over here.
+            for name in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+                child.env(name, &url);
+            }
+            // An inherited `NO_PROXY` is a bypass, not a preference: a parent
+            // that named a destination there would make the child connect to
+            // it directly, with no CONNECT, no proof and no substitution. The
+            // whole path is defeated by one inherited variable, so it is
+            // cleared rather than merged.
+            for name in ["NO_PROXY", "no_proxy"] {
+                child.env_remove(name);
+            }
+        }
+    }
+
+    // Spawn failures stop the shim on the way out, not just the normal exit.
+    // A child that never ran is exactly when a `?` would have returned with a
+    // bound loopback port and a live issuer still attached to it.
+    let status = match child.status() {
+        Ok(status) => status,
+        Err(e) => {
+            if let Some(handle) = shim {
+                handle.stop();
+            }
+            return Err(e);
+        }
+    };
+
+    // Stop the shim before the session ends. A shim that outlived the command
+    // would keep its loopback port bound and its proof issuer alive for a
+    // session that no longer exists — and a proof minted after that would
+    // resolve to nothing, which reads as a broken signer.
+    if let Some(handle) = shim {
+        handle.stop();
+    }
     // The session is closed before the agent is dropped, so a child that
     // outlived its own command cannot keep redeeming surrogates against a
     // session the operator believes has ended.

@@ -376,6 +376,7 @@ fn the_broker_version_is_never_the_clis_own() {
         landlock_installed: true,
         seccomp_installed: true,
         capabilities: vec!["system.health".into()],
+        connect_listen: None,
     };
     let measured = DoctorReport::judge(Observation {
         socket: SocketOutcome::SelfReported(Box::new(facts)),
@@ -397,6 +398,7 @@ fn a_broker_that_describes_itself_gets_a_measured_dumpable_check() {
         landlock_installed: true,
         seccomp_installed: true,
         capabilities: vec![],
+        connect_listen: None,
     };
     let report = DoctorReport::judge(Observation {
         socket: SocketOutcome::SelfReported(Box::new(facts.clone())),
@@ -441,6 +443,7 @@ fn a_debuggable_broker_is_a_warning_with_a_remedy() {
         landlock_installed: false,
         seccomp_installed: false,
         capabilities: vec![],
+        connect_listen: None,
     };
     let report = DoctorReport::judge(Observation {
         socket: SocketOutcome::SelfReported(Box::new(facts.clone())),

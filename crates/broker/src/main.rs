@@ -607,11 +607,46 @@ fn main() -> std::io::Result<()> {
             eprintln!("asv: the CONNECT listener must be non-blocking: {e}");
             std::process::exit(1);
         });
-        let tcp = tokio::net::TcpListener::from_std(tcp).unwrap_or_else(|e| {
-            eprintln!("asv: cannot adopt the CONNECT listener: {e}");
+        // The reactor context is required here, and it was missing.
+        //
+        // `tokio::net::TcpListener::from_std` registers the descriptor with the
+        // runtime's reactor, and there is no ambient reactor on the main thread
+        // just because a `Runtime` exists in scope — `runtime_guard` below is
+        // held for its *lifetime*, not entered. So `--connect-listen` panicked
+        // at startup with "there is no reactor running" and the CONNECT listener
+        // has never once started in a real broker process.
+        //
+        // Every CONNECT test constructs its listener in-process, where the test
+        // already runs inside a runtime, which is exactly why the suite stayed
+        // green over a surface that could not come up. The binding is entered
+        // rather than the whole function because that is the smallest scope that
+        // fixes it: `Handle::spawn` further down does not need a context, and
+        // entering one for the whole function would pin the reactor for the
+        // life of the accept loop for no reason.
+        let tcp = {
+            let _reactor = runtime_guard.enter();
+            tokio::net::TcpListener::from_std(tcp).unwrap_or_else(|e| {
+                eprintln!("asv: cannot adopt the CONNECT listener: {e}");
+                std::process::exit(1);
+            })
+        };
+        // Read back from the listener, not from `bind`.
+        //
+        // Port 0 is the kernel saying "choose one", and `bind` still holds the
+        // literal `127.0.0.1:0` that was asked for. Publishing that would hand
+        // every session a port nobody is listening on, and the failure is
+        // silent: the shim forwards each CONNECT into a closed port and the
+        // session simply never tunnels. The log line had the same defect, and
+        // this is the assertion that caught it.
+        let bound = tcp.local_addr().unwrap_or_else(|e| {
+            eprintln!("asv: cannot read back the CONNECT listener address: {e}");
             std::process::exit(1);
         });
-        tracing::info!(%bind, "CONNECT listener bound");
+        tracing::info!(%bound, "CONNECT listener bound");
+
+        // Published so `asv run` can start this session's shim without being
+        // told where to point it.
+        state.self_report.connect_listen = Some(bound.to_string());
 
         // Cloned before the spawn because the task outlives this scope: moving
         // `state.audit` in would take a field out of a `BrokerState` the socket

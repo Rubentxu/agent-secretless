@@ -40,6 +40,20 @@ pub struct SelfReport {
     pub seccomp_installed: bool,
     pub cgroup_v2: bool,
     pub capabilities: Vec<String>,
+    /// Where this broker's CONNECT listener is bound, as `addr:port`.
+    ///
+    /// `None` means the listener is not running — which is the default, and is
+    /// the same "absent, not assumed" reading the rest of this record takes.
+    ///
+    /// This field exists so `asv run` does not have to be *told* where to send
+    /// its session's CONNECTs. The reasoning is the module's own: the answer to
+    /// "where is the running broker's proxy?" otherwise exists for the length
+    /// of a log line, and the process that needs it — the one starting a
+    /// session — cannot ask. An operator supplying the address as a flag would
+    /// be a second source of truth that can disagree with the first, and a
+    /// disagreement here does not fail loudly: the shim would simply forward
+    /// every CONNECT somewhere that is not the broker.
+    pub connect_listen: Option<String>,
 }
 
 impl Default for SelfReport {
@@ -55,6 +69,10 @@ impl Default for SelfReport {
             seccomp_installed: false,
             cgroup_v2: false,
             capabilities: compiled_capabilities(),
+            // No listener unless one was started. See the field's docs: a
+            // default that named an address would send `asv run`'s shim
+            // somewhere that is not a broker.
+            connect_listen: None,
         }
     }
 }

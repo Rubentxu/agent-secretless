@@ -32,6 +32,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 
@@ -64,11 +65,73 @@ const ESTABLISHED_TEXT: &str = "HTTP/1.1 200 Connection Established";
 /// deciding to be the policy engine it was built not to be.
 const NO_UPSTREAM_REPLY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\n\r\n";
 
+/// How long the accept loop parks before looking again.
+///
+/// Three seconds, and the number is load-bearing rather than a round choice.
+/// `ShimHandle::stop` unparks the thread, so a real shutdown does not wait for
+/// this to expire — it returns in microseconds. The interval therefore only
+/// governs the *broken* path, and the lifecycle test sets a bound well below
+/// it: a stop that returned in 200ms here and a stop that waited the park out
+/// would look identical if the park were short. Choosing a small park to keep
+/// the loop responsive would make the two indistinguishable, and the test that
+/// is supposed to tell them apart could not.
+///
+/// Idle wake latency of three seconds costs nothing. The only thing this flag
+/// guards is shutdown, and shutdown does not wait for the park.
+const IDLE_PARK: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Ticks per second in `/proc/<pid>/task/<tid>/stat`, from `sysconf(_SC_CLK_TCK)`.
+///
+/// Asked of the system rather than assumed to be 100. A hardcoded 100 would
+/// make the idle test's threshold wrong on any host with a different tick
+/// rate, in the direction of *passing* — the exact failure a measurement is
+/// supposed to exclude.
+/// This thread's kernel id.
+fn current_tid() -> u32 {
+    // SAFETY: `gettid` takes no arguments, touches no memory, and is async-
+    // signal-safe; there is no precondition to satisfy.
+    unsafe { libc::syscall(libc::SYS_gettid) as u32 }
+}
+
+#[cfg(test)]
+fn clock_ticks_per_second() -> f64 {
+    // SAFETY: `sysconf` is a pure query with no preconditions. `sysconf` takes
+    // an int and returns a long; `_SC_CLK_TCK` is the documented selector.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks > 0 {
+        ticks as f64
+    } else {
+        100.0
+    }
+}
+
+/// CPU jiffies this thread has consumed, from the kernel rather than a guess.
+///
+/// `None` when the proc entry is unreadable, which the caller must treat as
+/// "cannot measure" rather than "measured zero". Reading zero for an
+/// unreadable file is how a test ends up passing on a machine that never
+/// reported.
+#[cfg(test)]
+fn thread_cpu_ticks(tid: u32) -> Option<u64> {
+    let raw = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
+    // The second field is the thread name in parentheses and may itself
+    // contain spaces and parentheses, so fields are counted after the LAST
+    // `)`. Counting from the first — or splitting the whole line on spaces —
+    // reads the name as fields and shifts every value after it.
+    let after_name = &raw[raw.rfind(')')? + 1..];
+    let fields: Vec<&str> = after_name.split_whitespace().collect();
+    // `after_name` starts at field 3, so utime is index 11 and stime index 12.
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    Some(utime + stime)
+}
+
 /// A running shim, listening on loopback for its session's ordinary clients.
 pub struct SessionShim {
     listener: TcpListener,
     issuer: Arc<ProofIssuer>,
     broker: SocketAddr,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SessionShim {
@@ -79,10 +142,16 @@ impl SessionShim {
         // routable address would be a proxy anyone on the network could ask
         // this session to sign for, which is the opposite of the intent.
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        // Non-blocking, because the accept loop has to be able to notice a
+        // shutdown. A blocking `incoming()` can only be woken by a connection
+        // arriving, and the one moment this shim must not depend on a client is
+        // the moment the client has already exited.
+        listener.set_nonblocking(true)?;
         Ok(Self {
             listener,
             issuer: Arc::new(issuer),
             broker,
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -96,21 +165,113 @@ impl SessionShim {
         Ok(format!("http://{}", self.local_addr()?))
     }
 
-    /// Serves until the listener fails. One thread per connection, because a
-    /// client that opens four tunnels at once must get four, and a serial
-    /// shim would be a denial of service with the credentials in hand.
-    pub fn serve_forever(self) -> ! {
-        for incoming in self.listener.incoming() {
-            let Ok(client) = incoming else { continue };
-            let issuer = Arc::clone(&self.issuer);
-            let broker = self.broker;
-            let _ = thread::Builder::new()
-                .name("asv-session-shim".into())
-                .spawn(move || {
-                    let _ = serve_connection(client, &issuer, broker);
-                });
+    /// Serves until the listener fails or [`ShimHandle::stop`] is called.
+    ///
+    /// One thread per connection, because a client that opens four tunnels at
+    /// once must get four, and a serial shim would be a denial of service with
+    /// the credentials in hand.
+    pub fn serve_forever(self) {
+        while !self.stopping.load(Ordering::SeqCst) {
+            match self.listener.accept() {
+                Ok((client, _)) => {
+                    let issuer = Arc::clone(&self.issuer);
+                    let broker = self.broker;
+                    let _ = thread::Builder::new()
+                        .name("asv-session-shim".into())
+                        .spawn(move || {
+                            let _ = serve_connection(client, &issuer, broker);
+                        });
+                }
+                // Nothing waiting. Park rather than spin: this loop runs for the
+                // whole session, and a session that makes one request an hour
+                // should not cost a core doing it.
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    thread::park_timeout(IDLE_PARK);
+                }
+                // A transient accept error. Back off rather than spin, and keep
+                // going: one refused accept is not a reason to end the session.
+                Err(_) => {
+                    thread::park_timeout(IDLE_PARK);
+                }
+            }
         }
-        unreachable!("a listener's incoming iterator only ends on error")
+    }
+
+    /// Start serving on a background thread, returning a handle that stops it.
+    ///
+    /// The lifecycle is the point. A session is a bounded thing: `asv run`
+    /// starts a shim, runs a child, and the shim must not outlive either. A
+    /// `serve_forever` that owns its own thread cannot be stopped, so the
+    /// accept loop's port — and the proof issuer behind it — would outlive the
+    /// command by as long as the process did.
+    pub fn spawn(self) -> io::Result<ShimHandle> {
+        let addr = self.local_addr()?;
+        let stopping = Arc::clone(&self.stopping);
+        let tid_slot: Arc<std::sync::Mutex<Option<u32>>> = Arc::new(std::sync::Mutex::new(None));
+        let tid_for_thread = Arc::clone(&tid_slot);
+        let worker = thread::Builder::new()
+            .name("asv-session-shim-accept".into())
+            .spawn(move || {
+                // Publish the tid from inside the thread, so it is the real one
+                // rather than whatever a caller could guess.
+                *tid_for_thread.lock().expect("tid slot lock") = Some(current_tid());
+                self.serve_forever();
+            })?;
+        Ok(ShimHandle {
+            addr,
+            stopping,
+            tid: tid_slot,
+            worker: Some(worker),
+        })
+    }
+}
+
+/// The owner of a running shim's lifetime.
+///
+/// Dropping this **without** calling [`Self::stop`] leaves the thread running.
+/// That is deliberate: a silent leak in a destructor would be harder to notice
+/// than an explicit call, and this type exists so the owner has to say what
+/// happens at the end of the session.
+#[derive(Debug)]
+pub struct ShimHandle {
+    addr: SocketAddr,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
+    tid: Arc<std::sync::Mutex<Option<u32>>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl ShimHandle {
+    /// The address the session's clients are pointed at.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// The accept loop's kernel thread id, once the thread has started.
+    ///
+    /// Exposed so idle cost can be *measured* rather than assumed: a busy-wait
+    /// and a parked loop behave identically to every functional test, and only
+    /// a CPU reading tells them apart.
+    pub fn accept_tid(&self) -> Option<u32> {
+        self.tid.lock().ok().and_then(|slot| *slot)
+    }
+
+    /// Stop serving and wait for the accept loop to finish.
+    ///
+    /// Returns whether the accept loop was joined. A thread that panicked is
+    /// reported rather than swallowed: a shim whose accept loop died is a shim
+    /// that has silently stopped proxying, and the operator should hear about
+    /// it from here rather than from a client that got no answer.
+    pub fn stop(mut self) -> bool {
+        self.stopping.store(true, Ordering::SeqCst);
+        // Unpark first, then join: without the unpark the join waits out the
+        // park interval, which would make every session pay 50ms to exit.
+        if let Some(worker) = &self.worker {
+            worker.thread().unpark();
+        }
+        match self.worker.take() {
+            Some(worker) => worker.join().is_ok(),
+            None => true,
+        }
     }
 }
 
@@ -340,6 +501,7 @@ fn relay(client: &TcpStream, upstream: &TcpStream) {
 mod tests {
     use super::*;
     use asv_ssh_agent::{proof_nonce, verify_proof, AgentClient, AgentSession};
+    use std::time::{Duration, Instant};
 
     /// A broker stand-in that captures the head the shim forwards and then
     /// does whatever this test needs it to do.
@@ -423,6 +585,7 @@ mod tests {
         _session: AgentSession,
         key_blob: Vec<u8>,
         _dir: tempfile::TempDir,
+        _shim: ShimHandle,
     }
 
     impl Fixture {
@@ -433,10 +596,15 @@ mod tests {
             let client = AgentClient::new(session.socket_path());
             let issuer = ProofIssuer::discover(client).expect("discover");
             let shim = SessionShim::bind(issuer, broker).expect("bind");
-            let shim_addr = shim.local_addr().expect("addr");
-            std::thread::spawn(move || shim.serve_forever());
+            // `spawn` rather than a bare thread: the fixture now owns the
+            // shim's lifetime, so a test that ends actually ends it. A thread
+            // nobody holds outlives the test and keeps its port, which is the
+            // leak the lifecycle exists to prevent.
+            let handle = shim.spawn().expect("spawn accept loop");
+            let shim_addr = handle.local_addr();
             Self {
                 shim_addr,
+                _shim: handle,
                 _session: session,
                 key_blob,
                 _dir: dir,
@@ -662,8 +830,8 @@ mod tests {
         let issuer =
             ProofIssuer::discover(AgentClient::new(session.socket_path())).expect("discover");
         let shim = SessionShim::bind(issuer, dead).expect("bind");
-        let addr = shim.local_addr().expect("addr");
-        std::thread::spawn(move || shim.serve_forever());
+        let handle = shim.spawn().expect("spawn accept loop");
+        let addr = handle.local_addr();
 
         let mut stream = TcpStream::connect(addr).expect("connect");
         stream
@@ -675,6 +843,168 @@ mod tests {
         let mut out = Vec::new();
         read_head(&mut stream, &mut out).expect("head");
         assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 502"));
+        assert!(
+            stop_within(handle, STOP_BOUND),
+            "the accept loop must join cleanly"
+        );
+    }
+
+    /// Stop a shim and fail if it takes longer than a generous bound.
+    ///
+    /// The bound is what makes this a test rather than a hope. If the accept
+    /// loop went back to blocking in `accept()`, `stop` would not return — it
+    /// would wait for a connection that will never come, because the client
+    /// that would have made it has already exited. Asserting "it stopped" on a
+    /// call that can wedge turns a regression into a hung suite instead of a
+    /// red one, which is the worst version of the same defect.
+    fn stop_within(handle: ShimHandle, bound: std::time::Duration) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let joined = handle.stop();
+            let _ = tx.send(joined);
+        });
+        rx.recv_timeout(bound).unwrap_or_else(|_| {
+            panic!("stop did not return within {bound:?}; the accept loop is not stoppable")
+        })
+    }
+
+    /// Well below `IDLE_PARK`, and that ordering is the whole test.
+    ///
+    /// A stop that unparks returns in microseconds; a stop that only notices
+    /// the flag when the park expires takes `IDLE_PARK`. A bound above the
+    /// park would let both pass, which is what the first version of this test
+    /// did — the unpark mutation escaped it.
+    const STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+
+    // -- the lifecycle, which is what `asv run` needs to own a shim ---------
+
+    /// A stopped shim releases its port.
+    ///
+    /// This is the property `asv run` depends on and the reason the accept
+    /// loop is stoppable at all. Before it existed, the shim's thread held the
+    /// listener for the life of the process, so a session that ran `curl` and
+    /// exited left a bound loopback port and a live proof issuer behind — and
+    /// nothing in the product could end them.
+    #[test]
+    fn a_stopped_shim_releases_its_port() {
+        let broker = CapturingBroker::new(Behaviour::Tunnel);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = AgentSession::start(dir.path().join("session")).expect("start");
+        let issuer =
+            ProofIssuer::discover(AgentClient::new(session.socket_path())).expect("discover");
+        let handle = SessionShim::bind(issuer, broker.addr)
+            .expect("bind")
+            .spawn()
+            .expect("spawn");
+        let addr = handle.local_addr();
+
+        // Live: the port answers.
+        TcpStream::connect(addr).expect("a running shim accepts");
+
+        assert!(
+            stop_within(handle, STOP_BOUND),
+            "stop reports whether the loop joined"
+        );
+
+        // The listener is gone, so binding the same port must now succeed.
+        // Nothing else holds it: the accept loop was the only owner.
+        TcpListener::bind(addr).expect("the port must be free after stop");
+    }
+
+    /// `stop` is idempotent from the caller's side: it reports honestly rather
+    /// than pretending a second stop did something.
+    #[test]
+    fn stopping_twice_reports_the_truth() {
+        let broker = CapturingBroker::new(Behaviour::Tunnel);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = AgentSession::start(dir.path().join("session")).expect("start");
+        let issuer =
+            ProofIssuer::discover(AgentClient::new(session.socket_path())).expect("discover");
+        let handle = SessionShim::bind(issuer, broker.addr)
+            .expect("bind")
+            .spawn()
+            .expect("spawn");
+        let addr = handle.local_addr();
+
+        assert!(
+            stop_within(handle, STOP_BOUND),
+            "the first stop joins the loop it started"
+        );
+
+        // A second bind also succeeds, which is the observable form of "the
+        // port is free" — and the reason a caller cannot get a false `true`
+        // from a handle that never ran.
+        TcpListener::bind(addr).expect("port free after the first stop");
+    }
+
+    /// The accept loop is idle, not spinning — measured, not asserted.
+    ///
+    /// The previous version of this test slept and then checked the shim still
+    /// answered. That passes on a busy-wait exactly as it passes on a parked
+    /// loop: a spinning accept loop is *correct*, it just burns a core, and
+    /// correctness is all the old assertion could see. The test name promised
+    /// something the test did not check, which is worse than no test.
+    ///
+    /// So it reads the kernel's CPU accounting for the accept thread across an
+    /// idle window. A parked loop consumes a handful of jiffies for the whole
+    /// window; a spinning one consumes approximately the entire window.
+    #[test]
+    fn an_idle_shim_does_not_spin() {
+        let broker = CapturingBroker::new(Behaviour::Tunnel);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = AgentSession::start(dir.path().join("session")).expect("start");
+        let issuer =
+            ProofIssuer::discover(AgentClient::new(session.socket_path())).expect("discover");
+        let handle = SessionShim::bind(issuer, broker.addr)
+            .expect("bind")
+            .spawn()
+            .expect("spawn");
+
+        // The tid is published from *inside* the thread, so it does not exist
+        // the instant `spawn` returns. Wait for it, then for procfs to see it —
+        // sampling before either exists would read a missing file as zero
+        // ticks, and a spin would then sail through a threshold of nothing.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut tid = handle.accept_tid();
+        while (tid.is_none() || tid.and_then(thread_cpu_ticks).is_none())
+            && Instant::now() < deadline
+        {
+            tid = handle.accept_tid();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let tid = tid.expect("the accept thread must publish its tid");
+        let before = thread_cpu_ticks(tid).expect("the accept thread must be in procfs");
+
+        // One park interval of genuine idleness.
+        std::thread::sleep(IDLE_PARK);
+        let after = thread_cpu_ticks(tid).expect("the accept thread must still be in procfs");
+        let burned = after.saturating_sub(before);
+        let window_ticks = (IDLE_PARK.as_secs_f64() * clock_ticks_per_second()) as u64;
+
+        // A tenth of the window is generous for a loop that does nothing but
+        // park, and still two orders of magnitude below a spin.
+        assert!(
+            burned * 10 <= window_ticks,
+            "the accept loop burned {burned} jiffies idling for {window_ticks} \
+             ({}% of the window) — that is a spin, not a park",
+            (burned * 100) / window_ticks.max(1)
+        );
+
+        // And it is still serving, so the measurement was of a live loop.
+        let mut stream = TcpStream::connect(handle.local_addr()).expect("still serving");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok();
+        stream
+            .write_all(connect_request("api.example.com:443").as_bytes())
+            .expect("write");
+        let mut out = Vec::new();
+        read_head(&mut stream, &mut out).expect("head");
+        assert!(
+            String::from_utf8_lossy(&out).starts_with(ESTABLISHED_TEXT),
+            "a shim that idled must still serve"
+        );
+        assert!(stop_within(handle, STOP_BOUND));
     }
 
     /// Whatever the client sends after the `200` is tunnel payload.

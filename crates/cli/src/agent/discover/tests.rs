@@ -205,6 +205,9 @@ fn spawn_broker(socket: &std::path::Path, protocol: u16) {
                         landlock_installed: true,
                         seccomp_installed: true,
                         cgroup_v2: true,
+                        // No listener in this fixture. Stated rather than left
+                        // implicit so a future test that needs one says so.
+                        connect_listen: None,
                         capabilities: vec![
                             "credentials.metadata".into(),
                             "session.run".into(),

@@ -1709,6 +1709,105 @@ fail-closed, and it means C2.7 needs an operator configuration to demonstrate
 anything: a route file *and* a policy file. The end-to-end vertical, the
 adversarial campaign and the concurrency work are C2.7 and C2.8, not this block.
 
+## C2.7 — CONNECT as a product capability, not an internal surface
+
+### Status: A, B and C landed; the end-to-end vertical does not exist yet
+
+The three prerequisites below are prerequisites, not the vertical. **C2.7 is
+not closed**, and nothing here should be read as a claim that `asv run` can
+drive a real credentialed request.
+
+### C2.7-A — the shim had a lifecycle no owner could end
+
+`SessionShim::serve_forever(self) -> !` took itself, returned nothing, and could
+not be stopped. Nothing in the product invoked it, so nothing noticed — and a
+thread holding a bound loopback port and a live `ProofIssuer` after the command
+it belonged to had exited is a session that keeps spending proofs for a session
+that no longer exists. A proof minted then resolves to nothing, which reads as a
+broken signer rather than as a dead session.
+
+`spawn` returns a `ShimHandle`; `stop` sets the flag, unparks, and joins. The
+accept loop is non-blocking and parks between attempts, so a session that makes
+one request an hour costs nothing.
+
+**`IDLE_PARK` is three seconds, and that is load-bearing.** `stop` unparks, so a
+real shutdown returns in microseconds; the interval only governs the broken path.
+It is long because the lifecycle test sets a bound *below* it — a stop that
+returned in 200ms and a stop that waited the park out are indistinguishable when
+the park is short, and the test meant to tell them apart could not. The first
+version used 50ms against a 5s bound, and deleting the `unpark` passed it.
+
+**The idle test measures rather than asserts.** Its first version slept and then
+checked the shim still answered, which passes on a busy-wait exactly as it
+passes on a parked loop: a spinning accept loop is *correct*, it just burns a
+core, and correctness was all the old assertion could see. It now reads the
+kernel's CPU accounting for the accept thread from `/proc/self/task/<tid>/stat`
+across a park interval, with the tick rate asked of `sysconf(_SC_CLK_TCK)`
+rather than assumed to be 100.
+
+### C2.7-B — the broker publishes where it listens, and it was publishing the wrong thing
+
+`connect_listen` is a new `SelfReport` field and a new `BrokerInfo` field, so
+`asv run` can start a session's shim without being *told* where to point it. Two
+sources of truth for one address can disagree, and the disagreement is silent:
+the shim would forward every CONNECT to a port where no broker is listening and
+the session would simply never tunnel. This is `SelfReport`'s own argument, from
+`selfreport.rs` — the answer to a question about the running broker should not
+exist for the length of a log line.
+
+`PROTOCOL_VERSION` is 5.
+
+**The broker was publishing `127.0.0.1:0`.** Port 0 means "choose one", and the
+value that gets logged is still the string that was passed in. Every session
+would have been handed a port nobody listens on.
+
+### C2.7-C — `asv run` starts the shim, and ends it
+
+One shim per session, started by `asv run` and not by the child: the shim owns
+the session's *only* counter, and three children each minting their own would
+present 1, 1, 1 with the second refused as a replay of the first.
+
+Four proxy variables are set — the ones that produce a CONNECT. `HTTP_PROXY` is
+deliberately not: it makes a client send a plain proxy request, the shim refuses
+anything that is not a CONNECT, and the result would be a mysterious failure for
+a request the broker was never going to see.
+
+`NO_PROXY` and `no_proxy` are **removed**, not merged. An inherited `NO_PROXY`
+naming a destination makes the child connect to it directly — no CONNECT, no
+proof, no substitution. One inherited variable defeats the whole path.
+
+The teardown covers the spawn-failure path, not just the normal exit: a child
+that never ran is exactly when a `?` would have returned with a bound port and a
+live issuer still attached.
+
+### The finding that mattered most: `--connect-listen` had never started
+
+`crates/broker/tests/connect_address_publication.rs` starts the real
+`asv-brokerd` binary and asks it where it is listening. It failed on the first
+run, and the reason was not the thing it was written for:
+
+```text
+thread 'main' panicked at crates/broker/src/main.rs:610:
+there is no reactor running, must be called from the context of a Tokio 1.x runtime
+```
+
+`tokio::net::TcpListener::from_std` registers the descriptor with the runtime's
+reactor, and holding a `Runtime` in scope is not the same as being inside it —
+`runtime_guard` was kept for its lifetime and never entered. `git log -S` over
+that file finds no `enter()`, so this predates every recent cycle.
+
+**The CONNECT listener has never once started in a real broker process.** Every
+CONNECT test builds its listener in-process, where the test already runs inside
+a runtime, which is why the suite reported a surface that could not come up. This
+is the failure class `tests/connect_wiring_falsification.py` exists to catch,
+arriving by a route it did not look for.
+
+It is worth being precise about what this says about the earlier evidence. The
+C2.6 route table, the C2.5 shim, the proof format and the counter are all real
+and all tested — but "tested" meant "tested in process", and the one hop between
+a test process and a running broker was broken. The end-to-end vertical is not
+an additional test to write. It is the first test that would have seen this.
+
 ## After v1.0 — M14 through M18
 
 Adopted from `docs/asv-agent-first-security-evolution-v2-2026-10-02/`. **This

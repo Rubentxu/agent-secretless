@@ -35,6 +35,12 @@ pub struct BrokerFacts {
     pub landlock_installed: bool,
     pub seccomp_installed: bool,
     pub capabilities: Vec<String>,
+    /// Where the broker's CONNECT listener is bound, if one is running.
+    ///
+    /// Carried rather than re-derived: the broker knows the address it actually
+    /// bound, and a client told an address by a flag could disagree with it
+    /// without either side noticing.
+    pub connect_listen: Option<String>,
 }
 
 impl BrokerFacts {
@@ -48,6 +54,7 @@ impl BrokerFacts {
                 landlock_installed,
                 seccomp_installed,
                 capabilities,
+                connect_listen,
                 ..
             } => Some(Self {
                 protocol: *protocol,
@@ -57,6 +64,7 @@ impl BrokerFacts {
                 landlock_installed: *landlock_installed,
                 seccomp_installed: *seccomp_installed,
                 capabilities: capabilities.clone(),
+                connect_listen: connect_listen.clone(),
             }),
             _ => None,
         }

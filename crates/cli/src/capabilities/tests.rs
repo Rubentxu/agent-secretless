@@ -16,6 +16,7 @@ fn facts(names: &[&str]) -> crate::ipc::BrokerFacts {
         landlock_installed: true,
         seccomp_installed: true,
         capabilities: names.iter().map(|s| s.to_string()).collect(),
+        connect_listen: None,
     }
 }
 

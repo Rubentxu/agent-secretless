@@ -957,6 +957,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                         landlock_installed: r.landlock_installed,
                         seccomp_installed: r.seccomp_installed,
                         cgroup_v2: r.cgroup_v2,
+                        connect_listen: r.connect_listen.clone(),
                         capabilities: r.capabilities.clone(),
                     }
                 }

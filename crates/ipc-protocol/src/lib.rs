@@ -116,7 +116,7 @@ impl std::fmt::Debug for OpaqueSecret {
 /// a v3 agent talking to a v4 broker would have no way to express the
 /// binding and would fail with an unknown-method error rather than a
 /// version error. Failing at the gate is the point.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Hard ceiling on a single inbound message. Bounded allocation is required for
 /// any IPC that faces an untrusted peer (`docs/17-IMPLEMENTATION-BOOTSTRAP.md` §9).
@@ -339,6 +339,14 @@ pub enum Response {
         seccomp_installed: bool,
         /// The kernel offers cgroup v2, and a session slice was created.
         cgroup_v2: bool,
+        /// Where this broker's CONNECT listener is bound, as `addr:port`, or
+        /// `None` when it is not running.
+        ///
+        /// Added so `asv run` can start a session's shim without being told
+        /// where to point it. `None` is the honest default: a broker with no
+        /// listener has no address to report, and a client that guessed one
+        /// would forward every CONNECT to something that is not a broker.
+        connect_listen: Option<String>,
         /// Capabilities this build actually compiled in, as wire names.
         ///
         /// Derived from the running process rather than from the roadmap, per
