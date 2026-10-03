@@ -206,7 +206,14 @@ struct Origin {
 }
 
 impl Origin {
-    fn start() -> Self {
+    /// An origin that answers `per_connection` requests on one connection
+    /// before closing it.
+    ///
+    /// One is the shape the vertical uses: a CONNECT tunnel the client opens
+    /// per request is what `curl` produces by default. More than one is the
+    /// shape the *protocol* allows, and it is a different question — see
+    /// `a_tunnel_serves_one_request_and_the_protocol_allows_more`.
+    fn start_serving(per_connection: usize) -> Self {
         // `[::]` is dual-stack on Linux, so one port answers on both `::1` and
         // `127.0.0.1`. The broker takes the first address the resolver returns,
         // and which one that is has changed between hosts; a single-family bind
@@ -223,24 +230,40 @@ impl Origin {
                 let sink = Arc::clone(&sink);
                 std::thread::spawn(move || {
                     stream.set_read_timeout(Some(Duration::from_secs(20))).ok();
-                    let mut raw = Vec::new();
-                    let mut chunk = [0u8; 2048];
-                    // Read until the headers are complete, then answer. The
-                    // origin serves one request per connection because that is
-                    // what the CONNECT path produces.
-                    while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
-                        match stream.read(&mut chunk) {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => raw.extend_from_slice(&chunk[..n]),
+                    for served in 0..per_connection {
+                        let mut raw = Vec::new();
+                        let mut chunk = [0u8; 2048];
+                        // Read until the headers are complete, then answer.
+                        // A `break` here ends the connection rather than the
+                        // loop, so a client that hangs up mid-sequence is not
+                        // answered with a fabricated request.
+                        while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => raw.extend_from_slice(&chunk[..n]),
+                            }
                         }
+                        if raw.is_empty() {
+                            return;
+                        }
+                        sink.lock()
+                            .expect("origin sink")
+                            .push(String::from_utf8_lossy(&raw).into_owned());
+                        // Keep the connection open unless this was the last
+                        // request the fixture was asked to serve. `close` on the
+                        // last one is what tells `curl` it may stop reusing it.
+                        let last = served + 1 == per_connection;
+                        let response = if last {
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                                .as_slice()
+                        } else {
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".as_slice()
+                        };
+                        if stream.write_all(response).is_err() {
+                            return;
+                        }
+                        let _ = stream.flush();
                     }
-                    sink.lock()
-                        .expect("origin sink")
-                        .push(String::from_utf8_lossy(&raw).into_owned());
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-                    );
-                    let _ = stream.flush();
                 });
             }
         });
@@ -346,6 +369,17 @@ impl Fixture {
     /// would not be in `state.credentials` when the session tries to mint for
     /// it, and the mint would be skipped for a reason no log would explain.
     fn new(tag: &str) -> Self {
+        Self::new_serving(tag, 1)
+    }
+
+    /// A fixture whose origin answers several requests per connection.
+    ///
+    /// The port has to be the one the route file names, so the origin is
+    /// started this way from the beginning rather than swapped afterwards: a
+    /// fixture that reconnected the origin would leave the route naming a port
+    /// nothing is listening on, and the tunnel would fail for a reason that has
+    /// nothing to do with the question being asked.
+    fn new_serving(tag: &str, per_connection: usize) -> Self {
         let dir = std::env::temp_dir().join(format!("asv-e2e-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create the working dir");
@@ -448,7 +482,7 @@ impl Fixture {
         let _ = std::fs::remove_file(&sock);
 
         // --- phase two: the broker that will actually tunnel ---------------
-        let origin = Origin::start();
+        let origin = Origin::start_serving(per_connection);
 
         let routes = dir.join("routes.json");
         std::fs::write(
@@ -904,6 +938,107 @@ fn asv_run_curl_reaches_the_origin_with_the_real_credential_and_nobody_else() {
     );
 
     let _ = f.credential_id;
+}
+
+/// The tunnel serves one request, and the protocol allows more.
+///
+/// **This is a characterization, not a claim.** It records the measured
+/// behaviour of a gap that V1-C2 names in its own scope — "more than one
+/// request per tunnel where the protocol allows" — and that is not closed.
+///
+/// The measurement, against the real broker with a real origin that keeps the
+/// connection open:
+///
+/// ```text
+/// CONN=1 CODE=200      the first request, on one connection
+/// CONN=0 CODE=000      the second request, curl reusing that same connection
+/// ```
+///
+/// `CONN=0` is the load-bearing half. `curl` did not open a second connection;
+/// it reused the tunnel, and got nothing back. So the second request is not
+/// failing because the origin refused it — the origin never saw it.
+///
+/// The cause is in `relay_substituted`: it reads one head, writes the rewritten
+/// one, and then `relay_back` copies the response direction until EOF or a byte
+/// limit. The request direction is never pumped again, so the second request
+/// sits in a socket buffer that nobody reads. Every real HTTP/1.1 client
+/// reuses its connection, so this is the shape of ordinary traffic and not an
+/// edge case.
+///
+/// What still holds, and is asserted here, is the part that would be a security
+/// problem if it did not: the destination never received a second request, so
+/// it never received a second copy of the credential, and nothing forwarded a
+/// surrogate it could not use. The gap is availability and opacity, not
+/// disclosure. That is worth knowing precisely, because "the second request
+/// fails" and "the second request leaks something" call for different work.
+#[test]
+fn a_tunnel_serves_one_request_and_the_protocol_allows_more() {
+    let f = Fixture::new_serving("pipelined", 2);
+
+    // One `-H`, two URLs: curl applies it to both and reuses the connection,
+    // which is the whole shape of the question. Two `-H` flags would send the
+    // header twice on every request, and the destination would see two.
+    let variable = f.surrogate_env_name();
+    let script = format!(
+        "curl -sS -k --max-time 20 -o /dev/null \\
+           -w 'CONN=%{{num_connects}} CODE=%{{http_code}}\\n' \\
+           -H \"Authorization: Bearer ${{{variable}}}\" \\
+           https://{FIXTURE_HOST}:{port}/first \\
+           https://{FIXTURE_HOST}:{port}/second",
+        port = f.origin.port
+    );
+    let child = Command::new(cargo_bin("asv"))
+        .arg("--socket")
+        .arg(&f.sock)
+        .arg("run")
+        .arg("sh")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("two requests on one tunnel");
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    let stderr = String::from_utf8_lossy(&child.stderr);
+
+    // The first request works, on one connection. Without this the rest of the
+    // test would be measuring a broken setup.
+    assert!(
+        stdout.contains("CONN=1 CODE=200"),
+        "the first request did not complete on one connection: {stdout}\n{stderr}"
+    );
+
+    // The measured limit, asserted rather than merely described. If this ever
+    // goes green the gap is closed and the comment above is wrong, which is the
+    // signal to rewrite both.
+    let served = stdout.matches("CODE=200").count();
+    assert_eq!(
+        served, 1,
+        "the tunnel served {served} requests where it is documented to serve one; if \
+         this ever goes green the limit above is stale and both need rewriting: \
+         {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("CONN=0"),
+        "curl opened a second connection instead of reusing the tunnel, so this \
+         measurement is about something else: {stdout}\n{stderr}"
+    );
+
+    // The part that must not move. If the broker ever starts forwarding a
+    // second request without rewriting it, the destination receives a surrogate
+    // it cannot spend, and this assertion is what would notice.
+    let seen = f.origin.saw();
+    assert_eq!(
+        f.origin.real_credential_requests(),
+        1,
+        "the destination received the credential more than once: \n{seen}"
+    );
+    assert!(
+        !seen.contains(&f.surrogate_env_name()),
+        "a variable name in the destination's bytes would mean a token arrived: \n{seen}"
+    );
+    assert!(
+        !stdout.contains(REAL) && !stderr.contains(REAL),
+        "the real credential appeared outside the destination: \n{stdout}\n{stderr}"
+    );
 }
 
 // ---------------------------------------------------------------------------

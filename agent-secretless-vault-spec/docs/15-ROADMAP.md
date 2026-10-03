@@ -1711,11 +1711,15 @@ adversarial campaign and the concurrency work are C2.7 and C2.8, not this block.
 
 ## C2.7 — CONNECT as a product capability, not an internal surface
 
-### Status: A, B and C landed; the end-to-end vertical does not exist yet
+### Status: closed — A, B, C and the end-to-end vertical all landed
 
-The three prerequisites below are prerequisites, not the vertical. **C2.7 is
-not closed**, and nothing here should be read as a claim that `asv run` can
-drive a real credentialed request.
+**C2.7 is closed.** The vertical below drives a real credentialed request from
+`asv run` through a real broker to a real origin with an ordinary `curl`, and
+every assertion in it was falsified before this line was written. What remains
+for this path is C2.8: the adversarial campaign and the concurrency work, which
+are properties of the running system rather than of a single request.
+
+The three prerequisites below were prerequisites, not the vertical.
 
 ### C2.7-A — the shim had a lifecycle no owner could end
 
@@ -1884,7 +1888,61 @@ the recorded outcome, the recorded destination, the surrogate handed to the chil
 — and requires the *named* assertion to go red. Five of five, and a run that
 fails for any other reason counts as an escape rather than as a pass.
 
-## After v1.0 — M14 through M18
+## C2.8 — CONNECT in production, and the first thing that is not
+
+### Status: open. The first measurement is in, and it is not a security finding
+
+V1-C2's scope, written when the block was opened and not narrowed since: *a
+production listener wiring `relay_substituted` into a running `asv-brokerd`,
+real CONNECT lifecycle, **more than one request per tunnel where the protocol
+allows**, a formal decision on freshness and replay, **shutdown and revoke
+mid-tunnel**, **stress and cancellation**, and observability that carries no
+sensitive material.* The listener, the lifecycle and the freshness decision are
+delivered by C2.6 and C2.7. The rest is this block.
+
+The first thing measured in it is the bolded one, and it is worth stating
+plainly because it is the kind of limit a demo never shows.
+
+**A CONNECT tunnel serves exactly one request, and HTTP/1.1 clients reuse their
+connections.** Against the real broker, with an origin that keeps the connection
+open and an ordinary `curl` told nothing but a proxy URL:
+
+```text
+CONN=1 CODE=200      the first request, on one connection
+CONN=0 CODE=000      the second, curl reusing that same connection
+```
+
+`CONN=0` is the half that carries the meaning. `curl` did not open a second
+connection; it reused the tunnel and got nothing back. So the second request is
+not being refused by the destination — **the destination never sees it**.
+
+The cause is in `relay_substituted`. It reads one head, writes the rewritten one,
+and then `relay_back` copies the response direction until EOF or a byte limit.
+The request direction is never pumped again, so a second request sits in a socket
+buffer that nobody reads. This is the shape of ordinary traffic rather than an
+edge case, and the failure is opaque: a client sees a dead transfer with no
+explanation, not a refusal.
+
+**What still holds, and why that distinction matters.** The destination never
+received a second request, so it never received a second copy of the credential,
+and nothing forwarded a surrogate it could not spend. The gap is availability and
+opacity, not disclosure. Recording that precisely is not a way of making it
+smaller — "the second request fails" and "the second request leaks something"
+call for different work, and only one of them is a security defect.
+
+`a_tunnel_serves_one_request_and_the_protocol_allows_more` in
+`crates/broker/tests/connect_vertical_e2e.rs` is the measurement held in the
+suite. It is a characterization and says so: it asserts the limit, and it goes
+red if the tunnel ever serves two — the signal that both the limit and its
+comment have become stale.
+
+**Still owed in this block.** Shutdown and revoke *mid-tunnel* — the shim's own
+teardown is measured and the session's revocation is measured, but a tunnel
+revoked while bytes are flowing is not. Stress and cancellation. And the
+observability sweep, which is the part most likely to be wrong in a way nobody
+is looking for.
+
+
 
 Adopted from `docs/asv-agent-first-security-evolution-v2-2026-10-02/`. **This
 section is the integration point, and it is the only one.** The pack remains
