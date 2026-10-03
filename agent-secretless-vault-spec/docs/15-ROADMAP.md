@@ -1890,7 +1890,7 @@ fails for any other reason counts as an escape rather than as a pass.
 
 ## C2.8 — CONNECT in production, and the first thing that is not
 
-### Status: open. Four measurements in. The third found three defects and the fourth found a fourth — all of them sat under a green test, and all four are fixed
+### Status: open. Four measurements in; the third found three defects and the fourth a fourth, all four sat under green tests and all four are fixed. The fifth is owed as a real increment: a multi-request relay needs an HTTP framing layer this broker does not have
 
 V1-C2's scope, written when the block was opened and not narrowed since: *a
 production listener wiring `relay_substituted` into a running `asv-brokerd`,
@@ -2138,6 +2138,36 @@ uses per session do not come close to a real `npm`, `Maven` or `Gradle` run. Any
 multi-request relay has to re-derive both numbers from a measurement like the
 table above rather than from a round power of two, and the re-derivation is
 work that is **owed, not done** — the relay itself is still the next increment.
+
+**And the increment is bigger than "add a loop", which is worth writing down
+before anyone starts it.** The obvious design is a loop: read the next
+`\r\n\r\n`, substitute, write, repeat. It is wrong, and the reason is that
+`\r\n\r\n` only frames a head when a head is what comes next — which is true
+of the *first* head on a connection and false of every head after a request
+body. After a `POST`, the bytes between the head and the next request are the
+body, and a body can contain `\r\n\r\n` itself, so "scan for the terminator"
+would substitute a credential into the middle of someone's form post.
+
+So a correct multi-request relay needs an HTTP framing layer this codebase
+deliberately does not have: `Content-Length` and `Transfer-Encoding: chunked` on
+the response side, the same on the request side, and — the part that is a
+judgement rather than an implementation — what the tunnel does with a response
+it cannot frame. The posture this repository takes everywhere else is the
+answer: **refuse, do not guess.** A tunnel that cannot frame a response ends
+there rather than forwarding a credential into a stream whose boundaries it
+does not know, and the client reconnects, which is what an HTTP client does
+anyway. That is defensible, and it is also a real layer of new code in the
+most security-sensitive part of the broker, which is why it is owed as an
+increment and not slipped in at the end of a block that has already found four
+defects in this path.
+
+The two-dimensional relay also has a cost that has to be chosen rather than
+inherited: both directions need the same `rustls::ServerConnection`, so it
+cannot be split across two threads, and it cannot block on one direction while
+the other has data. A poll interval small enough not to add latency to a
+keep-alive round trip makes revocation *faster* than today's 250 ms and costs
+CPU proportional to the number of idle tunnels open. Both numbers are
+decisions, and neither should be a default nobody wrote down.
 
 **Still owed in this block.** More than one request per tunnel where the
 protocol allows — the characterisation above stands and is not yet a fix. Stress
