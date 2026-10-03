@@ -1062,16 +1062,101 @@ pub trait SubstitutionAudit {
 pub struct RelayLimits {
     /// Largest inner request head that will be read from the client.
     pub max_head: usize,
-    /// Largest number of response bytes relayed back to the client.
+    /// Largest number of response bytes relayed back to the client, for the
+    /// whole life of the tunnel.
     pub max_response: usize,
+    /// Largest number of request bytes forwarded upstream, for the whole life of
+    /// the tunnel.
+    ///
+    /// The mirror of `max_response`, and it exists because a relay with one
+    /// bound and not the other has a direction nobody measured. A client that
+    /// can push 64 MiB upstream and receive 1 KiB back is not a client being
+    /// helped; it is a direction with no accounting.
+    pub max_forwarded: usize,
+    /// How many requests this one tunnel may carry.
+    ///
+    /// **A per-connection bound, not the spend budget.** The session's
+    /// `MAX_SURROGATE_USES` is what bounds how much a session can spend; this
+    /// is what stops a single connection from monopolising it, and it is
+    /// therefore required to stay *below* that ceiling. The invariant
+    /// `a_tunnel_is_bounded_below_its_sessions_own_ceiling` fails the build's
+    /// tests if that ever stops being true — because a tunnel that hits this
+    /// first fails for a reason that has nothing to do with the session it
+    /// belongs to, and an operator reading that failure would look in the wrong
+    /// place.
+    ///
+    /// Sized against the same measurement as the other limits: a trivial
+    /// `npm install express` is 93 requests, so this is roughly forty times a
+    /// workload that already needs a real client.
+    pub max_requests: usize,
 }
 
 impl Default for RelayLimits {
     fn default() -> Self {
+        // 64 MiB per direction. The measurement that set it:
+        // `npm install --loglevel=http express`, 65 packages, 2.1 MiB of
+        // installed content — and that is a *trivial* install, at which the old
+        // 1 MiB lifetime cap was already reached before the first large tarball.
         Self {
             max_head: 8 * 1024,
-            max_response: 1024 * 1024,
+            max_response: 64 * 1024 * 1024,
+            max_forwarded: 64 * 1024 * 1024,
+            max_requests: 4096,
         }
+    }
+}
+
+/// The two bounds a tunnel lives under, and the relationship between them.
+///
+/// One test rather than two, because the relationship is the property. A
+/// per-tunnel cap above the session's own ceiling is redundant; one below it
+/// means a connection dies for a reason that has nothing to do with the session
+/// holding it, and the failure looks like a tunnel bug.
+#[cfg(test)]
+mod relay_limit_tests {
+    use super::RelayLimits;
+    use asv_ipc_protocol::MAX_SURROGATE_USES;
+
+    #[test]
+    fn a_tunnel_is_bounded_below_its_sessions_own_ceiling() {
+        let limits = RelayLimits::default();
+        assert!(
+            limits.max_requests <= MAX_SURROGATE_USES as usize,
+            "one tunnel may carry {} requests and a session may only pay for {}; the \
+             connection would then be refused for a reason that has nothing to do \
+             with the session it belongs to",
+            limits.max_requests,
+            MAX_SURROGATE_USES
+        );
+    }
+
+    #[test]
+    fn both_directions_are_budgeted() {
+        // The direction that was missing, named in the failure message of the
+        // one that exists, so the next person to add a field notices there are
+        // two.
+        let limits = RelayLimits::default();
+        assert_eq!(
+            limits.max_forwarded, limits.max_response,
+            "the request direction has a different budget from the response \
+             direction, which means one of them was chosen and the other was \
+             inherited"
+        );
+    }
+
+    #[test]
+    fn the_defaults_cleared_a_measured_workload() {
+        // The measurement, kept as an assertion so the numbers cannot drift away
+        // from the reason they were chosen. 93 requests and 2.1 MiB for
+        // `npm install express`; these are roughly 44x and 30x that, which is
+        // the headroom a real build needs over a trivial one.
+        let limits = RelayLimits::default();
+        assert!(limits.max_requests >= 93 * 10, "{}", limits.max_requests);
+        assert!(
+            limits.max_response >= 3 * 1024 * 1024,
+            "{}",
+            limits.max_response
+        );
     }
 }
 

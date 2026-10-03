@@ -495,7 +495,7 @@ pub enum Response {
 /// choose an unbounded TTL would make the whole expiry mechanism advisory, so
 /// this constant is not a default the broker falls back to, it is a limit the
 /// broker enforces over the client's request.
-pub const MAX_SURROGATE_TTL_SECS: u64 = 900;
+pub const MAX_SURROGATE_TTL_SECS: u64 = 3600;
 
 /// Hard ceiling on a surrogate's use budget.
 ///
@@ -509,13 +509,29 @@ pub const MAX_SURROGATE_TTL_SECS: u64 = 900;
 /// `curl` session gets eight credentialed operations and then every further
 /// request is refused as exhausted, which no ordinary client can live with.
 ///
-/// The ceiling follows the broker's own declared intent (`32`) rather than a
-/// number invented here, and `session_mint_survives_the_protocol_ceiling` in
+/// The ceiling follows the broker's own declared intent rather than a number
+/// invented here, and `session_mint_survives_the_protocol_ceiling` in
 /// `crates/broker/src/lib.rs` fails if the two ever diverge again — silently,
 /// through `clamp`, which is how this went unnoticed until a session
 /// demonstrated it by completing exactly eight tunnels out of the sixty-four
 /// it was asked for.
-pub const MAX_SURROGATE_USES: u32 = 32;
+///
+/// **Raised from 32 on a measurement, not on a hunch.** A budget of 32 is a
+/// third of a trivial install: `npm install --loglevel=http express` on a
+/// throwaway package, 65 packages, makes **93** HTTPS requests. A client would
+/// have been refused at request 33 — a third of the way through the smallest
+/// workload anyone would call a build. 8192 leaves a session enough authority
+/// for a large build and still refuses it rather than becoming unbounded, and
+/// the number is a *spend* budget: the bound on how many credentialed
+/// operations one session may perform, which is a security boundary and not a
+/// throughput tuning knob.
+///
+/// It is deliberately larger than one tunnel's own `max_requests`, so the
+/// session budget is what bounds a session and a single connection is bounded
+/// below it. The reverse — a per-tunnel cap tighter than the session ceiling —
+/// would mean a tunnel failing for a reason that has nothing to do with the
+/// session it belongs to.
+pub const MAX_SURROGATE_USES: u32 = 8192;
 
 /// Serializable view of credential metadata.
 ///

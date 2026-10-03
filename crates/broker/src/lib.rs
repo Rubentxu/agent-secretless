@@ -2923,6 +2923,45 @@ mod tests {
         );
     }
 
+    /// The same property for the **TTL**, which had none.
+    ///
+    /// `mint` clamps both arguments, silently: `let ttl = ttl_secs.clamp(1,
+    /// MAX_SURROGATE_TTL_SECS)`. The uses clamp had a test and was found and
+    /// fixed; the TTL clamp is the same line of code and had nobody looking at
+    /// it, so it was live the whole time — the broker asking for an hour and
+    /// every surrogate it minted living fifteen minutes, with the wire
+    /// reporting the clamped number and nothing in the log saying otherwise.
+    ///
+    /// It matters for the relay rather than in the abstract. A surrogate is
+    /// minted once per session and spent once per request, so the TTL is the
+    /// wall-clock budget for a whole workload: at fifteen minutes a large build
+    /// has its credential authority expire in the middle, and the failure looks
+    /// like a client problem rather than like a ceiling.
+    #[test]
+    fn a_session_surrogate_survives_the_protocol_ceiling_on_time_too() {
+        let (store, session, _key) = session_with_key("ttl-ceiling", 3);
+        let _ = store;
+        let mut registry = SurrogateRegistry::default();
+        let (_, expires_at, _) = registry
+            .mint(
+                session,
+                CredentialId::from_wire("00000000-0000-4000-8000-000000000001").expect("wire id"),
+                CredentialClass::Generic,
+                SESSION_SURROGATE_TTL_SECS,
+                SESSION_SURROGATE_MAX_USES,
+                0,
+            )
+            .expect("mint");
+        assert_eq!(
+            expires_at, SESSION_SURROGATE_TTL_SECS,
+            "the protocol ceiling silently cut the surrogate lifetime from {}s to \
+             {expires_at}s; every surrogate the broker mints then dies at a quarter \
+             of the time the broker asked for, in the middle of whatever workload \
+             it was meant to cover",
+            SESSION_SURROGATE_TTL_SECS
+        );
+    }
+
     /// The same property, with a **gap** between the arrivals.
     ///
     /// The test above is the case the window was written for, and it is the one
