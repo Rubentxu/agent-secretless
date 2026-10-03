@@ -334,35 +334,66 @@ impl ConnectionHandler for SubstitutingHandler {
     }
 }
 
-/// Classify a CONNECT failure as a wire name, without quoting the failure.
+/// The class a CONNECT failure is recorded and logged under.
 ///
-/// **This function exists because the obvious thing is a leak.** `BridgeError`
-/// is `Display`, and several of its variants interpolate bytes the *client*
-/// sent: `parse_connect_target` builds `Protocol(format!("{authority} has no
-/// port"))` and `Protocol(format!("{host}: {e}"))` from the request line. So
-/// `ConnectionResult::Refused(reason)` carries attacker-controlled text, and
-/// writing that into the durable audit chain would let any client put bytes of
-/// their choosing — a secret-shaped string included — into a file that gets
-/// exported, hashed and shipped.
+/// **One function, derived from the error's *kind*, used by both surfaces.** It
+/// used to be two, and they were not the same function: this one existed and
+/// was correct, and production did not call it — the chain went through
+/// `refusal_class_from_text`, which recovered a class by matching on the
+/// rendered message. They disagreed for most variants (`NoSessionProof` is
+/// `proof_rejected` by text and `other` by kind), which is exactly the failure
+/// mode `cancellation_class` documents: *a class derived by searching a
+/// human-readable message is a class that changes when somebody improves the
+/// message*.
 ///
-/// The chain therefore gets a class, and the class is derived from the error's
-/// *kind*, never from its rendering. What an operator loses is the exact
-/// wording; what they keep is the ability to count, alert on and correlate
-/// refusals by cause, which is what an audit chain is for. The full text stays
-/// in the operator log, which is the surface that already exists to hold
-/// diagnostic detail and is not the artefact that leaves the machine.
+/// The names are the ones `AuditEventDto::ConnectHandled` already documents, and
+/// the two tests that pin them keep passing — which is the point of writing the
+/// contract down in the protocol crate rather than in the reporter.
 pub fn refusal_class(error: &BridgeError) -> &'static str {
     match error {
-        BridgeError::Connect(_) => "connect_rejected",
+        BridgeError::Connect(_) => "destination_not_allowed",
         BridgeError::Redirect(_) => "redirect_rejected",
-        BridgeError::Leaf(_) => "leaf_unavailable",
+        BridgeError::Leaf(_) | BridgeError::NoLeaf(_) => "leaf_unavailable",
         BridgeError::Protocol(_) => "malformed_request",
-        BridgeError::NoLeaf(_) => "leaf_unavailable",
+        BridgeError::NoSessionProof => "proof_rejected",
         BridgeError::Io(_) => "io_error",
         BridgeError::Handshake(_) => "tls_failure",
         BridgeError::Substitution(_) => "substitution_refused",
         BridgeError::Cancelled(_) => "cancelled",
-        _ => "other",
+        // The variant the old `_ => "other"` was swallowing. Every other
+        // arm here was reachable before the match became exhaustive, and this
+        // one is the reason it did: a `Connect` that fails to reach the
+        // destination was recorded as a class an operator could not act on.
+        // Writing the arm down is cheaper than the incident that finds it.
+        BridgeError::Upstream(_) => "upstream_unreachable",
+    }
+}
+
+/// The operator-facing detail for a failure, or `None` when the error's text is
+/// a copy of what the client sent.
+///
+/// **The rule is about provenance, not about length or about secrets.** An
+/// operator should not lose the wording of a fact about their own broker, and
+/// should not be handed a stranger's sentence. So the text travels when it is
+/// built from state the broker validated — a canonicalised host, an I/O error
+/// from a socket, a handshake failure, a refused substitution's constant — and
+/// is dropped when it is a verbatim copy of the request.
+///
+/// `Protocol` is the only such variant, and it is the one that carried the
+/// measured injection: `parse_connect_target` runs before the proof is
+/// authenticated, so its text is whatever an unauthenticated peer wrote into
+/// the CONNECT line.
+///
+/// `Connect` keeps its detail, and that is a judgement worth stating: the text
+/// names the host the client asked for, which a client *chose* — but
+/// `Authority::canonicalize` has already validated it by the time the policy
+/// refuses, so it is a bounded, well-formed name and the single most useful
+/// thing on the line. The chain records the same destination in its own field,
+/// so neither surface is relying on this one.
+pub fn refusal_detail(error: &BridgeError) -> Option<String> {
+    match error {
+        BridgeError::Protocol(_) => None,
+        other => Some(other.to_string()),
     }
 }
 
@@ -370,12 +401,12 @@ pub fn refusal_class(error: &BridgeError) -> &'static str {
 ///
 /// Three wire names and a class, none of which is the error's own text. Kept
 /// next to [`refusal_class`] so the two cannot drift apart: adding a
-/// `BridgeError` variant without adding a class here would fall into `_ =>
-/// "other"` and an operator would see every new failure lumped together.
+/// `BridgeError` variant without adding a class here would be a compile error
+/// rather than a silent fallthrough, because the match is exhaustive.
 pub fn outcome_wire_name(result: &ConnectionResult) -> &'static str {
     match result {
         ConnectionResult::Completed => "completed",
-        ConnectionResult::Refused(_) => "refused",
+        ConnectionResult::Refused { .. } => "refused",
         ConnectionResult::Cancelled(_) => "cancelled",
     }
 }
@@ -469,15 +500,28 @@ impl ListenerReport for ChainReport {
         let verdict = outcome_wire_name(&outcome.result);
         let detail = match &outcome.result {
             ConnectionResult::Completed => "completed".to_string(),
-            ConnectionResult::Refused(reason) => refusal_class_from_text(reason).to_string(),
+            // The class, as given. Not recovered from a string: the two
+            // surfaces read the same field, so a chain and a log line about one
+            // connection cannot say different things.
+            ConnectionResult::Refused { class, .. } => (*class).to_string(),
             ConnectionResult::Cancelled(reason) => cancellation_class(*reason).to_string(),
         };
         match &outcome.result {
             ConnectionResult::Completed => {
                 tracing::info!(%destination, session = ?outcome.session, "CONNECT completed");
             }
-            ConnectionResult::Refused(reason) => {
-                tracing::warn!(%destination, session = ?outcome.session, %reason, "CONNECT refused");
+            ConnectionResult::Refused { class, detail } => {
+                // `detail` is the error's own text when it is a fact about this
+                // broker, and absent when it would be a copy of what the client
+                // sent. `a_client_with_no_credential_cannot_write_its_own_text_into_the_operator_log`
+                // is what holds that line.
+                tracing::warn!(
+                    %destination,
+                    session = ?outcome.session,
+                    %class,
+                    ?detail,
+                    "CONNECT refused"
+                );
             }
             ConnectionResult::Cancelled(reason) => {
                 tracing::info!(%destination, session = ?outcome.session, %reason, "CONNECT cancelled");
@@ -512,36 +556,6 @@ impl ListenerReport for ChainReport {
             }
         }
         self.inner.record(outcome);
-    }
-}
-
-/// Recover a class from a rendered refusal, for the case where only the string
-/// survived.
-///
-/// `ConnectionResult::Refused` carries a `String` rather than the error, so
-/// the class cannot be recomputed at the far end — the kind is gone. Rather
-/// than widen `ConnectionResult` to carry both (which would change the type
-/// `connect_listener` produces and every test that matches on it), the class
-/// is matched back out of the text by its stable prefix.
-///
-/// This is a compromise and it is recorded as one: the audit chain is written
-/// from the string, so a future `BridgeError` whose `Display` does not begin
-/// with one of these prefixes lands in `"other"`. The prefixes are the error
-/// format strings, which are far more stable than an enum discriminant would
-/// be in a protocol crate.
-fn refusal_class_from_text(reason: &str) -> &'static str {
-    if reason.starts_with("malformed CONNECT request") {
-        "malformed_request"
-    } else if reason.starts_with("destination not allowed") {
-        "destination_not_allowed"
-    } else if reason.starts_with("no session proof") || reason.starts_with("session") {
-        "proof_rejected"
-    } else if reason.starts_with("no leaf") || reason.contains("leaf") {
-        "leaf_unavailable"
-    } else if reason.contains("poisoned") {
-        "broker_fault"
-    } else {
-        "other"
     }
 }
 

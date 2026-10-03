@@ -36,11 +36,17 @@ fn target(host: &str, port: u16) -> AuthorityEndpoint {
         .expect("valid endpoint")
 }
 
-fn refused(reason: &str) -> ConnectionOutcome {
+/// A refusal as `connect_listener` now builds it: a class derived from the
+/// error's kind, and a detail that is `None` when the error's text would be a
+/// copy of what the client sent.
+fn refused(class: &'static str, detail: Option<&str>) -> ConnectionOutcome {
     ConnectionOutcome {
         target: Some(target("example.test", 443)),
         session: Some("s-1".into()),
-        result: ConnectionResult::Refused(reason.into()),
+        result: ConnectionResult::Refused {
+            class,
+            detail: detail.map(str::to_string),
+        },
     }
 }
 
@@ -48,16 +54,19 @@ fn report(log: &Arc<Mutex<AuditLog>>) -> ChainReport {
     ChainReport::new(Arc::new(DiscardReport), Arc::clone(log))
 }
 
-/// A refusal is recorded, the class survives, and **the canary does not**.
+/// A refusal is recorded as a class, and the detail never reaches the chain.
 ///
-/// The reason string is exactly what `parse_connect_target` would produce for
-/// a hostile request line, which is the shape the finding took.
+/// The detail is exactly what `parse_connect_target` would have produced for a
+/// hostile request line, which is the shape the finding took — except that the
+/// listener now drops it before this point, and the point of the test is that
+/// the chain does not depend on that having happened. A reporter that reached
+/// for a reason would be reintroduced here without failing anything else.
 #[test]
-fn a_refusal_is_recorded_as_a_class_and_never_quotes_the_reason() {
+fn a_refusal_is_recorded_as_a_class_and_never_quotes_the_detail() {
     let log = Arc::new(Mutex::new(AuditLog::new(0)));
-    let reason = format!("malformed CONNECT request: {CANARY} has no port");
+    let detail = format!("malformed CONNECT request: {CANARY} has no port");
 
-    report(&log).record(refused(&reason));
+    report(&log).record(refused("malformed_request", Some(&detail)));
 
     let rendered = {
         let log = log.lock().expect("nobody holds this");
@@ -69,13 +78,50 @@ fn a_refusal_is_recorded_as_a_class_and_never_quotes_the_reason() {
     };
     assert!(
         !rendered.contains(CANARY),
-        "the refusal reason reached the durable chain, and a client chooses \
+        "the refusal detail reached the durable chain, and a client chooses \
          those bytes: {rendered}"
     );
     assert!(
         rendered.contains("malformed_request"),
         "the class must be recorded, or an operator cannot count refusals by \
          cause: {rendered}"
+    );
+}
+
+/// A refusal with no detail is still a refusal the chain can be read from.
+///
+/// The shape `refusal_detail` produces for every client-echoing error, and the
+/// reason it needs its own test: a reporter that treated a missing detail as a
+/// reason to skip the record would leave the chain with a gap, and a chain with
+/// gaps fails verification for everybody after it.
+#[test]
+fn a_refusal_without_a_detail_is_still_recorded_with_its_class() {
+    let log = Arc::new(Mutex::new(AuditLog::new(0)));
+
+    report(&log).record(refused("malformed_request", None));
+
+    let rendered = {
+        let log = log.lock().expect("nobody holds this");
+        assert!(
+            log.verify().is_ok(),
+            "an appended record must not break the chain it belongs to"
+        );
+        format!("{:?}", log.query(0))
+    };
+    assert!(
+        rendered.contains("refused") && rendered.contains("malformed_request"),
+        "a refusal with no detail left no usable record, so the chain would look \
+         like the connection never happened: {rendered}"
+    );
+    // The structural check second, and last on purpose. First it was the other
+    // way round, and a reporter that skipped the record failed on a bare
+    // `assert_eq!` against an empty string — the test caught it, and told
+    // nobody what it had found. A gate that fires first should be the one whose
+    // failure message a human wants to read.
+    assert_eq!(
+        rendered.matches("ConnectHandled").count(),
+        1,
+        "the record is not exactly one connect_handled entry: {rendered}"
     );
 }
 
@@ -89,16 +135,18 @@ fn a_refusal_is_recorded_as_a_class_and_never_quotes_the_reason() {
 fn a_relay_failure_reason_does_not_reach_the_chain_either() {
     let log = Arc::new(Mutex::new(AuditLog::new(0)));
 
-    for reason in [
-        format!("no credential in the request: {CANARY}"),
-        format!("surrogate not redeemable: {CANARY}"),
-        format!("{CANARY}: the origin hung up"),
+    for (class, detail) in [
+        (
+            "substitution_refused",
+            format!("no credential in the request: {CANARY}"),
+        ),
+        (
+            "substitution_refused",
+            format!("surrogate not redeemable: {CANARY}"),
+        ),
+        ("io_error", format!("{CANARY}: the origin hung up")),
     ] {
-        report(&log).record(ConnectionOutcome {
-            target: Some(target("example.test", 443)),
-            session: None,
-            result: ConnectionResult::Refused(reason),
-        });
+        report(&log).record(refused(class, Some(&detail)));
     }
 
     let rendered = format!("{:?}", log.lock().expect("nobody holds this").query(0));
@@ -153,7 +201,10 @@ fn cancellation_and_refusal_are_distinguishable_in_the_chain() {
     report.record(ConnectionOutcome {
         target: Some(target("example.test", 443)),
         session: Some("s-2".into()),
-        result: ConnectionResult::Refused("destination not allowed".into()),
+        result: ConnectionResult::Refused {
+            class: "destination_not_allowed",
+            detail: Some("CONNECT tunnel not allowed: example.test:443".into()),
+        },
     });
 
     let rendered = format!("{:?}", log.lock().expect("nobody holds this").query(0));
@@ -200,7 +251,10 @@ fn a_long_chain_of_connect_outcomes_still_verifies() {
             target: Some(target("example.test", 443)),
             session: Some(format!("s-{i}")),
             result: if i % 3 == 0 {
-                ConnectionResult::Refused("malformed CONNECT request: nope".into())
+                ConnectionResult::Refused {
+                    class: "malformed_request",
+                    detail: None,
+                }
             } else {
                 ConnectionResult::Completed
             },
@@ -217,8 +271,13 @@ fn a_long_chain_of_connect_outcomes_still_verifies() {
 /// A `BridgeError` classifies without rendering, and the classes stay distinct.
 ///
 /// The rendering is what carries client bytes, so this asserts the *other*
-/// half: that classifying did not collapse every failure into one bucket, which
-/// is what a lazy `_ => "other"` would do.
+/// half: that classifying did not collapse every failure into one bucket.
+///
+/// The catch-all is gone — the match is exhaustive, so a new variant is a
+/// compile error rather than a silent `other` — which means the old
+/// `!classes.contains(&"other")` assertion has nothing left to check. Removing
+/// it is the honest move: an assertion that cannot fail is not a measurement,
+/// and this block has already found two of them.
 #[test]
 fn distinct_bridge_errors_classify_distinctly() {
     use asv_broker::connect_runtime::refusal_class;
@@ -237,8 +296,60 @@ fn distinct_bridge_errors_classify_distinctly() {
         "four different failures produced {classes:?}; an operator cannot \
          count refusals by cause if the causes share a name"
     );
+}
+
+/// The detail is dropped for exactly the errors whose text is the client's.
+///
+/// The provenance rule, stated as a test because it is a judgement and
+/// judgements are where the next change goes wrong. `Protocol` is the only
+/// variant dropped, and it is the one the measured injection used: its text is
+/// the CONNECT request line, interpolated by `parse_connect_target` before the
+/// session proof has been looked at.
+///
+/// `Connect` keeps its detail, which is the other half of the judgement and the
+/// one a future reader is most likely to overturn by accident. Its text names
+/// the host the client asked for — a client *chose* it — but
+/// `Authority::canonicalize` has already validated it by the time the policy
+/// refuses, so it is a bounded, well-formed name, and it is the single most
+/// useful thing on the line.
+#[test]
+fn the_detail_is_dropped_for_exactly_the_errors_that_quote_the_client() {
+    use asv_broker::connect_runtime::{refusal_class, refusal_detail};
+
+    let client_quote = format!("malformed CONNECT request: {CANARY} has no port");
+    let protocol = BridgeError::Protocol(client_quote);
+    assert_eq!(refusal_class(&protocol), "malformed_request");
+    assert_eq!(
+        refusal_detail(&protocol),
+        None,
+        "the error whose text is a copy of the request line still offers that \
+         text to the operator's log"
+    );
+
+    // A fact about the broker, and it stays.
+    let upstream = BridgeError::Upstream(format!("{CANARY}: the origin hung up"));
+    assert_eq!(refusal_class(&upstream), "upstream_unreachable");
     assert!(
-        !classes.contains(&"other"),
-        "a known variant fell through to the catch-all: {classes:?}"
+        refusal_detail(&upstream)
+            .unwrap_or_default()
+            .contains("origin hung up"),
+        "a broker-side fact lost its detail, so the line an operator reads says \
+         only that something failed"
+    );
+    assert!(
+        !refusal_detail(&upstream).unwrap_or_default().is_empty(),
+        "an empty detail is not a detail"
+    );
+
+    // And the credential-shaped case: a constant in this codebase is not a
+    // client echo, so it travels, and the rule is about provenance rather than
+    // about whether the text looks sensitive.
+    let substitution =
+        BridgeError::Substitution(asv_broker::tls_bridge::SubstitutionError::NoCredential);
+    assert_eq!(refusal_class(&substitution), "substitution_refused");
+    assert!(
+        refusal_detail(&substitution).is_some(),
+        "a constant message is not a client echo and must not be dropped for being \
+         one"
     );
 }

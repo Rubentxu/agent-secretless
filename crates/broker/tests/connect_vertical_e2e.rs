@@ -1539,3 +1539,188 @@ fn a_route_the_policy_does_not_permit_is_refused_at_load() {
         "the refusal did not say why:\n{text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The observability sweep
+// ---------------------------------------------------------------------------
+
+/// The address the broker said it was listening on, read out of its own log.
+///
+/// Taken from the log rather than from a flag or a fixture argument for the
+/// same reason the concurrency test reads its refusals from there: the fixture
+/// launches the real binary and the log is the only channel it has. The
+/// circularity is benign — the address is a startup fact, and the thing under
+/// test is what arrives *after* it.
+fn connect_address_from_log(path: &std::path::Path) -> SocketAddr {
+    let log = std::fs::read_to_string(path).expect("read the broker log");
+    // `tracing_subscriber::fmt()` colourises, and the escape sequences land
+    // either side of the field. Stripped rather than worked around: a fixture
+    // that only parses the log when the terminal is a terminal is a fixture
+    // that reports "no address" on half the machines it runs on.
+    let plain = strip_ansi(&log);
+    plain
+        .lines()
+        .filter_map(|line| line.split("bound=").nth(1))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .find_map(|addr| addr.parse().ok())
+        .expect("the broker logged where it is listening")
+}
+
+/// Remove CSI escape sequences.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // `ESC [ … final-byte`, and the final byte is in `@`..=`~`.
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Waits for `needle` to appear in the broker's log, bounded.
+fn log_gains(log: &std::path::Path, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .contains(needle)
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// The broker's own log carries neither the credential nor a surrogate.
+///
+/// The vertical already proved the child's `argv`, its environment, its output
+/// and the durable chain are clean. The operator's log is the surface that was
+/// never checked, and it is the one an operator actually reads while something
+/// is going wrong — so "it is not in the chain" says very little about it.
+///
+/// The control is the line that has to be there. A grep over an empty file
+/// finds nothing and reports a pass, and an observer that is switched off is
+/// indistinguishable from an observer that does not exist.
+#[test]
+fn the_brokers_own_log_carries_neither_the_credential_nor_a_surrogate() {
+    let f = Fixture::new("observability");
+    let variable = f.surrogate_env_name();
+    let script = format!(
+        "curl -sS -k --max-time 20 -o /dev/null -w '%{{http_code}}' \
+           -H \"Authorization: Bearer ${{{variable}}}\" \
+           https://{FIXTURE_HOST}:{port}/resource; echo",
+        port = f.origin.port
+    );
+    let ran = Command::new(cargo_bin("asv"))
+        .arg("--socket")
+        .arg(&f.sock)
+        .arg("run")
+        .arg("sh")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("a session that reaches the origin");
+    assert!(
+        String::from_utf8_lossy(&ran.stdout).contains("200"),
+        "the session never reached the origin, so nothing was substituted and the \
+         log sweep would be measuring an idle broker:\n{}\n{}",
+        String::from_utf8_lossy(&ran.stdout),
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert!(f.origin.wait_for_requests(1));
+
+    let log_path = f.dir.join("broker.log");
+    assert!(
+        log_gains(&log_path, "CONNECT tunnel relayed", Duration::from_secs(30)),
+        "the broker never logged relaying a tunnel; the log is not what this test \
+         thinks it is"
+    );
+    let log = std::fs::read_to_string(&log_path).expect("read the broker log");
+
+    assert!(
+        !log.contains(REAL),
+        "the real credential reached the operator's log:\n{log}"
+    );
+    // `asv1_` is the surrogate prefix, declared in `surrogate.rs` so a token is
+    // never mistaken for a credential during triage. A log carrying one would
+    // be a log carrying a spendable bearer token.
+    assert!(
+        !log.contains("asv1_"),
+        "a surrogate reached the operator's log, so anything holding that file \
+         holds a spendable token:\n{log}"
+    );
+}
+
+/// A client with no credential cannot write its own words into the operator's
+/// log.
+///
+/// **This is a claim, and it is red.** It is written as a claim rather than as
+/// a characterisation because the thing it names is not a judgement call: a
+/// client that never proves anything can put arbitrary bytes into a file the
+/// operator reads, and the mechanism is short —
+///
+/// `parse_connect_target` runs **before** the session proof is authenticated
+/// (the order in `serve_connect` is head, then target, then authorisation, then
+/// proof), and `ConnectTargetError::NoPort` carries the request line's authority
+/// verbatim. So `CONNECT <anything-without-a-colon>` writes `<anything>` into
+/// the log, unvalidated and uncredited, up to the message bound.
+///
+/// The durable chain is already protected against exactly this, by
+/// `refusal_class`; the operator's line was left carrying the raw text on the
+/// judgement that it is "the surface that already exists to hold diagnostic
+/// detail". The chain's own comment calls that text *attacker-controlled*, and
+/// the reachability here is unauthenticated, which is a stronger statement than
+/// the one that judgement was made under.
+///
+/// The client here is a bare socket. It carries no proof, no surrogate and no
+/// credential, and it is not even a well-formed CONNECT — which is the point:
+/// the bytes land before any of that is looked at.
+#[test]
+fn a_client_with_no_credential_cannot_write_its_own_text_into_the_operator_log() {
+    let f = Fixture::new("injection");
+    let log_path = f.dir.join("broker.log");
+    // Waited for, not read once: the broker creates its control socket before
+    // it binds the CONNECT listener, so the fixture's own readiness check can
+    // be satisfied a moment before the line this test needs is written. A
+    // fixture that read the log at that instant would report "no address" for
+    // a broker that is about to say where it is.
+    assert!(
+        log_gains(&log_path, "CONNECT listener bound", Duration::from_secs(30)),
+        "the broker never logged its CONNECT listener"
+    );
+    let addr = connect_address_from_log(&log_path);
+
+    // Shaped like a credential so a substring search cannot be satisfied by a
+    // word that happens to appear in a stack trace, and with no colon, so the
+    // target parse fails with the request line's own text attached.
+    let planted = "gho_ASVclientWroteThisE7b1c3d5f7a9b1d3f5a7c9e1b3d5f7a9b1d3f5a7c9e1";
+    let mut client = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .expect("reach the CONNECT listener with no credential at all");
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    client
+        .write_all(format!("CONNECT {planted} HTTP/1.1\r\nHost: {FIXTURE_HOST}\r\n\r\n").as_bytes())
+        .expect("write a malformed CONNECT");
+    let _ = client.flush();
+
+    assert!(
+        !log_gains(&log_path, planted, Duration::from_secs(15)),
+        "a client that proved nothing, presented no surrogate and sent a malformed \
+         request wrote its own text into the operator's log; the broker logs what \
+         it cannot attribute to state it validated"
+    );
+}

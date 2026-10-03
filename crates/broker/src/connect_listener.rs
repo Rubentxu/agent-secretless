@@ -180,11 +180,47 @@ pub struct ConnectionOutcome {
 pub enum ConnectionResult {
     /// Handled, and the handler returned cleanly.
     Completed,
-    /// Refused or failed. The string is operator-facing and is **never** sent
-    /// to the client: the substitution refusal is opaque on the wire by
-    /// design, and a log line that quoted it would undo that for whoever reads
-    /// the logs.
-    Refused(String),
+    /// Refused or failed. **A class and an optional detail, not a rendered
+    /// string.**
+    ///
+    /// Both halves used to be one `String`, and the string was the error's own
+    /// `Display` — which for `Protocol` is the client's request line, verbatim.
+    ///
+    /// Measured: `parse_connect_target` runs *before* the session proof is
+    /// authenticated, and `ConnectTargetError::NoPort` attaches the request
+    /// line's authority unchanged. So a bare socket — no proof, no surrogate,
+    /// not even a well-formed CONNECT — could write arbitrary bytes into the
+    /// operator's log:
+    ///
+    /// ```text
+    /// WARN CONNECT refused destination=<no destination read> session=None
+    ///      reason=malformed CONNECT request: CONNECT authority "…" carries no port
+    /// ```
+    ///
+    /// The durable chain was already protected, because it recorded a class
+    /// rather than the text. The operator's line was left carrying the text on
+    /// the judgement that it is "the surface that already exists to hold
+    /// diagnostic detail" — a judgement the chain's own comment contradicts by
+    /// calling that same text attacker-controlled, and which was reached
+    /// without the fact that decides it: the reach is unauthenticated.
+    ///
+    /// The class is derived from the error's *kind* at the one point where the
+    /// error is in hand, so the chain and the log cannot disagree about it.
+    /// They previously had two functions, one of which matched on rendered
+    /// text, and they answered differently for most variants.
+    ///
+    /// Neither half is ever sent to the client: the substitution refusal is
+    /// opaque on the wire by design.
+    Refused {
+        /// Stable, client-free, and stable enough to count refusals by.
+        class: &'static str,
+        /// The diagnostic text, when it is a fact about *this* broker.
+        ///
+        /// `None` where the text would be a copy of what the client sent. An
+        /// operator loses the wording and keeps the ability to count, alert on
+        /// and correlate by cause, which is what a log line is for.
+        detail: Option<String>,
+    },
     /// Torn down deliberately: broker shutdown, session revoked, or the head
     /// deadline elapsed.
     ///
@@ -402,7 +438,10 @@ async fn serve_one(
                 return (
                     None,
                     String::new(),
-                    ConnectionResult::Refused(format!("could not take the socket: {e}")),
+                    ConnectionResult::Refused {
+                        class: "accept_failed",
+                        detail: Some(format!("could not take the socket: {e}")),
+                    },
                 )
             }
         };
@@ -410,7 +449,10 @@ async fn serve_one(
             return (
                 None,
                 String::new(),
-                ConnectionResult::Refused(format!("could not set the socket blocking: {e}")),
+                ConnectionResult::Refused {
+                    class: "accept_failed",
+                    detail: Some(format!("could not set the socket blocking: {e}")),
+                },
             );
         }
         let now = std::time::Instant::now();
@@ -438,7 +480,10 @@ async fn serve_one(
         (
             None,
             String::new(),
-            ConnectionResult::Refused(format!("connection task panicked: {e}")),
+            ConnectionResult::Refused {
+                class: "broker_fault",
+                detail: Some(format!("connection task panicked: {e}")),
+            },
         )
     });
 
@@ -462,7 +507,14 @@ fn classify(outcome: Result<(), BridgeError>) -> ConnectionResult {
         // tunnel closes either way — and an operator needs to tell them apart,
         // because one is policy working and the other is a client being rude.
         Err(BridgeError::Cancelled(reason)) => ConnectionResult::Cancelled(reason),
-        Err(e) => ConnectionResult::Refused(e.to_string()),
+        // The one place the error is in hand, and therefore the only place a
+        // class can honestly be derived from its kind. Doing it here rather
+        // than at each reporting surface is what makes the chain and the log
+        // incapable of disagreeing.
+        Err(e) => ConnectionResult::Refused {
+            class: crate::connect_runtime::refusal_class(&e),
+            detail: crate::connect_runtime::refusal_detail(&e),
+        },
     }
 }
 

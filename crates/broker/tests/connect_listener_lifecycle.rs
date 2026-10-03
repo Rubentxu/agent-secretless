@@ -217,7 +217,7 @@ async fn a_malformed_request_is_refused_and_the_listener_survives_it() {
         .wait_for(1, Duration::from_secs(10))
         .expect("the refusal must be reported");
     assert!(
-        matches!(first[0].result, ConnectionResult::Refused(_)),
+        matches!(first[0].result, ConnectionResult::Refused { .. }),
         "a non-CONNECT request must be refused, got {:?}",
         first[0].result
     );
@@ -389,7 +389,10 @@ fn a_connection_outcome_carries_only_metadata() {
     let o = ConnectionOutcome {
         target: Some(allowed()),
         session: Some("s-1".into()),
-        result: ConnectionResult::Refused("no".into()),
+        result: ConnectionResult::Refused {
+            class: "malformed_request",
+            detail: None,
+        },
     };
     let rendered = format!("{o:?}");
     assert!(rendered.contains("example.test"));
