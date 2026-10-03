@@ -1890,7 +1890,7 @@ fails for any other reason counts as an escape rather than as a pass.
 
 ## C2.8 — CONNECT in production, and the first thing that is not
 
-### Status: open. The first measurement is in, and it is not a security finding
+### Status: open. Three measurements in; the third found three defects, and every one of them sat under a green test
 
 V1-C2's scope, written when the block was opened and not narrowed since: *a
 production listener wiring `relay_substituted` into a running `asv-brokerd`,
@@ -1988,11 +1988,93 @@ produces was being discarded, and a test that silences the observer gets exactly
 the same result as a test with no observer at all. Capturing it turned a
 counter — "8" — into two named causes, and then into two line numbers.
 
-**Still owed in this block.** Shutdown and revoke *mid-tunnel* — the shim's own
-teardown is measured and the session's revocation is measured, but a tunnel
-revoked while bytes are flowing is not. Stress and cancellation. And the
-observability sweep, which is the part most likely to be wrong in a way nobody
-is looking for.
+**Revoke mid-tunnel: three defects, each of them already covered by a green
+test.** A CONNECT tunnel used to serve one request and then sit there, which is
+the ordinary state of a live tunnel, so the honest way to ask whether it
+outlives its session is to let it get there. The fixture answers from the far
+end: the origin holds the connection it was given and reports whether it is
+still holding it, **with no read deadline behind the answer**, so "still open"
+cannot be a timer wearing a tunnel's clothes. The test controls for that,
+because it first has to see the tunnel open while the session is still live —
+one sample is not an observation, and a tunnel that collapses the instant it is
+used satisfies "zero connections after teardown" perfectly while proving
+nothing.
+
+It found three things, in this order.
+
+**One, and the worst: the surrogate registry's lock was held for the whole
+length of every tunnel.** `SubstitutionPort` borrowed the registry, so the
+caller's `MutexGuard` had to outlive the port and the port had to outlive the
+relay. With one established and idle tunnel open, the broker could not
+`EndSession` for *any* peer, an `asv run` whose child exited never returned, and
+the main thread sat in `futex_do_wait` while the durable chain recorded no
+`end_session` at all. The same lock is what `CreateSession` mints through and
+what revocation deletes through, so one client holding a tunnel open froze the
+session lifecycle for the whole broker. It was found by looking at `/proc`,
+because the failure mode is a hang and a hang is not a red test.
+
+The two comments above the call site said the opposite of what the code did —
+"taken for the length of one registry operation — never for the length of a
+tunnel" — and `SharedSubstitutionAudit` cites "the same rule the surrogate
+registry follows", a rule its neighbour was not following. The port now takes a
+`&dyn SurrogateLending` and locks it itself, for one `redeem_for` per request.
+That is not tidiness: it makes "held for one operation" the only thing the type
+can express, because there is no borrow left to accidentally extend.
+
+**Two: `ShutdownSignal::revoke` had no caller outside tests.** The broker built
+a signal in `main.rs`, handed it to the listener, and had no way to name it
+again from the socket handler. Ending a session killed its *surrogates*, so no
+new tunnel could be authorised, while every tunnel already established went on
+relaying the real credential to its destination for a session that no longer
+existed. The mechanism was proven the whole time: C1.1,
+`revoking_an_established_session_tears_down_its_tunnel`, cancels a live tunnel
+and passes against a broker that never revokes anything, because it revokes the
+signal itself. A test that does the subject's job cannot tell a working product
+from a working mechanic. The signal is now in `BrokerState`, `main.rs` hands out
+that one, and `EndSession` revokes inside the ownership guard — a revoke placed
+earlier would let any peer on the socket destroy any session it can name without
+owning it, and that ordering is itself a test.
+
+**Three: `relay_back` never consulted the cancellation source.** It was a plain
+copy until EOF, so a revoke could only ever reach a tunnel still reading its
+*first* request head — and the ordinary state of a live tunnel is past that
+head. Wiring the revoke alone changed nothing observable: measured end to end
+with the fix in and `relay_back` untouched, the destination still held its
+connection 20 s after the session ended.
+
+**What the vertical can and cannot establish, stated because it is the kind of
+thing a test file quietly overclaims.** It asks the destination, not the client,
+so it measures the tunnel rather than the client's socket. It cannot say *who*
+closed it: `asv run` stops its shim before it ends its session, and a dead shim
+drops its sockets, so a tunnel dying at teardown is equally consistent with the
+shim dying and with the broker cancelling. So the end-to-end claim is checked
+here and the broker's own claim is checked where it can be isolated, in
+`connect_session_revocation_wiring.rs`. A green test in one with the other
+missing is a guarantee nobody actually has, and the wiring file says outright
+that it cannot see `main.rs` at all — a second signal there would pass all four
+of its tests, and covering that is the vertical's job.
+
+All five assertions are falsified by a named one going red: a lock held across
+the relay, the revoke deleted, the revoke moved ahead of the ownership check, a
+revocation that is not scoped to a session, a broker born stopped, a response
+relay that ignores cancellation, and two fixture mutations — **8 of 8**
+(`tests/connect_lifecycle_falsification.py`). Two of those eight exist to reach
+controls the others cannot: a fixture that closes instantly is caught at the
+first gate, so without one that closes *slowly* the settle window would be an
+assertion no mutation can reach, which is the decoration this repository keeps
+finding. A campaign that scored a killed run as "the test did not fail" would
+also have scored the worst defect in the slice as the mildest, so a hang counts
+as a detection.
+
+**Still owed in this block.** More than one request per tunnel where the
+protocol allows — the characterisation above stands and is not yet a fix. Stress
+and cancellation under load beyond the anti-replay property already measured.
+The observability sweep, which is the part most likely to be wrong in a way
+nobody is looking for. And **the broker has no ordered shutdown at all**:
+`main.rs` installs no signal handling, so tunnels dying when the process stops is
+carried entirely by the process dying. That is a real guarantee from the
+kernel and not one from this product, and it is recorded as owed rather than
+counted as delivered.
 
 
 
