@@ -771,6 +771,15 @@ pub struct BrokerState {
     /// without the harden profile reports the protections as absent, because
     /// a process that did not set them has not got them.
     pub self_report: selfreport::SelfReport,
+    /// The CONNECT routes the operator declared, C2.6.
+    ///
+    /// In state rather than a local in `main`, because `CreateSession` has to
+    /// mint one surrogate per route (C2.7-D) and it has no other way to learn
+    /// which credentials this broker is willing to tunnel to. Holding the table
+    /// here rather than re-reading the file is also what keeps one table: a
+    /// second copy parsed from the same path is a second set of answers, and
+    /// two answers can differ.
+    pub connect_routes: Arc<crate::connect_routes::ConnectRouteSet>,
 }
 
 impl Default for BrokerState {
@@ -791,6 +800,10 @@ impl Default for BrokerState {
             control_plane: admission::Enrolment::empty(),
             vault_writer: None,
             self_report: selfreport::SelfReport::default(),
+            // Closed by default, the same posture the listener itself ships
+            // with: a broker that was given no route file mints nothing, and a
+            // session in it has nothing to present.
+            connect_routes: Arc::new(crate::connect_routes::ConnectRouteSet::default()),
         }
     }
 }
@@ -858,6 +871,127 @@ macro_rules! sessions {
 /// The audit append lives in *this* wrapper, not in the inner dispatcher: every
 /// existing and future request variant is recorded exactly once, and a new
 /// variant cannot forget to audit because the wrapper does not dispatch.
+/// Mint one surrogate per authorized route for a session that has just opened.
+///
+/// This is the hop that makes CONNECT usable by a process that has never heard
+/// of Agent Secretless. `SubstitutingHandler` redeems a surrogate per tunnel,
+/// so without a token the child is holding, the broker authenticates the
+/// session, authorizes the route, terminates TLS — and then refuses to
+/// substitute, every time, for a reason that names neither the child nor the
+/// route.
+///
+/// Two refusals are counted as outcomes rather than errors, and the difference
+/// matters:
+///
+/// - A route whose credential is not in this broker's inventory is **skipped**.
+///   The vault is the operator's; a route may name a credential they have not
+///   stored here, and refusing to open the session would make one stale route
+///   cost every session.
+/// - A route the *policy* refuses to mint for is a hard error, because the
+///   policy is the authority and a silent skip would let an operator read "the
+///   session opened" as "every route I declared is in force".
+///
+/// One credential named by two routes is minted once and reported for both
+/// destinations. Two surrogates for one credential would be two budget counters
+/// for one secret, which is the confusion the counter was meant to remove.
+fn mint_session_surrogates(
+    state: &mut BrokerState,
+    session: AgentSessionId,
+    peer: &WorkloadIdentity,
+) -> Vec<asv_ipc_protocol::SessionSurrogate> {
+    let routes = state.connect_routes.clone();
+    if routes.is_empty() {
+        return Vec::new();
+    }
+
+    // Minting is a capability grant, so it goes through the same checks the
+    // `MintSurrogate` verb applies rather than around them. A session that
+    // cannot mint through the socket cannot mint because it opened a session.
+    let pinned = state
+        .sessions
+        .lock()
+        .map(|sessions| sessions.is_pinned(session))
+        .unwrap_or(false);
+    if !pinned {
+        tracing::warn!(
+            "no surrogates minted: this session is not pidfd-pinned, and minting a \
+             credential-shaped token for a weakly attributed process is refused"
+        );
+        return Vec::new();
+    }
+
+    let Ok(mut registry) = state.surrogates.lock() else {
+        tracing::error!("the surrogate registry is poisoned; no surrogate minted");
+        return Vec::new();
+    };
+
+    let mut minted: Vec<asv_ipc_protocol::SessionSurrogate> = Vec::new();
+    // One credential named by two routes is minted once. Two surrogates for one
+    // secret would be two budget counters for one value, which is the exact
+    // confusion the session counter exists to remove.
+    let mut spent: Vec<CredentialId> = Vec::new();
+
+    for route in routes.routes() {
+        let credential = route.credential();
+        if spent.contains(&credential) {
+            continue;
+        }
+
+        let Some(metadata) = state.credentials.iter().find(|c| c.id == credential) else {
+            tracing::warn!(
+                destination = %route.endpoint(),
+                "route names a credential this broker has not loaded; no surrogate minted"
+            );
+            continue;
+        };
+
+        let class = CredentialClass::from_kind(metadata.kind);
+        if let Err(response) = state.authorize_surrogate_mint(session, peer, class) {
+            // The policy refused. Say so rather than dropping the route quietly.
+            tracing::warn!(
+                destination = %route.endpoint(),
+                reason = ?response,
+                "policy refused to mint for a declared route"
+            );
+            continue;
+        }
+
+        match registry.mint(
+            session,
+            credential,
+            class,
+            SESSION_SURROGATE_TTL_SECS,
+            SESSION_SURROGATE_MAX_USES,
+            now_secs(),
+        ) {
+            Ok((token, _expires_at, remaining)) => {
+                spent.push(credential);
+                minted.push(asv_ipc_protocol::SessionSurrogate {
+                    label: metadata.label.clone(),
+                    token,
+                    destination: route.endpoint().to_string(),
+                    max_uses: remaining,
+                });
+            }
+            Err(error) => {
+                tracing::warn!(destination = %route.endpoint(), ?error, "could not mint");
+            }
+        }
+    }
+    minted
+}
+
+/// The lifetime of a surrogate minted at session open.
+///
+/// Bounded, because an unbounded surrogate is a permanent credential with extra
+/// steps — the same reasoning `MintSurrogate` documents. The session's own
+/// lifetime is the real bound; this is the backstop for a session that outlives
+/// the operator's expectation of it.
+const SESSION_SURROGATE_TTL_SECS: u64 = 3600;
+
+/// How many operations one session-minted surrogate may authorize.
+const SESSION_SURROGATE_MAX_USES: u32 = 32;
+
 pub fn handle(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request) -> Response {
     let response = handle_inner(state, peer, request);
 
@@ -969,7 +1103,10 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
 
         Request::CreateSession { workspace } => {
             let id = sessions!(state).create(workspace, peer);
-            Response::SessionCreated { session: id }
+            Response::SessionCreated {
+                session: id,
+                surrogates: mint_session_surrogates(state, id, peer),
+            }
         }
 
         Request::RegisterSessionKey {
@@ -2785,7 +2922,7 @@ mod tests {
                 workspace: "/tmp/project".into(),
             },
         ) {
-            Response::SessionCreated { session } => session,
+            Response::SessionCreated { session, .. } => session,
             other => panic!("expected a session, got {other:?}"),
         };
 
@@ -2839,7 +2976,7 @@ mod tests {
                 workspace: "/tmp/project".into(),
             },
         ) {
-            Response::SessionCreated { session } => session,
+            Response::SessionCreated { session, .. } => session,
             other => panic!("expected a session, got {other:?}"),
         };
         handle(
@@ -3070,7 +3207,7 @@ mod tests {
                 workspace: "/repo".into(),
             },
         ) {
-            Response::SessionCreated { session } => session,
+            Response::SessionCreated { session, .. } => session,
             other => panic!("expected session creation, got {other:?}"),
         };
         assert_eq!(sess(&state).len(), 1);
@@ -3141,7 +3278,7 @@ mod tests {
                 workspace: "/repo".into(),
             },
         ) {
-            Response::SessionCreated { session } => session,
+            Response::SessionCreated { session, .. } => session,
             other => panic!("expected session creation, got {other:?}"),
         };
         let request = AuthorizationRequest {
@@ -3220,7 +3357,7 @@ mod tests {
                 workspace: "/repo".into(),
             },
         ) {
-            Response::SessionCreated { session } => session,
+            Response::SessionCreated { session, .. } => session,
             other => panic!("expected session creation, got {other:?}"),
         };
         let request = AuthorizationRequest {
@@ -3303,7 +3440,7 @@ mod tests {
                 workspace: "/repo".into(),
             },
         ) {
-            Response::SessionCreated { session } => session,
+            Response::SessionCreated { session, .. } => session,
             other => panic!("expected session creation, got {other:?}"),
         };
         let request = AuthorizationRequest {
@@ -3459,7 +3596,7 @@ mod tests {
                 workspace: "/repo".into(),
             },
         ) {
-            Response::SessionCreated { session } => session,
+            Response::SessionCreated { session, .. } => session,
             other => panic!("expected session creation, got {other:?}"),
         };
         let real_uid = agent_peer.credentials.uid;
@@ -4227,7 +4364,7 @@ mod surrogate_tests {
                 workspace: "/repo".into(),
             },
         ) {
-            Response::SessionCreated { session } => session,
+            Response::SessionCreated { session, .. } => session,
             other => panic!("expected creation, got {other:?}"),
         };
         assert!(

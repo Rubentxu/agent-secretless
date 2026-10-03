@@ -289,7 +289,11 @@ impl ConnectionHandler for SubstitutingHandler {
             )
         })?;
         let family = route.operation_family();
-        let credential = route.credential();
+        // The audit records the *family* that ran, as a name. It is not the
+        // credential: the record already names the destination, and a record
+        // carrying a credential handle would be one more thing that has to be
+        // kept out of an operator's reach to stay harmless.
+        let family_name = family.wire_name();
 
         // One lock, one registry operation, released before any I/O. The
         // borrow cannot outlive this block: `SubstitutionPort` holds `&mut`,
@@ -306,7 +310,7 @@ impl ConnectionHandler for SubstitutingHandler {
                 )
             })?;
             let mut port =
-                SubstitutionPort::new(&mut registry, self.secrets.as_ref(), family, credential);
+                SubstitutionPort::new(&mut registry, self.secrets.as_ref(), family, family_name);
             // The registry guard is released at the end of this block; the
             // audit handle is the shared log itself rather than a guard, so the
             // relay records into the same chain the socket path appends to and

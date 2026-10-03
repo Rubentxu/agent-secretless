@@ -146,7 +146,7 @@ fn cli_and_broker_communicate_over_a_real_socket() {
         },
     );
     let session = match created {
-        asv_ipc_protocol::Response::SessionCreated { session } => session,
+        asv_ipc_protocol::Response::SessionCreated { session, .. } => session,
         other => panic!("expected a session, got {other:?}"),
     };
 

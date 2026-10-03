@@ -507,6 +507,20 @@ pub enum OperationFamily {
     Database,
 }
 
+impl OperationFamily {
+    /// The name the audit chain records for this family.
+    ///
+    /// Written out rather than derived, for the same reason `action_name` is:
+    /// the string is evidence, so it is pinned here where a test can assert it
+    /// rather than reconstructed from a `Debug` impl that may change.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::GitHub => "github",
+            Self::Database => "postgres",
+        }
+    }
+}
+
 /// Whether a human may ever obtain the raw value (FR-002).
 ///
 /// `NonExportable` is the default and the one agents should get. The agent

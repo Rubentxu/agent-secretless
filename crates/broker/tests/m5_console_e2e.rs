@@ -209,7 +209,7 @@ fn add_grant_use_revoke() {
         },
     );
     let session = match session_resp {
-        Response::SessionCreated { session } => session,
+        Response::SessionCreated { session, .. } => session,
         other => panic!("expected a session, got {other:?}"),
     };
 

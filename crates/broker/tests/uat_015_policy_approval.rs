@@ -92,7 +92,7 @@ fn the_protected_push_blocks_until_the_operator_approves_it() {
             workspace: "/repo".into(),
         },
     ) {
-        Response::SessionCreated { session } => session,
+        Response::SessionCreated { session, .. } => session,
         other => panic!("expected a session, got {other:?}"),
     };
     let request = protected_push(session, operator.credentials.uid);
@@ -198,7 +198,7 @@ fn an_approval_is_spent_only_on_the_request_it_describes() {
             workspace: "/repo".into(),
         },
     ) {
-        Response::SessionCreated { session } => session,
+        Response::SessionCreated { session, .. } => session,
         other => panic!("expected a session, got {other:?}"),
     };
 

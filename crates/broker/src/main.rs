@@ -568,6 +568,11 @@ fn main() -> std::io::Result<()> {
                 Arc::new(asv_broker::connect_routes::ConnectRouteSet::default())
             }
         };
+        // In state, not just in the listener: `CreateSession` mints one
+        // surrogate per route, and it has no other way to learn which
+        // credentials this broker will tunnel to. Set here, before the accept
+        // loop, so no session can be created against a half-loaded table.
+        state.connect_routes = Arc::clone(&routes);
 
         // The handler takes the table rather than a family and a credential
         // name, so which credential a tunnel may spend is the route's answer and

@@ -197,7 +197,7 @@ fn a_surrogate_minted_from_a_database_credential_cannot_reach_github() {
             workspace: "/tmp/project".into(),
         },
     ) {
-        Response::SessionCreated { session } => session,
+        Response::SessionCreated { session, .. } => session,
         other => panic!("expected a session, got {other:?}"),
     };
 

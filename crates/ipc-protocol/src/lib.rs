@@ -116,7 +116,25 @@ impl std::fmt::Debug for OpaqueSecret {
 /// a v3 agent talking to a v4 broker would have no way to express the
 /// binding and would fail with an unknown-method error rather than a
 /// version error. Failing at the gate is the point.
-pub const PROTOCOL_VERSION: u16 = 5;
+/// A surrogate minted for one route when a session opened.
+///
+/// `label` is the operator's own name for the credential, taken from the vault
+/// metadata rather than from the route file: it is the string that becomes an
+/// environment variable the child reads, and the operator's spelling is the one
+/// they will recognise when it goes wrong.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSurrogate {
+    /// The credential's label, as the operator wrote it.
+    pub label: String,
+    /// The token the child presents in place of the credential.
+    pub token: String,
+    /// The host and port this surrogate may be spent on.
+    pub destination: String,
+    /// How many operations remain.
+    pub max_uses: u32,
+}
+
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// Hard ceiling on a single inbound message. Bounded allocation is required for
 /// any IPC that faces an untrusted peer (`docs/17-IMPLEMENTATION-BOOTSTRAP.md` §9).
@@ -357,6 +375,14 @@ pub enum Response {
     },
     SessionCreated {
         session: AgentSessionId,
+        /// One surrogate per authorized route (C2.7-D).
+        ///
+        /// Minted here rather than on request because the session frontend is
+        /// what owns the session's capabilities, and a child that had to ask
+        /// for its own token would be a second protocol inside the one the
+        /// proxy already needs. Empty is a normal answer: a broker with no route
+        /// table mints nothing, and a session in it has nothing to present.
+        surrogates: Vec<SessionSurrogate>,
     },
     SessionEnded {
         session: AgentSessionId,
@@ -795,6 +821,7 @@ mod tests {
         let response = match &request {
             Request::CreateSession { .. } => Response::SessionCreated {
                 session: AgentSessionId::new(),
+                surrogates: Vec::new(),
             },
             other => panic!("unexpected request {other:?}"),
         };

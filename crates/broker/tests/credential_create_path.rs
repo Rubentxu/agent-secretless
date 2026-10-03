@@ -297,7 +297,7 @@ fn a_created_credential_can_mint_a_surrogate_immediately() {
             workspace: "/w".into(),
         },
     ) {
-        Response::SessionCreated { session } => session,
+        Response::SessionCreated { session, .. } => session,
         other => panic!("session failed: {other:?}"),
     };
 

@@ -634,6 +634,33 @@ fn start_session_shim(
     }
 }
 
+/// The environment variable a route's surrogate is published under.
+///
+/// From the credential's *label*, not from its id: a UUID in a variable name
+/// is unreadable to the person who has to debug it, and the label is the
+/// operator's own spelling.
+///
+/// Every character that is not alphanumeric becomes an underscore, so two
+/// different labels can never land on one variable name. If they could, the
+/// second would silently overwrite the first and one route's tunnel would spend
+/// another's token — a failure that looks exactly like a routing bug.
+fn env_name_for_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len() + 16);
+    for ch in label.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_uppercase());
+        } else {
+            out.push('_');
+        }
+    }
+    // A label made entirely of punctuation would otherwise produce a bare
+    // `ASV_SURROGATE_`, which is a legal variable name and a useless one.
+    if out.is_empty() || out.chars().all(|c| c == '_') {
+        out.push_str("CREDENTIAL");
+    }
+    out
+}
+
 /// Launches a command inside a real ASV session.
 ///
 /// The session used to be invented. `ASV_SESSION_ID` was set to this
@@ -665,13 +692,27 @@ fn run_command(socket: &std::path::Path, command: Vec<String>) -> std::io::Resul
                 .into_owned(),
         },
     )? {
-        Response::SessionCreated { session } => session,
+        Response::SessionCreated {
+            session,
+            surrogates,
+        } => (session, surrogates),
         other => {
             return Err(std::io::Error::other(format!(
                 "asv run could not open a session: {other:?}"
             )))
         }
     };
+
+    // The session's surrogates, one per authorized route (C2.7-D).
+    //
+    // These are what make a tunnel actually substitute: the CONNECT path
+    // redeems a surrogate per tunnel, so a session that opened without one
+    // authenticates, authorizes, terminates TLS and then refuses — every time,
+    // naming neither the child nor the route. A surrogate is a bearer token
+    // and not a secret, which is why an environment variable is defensible
+    // here: the value a child must never see is the credential, and that never
+    // leaves the broker.
+    let (session, session_surrogates) = session;
 
     let session_dir = std::env::temp_dir().join(format!(
         "asv-session-{}-{}",
@@ -708,6 +749,12 @@ fn run_command(socket: &std::path::Path, command: Vec<String>) -> std::io::Resul
     child.args(&command[1..]);
     for name in QUARANTINED_ENV_NAMES {
         child.env_remove(name);
+    }
+    for grant in &session_surrogates {
+        child.env(
+            format!("ASV_SURROGATE_{}", env_name_for_label(&grant.label)),
+            &grant.token,
+        );
     }
     child
         .env("SSH_AUTH_SOCK", agent.socket_path())
@@ -830,8 +877,21 @@ fn print_response(response: &Response) {
                  landlock: {landlock_installed}   seccomp: {seccomp_installed}"
             );
         }
-        Response::SessionCreated { session } => {
+        Response::SessionCreated {
+            session,
+            surrogates,
+        } => {
             println!("session {session} created");
+            // The surrogates are named but not printed. A session that opened
+            // silently carrying tokens is a session an operator cannot account
+            // for, and one that prints them is a session that has put bearer
+            // tokens in a terminal scrollback.
+            for grant in surrogates.iter() {
+                println!(
+                    "  surrogate for {} -> {} ({} uses left)",
+                    grant.label, grant.destination, grant.max_uses
+                );
+            }
         }
         // Reached only if a caller prints the response directly. `asv run`
         // consumes this one itself and never reaches here.

@@ -41,8 +41,8 @@
 //! whatever the operator thought the number meant.
 
 use asv_domain::{
-    Action, AgentSessionId, Authority, AuthorityError, IntegrationPosture, OperationFamily,
-    Resource,
+    Action, AgentSessionId, Authority, AuthorityError, CredentialId, IntegrationPosture,
+    OperationFamily, Resource,
 };
 use asv_policy::{PolicyContext, PolicyEngine, ReasonCode};
 use serde::{Deserialize, Serialize};
@@ -72,7 +72,15 @@ pub struct ConnectRoute {
     /// and is refused. The file therefore cannot be written from a guess at the
     /// Rust spelling, which is the intended direction to be wrong in.
     pub operation_family: OperationFamily,
-    /// The credential alias whose value is substituted into the tunnel.
+    /// The credential whose value is substituted into the tunnel, by its
+    /// canonical wire id.
+    ///
+    /// Typed as a `String` on the way in and parsed to a [`CredentialId`]
+    /// during validation, so a malformed id is refused with this file and this
+    /// line named rather than deserializing into something that fails later at
+    /// redemption — far from the typo that caused it. A route cannot name a
+    /// credential by an operator's label: the id is the handle policies
+    /// already reference.
     pub credential: String,
     /// The weakest posture that may be used for this route.
     ///
@@ -94,7 +102,7 @@ pub struct ConnectRoute {
 pub struct ResolvedRoute {
     endpoint: AuthorityEndpoint,
     operation_family: OperationFamily,
-    credential: String,
+    credential: CredentialId,
     minimum_posture: IntegrationPosture,
 }
 
@@ -109,9 +117,9 @@ impl ResolvedRoute {
         self.operation_family
     }
 
-    /// The credential alias substituted into the tunnel.
-    pub fn credential(&self) -> &str {
-        &self.credential
+    /// The credential substituted into the tunnel.
+    pub fn credential(&self) -> CredentialId {
+        self.credential
     }
 
     /// The weakest posture permitted for this route.
@@ -179,11 +187,12 @@ impl ConnectRouteSet {
                 }
             })?;
 
-            if route.credential.trim().is_empty() {
-                return Err(ConnectRouteError::EmptyCredential {
+            let credential = CredentialId::from_wire(&route.credential).map_err(|_| {
+                ConnectRouteError::UnusableCredential {
                     endpoint: endpoint.to_string(),
-                });
-            }
+                    spelled: route.credential.clone(),
+                }
+            })?;
 
             if resolved.iter().any(|r| r.endpoint == endpoint) {
                 // Two routes for one endpoint is a coin flip, not a merge: they
@@ -199,7 +208,7 @@ impl ConnectRouteSet {
             resolved.push(ResolvedRoute {
                 endpoint,
                 operation_family: route.operation_family,
-                credential: route.credential,
+                credential,
                 minimum_posture: route.minimum_posture,
             });
         }
@@ -316,7 +325,7 @@ fn looks_like_ip_literal(authority: &Authority) -> bool {
 ///
 /// Every variant names the offending route and none of them name a secret: the
 /// input is an operator's config file, and the values here are hosts, ports and
-/// credential *aliases*, never credential material.
+/// credential *ids*, never credential material.
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectRouteError {
     #[error("the route file is not valid JSON: {0}")]
@@ -335,8 +344,8 @@ pub enum ConnectRouteError {
     #[error("port 0 is not a service port ({spelled})")]
     ZeroPort { spelled: String },
 
-    #[error("{endpoint} declares an empty credential alias")]
-    EmptyCredential { endpoint: String },
+    #[error("{endpoint} names a credential that is not a usable id: {spelled:?}")]
+    UnusableCredential { endpoint: String, spelled: String },
 
     #[error("{endpoint} is declared more than once; which credential it uses would depend on file order")]
     Duplicate { endpoint: String },
@@ -379,12 +388,18 @@ mod tests {
         .expect("test policy must validate")
     }
 
+    /// A canonical credential id, so the loader's parse is exercised on a real
+    /// handle rather than a placeholder that happens to be accepted.
+    fn credential_id(n: u8) -> CredentialId {
+        CredentialId::from_wire(&format!("00000000-0000-4000-8000-{n:012x}")).expect("canonical id")
+    }
+
     fn route(authority: &str, port: u16) -> ConnectRoute {
         ConnectRoute {
             authority: authority.to_owned(),
             port,
             operation_family: OperationFamily::GitHub,
-            credential: "github".to_owned(),
+            credential: credential_id(1).to_wire(),
             minimum_posture: IntegrationPosture::StrongSecretless,
         }
     }
@@ -492,7 +507,7 @@ mod tests {
             .route_for(&endpoint("api.github.com", 443))
             .expect("route present");
         assert_eq!(resolved.operation_family(), OperationFamily::GitHub);
-        assert_eq!(resolved.credential(), "github");
+        assert_eq!(resolved.credential(), credential_id(1));
         assert_eq!(resolved.endpoint().port(), 443);
 
         // A clone is a copy: mutating the caller's copy does not reach the set.
@@ -593,7 +608,7 @@ mod tests {
     fn each_route_declares_its_own_family_and_credential() {
         let mut npm = route("registry.npmjs.org", 443);
         npm.operation_family = OperationFamily::Database;
-        npm.credential = "npm_token".to_owned();
+        npm.credential = credential_id(2).to_wire();
 
         let set =
             ConnectRouteSet::from_routes(vec![route("api.github.com", 443), npm], &permitting())
@@ -607,9 +622,9 @@ mod tests {
             .expect("npm route present");
 
         assert_eq!(github.operation_family(), OperationFamily::GitHub);
-        assert_eq!(github.credential(), "github");
+        assert_eq!(github.credential(), credential_id(1));
         assert_eq!(registry.operation_family(), OperationFamily::Database);
-        assert_eq!(registry.credential(), "npm_token");
+        assert_eq!(registry.credential(), credential_id(2));
     }
 
     // -- structural validation ---------------------------------------------
@@ -636,7 +651,7 @@ mod tests {
         // measurement, so the mutation is what proves this one bites.
         let json = r#"[
             {"authority":"api.github.com","port":443,
-             "operation_family":"git_hub","credential":"github",
+             "operation_family":"git_hub","credential":"00000000-0000-4000-8000-000000000001",
              "minimum_posture":"STRONG_SECRETLESS",
              "allowed_any_host":true}
         ]"#;
@@ -644,7 +659,7 @@ mod tests {
         // The control: the same document without the unknown field loads.
         let control = r#"[
             {"authority":"api.github.com","port":443,
-             "operation_family":"git_hub","credential":"github",
+             "operation_family":"git_hub","credential":"00000000-0000-4000-8000-000000000001",
              "minimum_posture":"STRONG_SECRETLESS"}
         ]"#;
         ConnectRouteSet::load(control, &permitting())
@@ -682,17 +697,17 @@ mod tests {
     }
 
     #[test]
-    fn port_zero_and_an_empty_credential_are_refused() {
+    fn port_zero_and_an_unusable_credential_are_refused() {
         let err = ConnectRouteSet::from_routes(vec![route("api.github.com", 0)], &permitting())
             .expect_err("port 0 must not become a route");
         assert!(matches!(err, ConnectRouteError::ZeroPort { .. }), "{err:?}");
 
         let mut blank = route("api.github.com", 443);
-        blank.credential = "   ".to_owned();
+        blank.credential = "not-an-id".to_owned();
         let err = ConnectRouteSet::from_routes(vec![blank], &permitting())
-            .expect_err("a blank credential must not become a route");
+            .expect_err("a credential that is not an id must not become a route");
         assert!(
-            matches!(err, ConnectRouteError::EmptyCredential { .. }),
+            matches!(err, ConnectRouteError::UnusableCredential { .. }),
             "{err:?}"
         );
     }
@@ -700,7 +715,7 @@ mod tests {
     #[test]
     fn two_routes_for_one_endpoint_are_refused() {
         let mut other = route("API.GITHUB.COM.", 443);
-        other.credential = "other".to_owned();
+        other.credential = credential_id(9).to_wire();
 
         let err =
             ConnectRouteSet::from_routes(vec![route("api.github.com", 443), other], &permitting())
