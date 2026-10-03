@@ -1936,9 +1936,8 @@ suite. It is a characterization and says so: it asserts the limit, and it goes
 red if the tunnel ever serves two — the signal that both the limit and its
 comment have become stale.
 
-**One session sustains 8 of the 64 tunnels it is asked for.** The concurrency
-question the roadmap asks — *32/64/128 CONNECT simultáneos, misma sesión,
-counters fuera de orden* — measured against the real broker:
+**One session sustained 8 of the 64 tunnels it was asked for — and both causes
+were bugs in this repository, not in the client.**
 
 ```text
 parallel=16  ok=8   failed=8
@@ -1947,43 +1946,47 @@ parallel=64  ok=8   failed=56
 ```
 
 Eight, every time, whatever the client asked for. The broker's own account of
-the 64 splits the 56 refusals into two causes, and **neither is a documented
+the 64 split the 56 refusals into two causes, and **neither was a documented
 budget**:
 
 ```text
-39  the presented surrogate was refused   -> SurrogateError::Exhausted
 17  no session proof resolved for this tunnel
+39  the presented surrogate was refused   -> SurrogateError::Exhausted
 ```
 
-The second one is the one that matters. Those 17 are freshly minted, correctly
-signed proofs from a session that did nothing wrong, refused by the anti-replay
-machinery. The window is 128 wide and its own comment reasons that the spread
-from N tunnels in flight is at most N counters, so 128 should be generous for
-64. It is not. That is the liveness-versus-security tension the comment says it
-resolved, failing in the one direction the honest client cannot distinguish from
-an attack.
+**The window marked the wrong bit when it advanced.** Bit `i` means
+`highest - 1 - i`, so the *previous* highest — which has just been spent — lands
+on bit `shift - 1`, not on bit 0. The two coincide only when the shift is exactly
+one, which is the single case the existing test happened to cover: *8 then 7*.
+Every arrival with a gap of two or more marked `highest - 1` as spent, a counter
+nobody had presented, and refused the next honest client to use it. Sixty-four
+concurrent CONNECTs lost seventeen legitimate proofs this way, and they were
+freshly minted, correctly signed, from a session that had done nothing wrong.
+The comment above the window says outright that refusing a legitimate out-of-order
+counter is "a liveness bug wearing a security costume"; it was wearing one.
 
-The first says the surrogate's 32-use budget is spent by tunnels that never
-complete, so a session that is refused rather than served still burns budget.
+**The surrogate's budget was 8, not the 32 the broker asked for.** `mint` clamps
+into the protocol's `MAX_SURROGATE_USES`, and a clamp that lowers what you asked
+for raises nothing, logs nothing, and returns a value the wire reports honestly —
+so the CLI, the audit and the tests all believed it. The ceiling was written when
+a surrogate was minted by an operator for one operation, where eight is
+generous; `CreateSession` mints one per route and hands it to a child that may
+issue a stream of requests, and eight is not a backstop but a product limit no
+ordinary client survives. The ceiling now follows the broker's already-declared
+intent, and a test fails if the two ever drift apart again.
 
-**What still holds.** The destination received the credential once per
-completed tunnel and never a surrogate. Both defects are availability with the
-shape of a denial, not disclosure — which is why they are worth fixing and why
-they are not an emergency.
+**Measured after both, against the same 64:** 32 complete and 32 are refused for
+the budget that is *documented* — a budget doing its job. The property the test
+now asserts is the one that must not regress: the anti-replay window refuses
+**nothing** honest under load, and every refusal carries a reason an operator can
+read.
 
 **How the defect was found, which is the part worth keeping.** The vertical's
-fixture started the broker with its `stdout` sent to `/dev/null`, because that
-is where `tracing_subscriber::fmt()` writes. Every refusal reason the broker
-produces was being discarded, and a test that silences the observer gets the
-same result as a test with no observer at all. Capturing it turned a
-counter — "8" — into two named causes. An observer that is switched off is
-indistinguishable from one that does not exist, and this file had been writing
-that claim for three blocks.
-
-`one_session_sustains_eight_of_the_tunnels_it_is_asked_for` holds the
-measurement, and asserts that the broker's refusal reasons account for every
-refusal it produced: a refusal with no reason in the log is one no operator can
-act on.
+fixture started the broker with its `stdout` sent to `/dev/null`, because that is
+where `tracing_subscriber::fmt()` writes. Every refusal reason the broker
+produces was being discarded, and a test that silences the observer gets exactly
+the same result as a test with no observer at all. Capturing it turned a
+counter — "8" — into two named causes, and then into two line numbers.
 
 **Still owed in this block.** Shutdown and revoke *mid-tunnel* — the shim's own
 teardown is measured and the session's revocation is measured, but a tunnel
