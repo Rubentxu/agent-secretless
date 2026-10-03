@@ -90,6 +90,27 @@ pipeline {
             // not contain. Every gate in this file was green while the
             // installation instructions were unfollowable.
             sh("python3 tests/install_path_contract.py")
+            // V1-C0. Every guard above checks code, tests or configuration.
+            // None of them read `README.md`, `README-es.md` or the spec pack,
+            // and the V1-C0 rebaseline found twelve stale or false claims
+            // there by measurement: the broker's IPC protocol documented as
+            // v2 while `PROTOCOL_VERSION` was 4, both READMEs marking M11 and
+            // M12 done while the gates table had them NOT MET, and a
+            // quick-start test count that had drifted by 174 without a single
+            // failing check. A second copy of milestone status in the most-read
+            // file in the repository is a second authority, and this stage is
+            // where claim-vs-repository checks live.
+            //
+            // The falsifiability suite runs beside it, and it has already paid
+            // for itself: two of its thirteen cases failed on its first run
+            // because the guard had bound its spec-pack paths at import time,
+            // so the vocabulary check was reading the real gates table instead
+            // of the synthetic one the test had built. The guard was fixed,
+            // not the test. That is the second time in this repository that a
+            // "the test passes" moment was a test passing for the wrong
+            // reason.
+            sh("python3 scripts/check-doc-claims.py")
+            sh("python3 tests/doc_claims_drift.py")
         }
 
         // Cheap, and it fails first on the things a reviewer would notice.

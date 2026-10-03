@@ -309,21 +309,39 @@ def main() -> int:
     text = table_path.read_text(encoding="utf-8")
     failures: list[str] = []
     checked = 0
+    recognised = 0
+    unchecked: list[str] = []
 
     for gate, status, evidence in rows(text):
         if any(marker in gate for marker in UNVERIFIABLE):
             continue
-        checked += 1
+        recognised += 1
+        # A row is only *checked* if at least one check below actually applied
+        # to it. Counting a recognised row as a verified one is an overclaim
+        # this guard was itself making: it reported "17 checkable claims
+        # verified" while several rows were only recognised and no check ever
+        # ran against them. The V1-C0 rows made that visible — 3 of 20 — so the
+        # count is now split and the unverified ones are named.
+        applied = False
         if "M11-M13" in gate or "semver" in gate.lower():
             check_milestone_ancestry(gate, evidence, failures)
+            applied = True
         if "full suite" in gate.lower():
             check_full_suite(gate, evidence, failures)
+            applied = True
         if "dependency audit" in gate.lower():
             check_dependency_audit(gate, evidence, failures)
+            applied = True
         if "readme" in gate.lower():
             check_readme_count(gate, evidence, failures)
+            applied = True
         if "console front-end" in gate.lower() or "remote origin" in gate.lower():
             check_console_surface(gate, evidence, failures)
+            applied = True
+        if applied:
+            checked += 1
+        else:
+            unchecked.append(gate)
 
     if failures:
         print("gate status drift in 16-SECURITY-RELEASE-GATES.md:\n")
@@ -337,9 +355,22 @@ def main() -> int:
         return 1
 
     print(
-        f"gate status table consistent: {checked} checkable claims verified "
-        f"against the repository"
+        f"gate status table consistent: {checked} of {recognised} claims checked "
+        f"by this guard"
     )
+    if unchecked:
+        # Named rather than counted away, and worded so it does not overclaim in
+        # the other direction either: several of these *are* checked elsewhere
+        # (clippy and fmt by the `static` stage, NFR-PERF-001 by UAT-030, the
+        # UAT map by `tools/check-gates.py`, the console CSP by the M5 row
+        # dispatch below). What is true of all of them is only that *this*
+        # script applies no check to them — which was previously reported as if
+        # every one of them had been verified here.
+        print(
+            f"\nrecognised but not checked by this guard ({len(unchecked)}); "
+            f"some are covered by another stage:\n  "
+            + "\n  ".join(unchecked)
+        )
     return 0
 
 
