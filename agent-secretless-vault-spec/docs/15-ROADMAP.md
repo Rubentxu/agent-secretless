@@ -1235,6 +1235,49 @@ client's second legitimate tunnel is worse than no counter at all: it is a
 denial of service wearing a security costume, which is the same shape as the
 "strict highest counter seen" rule the window deliberately avoids.
 
+#### C2.5-S1 — measured: only one client can carry the proof
+
+Before building the emitter, the question that decides its shape was measured
+rather than argued: does `x-asv-session-proof` reach a CONNECT at all on the
+clients an agent actually runs? `HTTPS_PROXY` is not an answer by itself — a
+client can add headers to the *origin* request, which is the wrong place,
+because the broker never sees those.
+
+`tests/connect_injection_spike.py`, each client against a one-shot local
+listener that reads the CONNECT head and closes. Nothing touches the network.
+
+| client | `x-asv-session-proof` on CONNECT |
+|---|---|
+| `curl --proxy-header` | **yes** |
+| `curl` without the flag (control) | no |
+| `git` via `http.proxy` | no |
+| `npm` via `HTTPS_PROXY` | no |
+| `java` via `-Dhttps.proxyHost`/`Port` | no |
+
+**The measurement is falsified by its own control**, which is the only reason
+to believe the "yes": the same client without the flag sends no such header.
+Every other row sent a CONNECT and simply had nothing of ours on it.
+
+**Two of the spike's own defects are worth more than the table.** The detector
+compared an uppercase canary against a lowercased head, so it reported "no"
+for a header that was sitting in the captured bytes — the positive case was
+invisible and the conclusion was the *opposite* of the truth, with output that
+looked entirely normal. And the first Java probe ran a class that did not
+exist, so the JVM exited before opening a socket: its row was absence of
+evidence wearing the clothes of evidence, which is a row that would have
+decided an architecture on nothing. A row that cannot fail is not a
+measurement.
+
+**The decision this forces: a session-local shim, not a portable header.**
+Option A — clients talking to the broker directly — is available on exactly one
+stack. Teaching `git`, `npm` and the JVM to manufacture an ASV header is
+precisely what must not happen: it puts the protocol inside every toolchain,
+which is the thing M14 exists to avoid, and it would mean three separate
+implementations of counter ownership. The shim is not the fallback; it is the
+only shape that works, and it is the same component that gives a session its
+single counter. One `asv run` produces one emitter, and `curl`, `git`, `npm`,
+`mvn`, `gradle` and the agent keep knowing nothing about `SessionProof`.
+
 **Two independent walls still stand.** The allow-list ships empty, so nothing
 is authorised; and no shipped client emits the header, so nothing can prove
 anything. A counter closes neither.
