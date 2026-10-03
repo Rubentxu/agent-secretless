@@ -373,21 +373,81 @@ scope item not delivered.
 - **The broker still runs as the invoking user.** A separate uid was specified
   and is not shipped. `PR_SET_DUMPABLE=0` and Landlock are what stand in the
   way of a same-uid process reading broker memory, and both are *policy*
-  enforcement that a same-uid process with the right privileges can defeat.
-  The README has said this plainly for several milestones; it remains true.
-- **UAT-003's strongest clause is `#[ignore]`d.**
-  `uat_003_open_proc_self_mem_returns_eacces_when_undumpable` in
-  `crates/broker/tests/uat_003_proc_inspection.rs` is ignored with the reason
-  *"structural: requires a child process to attempt the open; the in-process
-  check is dumpable_is_zero"*. That is the only ignored test in the workspace's
-  866. The clause that proves the *kernel* refuses the read is therefore not
-  executed by a default run; what is executed is the weaker in-process check
-  that the dumpable flag is zero.
+  enforcement that a same-uid process with `CAP_SYS_PTRACE` can defeat. The
+  README has said this plainly for several milestones; it remains true.
+- **The claim is therefore narrower than "the broker's memory is
+  unreadable",** and is now the one the tests make: unreadable by a process
+  that **lacks `CAP_SYS_PTRACE`**, which is the check the kernel performs.
+  A dedicated uid would make it unconditional by making the attacker
+  unprivileged by construction.
 
-This is carried as the first item of the v1.0 continuation (V1-C1) rather than
-left implicit, because "M7 closed" and "a same-uid process can read the
-broker's memory" are both true and only the second one is the one an attacker
-cares about.
+### What UAT-003's dropped clause now proves (V1-C1)
+
+UAT-003's strongest clause used to be `#[ignore]`d:
+`uat_003_open_proc_self_mem_returns_eacces_when_undumpable` was ignored as
+*"structural: requires a child process to attempt the open; the in-process
+check is dumpable_is_zero"*. That reason named the fix — a child process —
+and the fix was never built, so the clause had never executed. It was the
+only `#[ignore]`d test in the workspace, and **the workspace now contains
+none**.
+
+`crates/broker/tests/uat_003_proc_inspection.rs` runs the scenario against the
+kernel: a forked child sets the target's dumpable flag, forks an attacker
+under the **same uid**, and the attacker opens `/proc/<broker>/mem`. Three
+conditions make the result attributable rather than merely green:
+
+- the refusal must be `EACCES` or `EPERM` specifically, so a test cannot pass
+  because the target had exited (`ENOENT`);
+- the same attack against a *dumpable* sibling of the same uid must **succeed**,
+  so a host where the open failed for an unrelated reason cannot pass it;
+- the attacker must be shown to **lack `CAP_SYS_PTRACE`**, or on a privileged
+  host the kernel permits the read regardless of hardening and the assertion
+  measures the wrong thing. The guard is proven able to reject a privileged
+  `CapEff` by a doctored value, because no ordinary run can produce one.
+
+The first version of this test was **not falsifiable** and that was found by
+trying: `PR_SET_DUMPABLE` is a *process* attribute and every `#[test]` in a
+binary shares one process, so removing the hardening left the suite green —
+the neighbouring test had set the flag back. A test whose outcome depends on
+another test is not a test of the property. The scenario now runs entirely
+inside a forked child that owns its own state.
+
+### The defect this found next to it
+
+Writing that proof turned up a real defect in the hardened path, in the code
+rather than in a document. `install_with` runs at `crates/broker/src/main.rs:221`
+and the passphrase is read at `:315`; `landlock_restrict_self()` is
+irreversible, and the declared path set granted the socket directory, the
+vault's parent and the audit log's parent — **and nothing else the broker
+opens**. So `asv-brokerd --harden --passphrase-file ~/.config/asv/passphrase`
+sandboxed the broker out of its own passphrase and would have exited with
+`cannot read passphrase file`. `~/.config` is not in `STATIC_READ_HIERARCHIES`,
+which covers `/usr`, `/lib`, `/lib64`, `/etc`, `/proc/self`, `/sys/fs/cgroup`
+and `/dev/null`.
+
+The vault's directory *was* granted, so the vault would have opened. The
+shipped deployment never hit it because `packaging/asv-brokerd.service` does not
+pass `--harden` — and the unit's own comment had attributed the absent sandbox
+directives to the write set being *unenumerated*, which had itself become
+false. The mode that was broken was the one nobody enabled.
+
+Fixed by extracting the declaration into
+`harden::broker_install_paths`, which is testable, and adding the passphrase's
+parent as **read-only** — the broker has no business writing beside a
+passphrase. Five assertions in
+`crates/broker/tests/uat_048_landlock_install_paths.rs` cover the mapping from
+the operator's arguments to the set, including one that fails if a future
+change widens the static hierarchies over the test's premise.
+
+### What is still open
+
+The dedicated uid, and therefore the unconditional form of the claim. It needs
+a system account, and creating one requires privileges this host does not
+grant, so it is **host-dependent** in the same sense as M11 and M12 — and no
+guard asserts it, because nothing in a repository can decide whether an OS
+account exists. The service ownership that would go with it (a system unit, a
+dedicated `User=`, the right `StateDirectory`/`RuntimeDirectory` ownership) is
+part of that same work, not a separate thing.
 
 ---
 
@@ -741,11 +801,18 @@ CURRENT: v0.28.0
 └────────────── v1.0
 ```
 
-- **V1-C1** closes the M7 residual recorded above: `asv-brokerd` under a
-  separate OS identity, correct service ownership, and an adversarial test
-  that a process under the agent's uid cannot read or ptrace the broker's
-  memory. It also un-ignores UAT-003's dropped clause. No new sandbox
-  framework: seccomp, Landlock and cgroups are already M7's.
+- **V1-C1** closes the M7 residual recorded above. **Done, in two parts with
+  different owners.** The *proof* is delivered: UAT-003's dropped clause now
+  runs against the kernel with the same-uid attacker, a `EACCES`/`EPERM`
+  requirement, a control that must succeed against a dumpable sibling, and a
+  demonstrated guard that the attacker lacks `CAP_SYS_PTRACE`. Writing it also
+  found and fixed a real defect beside it — `--harden` was sandboxing the
+  broker out of its own passphrase file. The *identity* is **host-dependent**:
+  `asv-brokerd` under a separate OS uid, with the service ownership that goes
+  with it, needs a system account, and creating one needs privileges this
+  build host does not grant. No new sandbox framework: seccomp, Landlock and
+  cgroups are already M7's, and the gap was a declared read path, not a
+  missing control.
 - **V1-C2** productionizes what M9 verified but did not ship as a network
   surface: a production listener wiring `relay_substituted` into a running
   `asv-brokerd`, real CONNECT lifecycle, more than one request per tunnel where

@@ -16,7 +16,7 @@ agente ──(sustituto / socket)──▶ broker ──(credencial real)──�
 
 > **Estado: pre-1.0, en v0.28.0. Sin certificar, y los gates lo dicen.**
 >
-> El workspace compila y hay **866 tests enumerados** (865 pasan, 1 ignorado, 0
+> El workspace compila y hay **873 tests enumerados** (873 pasan, 0 ignorado, 0
 > fallan; el conteo lo vuelve a derivar el gate `R11 README test count` en cada
 > corrida de CI, así que esta línea ya no puede quedarse vieja). El vault, la
 > firma SSH, los brokers HTTP y PostgreSQL, la política Cedar, la consola de
@@ -106,15 +106,27 @@ Dicho sin adornos, porque un proyecto de seguridad que se sobrevende a sí
 mismo no vale nada. Cada punto dice dónde vive su detalle, porque nada de eso
 es una suposición:
 
-- **No se usa un uid dedicado para el broker, así que las lecturas de memoria
-  del mismo uid tienen éxito.** El broker corre como tú, luego un proceso que
-  corre como tú puede leerle la memoria; sólo se interponen
-  `PR_SET_DUMPABLE=0` y Landlock, y ambos son imposición de política que un
-  proceso del mismo uid puede derrotar. Un uid aparte (M7) es lo que hace que
-  esa negación sea incondicional. Es el primer punto de la secuencia hacia
-  v1.0. *(La cláusula más fuerte de UAT-003 —la que mostraría al kernel
-  rechazando la lectura— está marcada `#[ignore]`, y es el único test ignorado
-  aquí. Eso es V1-C1.)*
+- **No se usa un uid dedicado para el broker, así que la afirmación sobre
+  memoria es la más estrecha.** El broker corre como tú, luego un proceso que
+  corre como tú puede leerle la memoria. Lo que los tests demuestran ahora es
+  el hecho de kernel que hay debajo: un proceso con el mismo uid **sin
+  `CAP_SYS_PTRACE`** es rechazado por el kernel al abrir
+  `/proc/<broker>/mem`, y el ataque idéntico contra un *hermano* volcable con
+  el mismo uid tiene éxito — así que el rechazo es atribuible al
+  endurecimiento y no a que la apertura fallara por otra razón. Un uid aparte
+  (M7) es lo que hace la negación incondicional, y necesita una cuenta del
+  sistema, así que no se entrega.
+- **El ataque del mismo uid se ejecuta ahora, no se documenta.** La cláusula
+  más fuerte de UAT-003 estuvo marcada `#[ignore]` durante varios milestones:
+  su motivo nombraba el arreglo, *"requiere un proceso hijo que intente la
+  apertura"*, y el arreglo nunca se construyó. Corre ahora, y era el único test
+  ignorado de la suite. *(Esta línea antes decía que la cláusula seguía
+  ignorada. Escribir el test destapó además un defecto real justo al lado:
+  bajo `--harden` el broker quedaba fuera de su propio **fichero de
+  passphrase**, porque el ruleset se instala al arrancar y la passphrase se
+  lee después, y el conjunto de rutas declaradas nunca cubrió el directorio de
+  la passphrase. El unit que se envía no pasa `--harden`, y por eso nadie lo
+  notó.)*
 - **El perfil de hardening M7 es opt-in, no está desconectado.**
   `harden::install_with` se llama desde `crates/broker/src/main.rs:195` tras
   `--harden`; el broker se envía solo con `RLIMIT_CORE=0` cuando no se pasa.
@@ -145,7 +157,7 @@ es una suposición:
 cargo build --release -p asv-broker
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# esperado: passed=865 failed=0 ignored=1
+# esperado: passed=873 failed=0 ignored=0
 ```
 
 Ese número era `passed=692` en este fichero durante varios milestones, y nada

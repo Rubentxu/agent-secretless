@@ -79,7 +79,11 @@ const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 fn b64(bytes: &[u8]) -> String {
     let mut out = String::new();
     for group in bytes.chunks(3) {
-        let b = [group[0], *group.get(1).unwrap_or(&0), *group.get(2).unwrap_or(&0)];
+        let b = [
+            group[0],
+            *group.get(1).unwrap_or(&0),
+            *group.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         let quad = [n >> 18 & 63, n >> 12 & 63, n >> 6 & 63, n & 63];
         let take = match group.len() {
@@ -110,9 +114,8 @@ struct SessionLeaves {
 impl LeafSource for SessionLeaves {
     fn issue_for(&self, host: &str, now: Instant) -> Result<VerifiedLeaf, LeafError> {
         let certificate = issue_leaf(&self.ca, host, now)?;
-        VerifiedLeaf::from_certificate(&self.ca, certificate).map_err(|_| {
-            LeafError::InvalidHost("leaf material could not be assembled".to_string())
-        })
+        VerifiedLeaf::from_certificate(&self.ca, certificate)
+            .map_err(|_| LeafError::InvalidHost("leaf material could not be assembled".to_string()))
     }
 }
 
@@ -169,8 +172,7 @@ struct Origin {
     received: Arc<Mutex<Vec<u8>>>,
 }
 
-const ORIGIN_RESPONSE: &str =
-    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+const ORIGIN_RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
 
 impl Origin {
     fn start() -> Self {
@@ -302,18 +304,10 @@ impl Rig {
         let session_a = store.create("uat-010-a".into(), &peer);
         let session_b = store.create("uat-010-b".into(), &peer);
         store
-            .register_key(
-                session_a,
-                &peer,
-                public_key_blob(&key_a.verifying_key()),
-            )
+            .register_key(session_a, &peer, public_key_blob(&key_a.verifying_key()))
             .expect("session A registers its key");
         store
-            .register_key(
-                session_b,
-                &peer,
-                public_key_blob(&key_b.verifying_key()),
-            )
+            .register_key(session_b, &peer, public_key_blob(&key_b.verifying_key()))
             .expect("session B registers its key");
 
         // The stranger's key is deliberately *not* registered: that is what
@@ -403,8 +397,8 @@ impl Rig {
         proofs: Arc<dyn SessionProofs + Send + Sync>,
     ) -> Result<(ClientSide, EstablishedTunnel), BridgeError> {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bridge binds");
-        let mut client = TcpStream::connect(listener.local_addr().expect("bridge addr"))
-            .expect("connect");
+        let mut client =
+            TcpStream::connect(listener.local_addr().expect("bridge addr")).expect("connect");
         let (server_side, _) = listener.accept().expect("bridge accepts");
 
         let mut head = format!("CONNECT {HOST}:{port} HTTP/1.1\r\nHost: {HOST}\r\n");
@@ -424,7 +418,13 @@ impl Rig {
         };
 
         let handle = thread::spawn(move || {
-            bridge.serve_connect(server_side, &leaves, &upstream, Some(proofs.as_ref()), Instant::now())
+            bridge.serve_connect(
+                server_side,
+                &leaves,
+                &upstream,
+                Some(proofs.as_ref()),
+                Instant::now(),
+            )
         });
 
         let ack = read_head(&mut client);
@@ -442,8 +442,7 @@ impl Rig {
     /// report a socket error instead of the refusal under test.
     fn tunnel_refused(&self, proof: Option<String>, port: u16) -> BridgeError {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bridge binds");
-        let mut client =
-            TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let mut client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
         let (server_side, _) = listener.accept().expect("accepts");
 
         let mut head = format!("CONNECT {HOST}:{port} HTTP/1.1\r\nHost: {HOST}\r\n");
@@ -580,7 +579,12 @@ fn a_valid_proof_resolves_its_session_and_the_origin_receives_the_credential() {
     client.send(request_with(&rig.surrogate_a).as_bytes());
 
     let mut audit = Collected::default();
-    let mut port = SubstitutionPort::new(&mut rig.registry, &CanaryStore, OperationFamily::GitHub, "github");
+    let mut port = SubstitutionPort::new(
+        &mut rig.registry,
+        &CanaryStore,
+        OperationFamily::GitHub,
+        "github",
+    );
     let outcome: SubstitutionOutcome = tunnel
         .relay_substituted(&mut port, &mut audit, RelayLimits::default())
         .expect("a redeemable surrogate substitutes");
@@ -604,7 +608,10 @@ fn a_valid_proof_resolves_its_session_and_the_origin_receives_the_credential() {
         "the surrogate was forwarded upstream: {text}"
     );
     // The rest of the request survived the rewrite byte for byte.
-    assert!(text.starts_with("GET /repos/o/r/issues HTTP/1.1\r\n"), "{text}");
+    assert!(
+        text.starts_with("GET /repos/o/r/issues HTTP/1.1\r\n"),
+        "{text}"
+    );
     assert!(text.contains(&format!("Host: {HOST}\r\n")), "{text}");
     assert!(text.contains("Accept: application/json\r\n"), "{text}");
 
@@ -633,13 +640,21 @@ fn the_client_receives_the_response_and_neither_the_credential_nor_the_surrogate
     client.send(request_with(&rig.surrogate_a).as_bytes());
 
     let mut audit = Collected::default();
-    let mut port = SubstitutionPort::new(&mut rig.registry, &CanaryStore, OperationFamily::GitHub, "github");
+    let mut port = SubstitutionPort::new(
+        &mut rig.registry,
+        &CanaryStore,
+        OperationFamily::GitHub,
+        "github",
+    );
     tunnel
         .relay_substituted(&mut port, &mut audit, RelayLimits::default())
         .expect("substitution");
 
     let response = String::from_utf8_lossy(&client.recv(ORIGIN_RESPONSE.len())).to_string();
-    assert_eq!(response, ORIGIN_RESPONSE, "the response did not arrive intact");
+    assert_eq!(
+        response, ORIGIN_RESPONSE,
+        "the response did not arrive intact"
+    );
     assert!(
         !response.contains(REAL),
         "the client received the real credential: {response}"
@@ -652,9 +667,13 @@ fn the_client_receives_the_response_and_neither_the_credential_nor_the_surrogate
     // The relay's own outcome is a number, never a body: returning the
     // forwarded request would make it a second place the secret lives.
     let mut audit = Collected::default();
-    let mut port = SubstitutionPort::new(&mut rig.registry, &CanaryStore, OperationFamily::GitHub, "github");
-    let second = tunnel
-        .relay_substituted(&mut port, &mut audit, RelayLimits::default());
+    let mut port = SubstitutionPort::new(
+        &mut rig.registry,
+        &CanaryStore,
+        OperationFamily::GitHub,
+        "github",
+    );
+    let second = tunnel.relay_substituted(&mut port, &mut audit, RelayLimits::default());
     assert!(
         matches!(second, Err(BridgeError::Io(_)) | Err(BridgeError::Substitution(_))),
         "a second relay on the same tunnel answered with something other than a refusal: {second:?}"
@@ -686,11 +705,19 @@ fn another_sessions_proof_does_not_resolve_to_this_session() {
     // A's token, spent in B's tunnel.
     client.send(request_with(&rig.surrogate_a).as_bytes());
     let mut audit = Collected::default();
-    let mut port = SubstitutionPort::new(&mut rig.registry, &CanaryStore, OperationFamily::GitHub, "github");
+    let mut port = SubstitutionPort::new(
+        &mut rig.registry,
+        &CanaryStore,
+        OperationFamily::GitHub,
+        "github",
+    );
     let outcome = tunnel.relay_substituted(&mut port, &mut audit, RelayLimits::default());
 
     assert!(
-        matches!(outcome, Err(BridgeError::Substitution(SubstitutionError::Refused))),
+        matches!(
+            outcome,
+            Err(BridgeError::Substitution(SubstitutionError::Refused))
+        ),
         "a token from another session was redeemed: {outcome:?}"
     );
     rig.origin.assert_nothing_received();
@@ -716,10 +743,18 @@ fn a_surrogate_from_another_session_is_still_refused_and_the_right_one_still_wor
     let (mut client, mut tunnel) = rig.tunnel(Some(proof), 443).expect("an authorised tunnel");
     client.send(request_with(&rig.surrogate_b).as_bytes());
     let mut audit = Collected::default();
-    let mut port = SubstitutionPort::new(&mut rig.registry, &CanaryStore, OperationFamily::GitHub, "github");
+    let mut port = SubstitutionPort::new(
+        &mut rig.registry,
+        &CanaryStore,
+        OperationFamily::GitHub,
+        "github",
+    );
     let refused = tunnel.relay_substituted(&mut port, &mut audit, RelayLimits::default());
     assert!(
-        matches!(refused, Err(BridgeError::Substitution(SubstitutionError::Refused))),
+        matches!(
+            refused,
+            Err(BridgeError::Substitution(SubstitutionError::Refused))
+        ),
         "B's token redeemed in A's tunnel: {refused:?}"
     );
     // `serve_connect` dials the upstream before the relay runs, so "never
@@ -734,12 +769,18 @@ fn a_surrogate_from_another_session_is_still_refused_and_the_right_one_still_wor
     let (mut client, mut tunnel) = rig2.tunnel(Some(proof), 443).expect("an authorised tunnel");
     client.send(request_with(&rig2.surrogate_a).as_bytes());
     let mut audit = Collected::default();
-    let mut port = SubstitutionPort::new(&mut rig2.registry, &CanaryStore, OperationFamily::GitHub, "github");
+    let mut port = SubstitutionPort::new(
+        &mut rig2.registry,
+        &CanaryStore,
+        OperationFamily::GitHub,
+        "github",
+    );
     tunnel
         .relay_substituted(&mut port, &mut audit, RelayLimits::default())
         .expect("the matching token must still work, or this test proves nothing");
     assert!(
-        String::from_utf8_lossy(&rig2.origin.wait_for_received(Duration::from_secs(5))).contains(REAL),
+        String::from_utf8_lossy(&rig2.origin.wait_for_received(Duration::from_secs(5)))
+            .contains(REAL),
         "the control tunnel did not substitute, so the refusal above proves nothing"
     );
 }
@@ -864,9 +905,7 @@ fn an_unauthorised_destination_is_refused_before_the_proof_is_looked_at() {
     let bridge = Bridge::new(ConnectPolicy {
         allowed: vec![endpoint(HOST, 443)],
     });
-    let leaves = SessionLeaves {
-        ca: Arc::new(ca),
-    };
+    let leaves = SessionLeaves { ca: Arc::new(ca) };
     let upstream = FixedUpstream { addr: origin.addr };
     let calls = Arc::new(Mutex::new(0usize));
     let proofs = CountingProofs {
@@ -875,7 +914,13 @@ fn an_unauthorised_destination_is_refused_before_the_proof_is_looked_at() {
     };
 
     let error = bridge
-        .serve_connect(server_side, &leaves, &upstream, Some(&proofs), Instant::now())
+        .serve_connect(
+            server_side,
+            &leaves,
+            &upstream,
+            Some(&proofs),
+            Instant::now(),
+        )
         .expect_err("an unauthorised destination must be refused");
     assert!(matches!(error, BridgeError::Connect(_)), "{error:?}");
     assert_eq!(
@@ -920,10 +965,18 @@ fn without_a_valid_proof_or_a_credential_the_tunnel_closes_and_nothing_is_forwar
     client.send(b"GET /repos/o/r/issues HTTP/1.1\r\nHost: api.github.test\r\n\r\n");
 
     let mut audit = Collected::default();
-    let mut port = SubstitutionPort::new(&mut rig.registry, &CanaryStore, OperationFamily::GitHub, "github");
+    let mut port = SubstitutionPort::new(
+        &mut rig.registry,
+        &CanaryStore,
+        OperationFamily::GitHub,
+        "github",
+    );
     let outcome = tunnel.relay_substituted(&mut port, &mut audit, RelayLimits::default());
     assert!(
-        matches!(outcome, Err(BridgeError::Substitution(SubstitutionError::NoCredential))),
+        matches!(
+            outcome,
+            Err(BridgeError::Substitution(SubstitutionError::NoCredential))
+        ),
         "a request with no credential was not refused: {outcome:?}"
     );
     rig.origin.assert_nothing_received();
@@ -948,7 +1001,12 @@ fn the_audit_record_names_the_operation_and_carries_no_secret() {
     client.send(request_with(&rig.surrogate_a).as_bytes());
 
     let mut log = AuditLog::new(0);
-    let mut port = SubstitutionPort::new(&mut rig.registry, &CanaryStore, OperationFamily::GitHub, "github");
+    let mut port = SubstitutionPort::new(
+        &mut rig.registry,
+        &CanaryStore,
+        OperationFamily::GitHub,
+        "github",
+    );
     {
         let mut recorder = SubstitutionRecorder::new(&mut log, 1_700_000_000);
         tunnel
@@ -994,8 +1052,16 @@ fn the_audit_record_names_the_operation_and_carries_no_secret() {
     else {
         unreachable!("the record was found by that variant")
     };
-    assert_eq!(session, &rig.session_a.to_string(), "the wrong session was recorded");
-    assert_eq!(destination, &format!("{HOST}:443"), "the destination was not recorded");
+    assert_eq!(
+        session,
+        &rig.session_a.to_string(),
+        "the wrong session was recorded"
+    );
+    assert_eq!(
+        destination,
+        &format!("{HOST}:443"),
+        "the destination was not recorded"
+    );
     assert_eq!(family, "github", "the family was not recorded");
     assert_eq!(outcome, "substituted", "the outcome was not recorded");
 }
@@ -1015,11 +1081,19 @@ fn a_refused_substitution_is_audited_without_the_secret() {
     client.send(request_with(&rig.surrogate_b).as_bytes());
 
     let mut log = AuditLog::new(0);
-    let mut port = SubstitutionPort::new(&mut rig.registry, &CanaryStore, OperationFamily::GitHub, "github");
+    let mut port = SubstitutionPort::new(
+        &mut rig.registry,
+        &CanaryStore,
+        OperationFamily::GitHub,
+        "github",
+    );
     {
         let mut recorder = SubstitutionRecorder::new(&mut log, 1_700_000_000);
         let outcome = tunnel.relay_substituted(&mut port, &mut recorder, RelayLimits::default());
-        assert!(matches!(outcome, Err(BridgeError::Substitution(_))), "{outcome:?}");
+        assert!(
+            matches!(outcome, Err(BridgeError::Substitution(_))),
+            "{outcome:?}"
+        );
     }
 
     let records = log.query(0);
@@ -1028,7 +1102,9 @@ fn a_refused_substitution_is_audited_without_the_secret() {
     let refused = records
         .iter()
         .find_map(|r| match &r.event {
-            asv_ipc_protocol::AuditEventDto::CredentialSubstituted { outcome, .. } => Some(outcome.clone()),
+            asv_ipc_protocol::AuditEventDto::CredentialSubstituted { outcome, .. } => {
+                Some(outcome.clone())
+            }
             _ => None,
         })
         .expect("a refusal left no audit record");
@@ -1036,7 +1112,10 @@ fn a_refused_substitution_is_audited_without_the_secret() {
 
     for record in &records {
         let rendered = serde_json::to_string(&record.event).expect("serializes");
-        assert!(!rendered.contains(REAL), "a refusal record carried the credential: {rendered}");
+        assert!(
+            !rendered.contains(REAL),
+            "a refusal record carried the credential: {rendered}"
+        );
     }
 }
 
@@ -1062,7 +1141,12 @@ fn the_substitution_is_observable_from_both_ends_and_not_vacuous() {
     client.send(request_with(&rig.surrogate_a).as_bytes());
 
     let mut audit = Collected::default();
-    let mut port = SubstitutionPort::new(&mut rig.registry, &CanaryStore, OperationFamily::GitHub, "github");
+    let mut port = SubstitutionPort::new(
+        &mut rig.registry,
+        &CanaryStore,
+        OperationFamily::GitHub,
+        "github",
+    );
     tunnel
         .relay_substituted(&mut port, &mut audit, RelayLimits::default())
         .expect("substitution");
@@ -1078,10 +1162,19 @@ fn the_substitution_is_observable_from_both_ends_and_not_vacuous() {
 
     // End two: the client really got an answer.
     let response = client.recv(ORIGIN_RESPONSE.len());
-    assert_eq!(response, ORIGIN_RESPONSE.as_bytes(), "the response did not reach the client");
+    assert_eq!(
+        response,
+        ORIGIN_RESPONSE.as_bytes(),
+        "the response did not reach the client"
+    );
 
     // And exactly one record, for exactly one substitution.
-    assert_eq!(audit.0.len(), 1, "expected one audit record, got {:?}", audit.0);
+    assert_eq!(
+        audit.0.len(),
+        1,
+        "expected one audit record, got {:?}",
+        audit.0
+    );
     assert_eq!(audit.0[0].outcome, "substituted");
     assert_eq!(audit.0[0].destination, format!("{HOST}:443"));
 }

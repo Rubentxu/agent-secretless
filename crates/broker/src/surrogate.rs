@@ -390,12 +390,8 @@ impl crate::tls_bridge::CredentialSubstituter for SubstitutionPort<'_> {
             .redeem_for(surrogate, session, self.family, now_secs())
             .map_err(|_| SubstitutionError::Refused)?;
 
-        asv_connector_http::SecretPort::lend(
-            self.credential_port,
-            &credential.to_wire(),
-            sink,
-        )
-        .map_err(|e| SubstitutionError::Lend(e.to_string()))?;
+        asv_connector_http::SecretPort::lend(self.credential_port, &credential.to_wire(), sink)
+            .map_err(|e| SubstitutionError::Lend(e.to_string()))?;
 
         Ok(Substituted {
             family: self.family_name,

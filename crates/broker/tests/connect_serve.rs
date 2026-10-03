@@ -306,7 +306,13 @@ fn session_leaf_handshakes_and_the_tunnel_is_live_in_both_directions() {
             session: AgentSessionId::new(),
         };
         thread::spawn(move || {
-            bridge.serve_connect(server_side, &leaves, &upstream, Some(&proofs), Instant::now())
+            bridge.serve_connect(
+                server_side,
+                &leaves,
+                &upstream,
+                Some(&proofs),
+                Instant::now(),
+            )
         })
     };
 
@@ -457,7 +463,13 @@ fn a_pinning_client_is_refused_and_the_bridge_does_not_patch_it() {
             session: AgentSessionId::new(),
         };
         thread::spawn(move || {
-            bridge.serve_connect(server_side, &leaves, &upstream, Some(&proofs), Instant::now())
+            bridge.serve_connect(
+                server_side,
+                &leaves,
+                &upstream,
+                Some(&proofs),
+                Instant::now(),
+            )
         })
     };
 
@@ -599,7 +611,13 @@ fn handshake_through_bridge(
             session: AgentSessionId::new(),
         };
         thread::spawn(move || {
-            bridge.serve_connect(server_side, &leaves, &upstream, Some(&proofs), Instant::now())
+            bridge.serve_connect(
+                server_side,
+                &leaves,
+                &upstream,
+                Some(&proofs),
+                Instant::now(),
+            )
         })
     };
 

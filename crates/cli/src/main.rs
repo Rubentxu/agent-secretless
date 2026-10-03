@@ -816,7 +816,9 @@ fn print_response(response: &Response) {
                         // would be the more useful column in a different
                         // view, and this one has three.
                         asv_ipc_protocol::AuditEventDto::CredentialSubstituted {
-                            destination, outcome, ..
+                            destination,
+                            outcome,
+                            ..
                         } => (format!("connect:{destination}"), outcome.clone()),
                     };
                     println!("{:<6} {:<12} {:<22} {}", r.seq, outcome, method, r.ts);

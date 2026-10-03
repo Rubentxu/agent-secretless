@@ -16,7 +16,7 @@ agent ──(surrogate / socket)──▶ broker ──(real credential)──�
 
 > **Status: pre-1.0, at v0.28.0. Not certified, and the gates say so.**
 >
-> The workspace compiles and **866 tests are enumerated** (865 pass, 1 ignored,
+> The workspace compiles and **873 tests are enumerated** (873 pass, 0 ignored,
 > 0 fail; the count is re-derived every CI run by the `R11 README test count`
 > gate, so this line cannot go stale again). Vault, SSH signing, the HTTP and
 > PostgreSQL brokers, Cedar policy, the operator console and the CONNECT TLS
@@ -99,13 +99,25 @@ type system:
 Stated plainly, because a security project that oversells itself is worthless.
 Each item says where its detail lives, because none of it is a guess.
 
-- **A dedicated broker uid is not used, so same-uid memory reads succeed.** The
-  broker runs as you, which means a process running as you can read its memory;
-  only `PR_SET_DUMPABLE=0` and Landlock stand in the way, and both are policy
-  enforcement a same-uid process can defeat. A separate uid (M7) is what makes
-  the denial unconditional. This is the first item in the sequence to v1.0.
-  *(The strongest clause of UAT-003 — the one that would show the kernel refusing
-  the read — is `#[ignore]`d, and is the only ignored test here. That is V1-C1.)*
+- **A dedicated broker uid is not used, so the claim about memory is the
+  narrower one.** The broker runs as you, which means a process running as you
+  can read its memory. What the tests now prove is the kernel-level fact
+  underneath: a process under the same uid **lacking `CAP_SYS_PTRACE`** is
+  refused by the kernel when it opens `/proc/<broker>/mem`, and the identical
+  attack against a *dumpable* sibling of the same uid succeeds — so the
+  refusal is attributable to the hardening rather than to the open having
+  failed for some unrelated reason. A separate uid (M7) is what makes the
+  denial unconditional, and it needs a system account, so it is not shipped.
+- **The same-uid attack is now executed, not documented.** UAT-003's strongest
+  clause was `#[ignore]`d for several milestones — its reason named the fix,
+  *"requires a child process to attempt the open"*, and the fix was never
+  built. It runs now, and it was the only ignored test in the suite.
+  *(This line previously said the clause was still ignored. Writing the test
+  also turned up a real defect next door: under `--harden` the broker was
+  sandboxed out of its own **passphrase file**, because the ruleset is
+  installed at startup and the passphrase is read after it, and the declared
+  path set had never covered the passphrase's directory. The shipped unit does
+  not pass `--harden`, which is why nobody hit it.)*
 - **The M7 hardening profile is opt-in, not unwired.** `harden::install_with`
   is called from `crates/broker/src/main.rs:195` behind `--harden`; the broker
   ships with `RLIMIT_CORE=0` only when it is not passed. *(This line previously
@@ -134,7 +146,7 @@ Each item says where its detail lives, because none of it is a guess.
 cargo build --release -p asv-broker
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# expected: passed=865 failed=0 ignored=1
+# expected: passed=873 failed=0 ignored=0
 ```
 
 That number was `passed=692` in this file for several milestones, and nothing
