@@ -25,13 +25,31 @@
 # log produces a service that fails at boot with an error about a path, and the
 # operator's reasonable conclusion is that the broker is broken.
 #
-# The broker's actual write set was not enumerated before this unit was
-# written. `ProtectSystem=strict` would need `ReadWritePaths=` for the runtime
-# directory, the audit log and the vault, and choosing those wrong in either
-# direction is a real defect rather than a hardening. So the unit ships with
-# the directives whose behaviour is well understood, and the sandboxing waits
-# to be done against a measured write set. That is a real gap, recorded here
-# rather than papered over.
+# ## This section was wrong once, and the correction matters
+#
+# An earlier version of this comment said the broker's write set "was not
+# enumerated before this unit was written", and treated the missing
+# `ReadWritePaths=` as the reason for the absent directives. That became false:
+# `harden::broker_install_paths` now derives the set from the operator's
+# arguments, and it is asserted by
+# `crates/broker/tests/uat_048_landlock_install_paths.rs`.
+#
+# The gap was not missing enumeration. It was a **missing read path**, and it
+# was found while writing the UAT-003 proof rather than by looking here:
+# `install_with` runs at `main.rs:221`, the passphrase is read at
+# `main.rs:315`, and `restrict_self()` is irreversible — so `--harden` with
+# this unit's default `--passphrase-file` sandboxed the broker out of its own
+# passphrase and it would have exited with "cannot read passphrase file". The
+# vault's directory was granted, so the vault would have opened, which is
+# presumably why nobody had hit it: the failure was in the *other* file.
+#
+# The mode that was broken is the one this unit declines to enable, so the
+# shipped deployment never saw it. That is recorded here because the general
+# lesson is not about this unit: **an unenumerated path is not the only way a
+# sandbox is wrong, and "we never enable it" is not the same as "it works".**
+# `--harden` is now exercised by the broker's own suites, and the unit still
+# does not pass it — enabling it in a deployment is a decision about that
+# deployment's write set, and it belongs to whoever owns it.
 #
 # ## What IS here, and why each is safe
 #

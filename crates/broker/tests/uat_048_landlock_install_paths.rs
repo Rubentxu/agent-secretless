@@ -213,3 +213,111 @@ fn uat_048_missing_path_is_skipped_not_widened() {
         Ok(())
     });
 }
+
+/// The daemon's own declared path set must cover every file it opens *after*
+/// the ruleset is installed.
+///
+/// This is the test that was missing when `--harden` sandboxed the broker out
+/// of its own passphrase. `harden::broker_install_paths` is the declaration
+/// `main.rs` installs from, and the ordering that makes it dangerous is fixed
+/// in code: `install_with` at `main.rs:221`, the passphrase read at
+/// `main.rs:315`, and `restrict_self()` is irreversible.
+///
+/// The assertions are on the *declaration*, not on kernel behaviour — the
+/// kernel half is what the four scenarios above already prove. What was
+/// untested is the mapping from the operator's arguments to the set, and a
+/// mapping untested is a mapping that was wrong.
+mod broker_declared_paths {
+    use std::path::Path;
+
+    use asv_broker::harden::{broker_install_paths, statically_allowed, STATIC_READ_HIERARCHIES};
+
+    /// The unit's actual ExecStart arguments.
+    const SOCKET: &str = "/run/user/1000/asv/broker.sock";
+    const VAULT: &str = "/home/u/.local/share/asv/vault.asv";
+    const PASSPHRASE: &str = "/home/u/.config/asv/passphrase";
+    const AUDIT: &str = "/home/u/.local/share/asv/audit.log";
+
+    fn declared() -> asv_broker::harden::InstallPaths {
+        broker_install_paths(
+            Path::new(SOCKET),
+            Some(Path::new(VAULT)),
+            Some(Path::new(AUDIT)),
+            Some(Path::new(PASSPHRASE)),
+        )
+    }
+
+    #[test]
+    fn the_passphrase_directory_is_reachable_under_hardening() {
+        let paths = declared();
+        let dir = Path::new(PASSPHRASE).parent().unwrap();
+        assert!(
+            paths.read_paths.iter().any(|p| p == dir),
+            "the passphrase is read at main.rs:315, after install_with() has \
+             installed an irreversible ruleset at :221, so its directory has \
+             to be reachable. read_paths was {:?}. A broker started with \
+             --harden and the default --passphrase-file would exit with \
+             'cannot read passphrase file', and no unit-level check would \
+             have said why.",
+            paths.read_paths
+        );
+    }
+
+    #[test]
+    fn the_passphrase_directory_is_readable_but_not_writable() {
+        let paths = declared();
+        let dir = Path::new(PASSPHRASE).parent().unwrap();
+        assert!(
+            !paths.write_paths.iter().any(|p| p == dir),
+            "the broker must not need to write beside a passphrase; \
+             write_paths was {:?}",
+            paths.write_paths
+        );
+    }
+
+    /// The gap was invisible partly because `~/.config` *sounds* like a system
+    /// path. `/etc` is in the static read set; `~/.config` is not, and no
+    /// amount of intuition about the word "config" substitutes for asking.
+    #[test]
+    fn the_passphrase_directory_is_not_silently_covered_by_the_static_set() {
+        let dir = Path::new(PASSPHRASE).parent().unwrap();
+        assert!(
+            !statically_allowed(dir),
+            "this test's premise is that {dir:?} is outside every static \
+             hierarchy; if a future change widened the static set to cover it, \
+             the suite would stop detecting the missing declaration"
+        );
+        for base in STATIC_READ_HIERARCHIES {
+            assert!(
+                !dir.starts_with(base),
+                "{dir:?} unexpectedly starts with the static read hierarchy \
+                 {base:?}; the missing-declaration bug this guards would no \
+                 longer be reachable"
+            );
+        }
+    }
+
+    #[test]
+    fn the_socket_and_audit_and_vault_directories_remain_writable() {
+        let paths = declared();
+        for (label, file) in [("socket", SOCKET), ("vault", VAULT), ("audit", AUDIT)] {
+            let dir = Path::new(file).parent().unwrap();
+            assert!(
+                paths.write_paths.iter().any(|p| p == dir),
+                "the {label} directory {:?} must stay writable; the fix for the \
+                 passphrase must not have narrowed the set",
+                dir
+            );
+        }
+    }
+
+    /// A bare relative path has no parent, and the old inline code reached for
+    /// `/run` only when `parent()` returned `None` — while a *present but
+    /// empty* parent was silently skipped. Both must land somewhere usable.
+    #[test]
+    fn a_socket_with_no_usable_parent_falls_back_to_run() {
+        let paths = broker_install_paths(Path::new("broker.sock"), None, None, None);
+        assert_eq!(paths.write_paths, vec![Path::new("/run")]);
+        assert!(paths.read_paths.is_empty());
+    }
+}

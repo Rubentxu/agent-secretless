@@ -294,6 +294,41 @@ def check_console_surface(gate: str, evidence: str, failures: list[str]) -> None
                         f"that serves local files over it can be pointed elsewhere")
 
 
+def check_formatting(gate: str, evidence: str, failures: list[str]) -> None:
+    """The formatting row, which was the one actually lying.
+
+    `R11 formatting` claimed `cargo fmt --all -- --check clean` and the claim
+    was false: at `0ea4881` the check exited 1 with 33 diff hunks across four
+    files. It survived because the `static` stage runs the same command, so
+    there was a check — and because the table also said clean, a reader had no
+    way to tell the two apart.
+
+    A row that a *different* stage checks still needs this guard to look at it
+    for two reasons. The reader of the table should not have to know which
+    stage covers which row, and a guard that only reports rows it checks itself
+    makes "5 of 20" look like coverage rather than like a statement about this
+    one script. `cargo fmt --check` compiles nothing, so it costs almost
+    nothing here.
+
+    Clippy is deliberately *not* added: it is minutes of build for a claim the
+    `static` stage already makes, and duplicating it would buy a second
+    opinion nobody asked for.
+    """
+    if "formatting" not in gate.lower():
+        return
+    proc = subprocess.run(
+        ["cargo", "fmt", "--all", "--", "--check"],
+        cwd=REPO, capture_output=True, text=True, check=False,
+    )
+    if proc.returncode != 0:
+        hunks = sum(1 for line in (proc.stdout + proc.stderr).splitlines()
+                    if line.startswith("Diff in"))
+        failures.append(
+            f"{gate}: claims `cargo fmt --all -- --check` is clean, and it "
+            f"exits {proc.returncode} with {hunks} diff hunks"
+        )
+
+
 def main() -> int:
     table_path = TABLE
     args = sys.argv[1:]
@@ -337,6 +372,9 @@ def main() -> int:
             applied = True
         if "console front-end" in gate.lower() or "remote origin" in gate.lower():
             check_console_surface(gate, evidence, failures)
+            applied = True
+        if "formatting" in gate.lower():
+            check_formatting(gate, evidence, failures)
             applied = True
         if applied:
             checked += 1

@@ -117,6 +117,73 @@ impl InstallPaths {
             read_paths: Vec::new(),
         }
     }
+
+    /// Add a directory the broker only has to read.
+    pub fn with_read_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.read_paths.push(path.into());
+        self
+    }
+}
+
+/// The set of paths the broker daemon must be able to reach, derived from the
+/// operator's arguments.
+///
+/// This exists as a function, in the library, rather than as an inline
+/// construction in `main`, for one reason: it was a defect.
+///
+/// `install_with` runs at `main.rs:221` and the passphrase is read at
+/// `main.rs:315` — *after* the ruleset is installed and irreversible. The
+/// inline version granted read+write to the socket directory, the vault's
+/// parent and the audit log's parent, and nothing else that the broker opens.
+/// So under `--harden` with the shipped unit's default
+/// `--passphrase-file %h/.config/asv/passphrase`, the broker sandboxed itself
+/// out of its own passphrase: `~/.config` is not in
+/// [`STATIC_READ_HIERARCHIES`], which covers `/usr`, `/lib`, `/lib64`, `/etc`,
+/// `/proc/self`, `/sys/fs/cgroup` and `/dev/null`. The vault's parent *was*
+/// granted, so the vault would have opened — but the passphrase read comes
+/// first, and the broker exits with "cannot read passphrase file".
+///
+/// `packaging/asv-brokerd.service` does not pass `--harden`, so the shipped
+/// deployment never hit it. That is why it survived: the mode that was broken
+/// was the one the unit declined to enable, and the unit's own comment
+/// predicted exactly this failure — *"a wrong sandbox is worse than no
+/// sandbox"* — while attributing the absence of sandboxing to an unenumerated
+/// write set rather than to a missing read path.
+///
+/// A declaration that lives inline in a `main` cannot be tested. This one can.
+pub fn broker_install_paths(
+    socket: &std::path::Path,
+    vault: Option<&std::path::Path>,
+    audit_file: Option<&std::path::Path>,
+    passphrase_file: Option<&std::path::Path>,
+) -> InstallPaths {
+    // The socket's parent is written, not read: the broker creates the socket
+    // and refuses to start if one is already there.
+    let mut paths = InstallPaths::with_write_paths([socket
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("/run"))
+        .to_path_buf()]);
+
+    for dir in [vault, audit_file].into_iter().flatten().filter_map(|f| {
+        f.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+    }) {
+        paths.write_paths.push(dir);
+    }
+
+    // Read-only, and the reason this function exists: the passphrase file is
+    // opened after the ruleset is installed, and its directory was never
+    // granted. Read rather than read-write, because the broker has no business
+    // writing beside a passphrase.
+    if let Some(file) = passphrase_file {
+        if let Some(dir) = file.parent().filter(|p| !p.as_os_str().is_empty()) {
+            paths.read_paths.push(dir.to_path_buf());
+        }
+    }
+
+    paths
 }
 
 /// True when `path` is already covered by a static system hierarchy.

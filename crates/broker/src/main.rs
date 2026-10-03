@@ -195,27 +195,21 @@ fn main() -> std::io::Result<()> {
     if harden {
         // The Landlock ruleset is irreversible, so the paths the broker is
         // actually pointed at have to be allowed BEFORE it installs, or the
-        // broker would sandbox itself out of its own vault. All three come
+        // broker would sandbox itself out of its own vault. All of them come
         // from explicit CLI input; none is read from the environment, which
         // the quarantine invariant forbids.
-        let mut install_paths = asv_broker::harden::InstallPaths::with_write_paths([socket_path
-            .parent()
-            .unwrap_or(std::path::Path::new("/run"))
-            .to_path_buf()]);
-        if let Some(v) = &vault_path {
-            // --vault names a FILE. The parent directory is the unit
-            // Landlock can grant, so allow the directory and not the file.
-            let dir = v.parent().filter(|p| !p.as_os_str().is_empty());
-            if let Some(dir) = dir {
-                install_paths.write_paths.push(dir.to_path_buf());
-            }
-        }
-        if let Some(a) = &audit_file {
-            let dir = a.parent().filter(|p| !p.as_os_str().is_empty());
-            if let Some(dir) = dir {
-                install_paths.write_paths.push(dir.to_path_buf());
-            }
-        }
+        //
+        // The set is built by `harden::broker_install_paths` rather than here,
+        // because an inline declaration is one nobody can test — and this one
+        // was wrong: the passphrase file is opened *after* this call, and its
+        // directory was never granted, so `--harden` sandboxed the broker out
+        // of its own passphrase. See that function for the full account.
+        let install_paths = asv_broker::harden::broker_install_paths(
+            &socket_path,
+            vault_path.as_deref(),
+            audit_file.as_deref(),
+            passphrase_path.as_deref(),
+        );
         // DX2: kept for `Request::AgentInfo` rather than logged and dropped.
         // `asv doctor` asks the broker for these over the socket.
         let cfg = asv_broker::harden::install_with(install_paths).unwrap_or_else(|err| {
