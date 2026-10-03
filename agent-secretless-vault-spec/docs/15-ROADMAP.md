@@ -2114,6 +2114,31 @@ mutating the *clean* surface rather than the leaky one — a careless `tracing`
 of the forwarded request, and a careful-looking trace of the redemption — so
 the assertion that the log is clean is falsifiable in both directions.
 
+**And the two limits that make multi-request tunnels impossible are both too
+small, measured rather than argued.** The surrogate budget and the response cap
+were set when a tunnel served one request, and both are accidental limiters
+today. Measured on a real workload — `npm install --loglevel=http express` on a
+throwaway package, a 65-package tree:
+
+| | measured | today's limit | ratio |
+|---|---|---|---|
+| HTTPS requests | **93** | 32 surrogate uses per session | 0.34 |
+| content installed | **2.1 MiB** | 1 MiB `max_response` per tunnel | 0.48 |
+
+So the budget is a third of a *trivial* install, and the response cap is under
+half of it. A real project build is one to two orders of magnitude past both.
+The consequence is not that a tunnel is too generous; it is that the limits
+would break the workload at request 33 and at the first large tarball, while
+looking like a policy. They were the reason the concurrency measurement found
+8-of-64 and read it as the budget "doing its job" — it was doing its job, and
+the job was the wrong one.
+
+This is the answer to the question this block has carried since C2.7-D: no, 32
+uses per session do not come close to a real `npm`, `Maven` or `Gradle` run. Any
+multi-request relay has to re-derive both numbers from a measurement like the
+table above rather than from a round power of two, and the re-derivation is
+work that is **owed, not done** — the relay itself is still the next increment.
+
 **Still owed in this block.** More than one request per tunnel where the
 protocol allows — the characterisation above stands and is not yet a fix. Stress
 and cancellation under load beyond the anti-replay property already measured.
