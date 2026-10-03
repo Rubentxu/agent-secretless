@@ -1282,6 +1282,76 @@ single counter. One `asv run` produces one emitter, and `curl`, `git`, `npm`,
 is authorised; and no shipped client emits the header, so nothing can prove
 anything. A counter closes neither.
 
+#### C2.5-S2 — measured: a blind relay can inject the proof and still be blind
+
+S1 decided *who carries* the proof. It left one premise unmeasured, and the
+whole shim rests on it: that a shim can inject the header into the pre-`200`
+conversation and then stop being a protocol participant. If the blind relay
+breaks reuse, the shim has to terminate TLS and re-originate, which drags the
+broker's entire trust boundary down into the session directory — a different
+design with different risk, and one that would have been built on an assumption.
+
+`tests/connect_relay_spike.py` measures it over real TLS, with a real CONNECT
+listener that refuses anything without the proof, a real TLS-terminating
+broker, and ordinary `curl`.
+
+| row | question | result |
+|---|---|---|
+| A | direct to the broker, no proof | `403`, zero origin requests |
+| B | shim, 1 request | 1 request reaches the origin |
+| C | shim, 3 requests, one host | **3 requests over 1 TLS session** |
+| D | shim, 2 different hosts | 2 client conns, 2 upstream, 2 CONNECTs |
+| E | shim with injection disabled | `403` |
+
+**Row C is the answer, and row D is the relief.** TLS keep-alive survives being
+relayed by something that cannot read it, so the shim needs no framing, no
+session table and no TLS of its own: it writes one header and becomes
+`recv`/`sendall`. Row D says `curl` did not try to multiplex a second CONNECT
+onto the first socket, so the cheap shape is not being paid for with a
+connection-reuse regression on the client side either.
+
+**Row D is a measurement of one client.** `curl` not multiplexing says nothing
+about `git`, `npm` or the JVM, and the shim is written for the latter two in
+particular. Treat the loop-after-tunnel as unmeasured until it is measured on
+the clients that will use it.
+
+**The spike was falsified before its result was believed** —
+`tests/connect_relay_falsification.py`, 4 mutations, 4 killed, control green:
+
+| mutation | row that must go red | signature it produced |
+|---|---|---|
+| shim does not inject | B, C | `403` on every request |
+| shim never relays | B, C | broken pipe, zero origin requests |
+| proof gate disarmed | A, E | `through!` instead of `403` |
+| **origin closes early** | **C** | **3 requests over 3 TLS sessions** |
+
+The last one is the one that gives row C its meaning. It touches nothing in the
+shim and breaks reuse one layer below; row C went red with the exact reuse
+signature while A, B, D and E stayed green. Without it, C would only have shown
+that three bytes eventually arrived, which is a much weaker claim wearing the
+same label.
+
+**Three defects in the harness, all of which pointed at the shim.**
+
+1. `socket.timeout` is an `OSError`, so every `accept()` loop's `except OSError:
+   return` killed the servers one second in. A bank of tests that stops running
+   still prints a table.
+2. The broker spoke plain HTTP to a TLS origin and dropped response bodies, so
+   the tunnel "failed" twice before the harness was right. Both failures were
+   reported as failures of the *relay* — the exact shape of a false
+   architecture conclusion. The broker now terminates TLS and relays onward,
+   which is both correct and what the product does.
+3. The first harness parser matched `^(ok|XX) (A\..*)$`, whose greedy `.*` made
+   every key a whole table row. It reported **"FALSIFICATION FAILED" for four
+   mutants that had all been killed correctly**, with the right signatures, in
+   the output directly above the verdict. A second version split on two-or-more
+   spaces, which does not separate `ok` from the row name either. Both failed
+   by *asserting*, which is the safe direction and still useless.
+
+The pattern is the one this project keeps meeting: the detector is where the
+truth gets lost, and a red harness that is red for the wrong reason is worse
+than a green one, because it will be read as a finding about the system.
+
 #### The falsification run of this delivery, and what it caught about the harness
 
 The first run reported **4 of 7**. All three that stayed green were defects in
