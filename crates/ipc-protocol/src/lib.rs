@@ -499,10 +499,23 @@ pub const MAX_SURROGATE_TTL_SECS: u64 = 900;
 
 /// Hard ceiling on a surrogate's use budget.
 ///
-/// One is the common case and two already covers a retry. A larger budget
-/// turns the surrogate into a bearer token with a long tail, which is the
-/// shape ADR-0011 exists to avoid.
-pub const MAX_SURROGATE_USES: u32 = 8;
+/// One is the common case and two already covers a retry, so the original
+/// ceiling was **8**: a surrogate was minted by an operator, for one
+/// operation, and a longer tail was the shape ADR-0011 exists to avoid.
+///
+/// That model changed under it. `CreateSession` now mints one surrogate per
+/// authorized route and hands it to a child that may issue a stream of
+/// requests, so a budget of eight is not a backstop — it is the product. A
+/// `curl` session gets eight credentialed operations and then every further
+/// request is refused as exhausted, which no ordinary client can live with.
+///
+/// The ceiling follows the broker's own declared intent (`32`) rather than a
+/// number invented here, and `session_mint_survives_the_protocol_ceiling` in
+/// `crates/broker/src/lib.rs` fails if the two ever diverge again — silently,
+/// through `clamp`, which is how this went unnoticed until a session
+/// demonstrated it by completing exactly eight tunnels out of the sixty-four
+/// it was asked for.
+pub const MAX_SURROGATE_USES: u32 = 32;
 
 /// Serializable view of credential metadata.
 ///

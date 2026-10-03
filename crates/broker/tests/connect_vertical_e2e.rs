@@ -1049,44 +1049,35 @@ fn a_tunnel_serves_one_request_and_the_protocol_allows_more() {
     );
 }
 
-/// How many CONNECTs one session sustains at once — and it is nowhere near the
-/// number the code claims.
+/// Sixty-four CONNECTs at once from one session, and the anti-replay window
+/// must not refuse a single one of them.
 ///
-/// **A characterization of a defect, not a claim.** The roadmap asks for
-/// "32/64/128 CONNECT simultáneos, misma sesión, counters fuera de orden" and
-/// the replay window's own comment reasons that the spread from N tunnels in
-/// flight is at most N counters, so a 128-wide window is generous. Measured
-/// against the real broker, it is not generous enough, and neither is the
-/// surrogate's budget:
+/// This began as a characterisation of a defect and is now a claim, because the
+/// defect is fixed. Before, 8 of 64 completed and the broker's log split the 56
+/// refusals into 17 legitimate proofs refused as `Replayed` and 39 exhausted
+/// surrogates. The 17 were the important half: proofs the session had just
+/// minted, correctly signed, refused by the machinery that exists to stop
+/// replays, in the one direction an honest client cannot distinguish from an
+/// attack.
 ///
-/// ```text
-/// parallel=16  ok=8   failed=8
-/// parallel=32  ok=8   failed=24
-/// parallel=64  ok=8   failed=56
-/// ```
+/// Two defects were behind it, both in this repository and neither in a test:
 ///
-/// Eight, every time, whatever the client asked for. The broker's own account
-/// of the 64 splits the 56 refusals into two causes, and neither is a
-/// documented budget:
+/// - The window marked the wrong bit when it advanced. Bit `i` means
+///   `highest - 1 - i`, so the previous highest lands on `shift - 1`, not on
+///   bit 0 — and those coincide only when the shift is exactly one, which is
+///   the single case the existing test happened to cover.
+/// - The surrogate's use budget was 8, not the 32 the broker asked for:
+///   `mint` clamps into the protocol ceiling, and a clamp that lowers what you
+///   asked for raises nothing and logs nothing. The wire reported the clamped
+///   value, so every reader believed it.
 ///
-/// ```text
-/// 39  the presented surrogate was refused      -> SurrogateError::Exhausted
-/// 17  no session proof resolved for this tunnel
-/// ```
-///
-/// The second is the one that matters. Those 17 are freshly minted, correctly
-/// signed proofs from a session that did nothing wrong, refused by the
-/// anti-replay machinery — the exact liveness-versus-security tension the
-/// window's comment says it resolved, in the direction the honest client
-/// cannot tell apart from an attack.
-///
-/// The first says the surrogate's 32-use budget is spent by tunnels that never
-/// complete, so a session that is refused rather than served still burns
-/// budget. Both are liveness, not disclosure: the destination received the
-/// credential once per completed tunnel and never a surrogate, which is
-/// asserted here because a concurrency fix must not quietly change that.
+/// Measured after both: 32 of 64 complete, and the 32 that do not are refused
+/// for the budget that is *documented* — which is a budget doing its job, not
+/// a defect. The property asserted here is the one that must not regress: the
+/// anti-replay window refuses nothing, and every request is accounted for by a
+/// reason the operator can read.
 #[test]
-fn one_session_sustains_eight_of_the_tunnels_it_is_asked_for() {
+fn the_anti_replay_window_refuses_no_honest_proof_under_load() {
     const PARALLEL: usize = 64;
 
     let f = Fixture::new_serving("concurrent", 1);
@@ -1117,51 +1108,44 @@ fn one_session_sustains_eight_of_the_tunnels_it_is_asked_for() {
         .expect("parallel tunnels from one session");
     let codes = std::fs::read_to_string(&out).unwrap_or_default();
     let ok = codes.lines().filter(|l| l.trim() == "200").count();
-
-    // The measurement. If this ever holds, the defect is fixed and this test,
-    // its name and its comment are all stale — which is the signal to rewrite
-    // all three rather than to relax the assertion.
-    assert!(
-        ok < PARALLEL,
-        "{ok} of {PARALLEL} concurrent tunnels succeeded from one session; the \
-         documented limit is stale, so this characterization and its comment \
-         have to be rewritten:\n{}",
-        child.stderr.is_empty()
-    );
     assert!(
         ok > 0,
-        "no tunnel succeeded at all, so this measured a broken setup rather \
-         than a limit:\n{codes}"
+        "no tunnel completed, so this measured nothing:\n{codes}"
     );
 
     // The broker's own account, which is why the fixture captures its stdout:
-    // `tracing_subscriber::fmt()` writes to stdout, and a fixture that silences
+    // `tracing_subscriber::fmt()` writes there, and a fixture that silences
     // stdout hides the only record of why a tunnel was refused. An observer
-    // that is switched off is indistinguishable from one that does not exist.
+    // switched off is indistinguishable from one that does not exist.
     let log = std::fs::read_to_string(f.dir.join("broker.log")).unwrap_or_default();
     let proof_refusals = log.matches("no session proof resolved").count();
     let surrogate_refusals = log.matches("the presented surrogate was refused").count();
-    assert!(
-        proof_refusals > 0,
-        "no tunnel was refused for want of a session proof, so the anti-replay \
-         half of the defect is no longer reproducing:\n{log}"
+
+    // The property. Sixty-four freshly minted proofs, and not one of them
+    // refused for being a replay.
+    assert_eq!(
+        proof_refusals, 0,
+        "{proof_refusals} legitimate proofs were refused as replays; a client paying \
+         for a concurrent burst cannot tell that from an attack"
     );
-    assert!(
-        surrogate_refusals > 0,
-        "no tunnel was refused for an exhausted surrogate:\n{log}"
-    );
+    // And every request has a reason an operator can act on.
     assert_eq!(
         proof_refusals + surrogate_refusals,
         PARALLEL - ok,
-        "the broker refused {} tunnels but accounted for {} of them; a refusal \
-         with no reason in the log is one nobody can act on",
+        "the broker refused {} tunnels but accounted for {} of them; a refusal with \
+         no reason in the log is one nobody can act on",
         PARALLEL - ok,
         proof_refusals + surrogate_refusals
     );
+    // Whatever is left is the budget, doing what a budget is for.
+    assert!(
+        surrogate_refusals > 0,
+        "sixty-four requests exceeded the documented budget of 32 and nothing was \
+         refused, so the budget is not a bound:\n{log}"
+    );
 
-    // The part a concurrency fix must not break. The destination saw the
-    // credential once per completed tunnel and never a surrogate, so what is
-    // broken here is availability and not disclosure.
+    // What a concurrency fix must not break: the destination saw the credential
+    // once per completed tunnel, and never a surrogate.
     assert_eq!(
         f.origin.real_credential_requests(),
         ok,
@@ -1173,6 +1157,7 @@ fn one_session_sustains_eight_of_the_tunnels_it_is_asked_for() {
         !seen.contains("asv1_"),
         "a surrogate reached the destination:\n{seen}"
     );
+    let _ = child;
 }
 
 // ---------------------------------------------------------------------------

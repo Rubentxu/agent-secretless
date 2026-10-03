@@ -169,12 +169,25 @@ impl ReplayWindow {
         if counter > highest {
             // Advancing shifts the window: everything the bitmap remembered
             // moves one slot further from the new highest, and the old highest
-            // itself becomes spent at bit 0.
+            // itself becomes spent at bit `shift - 1`.
+            //
+            // **That index is the whole bug this line used to have.** Bit `i`
+            // means `highest - 1 - i`, so the previous highest — which has just
+            // been spent, and which is `counter - shift` — lands at
+            // `counter - 1 - i`, i.e. `i = shift - 1`. Marking bit 0 instead is
+            // only right when `shift` is 1, where the two expressions coincide.
+            //
+            // With a shift of two, bit 0 names `counter - 1`: a counter that
+            // has never been presented, and which the next honest client to
+            // use it is refused as a replay. Measured against the real broker,
+            // 64 concurrent CONNECTs from one session lost 17 legitimate
+            // proofs exactly this way — a liveness bug in security machinery,
+            // invisible to a test that only ever tried one counter out of order.
             let shift = (counter - highest) as u32;
             self.seen = if shift >= Self::CAPACITY {
                 0
             } else {
-                (self.seen << shift) | 1
+                (self.seen << shift) | (1u128 << (shift - 1))
             };
             self.highest = Some(counter);
             return true;
@@ -990,6 +1003,18 @@ fn mint_session_surrogates(
 const SESSION_SURROGATE_TTL_SECS: u64 = 3600;
 
 /// How many operations one session-minted surrogate may authorize.
+///
+/// This and [`asv_ipc_protocol::MAX_SURROGATE_USES`] are two numbers that used
+/// to disagree, and the disagreement was invisible: `SurrogateRegistry::mint`
+/// clamps into the protocol's ceiling, so a broker asking for 32 was served 8
+/// with no error, no log line, and no test — the wire reported the clamped
+/// value honestly, so every reader believed it.
+///
+/// The cost was that a session could perform **eight** credentialed operations,
+/// which is not a backstop but a product limit no ordinary client survives. The
+/// concurrency measurement found it: 64 CONNECTs from one session completed
+/// exactly eight. `session_mint_survives_the_protocol_ceiling` is the test that
+/// makes the two numbers unable to drift apart again.
 const SESSION_SURROGATE_MAX_USES: u32 = 32;
 
 pub fn handle(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request) -> Response {
@@ -2814,6 +2839,103 @@ mod tests {
             store.authenticate(&proof_for(&key, 7), &target()).ok(),
             Some(session),
             "a legitimate out-of-order counter was refused as a replay"
+        );
+    }
+
+    /// The budget the broker asks for has to survive the protocol's ceiling.
+    ///
+    /// `SurrogateRegistry::mint` clamps into `MAX_SURROGATE_USES`, and a clamp
+    /// that lowers what you asked for is indistinguishable from one that does
+    /// not. The broker asked for 32 and was served 8, with no error and no log
+    /// line, and the wire reported the clamped value so every reader — the
+    /// CLI, the audit, the tests — believed it.
+    ///
+    /// A session that can perform eight credentialed operations is not a
+    /// backstop. It is a product limit, and it is what made 64 concurrent
+    /// tunnels complete exactly eight.
+    #[test]
+    fn session_mint_survives_the_protocol_ceiling() {
+        let (store, session, _key) = session_with_key("budget-ceiling", 3);
+        let _ = store;
+        let mut registry = SurrogateRegistry::default();
+        let (_, _, granted) = registry
+            .mint(
+                session,
+                CredentialId::from_wire("00000000-0000-4000-8000-000000000001").expect("wire id"),
+                CredentialClass::Generic,
+                60,
+                SESSION_SURROGATE_MAX_USES,
+                0,
+            )
+            .expect("mint");
+        assert_eq!(
+            granted, SESSION_SURROGATE_MAX_USES,
+            "the protocol ceiling silently reduced the session budget from {}\
+             to {granted}; a session can then perform {granted} operations and \
+             no more, which is a product limit wearing the clothes of a backstop",
+            SESSION_SURROGATE_MAX_USES
+        );
+    }
+
+    /// The same property, with a **gap** between the arrivals.
+    ///
+    /// The test above is the case the window was written for, and it is the one
+    /// case that happens to work: 8 then 7 is a shift of one, and a shift of one
+    /// puts the previous highest at bit 0, which is where the code marks it. A
+    /// gap of two or more puts the previous highest somewhere else entirely,
+    /// and the marking lands on a counter nobody has spent.
+    ///
+    /// This is not a hypothetical ordering. Measured against the real broker,
+    /// 64 concurrent CONNECTs from one session complete eight of them and the
+    /// broker refuses seventeen *legitimate* proofs as `Replayed` — counters 3,
+    /// 8, 12, 16, 19 and a dozen more, each presented exactly once. The
+    /// honest client paying for a concurrent burst is the only party in the
+    /// window's own words: a liveness bug wearing a security costume.
+    #[test]
+    fn a_counter_arriving_out_of_order_after_a_gap_is_accepted() {
+        let (mut store, session, key) = session_with_key("gap", 11);
+        // A gap of two, then the counter that falls inside it.
+        assert_eq!(
+            store.authenticate(&proof_for(&key, 2), &target()).ok(),
+            Some(session)
+        );
+        assert_eq!(
+            store.authenticate(&proof_for(&key, 4), &target()).ok(),
+            Some(session)
+        );
+        assert_eq!(
+            store.authenticate(&proof_for(&key, 3), &target()).ok(),
+            Some(session),
+            "a legitimate counter that fell into a gap between two arrivals was \
+             refused as a replay"
+        );
+        // And one further below, which the same reasoning covers.
+        assert_eq!(
+            store.authenticate(&proof_for(&key, 5), &target()).ok(),
+            Some(session)
+        );
+        assert_eq!(
+            store.authenticate(&proof_for(&key, 1), &target()).ok(),
+            Some(session),
+            "a legitimate counter below the lowest seen was refused as a replay"
+        );
+    }
+
+    /// The same counter twice is still a replay, at every gap.
+    ///
+    /// The point of the fix that the test above motivates: closing a hole in
+    /// the out-of-order path must not open one in the replay path. Without this
+    /// a window that accepts everything is a window that catches nothing.
+    #[test]
+    fn a_counter_replayed_after_a_gap_is_still_refused() {
+        let (mut store, _session, key) = session_with_key("gap-replay", 11);
+        for counter in [2u64, 4, 4] {
+            let _ = store.authenticate(&proof_for(&key, counter), &target());
+        }
+        assert!(
+            store.authenticate(&proof_for(&key, 4), &target()).is_err(),
+            "the same counter was accepted twice, which is the replay the window exists \
+             to refuse"
         );
     }
 
