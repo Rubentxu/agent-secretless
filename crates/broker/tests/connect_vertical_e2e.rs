@@ -203,6 +203,12 @@ fn wait_for_file(path: &std::path::Path, timeout: Duration) -> bool {
 struct Origin {
     port: u16,
     requests: Arc<Mutex<Vec<String>>>,
+    /// Connections this origin is still holding open.
+    ///
+    /// The point of the fixture is the question "is that tunnel *still
+    /// there*", and a request counter cannot answer it: a tunnel that is
+    /// established and idle looks exactly like one that never existed.
+    open: Arc<Mutex<usize>>,
 }
 
 impl Origin {
@@ -214,6 +220,27 @@ impl Origin {
     /// shape the *protocol* allows, and it is a different question — see
     /// `a_tunnel_serves_one_request_and_the_protocol_allows_more`.
     fn start_serving(per_connection: usize) -> Self {
+        Self::spawn(per_connection, false)
+    }
+
+    /// An origin that answers one request and then *keeps the connection open*.
+    ///
+    /// This is what an established, idle tunnel looks like from the
+    /// destination's side, and it is the only shape in which "did the tunnel
+    /// end?" is a question about time rather than about a count.
+    ///
+    /// Two details make the answer trustworthy. The response omits
+    /// `Connection: close`, so the client is not told to go; and the read that
+    /// follows has **no deadline at all**, so the only thing that can end this
+    /// connection is the other end going away. A holding origin with a read
+    /// timeout would answer "is it still open?" with a yes for a while and a
+    /// no for a reason that has nothing to do with the tunnel — which is how a
+    /// lifecycle test ends up asserting a timer.
+    fn start_holding() -> Self {
+        Self::spawn(1, true)
+    }
+
+    fn spawn(per_connection: usize, holding: bool) -> Self {
         // `[::]` is dual-stack on Linux, so one port answers on both `::1` and
         // `127.0.0.1`. The broker takes the first address the resolver returns,
         // and which one that is has changed between hosts; a single-family bind
@@ -223,52 +250,32 @@ impl Origin {
         let port = addr.port();
         let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&requests);
+        let open: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let counter = Arc::clone(&open);
 
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 let sink = Arc::clone(&sink);
+                let counter = Arc::clone(&counter);
                 std::thread::spawn(move || {
-                    stream.set_read_timeout(Some(Duration::from_secs(20))).ok();
-                    for served in 0..per_connection {
-                        let mut raw = Vec::new();
-                        let mut chunk = [0u8; 2048];
-                        // Read until the headers are complete, then answer.
-                        // A `break` here ends the connection rather than the
-                        // loop, so a client that hangs up mid-sequence is not
-                        // answered with a fabricated request.
-                        while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
-                            match stream.read(&mut chunk) {
-                                Ok(0) | Err(_) => return,
-                                Ok(n) => raw.extend_from_slice(&chunk[..n]),
-                            }
-                        }
-                        if raw.is_empty() {
-                            return;
-                        }
-                        sink.lock()
-                            .expect("origin sink")
-                            .push(String::from_utf8_lossy(&raw).into_owned());
-                        // Keep the connection open unless this was the last
-                        // request the fixture was asked to serve. `close` on the
-                        // last one is what tells `curl` it may stop reusing it.
-                        let last = served + 1 == per_connection;
-                        let response = if last {
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
-                                .as_slice()
-                        } else {
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".as_slice()
-                        };
-                        if stream.write_all(response).is_err() {
-                            return;
-                        }
-                        let _ = stream.flush();
-                    }
+                    *counter.lock().expect("open counter") += 1;
+                    serve_connection(&mut stream, &sink, per_connection, holding);
+                    // The decrement is on the way out of every path, and there
+                    // is no `return` in `serve_connection` to skip it. A counter
+                    // that can be skipped is one the lifecycle test reads as
+                    // "the tunnel closed" when the connection thread simply
+                    // left early.
+                    *counter.lock().expect("open counter") -= 1;
                 });
             }
         });
 
-        Self { port, requests }
+        Self {
+            port,
+            requests,
+            open,
+        }
     }
 
     /// Everything the origin was sent, joined, for substring assertions.
@@ -278,6 +285,29 @@ impl Origin {
 
     fn request_count(&self) -> usize {
         self.requests.lock().expect("origin sink").len()
+    }
+
+    /// How many connections are still open.
+    fn open_connections(&self) -> usize {
+        *self.open.lock().expect("open counter")
+    }
+
+    /// Waits for the open count to *become* `n`, bounded.
+    ///
+    /// Polling rather than reading once, for the reason `wait_for_requests`
+    /// gives: the fixture runs on its own threads, and a single read is a race
+    /// that fails the test for being early instead of for being wrong.
+    fn wait_for_open(&self, n: usize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.open_connections() == n {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     /// Connections that carried a request at all.
@@ -333,6 +363,70 @@ impl Origin {
     }
 }
 
+/// Serves one connection, and returns when that connection is over.
+///
+/// A free function rather than a method because it takes the mutable stream,
+/// and a `&mut self` here would borrow the fixture for the whole life of a
+/// connection that is supposed to outlive every line the test writes next.
+///
+/// `served_any` decides whether the hold is entered. A connection that never
+/// carried a request is the bridge's dial-before-the-head behaviour, not a
+/// tunnel; holding it open forever would pin a thread and inflate the open
+/// count with something no session authorised.
+fn serve_connection(
+    stream: &mut TcpStream,
+    sink: &Arc<Mutex<Vec<String>>>,
+    per_connection: usize,
+    holding: bool,
+) {
+    // This deadline covers the request phase only, so a client that connects
+    // and says nothing cannot pin a thread for the life of the suite.
+    stream.set_read_timeout(Some(Duration::from_secs(20))).ok();
+    let mut served_any = false;
+    for served in 0..per_connection {
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 2048];
+        // Read until the headers are complete, then answer. A `break` here ends
+        // the connection rather than the loop, so a client that hangs up
+        // mid-sequence is not answered with a fabricated request.
+        while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            }
+        }
+        if raw.is_empty() {
+            break;
+        }
+        served_any = true;
+        sink.lock()
+            .expect("origin sink")
+            .push(String::from_utf8_lossy(&raw).into_owned());
+        // `close` on the last request is what tells `curl` it may stop reusing
+        // the connection. A holding origin never sends it: the point is that
+        // the connection outlives the response, and a client told to close
+        // would close it and take the tunnel with it.
+        let last = served + 1 == per_connection;
+        let response: &[u8] = if last && !holding {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+        } else {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+        };
+        if stream.write_all(response).is_err() {
+            break;
+        }
+        let _ = stream.flush();
+    }
+    if holding && served_any {
+        // No deadline. From here the connection ends when the tunnel ends and
+        // for no other reason, which is what lets `open_connections` answer
+        // "is the tunnel still there" instead of "has the timeout fired".
+        stream.set_read_timeout(None).ok();
+        let mut buf = [0u8; 256];
+        while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The fixture
 // ---------------------------------------------------------------------------
@@ -369,7 +463,7 @@ impl Fixture {
     /// would not be in `state.credentials` when the session tries to mint for
     /// it, and the mint would be skipped for a reason no log would explain.
     fn new(tag: &str) -> Self {
-        Self::new_serving(tag, 1)
+        Self::with_origin(tag, Origin::start_serving(1))
     }
 
     /// A fixture whose origin answers several requests per connection.
@@ -380,6 +474,19 @@ impl Fixture {
     /// nothing is listening on, and the tunnel would fail for a reason that has
     /// nothing to do with the question being asked.
     fn new_serving(tag: &str, per_connection: usize) -> Self {
+        Self::with_origin(tag, Origin::start_serving(per_connection))
+    }
+
+    /// A fixture whose origin holds its connection open after answering.
+    ///
+    /// Started from the beginning for the same reason, and the origin is
+    /// therefore a different *kind* of origin rather than a later phase of the
+    /// same one.
+    fn new_holding(tag: &str) -> Self {
+        Self::with_origin(tag, Origin::start_holding())
+    }
+
+    fn with_origin(tag: &str, origin: Origin) -> Self {
         let dir = std::env::temp_dir().join(format!("asv-e2e-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create the working dir");
@@ -482,8 +589,6 @@ impl Fixture {
         let _ = std::fs::remove_file(&sock);
 
         // --- phase two: the broker that will actually tunnel ---------------
-        let origin = Origin::start_serving(per_connection);
-
         let routes = dir.join("routes.json");
         std::fs::write(
             &routes,
@@ -1163,6 +1268,132 @@ fn the_anti_replay_window_refuses_no_honest_proof_under_load() {
 // ---------------------------------------------------------------------------
 // The negative half
 // ---------------------------------------------------------------------------
+
+/// A tunnel does not outlive the session that authorised it.
+///
+/// Two things are being measured, and the difference between them is the whole
+/// reason this test is worth writing down.
+///
+/// **What the destination sees.** The origin holds the connection it was given
+/// and reports whether it is still holding it, with no read deadline behind
+/// the answer — so "still open" cannot be a timer wearing a tunnel's clothes.
+/// When the session ends and the count goes to zero, the tunnel is gone from
+/// the far end of the chain, which is the shape an operator would recognise.
+///
+/// **What it cannot settle.** It cannot say *who* closed it. `asv run` stops
+/// its shim and ends its session in that order, and a dead shim drops its
+/// sockets, so a tunnel closing here is equally consistent with the shim dying
+/// and with the broker cancelling. The vertical has no way to hold the shim
+/// open while the session ends, because ending the session *is* the shim
+/// stopping.
+///
+/// So the end-to-end claim is checked here and the broker's own claim is
+/// checked where it can be isolated, in
+/// `connect_session_revocation_wiring.rs`. A green test above and a green test
+/// there are two different guarantees; a green one with the other missing is
+/// a guarantee nobody actually has.
+///
+/// Two URLs on one connection, deliberately. The first is answered and the
+/// second is not — the limit measured in
+/// `a_tunnel_serves_one_request_and_the_protocol_allows_more` — and that is
+/// precisely what keeps `curl` inside the tunnel. A single-URL curl exits on
+/// its response, and a tunnel whose client has already exited is not a tunnel
+/// that outlived anything: the control below would pass against a fixture that
+/// never held a connection at all.
+///
+/// `--max-time` is the second request giving up, and it is why this test takes
+/// twenty seconds rather than three: the release file is only read after `curl`
+/// returns, so curl's own deadline is what ends the command and lets `asv run`
+/// begin its teardown. It has to clear the settle window below with room to
+/// spare, because a `curl` that hit its deadline first would close the tunnel
+/// for a reason that has nothing to do with the session — the one confound this
+/// test cannot survive. Twenty against a control that fires at under one is
+/// that room.
+#[test]
+fn a_tunnel_does_not_outlive_the_session_that_authorised_it() {
+    let f = Fixture::new_holding("midtunnel");
+    let variable = f.surrogate_env_name();
+    let release_path = f.dir.join("mid.release");
+    let script = format!(
+        "curl -sS -k --max-time 20 -o /dev/null \
+           -H \"Authorization: Bearer ${{{variable}}}\" \
+           https://{FIXTURE_HOST}:{port}/first \
+           https://{FIXTURE_HOST}:{port}/second; \
+         while [ ! -f {release} ]; do sleep 0.2; done",
+        port = f.origin.port,
+        release = release_path.display()
+    );
+
+    let session = Session {
+        child: Some(
+            Command::new(cargo_bin("asv"))
+                .arg("--socket")
+                .arg(&f.sock)
+                .arg("run")
+                .arg("sh")
+                .arg("-c")
+                .arg(&script)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("run the session under measurement"),
+        ),
+        release: release_path.clone(),
+    };
+
+    // The destination is asked, not the client. A client inside its own tunnel
+    // cannot tell a live tunnel from a socket it is holding open by itself.
+    assert!(
+        f.origin.wait_for_open(1, Duration::from_secs(90)),
+        "the tunnel was never established: the destination holds {} connections, \
+         so the assertion after the session ends would be measuring nothing",
+        f.origin.open_connections()
+    );
+    assert!(
+        f.origin.wait_for_requests(1),
+        "the destination never received a request"
+    );
+
+    // The control, and the reason the tunnel has to survive the request that
+    // built it. One sample is not an observation: a tunnel that collapses the
+    // instant it is used satisfies "zero connections after the session ends"
+    // perfectly while proving nothing. A second look, after a settle window
+    // and with the session still live, is what gives the later zero its
+    // meaning.
+    std::thread::sleep(Duration::from_millis(750));
+    assert_eq!(
+        f.origin.open_connections(),
+        1,
+        "the tunnel did not survive the request that established it; the \
+         destination gave the connection back while the session was still live, \
+         so nothing here is measuring a tunnel outliving anything"
+    );
+    assert_eq!(
+        f.origin.real_credential_requests(),
+        1,
+        "the credential did not reach the destination exactly once under a live \
+         session; whatever closes later is not a tunnel that was working"
+    );
+
+    // The session ends. `Session::finish` releases the child, waits for it, and
+    // so returns only after `asv run` has stopped its shim and sent
+    // `EndSession` — the teardown is over before the first observation.
+    let out = session.finish();
+    assert!(
+        out.status.success(),
+        "the session failed while tearing down\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        f.origin.wait_for_open(0, Duration::from_secs(20)),
+        "a tunnel outlived the session that authorised it: the destination still \
+         holds {} connections 20s after the session ended, carrying a credential \
+         nobody authorised any more",
+        f.origin.open_connections()
+    );
+}
 
 #[test]
 fn a_session_that_ends_takes_its_proof_authority_with_it() {
