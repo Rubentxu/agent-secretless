@@ -71,18 +71,25 @@ impl std::fmt::Debug for SharedSessions {
 }
 
 impl crate::tls_bridge::SessionProofs for SharedSessions {
-    fn resolve(
+    fn authenticate(
         &self,
-        presented_key: &[u8],
-        nonce: &[u8],
-        signature: &[u8],
-    ) -> Option<asv_domain::AgentSessionId> {
-        // A poisoned store resolves to "no such session", which is the
-        // fail-closed answer and is indistinguishable, on the wire, from the
-        // refusal a stranger's proof gets. That is the correct shape: a broker
-        // whose own state is unreadable must not be able to *grant*.
-        let store = self.store.lock().ok()?;
-        crate::SessionStore::resolve(&*store, presented_key, nonce, signature)
+        proof: &crate::tls_bridge::SessionProof,
+        target: &crate::tls_bridge::AuthorityEndpoint,
+    ) -> Result<asv_domain::AgentSessionId, crate::ProofRejection> {
+        // One lock, one operation. `SessionStore::authenticate` derives the
+        // nonce, verifies against the registered key and spends the counter
+        // under this guard, so the key and its replay window can never be
+        // read from one state and written to another.
+        //
+        // A poisoned store authenticates nobody, which is the fail-closed
+        // answer and is indistinguishable on the wire from the refusal a
+        // stranger's proof gets. A broker whose own state is unreadable must
+        // not be able to *grant*.
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| crate::ProofRejection::NoSuchSession)?;
+        crate::SessionStore::authenticate(&mut store, proof, target)
     }
 }
 

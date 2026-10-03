@@ -44,6 +44,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use asv_broker::audit::{AuditLog, SubstitutionRecorder};
+use asv_broker::connect_runtime::SharedSessions;
 use asv_broker::tls_bridge::{
     issue_leaf, proof_nonce, AuthorityEndpoint, Bridge, BridgeError, ConnectPolicy,
     EstablishedTunnel, LeafError, LeafSource, RelayLimits, SessionCa, SessionProofs,
@@ -142,22 +143,27 @@ impl SecretPort for CanaryStore {
     }
 }
 
-/// Counts `resolve` calls, so the ordering test can prove the proof was never
+/// Counts `authenticate` calls, so the ordering test can prove the proof was never
 /// looked at rather than inferring it from an error.
 struct CountingProofs {
-    inner: Arc<SessionStore>,
+    inner: Arc<Mutex<SessionStore>>,
     calls: Arc<Mutex<usize>>,
 }
 
 impl SessionProofs for CountingProofs {
-    fn resolve(
+    fn authenticate(
         &self,
-        presented_key: &[u8],
-        nonce: &[u8],
-        signature: &[u8],
-    ) -> Option<AgentSessionId> {
+        proof: &asv_broker::tls_bridge::SessionProof,
+        target: &AuthorityEndpoint,
+    ) -> Result<AgentSessionId, asv_broker::ProofRejection> {
         *self.calls.lock().expect("count") += 1;
-        self.inner.resolve(presented_key, nonce, signature)
+        // The real store, under the same lock production uses, so this double
+        // counts calls without re-implementing what it counts.
+        let mut store = self
+            .inner
+            .lock()
+            .map_err(|_| asv_broker::ProofRejection::NoSuchSession)?;
+        SessionStore::authenticate(&mut store, proof, target)
     }
 }
 
@@ -272,7 +278,7 @@ fn policy() -> Bridge {
 }
 
 struct Rig {
-    store: Arc<SessionStore>,
+    store: Arc<Mutex<SessionStore>>,
     registry: SurrogateRegistry,
     ca: Arc<SessionCa>,
     root_der: Vec<u8>,
@@ -286,6 +292,14 @@ struct Rig {
     surrogate_a: String,
     /// The surrogate minted for session B.
     surrogate_b: String,
+    /// One counter per signer, in that party's own sequence. A real client
+    /// holds a counter per session and increments it for every CONNECT; tests
+    /// that open more than one tunnel for the same session would otherwise
+    /// reuse a counter, and the second would be refused as a replay — which
+    /// would be the property working, not the fixture being wrong.
+    next_a: std::sync::atomic::AtomicU64,
+    next_b: std::sync::atomic::AtomicU64,
+    next_stranger: std::sync::atomic::AtomicU64,
 }
 
 impl Rig {
@@ -342,7 +356,7 @@ impl Rig {
         let root_der = ca.root_der.clone();
 
         Self {
-            store: Arc::new(store),
+            store: Arc::new(Mutex::new(store)),
             registry,
             ca,
             root_der,
@@ -354,6 +368,19 @@ impl Rig {
             stranger: SigningKey::generate(&mut rand::rngs::OsRng),
             surrogate_a,
             surrogate_b,
+            next_a: std::sync::atomic::AtomicU64::new(1),
+            next_b: std::sync::atomic::AtomicU64::new(1),
+            next_stranger: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
+    /// The next counter for whoever is signing, in that party's own sequence.
+    fn next_counter(&self, who: Who) -> u64 {
+        use std::sync::atomic::Ordering::SeqCst;
+        match who {
+            Who::A => self.next_a.fetch_add(1, SeqCst),
+            Who::B => self.next_b.fetch_add(1, SeqCst),
+            Who::Stranger => self.next_stranger.fetch_add(1, SeqCst),
         }
     }
 
@@ -371,9 +398,10 @@ impl Rig {
         let key = self.key(who);
         let blob = public_key_blob(&key.verifying_key());
         let target = endpoint(host, port);
-        let nonce = proof_nonce(&blob, &target);
+        let counter = self.next_counter(who);
+        let nonce = proof_nonce(&blob, &target, counter);
         let signature = key.sign(&nonce).to_bytes();
-        format!("{}.{}", b64(&blob), b64(&signature))
+        format!("{}.{counter}.{}", b64(&blob), b64(&signature))
     }
 
     /// Opens a CONNECT and returns the client's TLS side plus the tunnel.
@@ -386,7 +414,8 @@ impl Rig {
         proof: Option<String>,
         port: u16,
     ) -> Result<(ClientSide, EstablishedTunnel), BridgeError> {
-        let proofs: Arc<dyn SessionProofs + Send + Sync> = self.store.clone();
+        let proofs: Arc<dyn SessionProofs + Send + Sync> =
+            Arc::new(SharedSessions::new(Arc::clone(&self.store)));
         self.tunnel_with(proof, port, proofs)
     }
 
@@ -411,7 +440,8 @@ impl Rig {
         port: u16,
         cancel: Arc<dyn asv_broker::tls_bridge::Cancel>,
     ) -> Result<(ClientSide, EstablishedTunnel), BridgeError> {
-        let proofs: Arc<dyn SessionProofs + Send + Sync> = self.store.clone();
+        let proofs: Arc<dyn SessionProofs + Send + Sync> =
+            Arc::new(SharedSessions::new(Arc::clone(&self.store)));
         self.tunnel_on(policy().with_cancel(cancel), proof, port, proofs)
     }
 
@@ -485,7 +515,8 @@ impl Rig {
         let upstream = FixedUpstream {
             addr: self.origin.addr,
         };
-        let proofs: Arc<dyn SessionProofs + Send + Sync> = self.store.clone();
+        let proofs: Arc<dyn SessionProofs + Send + Sync> =
+            Arc::new(SharedSessions::new(Arc::clone(&self.store)));
 
         bridge
             .serve_connect(
@@ -835,7 +866,7 @@ fn a_signature_under_one_key_presented_with_another_keys_blob_resolves_to_nothin
     // falsify is not evidence, and this is the second time in this block that
     // one nearly passed for one.
     let presented_blob = public_key_blob(&rig.key_a.verifying_key());
-    let nonce = proof_nonce(&presented_blob, &target);
+    let nonce = proof_nonce(&presented_blob, &target, 1);
     // Signed by B, presented under A's blob.
     let signature = rig.key_b.sign(&nonce).to_bytes();
     let proof = format!("{}.{}", b64(&presented_blob), b64(&signature));
@@ -912,7 +943,7 @@ fn an_unauthorised_destination_is_refused_before_the_proof_is_looked_at() {
 
     let blob = public_key_blob(&key.verifying_key());
     let target = endpoint("evil.example.net", 443);
-    let nonce = proof_nonce(&blob, &target);
+    let nonce = proof_nonce(&blob, &target, 1);
     let signature = key.sign(&nonce).to_bytes();
     let proof = format!("{}.{}", b64(&blob), b64(&signature));
 
@@ -934,7 +965,7 @@ fn an_unauthorised_destination_is_refused_before_the_proof_is_looked_at() {
     let upstream = FixedUpstream { addr: origin.addr };
     let calls = Arc::new(Mutex::new(0usize));
     let proofs = CountingProofs {
-        inner: Arc::new(store),
+        inner: Arc::new(Mutex::new(store)),
         calls: Arc::clone(&calls),
     };
 

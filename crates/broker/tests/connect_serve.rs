@@ -82,22 +82,22 @@ struct AnyProof {
 }
 
 impl SessionProofs for AnyProof {
-    fn resolve(
+    fn authenticate(
         &self,
-        _presented_key: &[u8],
-        _nonce: &[u8],
-        _signature: &[u8],
-    ) -> Option<AgentSessionId> {
-        Some(self.session)
+        _proof: &asv_broker::tls_bridge::SessionProof,
+        _target: &AuthorityEndpoint,
+    ) -> Result<AgentSessionId, asv_broker::ProofRejection> {
+        Ok(self.session)
     }
 }
 
 /// A proof that parses but proves nothing, for `AnyProof` to accept.
 ///
-/// Both halves must be non-empty after base64 decoding, or `parse_session_proof`
-/// reads the absence as "no proof" and this file would be testing the refusal
-/// rather than the thing it names.
-const ANY_PROOF: &str = "AAAA.BBBB";
+/// Three parts now: the key blob, the counter this proof spends, and the
+/// signature. Both binary halves must be non-empty after base64 decoding, or
+/// `parse_session_proof` reads the absence as "no proof" and this file would be
+/// testing the refusal rather than the thing it names.
+const ANY_PROOF: &str = "AAAA.1.BBBB";
 
 /// Resolves every target to one address, so a test needs no DNS.
 struct FixedUpstream {

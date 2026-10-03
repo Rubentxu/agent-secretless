@@ -14,7 +14,6 @@ use asv_domain::{
 use asv_identity::WorkloadIdentity;
 use asv_ipc_protocol::{AuditEventDto, ErrorCode, Request, Response, PROTOCOL_VERSION};
 use asv_policy::{AuthorizationRequest, PolicyContext, PolicyEngine};
-use tls_bridge::SessionProofs;
 // The row renderer is imported from the session module rather than redefined so
 // the wire separator is defined in exactly one place and a client-side renderer
 // cannot drift from it.
@@ -75,6 +74,135 @@ struct SessionRecord {
     /// `None` means no key was ever registered, and the bridge refuses
     /// rather than guessing. Set exactly once: see `register_key`.
     public_key: Option<Vec<u8>>,
+    /// Counters this session has already spent, so a captured proof cannot be
+    /// presented twice. See [`ReplayWindow`].
+    ///
+    /// Lives beside the key because the key is what makes the counter
+    /// meaningful: a counter with no key behind it authorises nothing, and a
+    /// key with no counter behind it accepts a proof forever.
+    ///
+    /// Inside the record, not beside it, and that is the point.
+    ///
+    /// `EndSession` removes the record, so the window is freed with it and
+    /// there is no second map to keep in step. It also means one lock: the
+    /// `Arc<Mutex<SessionStore>>` the port already holds covers the key and the
+    /// window together, so there is no lock-ordering law to state and no new
+    /// class of deadlock to reason about. An earlier version put the window
+    /// behind its own `Mutex` because the trait method could only take
+    /// `&self`; the trait was the wrong shape, not the state.
+    proof_counters: ReplayWindow,
+}
+
+/// The set of counters a session has already spent, held as a sliding window.
+///
+/// **Why a window and not the highest counter seen.** A strict "reject anything
+/// at or below the highest" rule is the textbook version and it is wrong here:
+/// two CONNECTs from one session can be in flight at once, so a client that
+/// legitimately signs counters 7 and 8 in parallel can have 8 arrive first.
+/// A fixed replay window: one highest counter and a bitmap of what has been
+/// spent below it.
+///
+/// **Why a bitmap and not a set of spent counters.** A set grows for the life
+/// of a session, and the counters are attacker-supplied numbers, so an
+/// unbounded set is a memory-growth lever handed to anyone who can complete a
+/// proof. A `u128` of bits is sixteen bytes per session, fixed, with no
+/// allocation on the hot path and no pruning loop — and "is this counter
+/// already spent" becomes a shift and a mask rather than a tree walk.
+///
+/// **Why a window and not the highest counter seen.** The strict rule —
+/// refuse anything at or below the highest — refuses 7 when 8 landed first,
+/// which a client issuing two CONNECTs concurrently produces legitimately.
+/// That is a liveness bug wearing a security costume, and one the honest
+/// client cannot distinguish from an attack. The bitmap remembers a bounded
+/// run below the highest, so an out-of-order arrival inside the window is
+/// recognised as a replay and an arrival outside it is refused as stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplayWindow {
+    /// The largest counter accepted so far. `None` until the first proof.
+    ///
+    /// An `Option` rather than a sentinel like `u64::MAX`: the first version
+    /// used a sentinel, and the age of the first counter came out as
+    /// `u64::MAX - counter` — far older than the window — so every session's
+    /// *first* proof was refused as stale. Five tests caught it. The sentinel
+    /// saved eight bytes and cost the whole property.
+    highest: Option<u64>,
+    /// Bit `i` set means counter `highest - 1 - i` has been spent.
+    ///
+    /// Bit 0 is therefore the counter just below the highest, and the bitmap
+    /// is indexed from the newest, not the oldest, so advancing `highest` is a
+    /// shift rather than a rebuild.
+    seen: u128,
+}
+
+impl ReplayWindow {
+    /// How many spent counters below the highest are remembered.
+    ///
+    /// A client with N CONNECTs in flight is out of order by at most N
+    /// counters, so the window only has to exceed the worst plausible spread.
+    /// 128 is generous for a path where each tunnel costs a TLS handshake, and
+    /// it is exactly the width of the bitmap, so there is no tuning knob: the
+    /// memory and the policy are the same number.
+    const CAPACITY: u32 = 128;
+
+    /// A window that has never seen a counter. `u64::MAX` is unreachable as a
+    /// real counter in any session that has not already accepted `u64::MAX`
+    /// proofs, and the first `accept` overwrites it.
+    const EMPTY: Self = Self {
+        highest: None,
+        seen: 0,
+    };
+
+    /// Records `counter` as spent and reports whether it was fresh.
+    ///
+    /// `false` means this counter is a replay or is too old to distinguish
+    /// from one. Call this **after** the signature has verified and never
+    /// before: consuming a counter for a proof that did not verify would let
+    /// anyone who cannot sign walk the session's counters forward until the
+    /// honest client's real counter looked stale — a denial delivered by a
+    /// party that never proved anything.
+    fn accept(&mut self, counter: u64) -> bool {
+        let Some(highest) = self.highest else {
+            self.highest = Some(counter);
+            return true;
+        };
+        if counter > highest {
+            // Advancing shifts the window: everything the bitmap remembered
+            // moves one slot further from the new highest, and the old highest
+            // itself becomes spent at bit 0.
+            let shift = (counter - highest) as u32;
+            self.seen = if shift >= Self::CAPACITY {
+                0
+            } else {
+                (self.seen << shift) | 1
+            };
+            self.highest = Some(counter);
+            return true;
+        }
+        let age = highest - counter;
+        if age == 0 {
+            // The highest counter has, by construction, already been spent:
+            // accepting it is what moved `highest` here.
+            return false;
+        }
+        if age > Self::CAPACITY as u64 {
+            // Older than the bitmap reaches. Refused rather than accepted.
+            //
+            // The first version of this window *accepted* a stale counter, on
+            // the reasoning that an honest client cannot be that far behind.
+            // That reasoning is about the honest client, and the caller is
+            // precisely the thing that is not assumed honest: an attacker
+            // replaying an old captured proof presents exactly such a counter.
+            return false;
+        }
+        let bit = 1u128 << (age - 1);
+        if self.seen & bit != 0 {
+            // Already spent: this exact counter is being presented twice.
+            return false;
+        }
+        // Inside the window, never seen: legitimately out of order.
+        self.seen |= bit;
+        true
+    }
 }
 
 /// Why a key registration was refused.
@@ -112,6 +240,7 @@ impl SessionStore {
                 peer_pid: peer.credentials.pid,
                 pinned: peer.is_pidfd_pinned(),
                 public_key: None,
+                proof_counters: ReplayWindow::EMPTY,
             },
         );
         id
@@ -169,7 +298,6 @@ impl SessionStore {
     pub fn workspace_of(&self, id: AgentSessionId) -> Option<&str> {
         self.sessions.get(&id).map(|r| r.workspace.as_str())
     }
-
     /// Returns the PID that opened a session.
     ///
     /// M1 uses this to bind a session to the launching process, and M7 uses it
@@ -240,34 +368,98 @@ impl SessionStore {
 /// deliberate: an index keyed on the blob would be a second place to keep
 /// session keys, and the table is bounded by concurrent sessions, not by
 /// anything an attacker chooses.
-impl SessionProofs for SessionStore {
-    fn resolve(
-        &self,
-        presented_key: &[u8],
-        nonce: &[u8],
-        signature: &[u8],
-    ) -> Option<AgentSessionId> {
-        self.sessions.iter().find_map(|(id, record)| {
-            let registered = record.public_key.as_deref()?;
-            if registered != presented_key {
-                return None;
-            }
-            // Verified against `registered`, not `presented_key`: the two are
-            // equal today because the lookup demanded it, and the point is
-            // that this line stays correct if that ever stops being the
-            // reason they match.
-            //
-            // The comparison above is therefore defence in depth, not the
-            // control. Removing it does not weaken resolution — the signature
-            // is checked against each session's *own* registered key, so a
-            // stranger's key fails everywhere — and a falsification run
-            // confirmed that by mutating the comparison away and watching the
-            // suite stay green. The line is kept because it makes the intent
-            // legible and because a linear scan that verifies every key
-            // against a signature is more work than one that skips; it is not
-            // kept on a claim that it decides anything.
-            asv_ssh_agent::verify_proof(registered, nonce, signature).then_some(*id)
-        })
+/// Why a session proof was refused.
+///
+/// `Err` rather than `None`, and the variants are distinct for the same
+/// reason the key-registration ones are: whoever is refused has to be able to
+/// tell "that was a replay" from "that was too old" from "you are not you",
+/// because those three call for completely different responses. A single
+/// `None` collapses a client's counter bug and an attacker's captured proof
+/// into the same silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofRejection {
+    /// No registered key matches the presented blob, or the signature does not
+    /// verify against the key the broker did register.
+    NoSuchSession,
+    /// This counter has already been spent: the proof is a replay.
+    Replayed,
+    /// This counter is older than the window reaches, so it can no longer be
+    /// told apart from a replay and is refused.
+    TooOld,
+}
+
+impl SessionStore {
+    /// Decides whether `proof` authorises `target`, and spends its counter.
+    ///
+    /// One operation on purpose. Deriving the nonce, choosing the key to
+    /// verify against, and consuming the counter are three decisions that
+    /// only mean anything together, and splitting them across a caller and a
+    /// resolver is how a future caller ends up verifying a proof against the
+    /// wrong nonce. The first version of this took `(key, nonce, signature)`
+    /// and trusted the caller to have built the nonce correctly — and a test
+    /// written against that boundary failed to fail, because the resolver
+    /// verifies the bytes it is handed and has no idea what they were *for*.
+    ///
+    /// `target` is a parameter rather than something recovered from the nonce
+    /// for the same reason: the caller cannot supply a nonce, so it cannot
+    /// supply a nonce for the wrong destination.
+    pub fn authenticate(
+        &mut self,
+        proof: &crate::tls_bridge::SessionProof,
+        target: &crate::tls_bridge::AuthorityEndpoint,
+    ) -> Result<AgentSessionId, ProofRejection> {
+        let nonce = crate::tls_bridge::proof_nonce(&proof.key, target, proof.counter);
+
+        // Find the session this proof is for. Identity is decided here and
+        // nowhere else, and never against a key the client chose.
+        let (id, registered) = self
+            .sessions
+            .iter()
+            .find_map(|(id, record)| {
+                let registered = record.public_key.as_deref()?;
+                // The comparison is defence in depth, not the control: the
+                // signature is verified against each session's *own* key, so a
+                // stranger's blob fails everywhere. A falsification run
+                // confirmed it by removing this line and watching the suite
+                // stay green. It stays because it makes the intent legible and
+                // because skipping candidates is less work than verifying
+                // every one — not on a claim that it decides anything.
+                if registered != proof.key {
+                    return None;
+                }
+                Some((*id, registered.to_vec()))
+            })
+            .ok_or(ProofRejection::NoSuchSession)?;
+
+        if !asv_ssh_agent::verify_proof(&registered, &nonce, &proof.signature) {
+            return Err(ProofRejection::NoSuchSession);
+        }
+
+        // Verify first, spend second. The ordering is load-bearing: a proof
+        // that does not verify must never reach the window, or anyone who
+        // cannot sign could walk this session's counters forward until the
+        // honest client's real counter looked stale.
+        let record = self
+            .sessions
+            .get_mut(&id)
+            .ok_or(ProofRejection::NoSuchSession)?;
+        let fresh = record.proof_counters.accept(proof.counter);
+        if !fresh {
+            // Distinguish "already spent" from "too old to tell", because the
+            // first is a replay and the second is a client that has fallen
+            // behind, and a client needs to be able to tell them apart.
+            let age = record
+                .proof_counters
+                .highest
+                .unwrap_or(0)
+                .saturating_sub(proof.counter);
+            return Err(if age > ReplayWindow::CAPACITY as u64 {
+                ProofRejection::TooOld
+            } else {
+                ProofRejection::Replayed
+            });
+        }
+        Ok(id)
     }
 }
 
@@ -2350,6 +2542,7 @@ mod tests {
     use asv_domain::CredentialKind;
     use asv_identity::PeerCredentials;
     use asv_policy::{AuthorizationRequest, PolicyContext};
+    use ed25519_dalek::Signer;
 
     fn peer() -> WorkloadIdentity {
         WorkloadIdentity::from_peer(PeerCredentials {
@@ -2367,6 +2560,214 @@ mod tests {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
         })
+    }
+
+    /// A destination to aim a proof at. `asv.test` is used throughout, and it
+    /// never resolves: these tests never open a socket, and a proof is about
+    /// identity rather than connectivity.
+    fn target() -> crate::tls_bridge::AuthorityEndpoint {
+        crate::tls_bridge::AuthorityEndpoint::new(
+            asv_domain::Authority::canonicalize("asv.test").expect("authority"),
+            443,
+        )
+        .expect("endpoint")
+    }
+
+    /// What a real client sends: the blob, a counter, and a signature over the
+    /// nonce the broker will rebuild. Building it here rather than signing a
+    /// raw byte string is the point — it is the shape the wire actually has,
+    /// and a test that signs arbitrary bytes would not notice if the broker
+    /// derived the nonce from something else.
+    fn proof_for(key: &ed25519_dalek::SigningKey, counter: u64) -> crate::tls_bridge::SessionProof {
+        let blob = asv_ssh_agent::public_key_blob(&key.verifying_key());
+        let nonce = crate::tls_bridge::proof_nonce(&blob, &target(), counter);
+        crate::tls_bridge::SessionProof {
+            signature: key.sign(&nonce).to_bytes().to_vec(),
+            key: blob,
+            counter,
+        }
+    }
+
+    /// A session with a registered key, and the key to sign as that session.
+    fn session_with_key(
+        workspace: &str,
+        seed: u8,
+    ) -> (SessionStore, AgentSessionId, ed25519_dalek::SigningKey) {
+        let peer = peer();
+        let mut store = SessionStore::new();
+        let session = store.create(workspace.into(), &peer);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        store
+            .register_key(
+                session,
+                &peer,
+                asv_ssh_agent::public_key_blob(&key.verifying_key()),
+            )
+            .expect("register the key");
+        (store, session, key)
+    }
+
+    /// A captured proof, presented twice, is refused the second time.
+    ///
+    /// This is the property the counter exists for. Before it, the identical
+    /// `(key, destination)` pair verified forever, so a proof observed on the
+    /// wire was good for the life of the session and for every surrogate that
+    /// session held.
+    #[test]
+    fn a_proof_replayed_with_the_same_counter_is_refused() {
+        let (mut store, session, key) = session_with_key("replay", 9);
+        let proof = proof_for(&key, 1);
+        assert_eq!(
+            store.authenticate(&proof, &target()).ok(),
+            Some(session),
+            "the first presentation must succeed or the rest proves nothing"
+        );
+        assert_eq!(
+            store.authenticate(&proof, &target()),
+            Err(ProofRejection::Replayed),
+            "the identical proof authenticated twice"
+        );
+    }
+
+    /// A proof captured from an earlier tunnel, replayed after a later one.
+    ///
+    /// **This is the case the bitmap exists for, and it was the one that was
+    /// missing.** The first replay test presented the same counter twice in a
+    /// row, which the `age == 0` shortcut catches before the bitmap is
+    /// consulted at all — so a mutation that disabled the duplicate-bit check
+    /// entirely left the suite green. The bitmap only ever decides for a
+    /// counter *below* the highest, which is exactly what an attacker
+    /// replaying an old captured proof presents, and which no test was
+    /// driving.
+    #[test]
+    fn an_earlier_proof_replayed_after_a_later_one_is_refused() {
+        let (mut store, session, key) = session_with_key("old", 15);
+        let first = proof_for(&key, 1);
+        assert_eq!(store.authenticate(&first, &target()).ok(), Some(session));
+        // A later tunnel moves the window on, so counter 1 is now below the
+        // highest and only the bitmap can recognise it.
+        assert_eq!(
+            store.authenticate(&proof_for(&key, 2), &target()).ok(),
+            Some(session)
+        );
+        assert_eq!(
+            store.authenticate(&first, &target()),
+            Err(ProofRejection::Replayed),
+            "a proof captured from an earlier tunnel authenticated again"
+        );
+    }
+
+    /// Out-of-order arrivals inside the window are legitimate, not replays.
+    ///
+    /// The strict alternative — refuse anything at or below the highest
+    /// counter seen — turns two CONNECTs a client issued concurrently into
+    /// one tunnel and one spurious denial, and the denial is indistinguishable
+    /// from an attack to whoever has to debug it.
+    #[test]
+    fn a_counter_arriving_out_of_order_inside_the_window_is_accepted() {
+        let (mut store, session, key) = session_with_key("ooo", 11);
+        // 8 arrives first, then 7: the classic concurrent client.
+        assert_eq!(
+            store.authenticate(&proof_for(&key, 8), &target()).ok(),
+            Some(session)
+        );
+        assert_eq!(
+            store.authenticate(&proof_for(&key, 7), &target()).ok(),
+            Some(session),
+            "a legitimate out-of-order counter was refused as a replay"
+        );
+    }
+
+    /// A counter older than the window is refused, and says so distinctly.
+    ///
+    /// The first version of this test did not reach the branch it named, and
+    /// the falsification run is what proved it: it accepted 1, then 500, then
+    /// replayed 1 — but accepting 500 had already *remembered* 1, so the
+    /// "already spent" arm caught it and the stale arm was never entered.
+    /// Disabling the stale arm left the suite green. Reaching it needs a
+    /// counter old enough to have fallen out of a `BTreeSet`-shaped window,
+    /// which a `u128` bitmap reaches after 128 counters.
+    #[test]
+    fn a_counter_older_than_the_window_is_refused_rather_than_accepted() {
+        let (mut store, _session, key) = session_with_key("stale", 12);
+        for counter in 0..1_000u64 {
+            store
+                .authenticate(&proof_for(&key, counter), &target())
+                .expect("a fresh counter authenticates");
+        }
+        assert_eq!(
+            store.authenticate(&proof_for(&key, 0), &target()),
+            Err(ProofRejection::TooOld),
+            "a counter far below the window was accepted, which reopens the \
+             replay the window exists to close"
+        );
+    }
+
+    /// The window is a fixed sixteen bytes, whatever an attacker does.
+    #[test]
+    fn the_window_does_not_grow_with_the_number_of_proofs() {
+        let mut window = ReplayWindow::EMPTY;
+        let before = std::mem::size_of::<ReplayWindow>();
+        for counter in 0..100_000u64 {
+            window.accept(counter);
+        }
+        assert_eq!(
+            std::mem::size_of_val(&window),
+            before,
+            "the window grew with the number of counters"
+        );
+    }
+
+    /// A proof that does not verify must not be able to spend a counter.
+    ///
+    /// This is the ordering, and it is the half that is easy to get
+    /// backwards. If an unverified proof could reach the window, anyone who
+    /// could not sign could walk the session's counters forward one at a time
+    /// until the honest client's real counter looked stale — a denial of
+    /// service delivered by a party that never proved anything, and one the
+    /// honest client cannot tell from an attack.
+    #[test]
+    fn a_proof_that_does_not_verify_cannot_spend_a_counter() {
+        let (mut store, session, key) = session_with_key("nospend", 13);
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[77u8; 32]);
+        // Correct blob, wrong signature: the broker must not spend on it.
+        let mut forged = proof_for(&key, 1);
+        forged.signature = stranger
+            .sign(&crate::tls_bridge::proof_nonce(&forged.key, &target(), 1))
+            .to_bytes()
+            .to_vec();
+        assert_eq!(
+            store.authenticate(&forged, &target()),
+            Err(ProofRejection::NoSuchSession),
+            "a forged proof authenticated"
+        );
+        // The honest client's counter 1 must still be available.
+        assert_eq!(
+            store.authenticate(&proof_for(&key, 1), &target()).ok(),
+            Some(session),
+            "a forged proof burned the honest client's counter: counter poisoning"
+        );
+    }
+
+    /// Ending a session takes its replay window with it.
+    ///
+    /// The window lives inside the record, so this is not a property anything
+    /// has to maintain — it is what happens. The test exists because the
+    /// alternative (a window keyed outside the session table) is a map that
+    /// has to be cleaned up in step, and a map that is not cleaned up is a
+    /// leak that no test would notice until someone measured memory.
+    #[test]
+    fn ending_a_session_releases_its_replay_window() {
+        let (mut store, session, key) = session_with_key("end", 14);
+        store
+            .authenticate(&proof_for(&key, 1), &target())
+            .expect("first proof");
+        assert!(store.end(session), "the session existed");
+        assert_eq!(
+            store.authenticate(&proof_for(&key, 1), &target()),
+            Err(ProofRejection::NoSuchSession),
+            "an ended session still resolved a proof"
+        );
     }
 
     /// ADR-0019's binding. These pin the two properties the bridge depends

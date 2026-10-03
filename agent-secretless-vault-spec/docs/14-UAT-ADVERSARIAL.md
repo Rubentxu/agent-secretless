@@ -117,9 +117,15 @@ ADR-0019 answered that question and `uat_010_connect_substitution.rs` now
 covers the path. An ordinary CLI opens a real session against the broker, and
 the broker binds that session's public signing key to it over the
 kernel-authenticated socket. The CONNECT client presents
-`x-asv-session-proof`, which is its key blob plus a signature over a nonce
-derived from the destination, and the bridge resolves it to the session whose
-**registered** key verifies. The surrogate is then redeemed in that session,
+`x-asv-session-proof`, which is its key blob, the per-session counter it is
+spending, and a signature over a nonce derived from the destination and that
+counter, and the bridge resolves it to the session whose
+**registered** key verifies. The counter is what makes the proof single use:
+the broker spends it once the signature verifies, so the identical proof
+presented twice is refused the second time. A proof that omits the counter is
+refused rather than parsed with a default — every proof minted before counters
+existed would otherwise share counter 0, and the refusals that followed would
+have looked like a replay attack rather than a version mismatch. The surrogate is then redeemed in that session,
 the credential is lent, the authorization header is rewritten on the way
 upstream, and the response is relayed back without ever touching the client
 side. The suite runs a full rustls client with server-name verification, real

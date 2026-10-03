@@ -1078,6 +1078,205 @@ protocol that is already v4. The window for making this correct is open
 precisely because the surface is not yet reachable, and it closes the moment
 the first real client can complete a CONNECT.
 
+#### V1-C2 — the counter, implemented (fifth delivery)
+
+`proof_nonce` now folds the counter in, the counter travels in the clear on
+the wire as the middle of three dot-separated parts, and the broker spends it.
+What it buys is **single use, not recency** — a proof is good once, and "good
+once" is a different claim from "recent", and the documentation says so rather
+than borrowing the word *freshness* for it.
+
+**A proof with no counter is refused, not defaulted.** The lenient reading —
+parse what is there, default the rest to zero — looks generous and is a
+downgrade: every proof minted before counters existed would share counter 0,
+the first arrival would spend it, and the rest would be refused for what reads
+like a replay attack rather than a version mismatch. The test for this is
+`a_proof_without_a_counter_is_refused_rather_than_defaulted`, and it pins a
+wire-format decision that is otherwise invisible.
+
+**Verify, then spend, in one method.** The counter is spent by the same call
+that verifies the signature, because splitting it into `resolve` plus `spend`
+would let a caller invert the order. The ordering is the half that is easy to
+get backwards: a proof that does not verify must never reach the window, or
+anyone who cannot sign could walk a session's counters forward until the
+honest client's real counter looked stale — a denial delivered by a party that
+never proved anything, and one the honest client cannot distinguish from an
+attack. The test double honours the counter for the same reason: a double that
+ignored it would let every replay test pass for the wrong reason, with the
+refusal coming from the double rather than from the design.
+
+**The window lives inside the session record, and there is one lock.**
+`SessionRecord` holds `public_key` and `ReplayWindow` together, under the
+`Arc<Mutex<SessionStore>>` the port already had. An intermediate version gave
+the window its own `Mutex` because the trait method could only take `&self`,
+and added a lock-ordering law to go with it. That was the wrong diagnosis: the
+`MutexGuard` was already mutable, so the **trait** was the thing with the bad
+shape, and the fix was to change the trait rather than to add a second lock.
+Two things follow that a second lock would have cost. There is no
+`store -> window` ordering to state and therefore no new class of deadlock to
+reason about, and `EndSession` removes the record, so the window is freed with
+it — no second map to keep in step, and a test that says so
+(`ending_a_session_releases_its_replay_window`) rather than a memory number
+nobody checks.
+
+**The window is a bitmap, not a set.** `highest: Option<u64>` and `seen:
+u128`: sixteen bytes of bitmap, fixed, no allocation on the hot path, and
+"is this counter already spent" is a shift and a mask. A growing set of spent
+counters would be a memory-growth lever handed to anyone who can complete a
+proof, since the counters are attacker-supplied numbers. The capacity and the
+policy are the same number — 128 — so there is no knob to tune.
+
+**The first version of the window accepted stale counters, and was corrected
+before it shipped.** It reasoned that an honest client cannot fall further
+behind than the window, so a counter below the window must be an attack — and
+then *accepted* it. That reasoning is about the honest client, and the caller
+is precisely the thing that is not assumed honest: an attacker replaying an
+old captured proof presents exactly such a counter. It now fails closed, and
+`a_counter_older_than_the_window_is_refused_rather_than_accepted` is the test
+that says so.
+
+**The textbook rule is wrong here.** "Refuse anything at or below the highest
+counter seen" is the version most designs reach for, and it turns two CONNECTs
+a client issued concurrently into one tunnel and one spurious denial — a
+liveness bug wearing a security costume, and one the honest client cannot
+distinguish from an attack either. The window accepts an out-of-order counter
+inside its range and refuses a replay of one already spent, which is the pair
+of behaviours that match what a real client does.
+
+**The caller no longer supplies a nonce.** `SessionProofs::resolve(key, nonce,
+signature)` split one invariant across two components: the bridge built the
+nonce, the resolver trusted it. A test written against that boundary failed to
+fail, because the resolver verifies the bytes it is handed and has no idea
+what they were *for*. The contract is now `authenticate(proof, target)`: the
+nonce is derived inside, from `(key, destination, counter)`, so "verified
+against the wrong destination" is unrepresentable rather than merely
+discouraged. `ProofRejection` distinguishes `NoSuchSession`, `Replayed` and
+`TooOld`, because a client that has fallen behind needs to tell that from an
+attack, and both from a bug.
+
+**The nonce says what it may mean.** `PROOF_DOMAIN` —
+`asv/connect/session-proof/v2` — is hashed in before anything else. The same
+session key signs other things, and ten bytes make it explicit that this
+signature can only ever mean "CONNECT session proof v2". Bumping the constant
+is a breaking change, which is the point.
+
+**A test I wrote asserted something false, and the run said so.** The first
+version of the counter test passed the old nonce to the resolver with counter
+0 and expected a refusal, on the theory that the resolver would notice the
+signature had not committed to that counter. It does not. The assertion was
+wrong about the design rather than catching a hole in it, and it now lives
+where the nonce is constructed — `a_proof_signed_for_one_counter_does_not_verify_for_another`.
+
+**A sentinel for "empty" cost the whole property.** The window started as
+`highest = u64::MAX`, which saves eight bytes. The age of a session's *first*
+counter then came out as `u64::MAX - counter` — far older than the window — so
+every session's first proof was refused as stale. Five tests caught it at once.
+`Option<u64>` is twenty-four bytes and works.
+
+**The fixtures had to learn the rule, and that is the evidence.** A mechanical
+update gave every proof in `uat_010_connect_substitution.rs` counter 1, and
+eleven tests went red. Nothing was broken: the fixture was minting a new proof
+per tunnel from a session that had already spent that counter, and the broker
+was right to refuse. The fixture now holds one counter per signer in that
+party's own sequence, which is what a real client does.
+
+**One test would have passed for the wrong reason.** `an_ended_session_stops_resolving`
+re-presented the same counter after ending the session, so it would have been
+refused as a replay whether or not the session still existed. It now uses a
+fresh counter, and says why.
+
+**Still owed, and not claimed by this delivery.** No client produces a proof,
+so there is no end-to-end evidence of the counter working across a real
+socket — only across the store. The window is bounded, so a proof older than
+the bitmap reaches is refused rather than replayed, and that bound is a
+deliberate memory trade rather than a claim of unbounded replay protection.
+And the double-lock class found in the third delivery still has no shipped
+guard.
+
+#### Who owns the counter — recorded before it is built
+
+A counter per session is only meaningful if exactly one thing increments it.
+The obvious shape breaks:
+
+```text
+asv run <agent>
+   ├── curl A
+   ├── curl B
+   └── npm
+```
+
+Three children, one session, each starting at 1. The window would refuse the
+second and the third as replays of a counter the first already spent, and the
+refusal is indistinguishable from an attack — the client cannot tell, and
+neither can an operator reading the log.
+
+So the counter cannot belong to the session, and it cannot belong to each
+child. It belongs to **one emitter per session**, and the shape that fits the
+product is a session-local shim rather than a change to every client:
+
+```text
+ordinary CLI (curl, npm, Maven, Gradle)
+     │  knows nothing about ASV
+     ▼
+session-local ASV proxy
+     ├── owns the atomic counter
+     ├── asks SSH_AUTH_SOCK to sign the nonce
+     └── adds x-asv-session-proof
+     ▼
+asv-brokerd CONNECT listener
+```
+
+This is the shell-first requirement applied to the replay fix. The
+alternative — teaching each client to manufacture an ASV header — is M14's
+work, and it would put the protocol inside every toolchain, which is the
+opposite of what M14 is for. **Nothing of this is built.** It is recorded
+because the counter is worthless without it, and a counter that refuses a
+client's second legitimate tunnel is worse than no counter at all: it is a
+denial of service wearing a security costume, which is the same shape as the
+"strict highest counter seen" rule the window deliberately avoids.
+
+**Two independent walls still stand.** The allow-list ships empty, so nothing
+is authorised; and no shipped client emits the header, so nothing can prove
+anything. A counter closes neither.
+
+#### The falsification run of this delivery, and what it caught about the harness
+
+The first run reported **4 of 7**. All three that stayed green were defects in
+the *tests or the harness*, not holes in the code, and each is worth naming
+because the failure mode is the same one this project keeps meeting:
+
+- **A test that never reached the branch it named.** The stale-counter test
+  accepted 1, then 500, then replayed 1 — but accepting 500 had already
+  *remembered* 1, so the "already spent" arm caught it and the stale arm was
+  never entered. Disabling the stale arm left the suite green. It now pushes
+  more counters than the window holds, and asserts that its own fixture is
+  valid before asserting the property.
+- **A mutation that was not the mutation it claimed.** "Spend before verify"
+  inserted the signature check *between* the two phases, which is still
+  verify-then-spend. It is now a genuine two-site swap.
+- **A mutation that was not observable at all.** Defaulting a missing counter
+  to 0 was tested only against a two-part header, which is refused on arity
+  before the counter is ever read. The case that reaches it is a counter that
+  is *present and not a number*, and that is now a test of its own.
+
+**And then the harness itself was wrong, in a way it had already been wrong
+before.** With two edits on one file, the driver re-read the *pristine* text
+for each site, so the second write threw the first mutation away and a
+multi-site mutation silently degraded into its last edit. The
+`connect_wiring_falsification.py` harness written in the second delivery keeps
+two maps — `pristine` for the restore and `working` for the application —
+precisely because of that, and this new harness collapsed them back into one.
+A lesson recorded once is not a lesson recorded; it is a thing that happened
+to one harness until it happens to a second one.
+
+The harness was then rebuilt against the redesigned code, with eight
+mutations over nine sites. Two of them exist because the window is a bitmap
+and a counter on the wire, and neither is reachable by a mutation of the
+older design: **not checking the duplicate bit** — the bitmap's only job, and
+without which the window remembers nothing — and **accepting the two-segment
+legacy header** as counter 0, which is the compatibility reading that looks
+kind and would give every pre-counter proof the same counter.
+
 ## After v1.0 — M14 through M18
 
 Adopted from `docs/asv-agent-first-security-evolution-v2-2026-10-02/`. **This

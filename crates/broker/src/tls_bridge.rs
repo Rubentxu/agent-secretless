@@ -911,63 +911,74 @@ pub struct EstablishedTunnel {
 /// `tls_bridge` must not depend on the broker's state or the vault (D2,
 /// enforced by a test). The bridge only ever sees the answer.
 pub trait SessionProofs {
-    /// Resolves a session proof to the session whose registered key signed
-    /// it, or `None` if no registered key does.
+    /// Decides whether `proof` authorises `target`, spending its counter.
     ///
-    /// The presented blob only *selects* a candidate. What proves ownership
-    /// is the signature over the nonce, checked by the implementation
-    /// against the key the broker actually registered — never against the
-    /// blob the client presented.
-    fn resolve(
+    /// The caller supplies the proof and the destination, and **cannot supply
+    /// a nonce**. An earlier version of this took
+    /// `(presented_key, nonce, signature)` and trusted the caller to have
+    /// built the nonce correctly; that split the invariant across two
+    /// components, and a test written against it failed to fail because the
+    /// resolver verifies the bytes it is handed and has no idea what they were
+    /// *for*. Deriving the nonce here makes "verified against the wrong
+    /// destination" unrepresentable rather than merely discouraged.
+    ///
+    /// The counter is spent inside this method, after the signature verifies.
+    /// Spending it here is what stops a caller from spending one for a proof
+    /// that never verified, and returning `Ok` promises it was spent.
+    fn authenticate(
         &self,
-        presented_key: &[u8],
-        nonce: &[u8],
-        signature: &[u8],
-    ) -> Option<AgentSessionId>;
+        proof: &SessionProof,
+        target: &AuthorityEndpoint,
+    ) -> Result<AgentSessionId, crate::ProofRejection>;
 }
+
+/// What this signature is allowed to mean, hashed in before anything else.
+///
+/// Bumping it is a breaking protocol change, which is the point: it is the
+/// cheapest possible way to keep a signature minted for one mechanism from
+/// ever being accepted by another.
+pub const PROOF_DOMAIN: &[u8] = b"asv/connect/session-proof/v2";
 
 /// The nonce a session proof is computed over.
 ///
-/// It is bound to the destination, not drawn fresh per tunnel. That is a
-/// deliberate trade: a server-issued nonce would be stronger against
-/// replay, but it costs a round trip before the CONNECT, and this path
-/// exists to serve ordinary HTTP clients that do not have one.
+/// It is bound to the destination *and* to a per-session counter, and it is
+/// not drawn fresh per tunnel. The destination binding is worth having and
+/// costs nothing; the counter is what makes a proof single-use.
 ///
-/// What the binding buys is that a proof captured for one destination does
-/// not verify against another, so it cannot be moved to a host the operator
-/// did not authorise. What it does not buy is freshness: a proof replayed
-/// against the *same* destination verifies again, every time, for as long as
-/// the session lives.
+/// A server-issued nonce would be stronger still, and ADR-0019 already
+/// rejected it for a reason that still holds: it costs a round trip *before*
+/// the CONNECT, on a path that exists to serve clients that have no round trip
+/// to spend. A counter needs no round trip and no clock agreement — the client
+/// already holds a session, so it holds a counter too.
 ///
-/// **This documentation previously claimed the replay was harmless, and that
-/// claim was false.** It said a replay "is not a grant, because the surrogate
-/// it would be spent with is single-use and was already spent the first
-/// time". That holds for the first surrogate only. `SurrogateRegistry::mint`
-/// appends a record with no cap per session or per credential, and the nonce
-/// binds to (key, destination) alone, so it cannot distinguish one live
-/// surrogate from another. Measured by
-/// `one_proof_reaches_every_live_surrogate_of_a_session`: one captured proof
-/// redeems a *second*, still-unspent surrogate of the same session, to the
-/// same credential, and the returned `CredentialId` is identical. A single
-/// observed proof is thus a bearer for every surrogate that session holds for
-/// that destination.
+/// **What the destination binding buys:** a proof captured for one destination
+/// does not verify against another, so it cannot be moved to a host the
+/// operator did not authorise.
 ///
-/// It is not yet a grant on its own — the attacker still has to present a
-/// surrogate, and the surrogate travels inside the TLS session the broker
-/// terminates rather than in the plaintext CONNECT head. But the argument
-/// this comment used to make does not hold, and the honest position is that
-/// freshness is *absent*, not *bounded by the surrogate*. The decision on what
-/// to put in its place is owed; see `15-ROADMAP.md`, *V1-C2 — freshness and
-/// replay*.
-pub fn proof_nonce(presented_key: &[u8], target: &AuthorityEndpoint) -> Vec<u8> {
+/// **What the counter buys, and what it does not.** It buys single use: the
+/// broker spends a counter when a proof resolves, so the same `(key,
+/// destination, counter)` triple is refused the second time. What it does not
+/// buy is unpredictability — the counter is an attacker-supplied number, and
+/// the window that remembers spent ones is bounded, so a proof older than the
+/// window is refused as stale rather than replayed. Freshness here means
+/// *single use*, not *recent*.
+pub fn proof_nonce(presented_key: &[u8], target: &AuthorityEndpoint, counter: u64) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
+    // Domain separation first. The same session key also signs other things,
+    // so a signature produced for one mechanism must not be replayable into
+    // another. It costs ten bytes and buys the statement that this signature
+    // can only ever mean "CONNECT session proof v2".
+    hasher.update(PROOF_DOMAIN);
     // Length-prefixed so a key ending in the same bytes as a host cannot
     // produce the same digest as a shorter key followed by a longer host.
     hasher.update((presented_key.len() as u64).to_be_bytes());
     hasher.update(presented_key);
     hasher.update(target.host().as_bytes());
     hasher.update((target.port() as u64).to_be_bytes());
+    // Fixed width, so no choice of counter bytes can be confused with a
+    // shorter host or a different port.
+    hasher.update(counter.to_be_bytes());
     hasher.finalize().to_vec()
 }
 
@@ -1196,13 +1207,18 @@ pub fn replace_bearer_token(
 /// refused rather than half-authorised.
 pub const SESSION_PROOF_HEADER: &str = "x-asv-session-proof";
 
-/// A session proof as it arrives on the wire: the client's key blob and a
-/// signature over [`proof_nonce`], both unpadded base64 and separated by a
-/// dot.
+/// A session proof as it arrives on the wire: the client's key blob, the
+/// per-session counter it is spending, and a signature over
+/// [`proof_nonce`]. The counter sits in the clear because it is not a secret —
+/// it is a number the client chose, and hiding it would buy nothing while
+/// making the single-use property unauditable from the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionProof {
     pub key: Vec<u8>,
     pub signature: Vec<u8>,
+    /// The counter this proof spends, folded into the nonce by
+    /// [`proof_nonce`] so the signature commits to it.
+    pub counter: u64,
 }
 
 fn parse_session_proof(head: &str) -> Option<SessionProof> {
@@ -1214,16 +1230,28 @@ fn parse_session_proof(head: &str) -> Option<SessionProof> {
             None
         }
     })?;
-    let (key, signature) = raw.split_once('.')?;
-    let key = base64_decode(key)?;
-    let signature = base64_decode(signature)?;
+    // Three parts, and exactly three. A proof that omits the counter is not a
+    // proof from this version of the protocol, and parsing it leniently would
+    // hand the resolver a proof that costs no counter at all.
+    let mut parts = raw.split('.');
+    let key = base64_decode(parts.next()?)?;
+    let counter_text = parts.next()?;
+    let signature = base64_decode(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let counter: u64 = counter_text.parse().ok()?;
     // An empty half is not a malformed proof, it is *no* proof: accepting
     // one would hand the resolver an empty signature to fail on later, at
     // a point where the failure no longer says the client sent nonsense.
     if key.is_empty() || signature.is_empty() {
         return None;
     }
-    Some(SessionProof { key, signature })
+    Some(SessionProof {
+        key,
+        signature,
+        counter,
+    })
 }
 
 /// Standard base64, no padding, no external dependency.
@@ -1380,14 +1408,18 @@ impl Bridge {
             let Some(proof) = parse_session_proof(&head) else {
                 return Err(BridgeError::NoSessionProof);
             };
-            let nonce = proof_nonce(&proof.key, &target);
-            // A presented proof that does not resolve is a failure, not an
-            // anonymous tunnel. Forwarding it unsubstituted would send the
+            // A presented proof that does not authenticate is a failure, not
+            // an anonymous tunnel. Forwarding it unsubstituted would send the
             // client's credential to the outside world and report a provider
             // error instead of the truth.
+            //
+            // The resolver derives the nonce, verifies the signature against
+            // the *registered* key, and spends the counter — all of it here, so
+            // there is no way to reach a tunnel with a proof that was checked
+            // against something other than this destination.
             proofs
-                .resolve(&proof.key, &nonce, &proof.signature)
-                .ok_or(BridgeError::NoSessionProof)?
+                .authenticate(&proof, &target)
+                .map_err(|_| BridgeError::NoSessionProof)?
         };
 
         let mut ack = &client;
@@ -1983,28 +2015,58 @@ mod proof_tests {
     use ed25519_dalek::{Signer, SigningKey};
 
     /// Stands in for the broker: it knows which key belongs to which
-    /// session, and checks the signature against the **registered** key
-    /// rather than against the blob the client presented.
+    /// session, checks the signature against the **registered** key rather
+    /// than against the blob the client presented, and spends the counter.
+    ///
+    /// The counter is honoured here rather than ignored, so a test that
+    /// replays a proof here sees the refusal the real store would give. A
+    /// double that skipped it would let every replay test below pass for the
+    /// wrong reason — the refusal would be the double's, not the design's.
     struct FakeProofs {
         registered: Vec<(AgentSessionId, Vec<u8>)>,
+        spent: std::sync::Mutex<std::collections::HashSet<(AgentSessionId, u64)>>,
     }
 
     impl SessionProofs for FakeProofs {
-        fn resolve(
+        fn authenticate(
             &self,
-            presented_key: &[u8],
-            nonce: &[u8],
-            signature: &[u8],
-        ) -> Option<AgentSessionId> {
-            self.registered
+            proof: &SessionProof,
+            target: &AuthorityEndpoint,
+        ) -> Result<AgentSessionId, crate::ProofRejection> {
+            // Derives the nonce itself, exactly as the store does, so a test
+            // cannot accidentally prove something the broker would not.
+            let nonce = proof_nonce(&proof.key, target, proof.counter);
+            let session = self
+                .registered
                 .iter()
                 .find(|(_, key)| {
-                    key.len() == presented_key.len()
-                        && bool::from(subtle::ConstantTimeEq::ct_eq(key.as_slice(), presented_key))
+                    key.len() == proof.key.len()
+                        && bool::from(subtle::ConstantTimeEq::ct_eq(key.as_slice(), &proof.key))
                 })
                 .and_then(|(session, key)| {
-                    asv_ssh_agent::verify_proof(key, nonce, signature).then_some(*session)
+                    asv_ssh_agent::verify_proof(key, &nonce, &proof.signature).then_some(*session)
                 })
+                .ok_or(crate::ProofRejection::NoSuchSession)?;
+            // Verify first, spend second, the same order the store uses.
+            let mut spent = self
+                .spent
+                .lock()
+                .map_err(|_| crate::ProofRejection::NoSuchSession)?;
+            if !spent.insert((session, proof.counter)) {
+                return Err(crate::ProofRejection::Replayed);
+            }
+            Ok(session)
+        }
+    }
+
+    /// Builds the proof a real client would send for `counter`.
+    fn signed(key: &SigningKey, target: &AuthorityEndpoint, counter: u64) -> SessionProof {
+        let blob = public_key_blob_for(key);
+        let nonce = proof_nonce(&blob, target, counter);
+        SessionProof {
+            key: blob,
+            signature: key.sign(&nonce).to_bytes().to_vec(),
+            counter,
         }
     }
 
@@ -2055,6 +2117,7 @@ mod proof_tests {
         let session = AgentSessionId::new();
         let proofs = FakeProofs {
             registered: vec![(session, blob.clone())],
+            spent: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
         (session, key, blob, proofs)
     }
@@ -2065,12 +2128,10 @@ mod proof_tests {
 
     #[test]
     fn a_proof_over_the_destination_resolves_to_its_session() {
-        let (session, _key, blob, proofs) = fixture();
+        let (session, key, _blob, proofs) = fixture();
         let target = endpoint("asv.test", 443);
-        let nonce = proof_nonce(&blob, &target);
-        let signature = _key.sign(&nonce).to_bytes();
         assert_eq!(
-            proofs.resolve(&blob, &nonce, &signature),
+            proofs.authenticate(&signed(&key, &target, 1), &target).ok(),
             Some(session),
             "a valid proof did not resolve"
         );
@@ -2078,28 +2139,31 @@ mod proof_tests {
 
     #[test]
     fn a_proof_for_one_destination_does_not_resolve_against_another() {
-        let (_session, key, blob, proofs) = fixture();
+        let (_session, key, _blob, proofs) = fixture();
         let honest = endpoint("asv.test", 443);
         let attacker = endpoint("evil.example", 443);
-        let nonce = proof_nonce(&blob, &honest);
-        let signature = key.sign(&nonce).to_bytes();
+        // Signed honestly for `honest`, presented against `attacker`: the
+        // broker rebuilds the nonce for the destination it was given, so the
+        // signature cannot carry over.
         assert_eq!(
-            proofs.resolve(&blob, &proof_nonce(&blob, &attacker), &signature),
-            None,
+            proofs.authenticate(&signed(&key, &honest, 1), &attacker),
+            Err(crate::ProofRejection::NoSuchSession),
             "a proof captured for one host verified against another"
         );
     }
 
     #[test]
     fn a_proof_made_by_a_key_the_broker_never_registered_does_not_resolve() {
-        let (_session, _key, blob, proofs) = fixture();
+        let (_session, key, _blob, proofs) = fixture();
         let other = SigningKey::from_bytes(&[22u8; 32]);
         let target = endpoint("asv.test", 443);
-        let nonce = proof_nonce(&blob, &target);
-        let signature = other.sign(&nonce).to_bytes();
+        // A registered blob with somebody else's signature.
+        let mut forged = signed(&key, &target, 1);
+        let nonce = proof_nonce(&forged.key, &target, 1);
+        forged.signature = other.sign(&nonce).to_bytes().to_vec();
         assert_eq!(
-            proofs.resolve(&blob, &nonce, &signature),
-            None,
+            proofs.authenticate(&forged, &target),
+            Err(crate::ProofRejection::NoSuchSession),
             "a stranger's signature resolved against a registered blob"
         );
     }
@@ -2120,14 +2184,12 @@ mod proof_tests {
     fn a_stranger_presenting_their_own_key_and_their_own_signature_is_refused() {
         let (session, _key, blob, proofs) = fixture();
         let attacker = SigningKey::from_bytes(&[77u8; 32]);
-        let their_blob = public_key_blob_for(&attacker);
         let target = endpoint("asv.test", 443);
-        let nonce = proof_nonce(&their_blob, &target);
-        let signature = attacker.sign(&nonce).to_bytes();
-        assert_ne!(their_blob, blob, "the fixture keys collided");
+        let their_proof = signed(&attacker, &target, 1);
+        assert_ne!(their_proof.key, blob, "the fixture keys collided");
         assert_eq!(
-            proofs.resolve(&their_blob, &nonce, &signature),
-            None,
+            proofs.authenticate(&their_proof, &target),
+            Err(crate::ProofRejection::NoSuchSession),
             "a stranger's own key resolved to session {session}"
         );
     }
@@ -2154,14 +2216,126 @@ mod proof_tests {
     fn the_header_is_matched_case_insensitively_like_every_http_header() {
         let (session, key, blob, proofs) = fixture();
         let target = endpoint("asv.test", 443);
-        let nonce = proof_nonce(&blob, &target);
+        let nonce = proof_nonce(&blob, &target, 7);
         let signature = key.sign(&nonce).to_bytes();
-        let proof = format!("{}.{}", encode(&blob), encode(&signature));
+        let proof = format!("{}.7.{}", encode(&blob), encode(&signature));
         let head = format!("CONNECT asv.test:443 HTTP/1.1\r\nX-ASV-Session-Proof: {proof}\r\n\r\n");
         let parsed = parse_session_proof(&head).expect("a case-variant header parsed");
+        assert_eq!(parsed.counter, 7, "the counter did not survive the wire");
+        assert_eq!(proofs.authenticate(&parsed, &target).ok(), Some(session));
+    }
+
+    /// A counter that is present but is not a number is refused, not coerced.
+    ///
+    /// This is the case the arity check does *not* cover, and it is the one a
+    /// `unwrap_or(0)` would silently pass. The first version of the harness
+    /// mutated the default and the suite stayed green, because the only test
+    /// it exercised was the two-part header — and that is refused on arity,
+    /// before the counter is ever read. Coercing a present-but-unparseable
+    /// counter to 0 would be worse than the two-part case: it would look like
+    /// a well-formed proof from a client that sent nonsense, and every such
+    /// proof would then compete for one counter.
+    #[test]
+    fn a_counter_that_is_not_a_number_is_refused_rather_than_coerced() {
+        let (_session, _key, blob, _proofs) = fixture();
+        for bad_counter in ["not-a-number", "", "0x10", "-1", "1.5", "９"] {
+            let head = format!(
+                "CONNECT asv.test:443 HTTP/1.1\r\nX-ASV-Session-Proof: {}.{bad_counter}.AAAA\r\n\r\n",
+                encode(&blob)
+            );
+            assert_eq!(
+                parse_session_proof(&head),
+                None,
+                "a counter of {bad_counter:?} was coerced into a proof"
+            );
+        }
+    }
+
+    /// A proof that carries no counter is not a proof from this version of the
+    /// protocol, and it must not parse into one.
+    ///
+    /// This is the backwards-compatibility question, and the answer is a clean
+    /// refusal rather than a default. Defaulting the missing counter to zero
+    /// would look generous and would be a downgrade: every proof minted before
+    /// the counter existed would share counter 0, the first one to arrive would
+    /// spend it, and the rest would be refused for a reason that looks like a
+    /// replay attack rather than a version mismatch.
+    #[test]
+    fn a_proof_without_a_counter_is_refused_rather_than_defaulted() {
+        let (_session, key, blob, _proofs) = fixture();
+        // Exactly the signature the client would have sent before counters
+        // existed, over the nonce the old derivation produced.
+        let old_nonce = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update((blob.len() as u64).to_be_bytes());
+            h.update(&blob);
+            h.update(b"asv.test");
+            h.update(443u64.to_be_bytes());
+            h.finalize().to_vec()
+        };
+        let signature = key.sign(&old_nonce).to_bytes();
+        let two_parts = format!("{}.{}", encode(&blob), encode(&signature));
+        let head =
+            format!("CONNECT asv.test:443 HTTP/1.1\r\nX-ASV-Session-Proof: {two_parts}\r\n\r\n");
         assert_eq!(
-            proofs.resolve(&parsed.key, &nonce, &parsed.signature),
-            Some(session)
+            parse_session_proof(&head),
+            None,
+            "a two-part proof parsed: the counter is mandatory, not defaulted"
+        );
+    }
+
+    /// The counter is committed to by the signature, because the broker
+    /// rebuilds the nonce from `(key, destination, counter)` and verifies over
+    /// *that*.
+    ///
+    /// A first version of the previous test asserted this at the resolver,
+    /// passing the old nonce and counter 0, and it passed when it should have
+    /// failed: `resolve` verifies the signature over the bytes it is handed
+    /// and does not rebuild the nonce, because building it is the bridge's
+    /// job. So that assertion was asserting something false about the design
+    /// rather than catching a hole in it. The property lives where the nonce
+    /// is constructed, so that is where it is tested.
+    #[test]
+    fn a_proof_signed_for_one_counter_does_not_verify_for_another() {
+        let (_session, key, blob, proofs) = fixture();
+        let target = endpoint("asv.test", 443);
+
+        let signed_for_seven = proof_nonce(&blob, &target, 7);
+        let signature = key.sign(&signed_for_seven).to_bytes().to_vec();
+
+        // The broker rebuilds the nonce for the counter that arrived. Same
+        // signature, different counter, different nonce, no verify.
+        let rebuilt_for_eight = proof_nonce(&blob, &target, 8);
+        assert_ne!(
+            signed_for_seven, rebuilt_for_eight,
+            "the counter is not in the nonce at all"
+        );
+        assert_eq!(
+            proofs.authenticate(
+                &SessionProof {
+                    signature: signature.clone(),
+                    key: blob.clone(),
+                    counter: 8
+                },
+                &target,
+            ),
+            Err(crate::ProofRejection::NoSuchSession),
+            "a proof signed for counter 7 verified at counter 8"
+        );
+        // And the counter it *was* signed for still verifies.
+        assert_eq!(
+            proofs
+                .authenticate(
+                    &SessionProof {
+                        signature,
+                        key: blob,
+                        counter: 7
+                    },
+                    &target
+                )
+                .ok(),
+            Some(_session)
         );
     }
 
@@ -2169,9 +2343,9 @@ mod proof_tests {
     fn the_nonce_differs_per_destination_and_per_key() {
         let a = endpoint("asv.test", 443);
         let b = endpoint("asv.test", 8443);
-        assert_ne!(proof_nonce(b"k", &a), proof_nonce(b"k", &b));
-        assert_ne!(proof_nonce(b"k", &a), proof_nonce(b"kk", &a));
-        assert_eq!(proof_nonce(b"k", &a), proof_nonce(b"k", &a));
+        assert_ne!(proof_nonce(b"k", &a, 1), proof_nonce(b"k", &b, 1));
+        assert_ne!(proof_nonce(b"k", &a, 1), proof_nonce(b"kk", &a, 1));
+        assert_eq!(proof_nonce(b"k", &a, 1), proof_nonce(b"k", &a, 1));
     }
 }
 

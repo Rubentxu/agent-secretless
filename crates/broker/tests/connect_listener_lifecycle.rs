@@ -108,8 +108,12 @@ impl asv_broker::tls_bridge::UpstreamResolver for NoUpstream {
 struct NoProofs;
 
 impl asv_broker::tls_bridge::SessionProofs for NoProofs {
-    fn resolve(&self, _k: &[u8], _n: &[u8], _s: &[u8]) -> Option<asv_domain::AgentSessionId> {
-        panic!("a session proof was resolved in a test that never proves a session");
+    fn authenticate(
+        &self,
+        _proof: &asv_broker::tls_bridge::SessionProof,
+        _target: &asv_broker::tls_bridge::AuthorityEndpoint,
+    ) -> Result<asv_domain::AgentSessionId, asv_broker::ProofRejection> {
+        panic!("a session proof was authenticated in a test that never proves a session");
     }
 }
 

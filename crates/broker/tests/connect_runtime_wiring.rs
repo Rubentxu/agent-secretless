@@ -28,6 +28,24 @@ use asv_identity::{PeerCredentials, WorkloadIdentity};
 use asv_ssh_agent::public_key_blob;
 use ed25519_dalek::{Signer, SigningKey};
 
+/// A destination to aim proofs at, and a proof shaped the way the wire carries
+/// it. The point of building it here rather than signing raw bytes is that the
+/// broker rebuilds the nonce from `(key, destination, counter)`, so a test
+/// that signs arbitrary bytes would not notice a change to that derivation.
+fn proof_for(
+    key: &SigningKey,
+    target: &asv_broker::tls_bridge::AuthorityEndpoint,
+    counter: u64,
+) -> asv_broker::tls_bridge::SessionProof {
+    let key_blob = public_key_blob(&key.verifying_key());
+    let nonce = asv_broker::tls_bridge::proof_nonce(&key_blob, target, counter);
+    asv_broker::tls_bridge::SessionProof {
+        signature: key.sign(&nonce).to_bytes().to_vec(),
+        key: key_blob,
+        counter,
+    }
+}
+
 fn endpoint(host: &str, port: u16) -> AuthorityEndpoint {
     AuthorityEndpoint::new(Authority::canonicalize(host).expect("canonical host"), port)
         .expect("valid endpoint")
@@ -58,12 +76,13 @@ fn the_shared_store_resolves_a_proof_and_an_empty_one_cannot() {
     real.register_key(session, &peer, blob.clone())
         .expect("register the key");
 
-    let nonce = b"a destination-bound nonce";
-    let signature = key.sign(nonce).to_bytes();
+    let target = endpoint("asv.test", 443);
 
     let shared = SharedSessions::new(Arc::new(std::sync::Mutex::new(real)));
     assert_eq!(
-        shared.resolve(&blob, nonce, &signature),
+        shared
+            .authenticate(&proof_for(&key, &target, 1), &target)
+            .ok(),
         Some(session),
         "the listener must resolve a proof against the broker's own session table"
     );
@@ -71,8 +90,8 @@ fn the_shared_store_resolves_a_proof_and_an_empty_one_cannot() {
     // The exact thing the first wiring did.
     let empty = SharedSessions::new(Arc::new(std::sync::Mutex::new(SessionStore::new())));
     assert_eq!(
-        empty.resolve(&blob, nonce, &signature),
-        None,
+        empty.authenticate(&proof_for(&key, &target, 1), &target),
+        Err(asv_broker::ProofRejection::NoSuchSession),
         "an empty store must resolve nothing — this is the bug, stated as an \
          assertion so a regression is a red test rather than a silent refusal"
     );
@@ -98,11 +117,10 @@ fn a_proof_under_one_key_never_resolves_to_another_session() {
         .expect("A registers");
 
     let shared = SharedSessions::new(Arc::new(std::sync::Mutex::new(store)));
-    let nonce = b"nonce";
-    let blob_b = public_key_blob(&key_b.verifying_key());
+    let target = endpoint("asv.test", 443);
     assert_eq!(
-        shared.resolve(&blob_b, nonce, &key_b.sign(nonce).to_bytes()),
-        None,
+        shared.authenticate(&proof_for(&key_b, &target, 1), &target),
+        Err(asv_broker::ProofRejection::NoSuchSession),
         "B's key is not registered anywhere, so it must resolve to nothing"
     );
 }
@@ -125,10 +143,19 @@ fn a_matching_blob_with_a_bad_signature_resolves_to_nothing() {
         .expect("A registers");
 
     let shared = SharedSessions::new(Arc::new(std::sync::Mutex::new(store)));
-    let nonce = b"nonce";
+    let target = endpoint("asv.test", 443);
+    let mut forged = proof_for(&key, &target, 1);
+    forged.signature = other
+        .sign(&asv_broker::tls_bridge::proof_nonce(
+            &forged.key,
+            &target,
+            1,
+        ))
+        .to_bytes()
+        .to_vec();
     assert_eq!(
-        shared.resolve(&blob, nonce, &other.sign(nonce).to_bytes()),
-        None,
+        shared.authenticate(&forged, &target),
+        Err(asv_broker::ProofRejection::NoSuchSession),
         "a signature by a different key over the same blob must not resolve"
     );
 }
@@ -262,8 +289,7 @@ fn an_ended_session_stops_resolving() {
     let peer = peer();
     let key = SigningKey::generate(&mut rand::rngs::OsRng);
     let blob = public_key_blob(&key.verifying_key());
-    let nonce = b"nonce";
-    let signature = key.sign(nonce).to_bytes();
+    let target = endpoint("asv.test", 443);
 
     let mut store = SessionStore::new();
     let session: AgentSessionId = store.create("revoke".into(), &peer);
@@ -277,11 +303,21 @@ fn an_ended_session_stops_resolving() {
     let store = Arc::new(std::sync::Mutex::new(store));
     let shared = SharedSessions::new(Arc::clone(&store));
 
-    assert_eq!(shared.resolve(&blob, nonce, &signature), Some(session));
-    store.lock().expect("no one holds this").end(session);
     assert_eq!(
-        shared.resolve(&blob, nonce, &signature),
-        None,
+        shared
+            .authenticate(&proof_for(&key, &target, 1), &target)
+            .ok(),
+        Some(session)
+    );
+    store.lock().expect("no one holds this").end(session);
+    // A **fresh** counter, deliberately. Replaying counter 1 would be refused
+    // as a replay whether or not the session had ended, so the assertion would
+    // pass for the wrong reason and prove nothing about revocation. This is the
+    // same trap as a test that ends a session and then re-presents the one
+    // proof that already worked.
+    assert_eq!(
+        shared.authenticate(&proof_for(&key, &target, 2), &target),
+        Err(asv_broker::ProofRejection::NoSuchSession),
         "a session the broker has ended must not still open a tunnel"
     );
 }
