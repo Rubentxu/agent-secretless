@@ -447,6 +447,48 @@ mod tests {
         (token, credential)
     }
 
+    /// Pins the exposure behind `proof_nonce`'s freshness claim, because that
+    /// claim is only true for the *first* surrogate.
+    ///
+    /// `proof_nonce` documents that a replayed proof is harmless "because the
+    /// surrogate it would be spent with is single-use and was already spent
+    /// the first time". `mint` pushes a record with no cap per session or per
+    /// credential, so a session can hold several live ones for the same
+    /// destination — and the nonce binds only to (key, destination), so it
+    /// cannot tell them apart. One captured proof is therefore a valid bearer
+    /// for *every* surrogate the session holds for that destination, for as
+    /// long as the session lives.
+    ///
+    /// This asserts the measured behaviour rather than the desired one. It is
+    /// the regression test for the fix the freshness decision owes, and it is
+    /// written so that fixing the exposure **breaks it** — a test that would
+    /// still pass after a correct fix would be documenting nothing.
+    #[test]
+    fn one_proof_reaches_every_live_surrogate_of_a_session() {
+        let session = session();
+        let credential = credential();
+        let mut registry = SurrogateRegistry::new();
+        let (first, _, _) = registry
+            .mint(session, credential, CredentialClass::Generic, 60, 1, T0)
+            .expect("first mint");
+        let (second, _, _) = registry
+            .mint(session, credential, CredentialClass::Generic, 60, 1, T0)
+            .expect("second mint");
+        assert_ne!(first, second, "two mints produced one token");
+
+        assert!(registry
+            .redeem_for(&first, session, OperationFamily::GitHub, T0)
+            .is_ok());
+        assert!(
+            registry
+                .redeem_for(&second, session, OperationFamily::GitHub, T0)
+                .is_ok(),
+            "the second live surrogate is unreachable: if this now fails, the \
+             exposure is closed and the freshness decision owes an update to \
+             proof_nonce's documentation, which currently claims it is not a grant"
+        );
+    }
+
     /// The shape of a surrogate is load-bearing: it must be recognizable as a
     /// surrogate so triage never confuses it with a leaked provider token, and
     /// it must carry enough entropy to be unguessable.

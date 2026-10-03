@@ -1011,6 +1011,73 @@ that hands the listener its `SessionStore` is still uncovered, because an
 integration test does not build the binary; the suite pins the construction, not
 the line.
 
+### V1-C2 — freshness and replay: the decision, and the claim it withdraws
+
+`proof_nonce` is `SHA256(len(key) ‖ key ‖ host ‖ port)`. It binds a proof to a
+destination, which is worth having, and it is **not** freshness. That much was
+already recorded. What was not recorded is that the justification written next
+to it was **false**, and writing the decision down meant measuring it first.
+
+**The withdrawn claim.** `proof_nonce` said a replay "is not a grant, because
+the surrogate it would be spent with is single-use and was already spent the
+first time". That is true of the first surrogate and of no other.
+`SurrogateRegistry::mint` appends a record with no cap per session or per
+credential, and the nonce binds to `(key, destination)` alone, so it cannot
+tell two live surrogates apart. `one_proof_reaches_every_live_surrogate_of_a_
+session` measures the consequence: a second, still-unspent surrogate of the
+same session redeems under the same captured proof and returns the identical
+`CredentialId`. One observed proof is a bearer for **every** surrogate that
+session holds for that destination, for the life of the session.
+
+The exposure is bounded, and the bounds are the reason this is a decision
+rather than an incident. The attacker must still present a surrogate, and the
+surrogate travels *inside* the TLS session the broker terminates, not in the
+plaintext CONNECT head where the proof is. The destination is authorised
+before the proof is examined at all. And no test, listener or attacker needs a
+credential to observe the difference. So the honest position is that freshness
+is **absent**, not that it is **bounded by the surrogate** — and a security
+comment that gets this backwards is the same defect as a document that
+overstates what is verified.
+
+**A second wall, found while looking.** Nothing in the shipped product emits
+`x-asv-session-proof`. The header name occurs in the broker and in two
+documents; `proof_nonce` is called only from tests and from the broker's own
+verification. So the live `--connect-listen` surface refuses every client for a
+second, independent reason beyond the empty allow-list: not only is nothing
+authorised, **no client can prove anything at all**. This is the same shape as
+the `SessionStore::new()` finding in the second delivery — a surface whose
+tests all pass because every test drives the producing side itself.
+
+**The decision: a per-session counter, in the nonce, with a windowed replay
+cache on the broker.** The three options and why the other two lose:
+
+1. **Keep the nonce as it is and document the exposure.** Cheapest, and it
+   leaves a live bearer whose lifetime is the session rather than the tunnel.
+2. **A server-issued nonce.** Strongest against replay, and the reason it was
+   already rejected in ADR-0019 stands: it costs a round trip *before* the
+   CONNECT, on a path whose entire purpose is to serve clients that have no
+   round trip to spend. It would make the security property true by making the
+   feature unusable.
+3. **A per-session monotonic counter folded into the nonce, with the broker
+   refusing a counter it has already seen.** This is the one that is chosen.
+   The client holds the counter in the session it already has open, so there
+   is no new round trip and no clock agreement. The broker keeps a *windowed*
+   set of spent counters per session rather than only the highest: two
+   concurrent CONNECTs from one session would otherwise race, and a
+   strict-highest scheme turns a concurrency accident into a spurious refusal.
+
+The honest cost of the choice: a counter is state, and it is state that must be
+bounded, released on session end, and reasoned about concurrently. It is not a
+five-line change to a hash function, and it is deliberately **not** landed in
+the same commit that recorded the finding.
+
+**Why now is the right moment, and it is a narrow one.** No client exists, so
+there is nothing to migrate and no deployed proof to invalidate. Once a client
+ships, changing what the nonce commits to becomes a breaking change to a
+protocol that is already v4. The window for making this correct is open
+precisely because the surface is not yet reachable, and it closes the moment
+the first real client can complete a CONNECT.
+
 ## After v1.0 — M14 through M18
 
 Adopted from `docs/asv-agent-first-security-evolution-v2-2026-10-02/`. **This

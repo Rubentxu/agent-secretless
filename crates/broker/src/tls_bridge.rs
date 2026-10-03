@@ -936,9 +936,29 @@ pub trait SessionProofs {
 /// What the binding buys is that a proof captured for one destination does
 /// not verify against another, so it cannot be moved to a host the operator
 /// did not authorise. What it does not buy is freshness: a proof replayed
-/// against the *same* destination verifies again. That is not a grant,
-/// because the surrogate it would be spent with is single-use and was
-/// already spent the first time.
+/// against the *same* destination verifies again, every time, for as long as
+/// the session lives.
+///
+/// **This documentation previously claimed the replay was harmless, and that
+/// claim was false.** It said a replay "is not a grant, because the surrogate
+/// it would be spent with is single-use and was already spent the first
+/// time". That holds for the first surrogate only. `SurrogateRegistry::mint`
+/// appends a record with no cap per session or per credential, and the nonce
+/// binds to (key, destination) alone, so it cannot distinguish one live
+/// surrogate from another. Measured by
+/// `one_proof_reaches_every_live_surrogate_of_a_session`: one captured proof
+/// redeems a *second*, still-unspent surrogate of the same session, to the
+/// same credential, and the returned `CredentialId` is identical. A single
+/// observed proof is thus a bearer for every surrogate that session holds for
+/// that destination.
+///
+/// It is not yet a grant on its own — the attacker still has to present a
+/// surrogate, and the surrogate travels inside the TLS session the broker
+/// terminates rather than in the plaintext CONNECT head. But the argument
+/// this comment used to make does not hold, and the honest position is that
+/// freshness is *absent*, not *bounded by the surrogate*. The decision on what
+/// to put in its place is owed; see `15-ROADMAP.md`, *V1-C2 — freshness and
+/// replay*.
 pub fn proof_nonce(presented_key: &[u8], target: &AuthorityEndpoint) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
