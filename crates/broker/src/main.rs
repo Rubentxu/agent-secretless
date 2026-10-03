@@ -495,7 +495,14 @@ fn main() -> std::io::Result<()> {
     // ever report a refusal. Starting it there would mean a second socket that
     // answers "no" to everything, and an operator would have to work out
     // whether that was a policy decision or a misconfiguration.
-    let shutdown = Arc::new(asv_broker::connect_listener::ShutdownSignal::new());
+    //
+    // The signal is the state's own (C2.8), not a local. It used to be built
+    // here, and a local is precisely the defect: `EndSession` has to mark a
+    // session revoked in the very object the listener cancels against, and
+    // with a local in `main` the socket handler could not name that object at
+    // all. So the whole revocation path worked in tests and did not exist in
+    // the product.
+    let shutdown = Arc::clone(&state.shutdown);
     if let Some(addr) = connect_listen.as_deref() {
         let Some(secrets) = state.secrets.clone() else {
             eprintln!("asv: --connect-listen needs --vault; a tunnel with no credential behind it is refused");

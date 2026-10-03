@@ -796,6 +796,26 @@ pub struct BrokerState {
     /// second copy parsed from the same path is a second set of answers, and
     /// two answers can differ.
     pub connect_routes: Arc<crate::connect_routes::ConnectRouteSet>,
+    /// The signal the CONNECT path cancels tunnels against, C2.8.
+    ///
+    /// In state rather than a local in `main`, and the reason is not tidiness.
+    /// `ShutdownSignal::revoke` is the only thing that tears down an
+    /// established tunnel when its session goes away, and for the whole
+    /// history of this path it had **no caller outside tests**: the broker
+    /// built a signal, handed it to the listener, and had no way to name it
+    /// again from the socket handler. Ending a session killed its surrogates —
+    /// so no *new* tunnel could be authorised — while every tunnel already
+    /// established kept relaying the real credential to its destination for a
+    /// session that no longer existed. The session lifetime was advisory for
+    /// exactly the case it exists to bound.
+    ///
+    /// The mechanism was proven and still did not help:
+    /// `revoking_an_established_session_tears_down_its_tunnel` cancels a live
+    /// tunnel, and it does it by revoking the signal itself, so it passed
+    /// against a broker that never revokes anything. Holding the signal here
+    /// is what makes the wiring observable at all — see
+    /// `connect_session_revocation_wiring.rs`.
+    pub shutdown: Arc<crate::connect_listener::ShutdownSignal>,
 }
 
 impl Default for BrokerState {
@@ -820,6 +840,12 @@ impl Default for BrokerState {
             // with: a broker that was given no route file mints nothing, and a
             // session in it has nothing to present.
             connect_routes: Arc::new(crate::connect_routes::ConnectRouteSet::default()),
+            // Nothing is stopped and nothing is revoked. A broker that has not
+            // been asked to shut down must not behave as though it had, and a
+            // default that started revoked would make `EndSession`'s effect
+            // unmeasurable — the wiring tests need to see a session go from
+            // live to revoked, and a broker born revoked cannot show that.
+            shutdown: Arc::new(crate::connect_listener::ShutdownSignal::new()),
         }
     }
 }
@@ -1197,6 +1223,22 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                 // make the session lifetime advisory: an agent could keep
                 // spending a token after the session that authorized it is gone.
                 surrogates!(state).revoke_session(session);
+                // And so do its *tunnels*, C2.8. Killing the surrogates only
+                // stops the next tunnel: one already established is a live
+                // connection to a destination that is being handed the real
+                // credential, and nothing in the relay ever asks whether the
+                // session behind it still exists. Measured before this line
+                // existed — the destination still held its connection 20 s
+                // after the session ended, with `asv run` already exited and
+                // the shim already dead, so nothing else on the path was going
+                // to close it.
+                //
+                // Inside the ownership guard and inside the branch that
+                // actually ended the session, because a revoke placed earlier
+                // would let any peer on the socket destroy any session it can
+                // name without owning it. The reversal of that is a test:
+                // `a_refused_end_session_revokes_nothing`.
+                state.shutdown.revoke(session.to_string().as_str());
                 Response::SessionEnded { session }
             } else {
                 // Unreachable while the session is known to exist, kept so a

@@ -1402,19 +1402,50 @@ fn read_inner_head<R: Read>(
     }
 }
 
-/// Copies upstream to client until the upstream closes or `max` is reached.
+/// Copies upstream to client until the upstream closes, the cap is reached, or
+/// the tunnel is cancelled.
+///
+/// **The cancellation is the whole reason this takes three more arguments.**
+/// It used to be a plain copy, so a revoke could only ever reach a tunnel that
+/// was still reading its first request head — and the ordinary state of a live
+/// tunnel is *past* that head, sitting in this function. One established and
+/// idle tunnel was therefore immune to the revocation of the session that
+/// authorised it, which is the exact state a session revocation exists to
+/// reach, and the state C1.1's test deliberately avoided by revoking before
+/// the client had said anything.
+///
+/// The poll tick is not an error path: a timeout with nothing to say is what an
+/// idle origin looks like, and the only news on a tick is a cancel. `pollable`
+/// is false for a bridge with no cancellation source, where a timeout really is
+/// the caller's problem and is reported as one.
 fn relay_back<R: Read, W: Write>(
     from: &mut R,
     to: &mut W,
     max: usize,
+    session: &AgentSessionId,
+    cancel: &dyn Cancel,
+    pollable: bool,
 ) -> Result<usize, BridgeError> {
     let mut buf = [0u8; 8 * 1024];
     let mut total = 0usize;
     while total < max {
         let want = (max - total).min(buf.len());
-        let n = from
-            .read(&mut buf[..want])
-            .map_err(|e| BridgeError::Io(e.to_string()))?;
+        let n = match from.read(&mut buf[..want]) {
+            Ok(n) => n,
+            Err(e)
+                if pollable
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+            {
+                if let Some(reason) = cancel.cancel_reason(Some(session)) {
+                    return Err(BridgeError::Cancelled(reason));
+                }
+                continue;
+            }
+            Err(e) => return Err(BridgeError::Io(e.to_string())),
+        };
         if n == 0 {
             break;
         }
@@ -1565,7 +1596,33 @@ impl EstablishedTunnel {
             outcome: "substituted",
         })?;
 
-        let returned = relay_back(&mut self.upstream, &mut self.client, limits.max_response)?;
+        // The upstream socket is what this relay blocks on, so it is the one
+        // that needs the poll deadline armed — the same reasoning as the client
+        // side above, and the same `CANCEL_POLL`. Disarmed again before the
+        // bytes are counted, for the same reason it is disarmed there.
+        if cancellable {
+            self.upstream
+                .set_read_timeout(Some(CANCEL_POLL))
+                .map_err(|e| BridgeError::Io(e.to_string()))?;
+        }
+        let returned = {
+            let source: &dyn Cancel = match &cancel {
+                Some(c) => c.as_ref(),
+                None => &NEVER_CANCELLED,
+            };
+            let copied = relay_back(
+                &mut self.upstream,
+                &mut self.client,
+                limits.max_response,
+                &session,
+                source,
+                cancellable,
+            );
+            if cancellable {
+                let _ = self.upstream.set_read_timeout(None);
+            }
+            copied?
+        };
 
         Ok(SubstitutionOutcome {
             forwarded,
