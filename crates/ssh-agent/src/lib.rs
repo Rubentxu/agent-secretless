@@ -9,6 +9,15 @@
 //!
 //! Every other message is rejected. This is an authorization boundary, not a
 //! general-purpose SSH-agent implementation.
+//!
+//! [`proof`] holds the CONNECT session proof, which moved here from
+//! `asv-broker` when a *producer* for it appeared. It sits beside
+//! [`verify_proof`] and [`public_key_blob`] for the same reason: this crate is
+//! the one place that decides what a signature over a session key means.
+
+pub mod proof;
+
+pub use proof::{proof_nonce, SessionProof, PROOF_DOMAIN, SESSION_PROOF_HEADER};
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};

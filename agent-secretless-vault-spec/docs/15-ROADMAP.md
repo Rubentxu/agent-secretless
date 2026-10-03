@@ -1390,6 +1390,85 @@ without which the window remembers nothing — and **accepting the two-segment
 legacy header** as counter 0, which is the compatibility reading that looks
 kind and would give every pre-counter proof the same counter.
 
+#### C2.5-a — the format gets a second side, so it moves to where both sides can see it
+
+S1 decided who carries the proof, S2 decided how thin the shim can be. Both
+answers left the same prerequisite untouched: **there was no producer.** Every
+`x-asv-session-proof` on the wire to date was built by a test, by hand, out of
+the same constants the broker then parsed. A test that builds a value the way
+the code under test builds it is a test that agrees with a broken format.
+
+So the format now has two sides, and that changes where it lives.
+`proof_nonce`, `SessionProof`, `PROOF_DOMAIN`, `SESSION_PROOF_HEADER` and the
+base64 codec move out of `asv-broker`'s `tls_bridge` into `asv-ssh-agent`,
+next to `verify_proof` and `public_key_blob` — the crate that already owns what
+a signature over a session key *means*. The broker keeps a three-line adapter,
+because a destination there is an `AuthorityEndpoint` and the call sites that
+authorise one should not have to destructure it to sign for it. **The adapter
+is vocabulary, not a second derivation**: there is one hash in the tree and it
+lives where both parties can call it.
+
+**The digest layout is pinned, and the vectors came from the old code.** Three
+digests were taken from the broker's implementation *before* the move, by
+printing what it actually produced. A vector written after the move would only
+prove the new code agrees with itself, which is the property most likely to be
+wrong: a nonce derivation that changes silently does not fail at the broker, it
+fails as "no proof ever verifies", which is the same error a dozen unrelated
+mistakes produce.
+
+**The producer side is new, and it is the side that was missing.** A base64
+*encoder* did not exist in the tree at all — the decoder had been carrying the
+format alone, which is a format that can be parsed but never minted. It is
+unpadded, because that is what the wire already carries and a second spelling
+of the same proof is a second thing to canonicalise later.
+
+**Falsification: 13 mutations, 13 killed, control green**
+(`tests/proof_format_falsification.py`). Six of them are caught by the pinned
+vector and by nothing else, which is worth stating plainly: the round-trip
+test signs and verifies with the same function, so it agrees with *any* layout
+and cannot see a digest change. Only the vector can.
+
+**Two defects the run found, and the second one is a real hole.**
+
+1. The harness's first expectations were wrong in that same direction — six
+   mutations were expected to redden the round trip as well as the vector, and
+   they did not, because my own module doc had already said they would not.
+   Expectation and reasoning disagreed, and the code won.
+2. `a_two_segment_proof_is_not_a_proof` was **passing for the wrong reason**. It
+   fed the legacy shape `key.signature`, which the decoder refuses because
+   `signature` is not a number — the counter parse fails first, and arity is
+   never reached. A decoder that had started supplying a default for a missing
+   signature would have passed that test. The test now also feeds `key.counter`,
+   the shape such a decoder actually admits, and the harness mutates exactly
+   that. This is the falsification earning its keep: the mutation could not
+   reach the test as written, and "the mutation could not reach it" and "the
+   property is covered" are different sentences.
+
+**And it is the third time that exact trap, in the same project.** The C2.4
+section immediately above this one records it under a different name: *"A
+mutation that was not observable at all. Defaulting a missing counter to 0 was
+tested only against a two-part header, which is refused on arity before the
+counter is ever read."* Same structure, same crate, two deliveries apart: a
+mutation aimed at a parser rule, landing on an input that a *different* parser
+rule already refused, so the property looked covered and was not. The written
+record of the first one did not prevent the second. What would have is a rule —
+*every mutation names the input that reaches the branch it targets* — checked by
+reading the mutations rather than by reading the prose. That is a candidate for
+a permanent guard, and it is not written.
+
+**A decoder claim nothing checked.** The base64 decoder's doc has always said
+it refuses characters outside the alphabet, and until this delivery no test
+did. The test that now covers it asserts its own preconditions after its first
+version silently passed on a `replace` whose target character was not in the
+string — the absence-of-evidence trap, in a test written specifically to catch
+a decoder that would have skipped those characters.
+
+**Known laxity, deliberately not fixed here.** The decoder accepts `=` and
+stops, so a padded and an unpadded spelling of the same proof would both parse.
+Closing that is a behaviour change to a security path, and mixing it into a
+move makes the move unverifiable: the vector cannot tell "the move was
+faithful" from "the move was also a change". It is a separate delivery.
+
 ## After v1.0 — M14 through M18
 
 Adopted from `docs/asv-agent-first-security-evolution-v2-2026-10-02/`. **This

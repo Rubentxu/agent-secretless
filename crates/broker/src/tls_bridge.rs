@@ -932,54 +932,19 @@ pub trait SessionProofs {
     ) -> Result<AgentSessionId, crate::ProofRejection>;
 }
 
-/// What this signature is allowed to mean, hashed in before anything else.
+/// The nonce a session proof is computed over, for a broker destination.
 ///
-/// Bumping it is a breaking protocol change, which is the point: it is the
-/// cheapest possible way to keep a signature minted for one mechanism from
-/// ever being accepted by another.
-pub const PROOF_DOMAIN: &[u8] = b"asv/connect/session-proof/v2";
-
-/// The nonce a session proof is computed over.
+/// This is an **adapter, not a definition**. The digest layout, the domain
+/// separation constant and the reason each field is the width it is all live
+/// in `asv_ssh_agent::proof`, because a session-local shim now has to derive
+/// the same nonce and a second derivation in a second crate would be a future
+/// divergence that passes every test on both sides.
 ///
-/// It is bound to the destination *and* to a per-session counter, and it is
-/// not drawn fresh per tunnel. The destination binding is worth having and
-/// costs nothing; the counter is what makes a proof single-use.
-///
-/// A server-issued nonce would be stronger still, and ADR-0019 already
-/// rejected it for a reason that still holds: it costs a round trip *before*
-/// the CONNECT, on a path that exists to serve clients that have no round trip
-/// to spend. A counter needs no round trip and no clock agreement — the client
-/// already holds a session, so it holds a counter too.
-///
-/// **What the destination binding buys:** a proof captured for one destination
-/// does not verify against another, so it cannot be moved to a host the
-/// operator did not authorise.
-///
-/// **What the counter buys, and what it does not.** It buys single use: the
-/// broker spends a counter when a proof resolves, so the same `(key,
-/// destination, counter)` triple is refused the second time. What it does not
-/// buy is unpredictability — the counter is an attacker-supplied number, and
-/// the window that remembers spent ones is bounded, so a proof older than the
-/// window is refused as stale rather than replayed. Freshness here means
-/// *single use*, not *recent*.
+/// What stays here is the broker's own vocabulary: a destination is an
+/// [`AuthorityEndpoint`], not a `(host, port)` pair, and the call sites that
+/// authorise a destination should not have to destructure it to sign for it.
 pub fn proof_nonce(presented_key: &[u8], target: &AuthorityEndpoint, counter: u64) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    // Domain separation first. The same session key also signs other things,
-    // so a signature produced for one mechanism must not be replayable into
-    // another. It costs ten bytes and buys the statement that this signature
-    // can only ever mean "CONNECT session proof v2".
-    hasher.update(PROOF_DOMAIN);
-    // Length-prefixed so a key ending in the same bytes as a host cannot
-    // produce the same digest as a shorter key followed by a longer host.
-    hasher.update((presented_key.len() as u64).to_be_bytes());
-    hasher.update(presented_key);
-    hasher.update(target.host().as_bytes());
-    hasher.update((target.port() as u64).to_be_bytes());
-    // Fixed width, so no choice of counter bytes can be confused with a
-    // shorter host or a different port.
-    hasher.update(counter.to_be_bytes());
-    hasher.finalize().to_vec()
+    asv_ssh_agent::proof_nonce(presented_key, target.host(), target.port(), counter)
 }
 
 /// Why a credential could not be substituted into a CONNECT request.
@@ -1205,24 +1170,28 @@ pub fn replace_bearer_token(
 /// Named, not positional, so that a client which does not know about ASV
 /// is unaffected: an absent header means "no proof", and the tunnel is
 /// refused rather than half-authorised.
-pub const SESSION_PROOF_HEADER: &str = "x-asv-session-proof";
+/// The header a session proof travels in. Defined in `asv_ssh_agent::proof`
+/// and re-exported here because the broker is the side that reads it, and the
+/// shim is the side that writes it.
+pub use asv_ssh_agent::SESSION_PROOF_HEADER;
 
-/// A session proof as it arrives on the wire: the client's key blob, the
-/// per-session counter it is spending, and a signature over
-/// [`proof_nonce`]. The counter sits in the clear because it is not a secret —
-/// it is a number the client chose, and hiding it would buy nothing while
-/// making the single-use property unauditable from the wire.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionProof {
-    pub key: Vec<u8>,
-    pub signature: Vec<u8>,
-    /// The counter this proof spends, folded into the nonce by
-    /// [`proof_nonce`] so the signature commits to it.
-    pub counter: u64,
-}
+/// A session proof as it arrives on the wire.
+///
+/// Defined in `asv_ssh_agent::proof` and re-exported here, because the broker
+/// is the side that verifies one and a session-local shim is now the side that
+/// mints one. Two definitions of a wire shape would be a divergence waiting
+/// for a proof minted by one and verified by the other.
+pub use asv_ssh_agent::SessionProof;
 
+/// Reads the session proof out of a CONNECT head.
+///
+/// Finding the header is the broker's job — it is the party that reads a
+/// request — and deciding what the header's *value* means is the shared
+/// format's job. The split is drawn there so the strictness about segment
+/// count lives in one crate rather than in the one that happens to parse
+/// first.
 fn parse_session_proof(head: &str) -> Option<SessionProof> {
-    let raw = head.split("\r\n").find_map(|line| {
+    let value = head.split("\r\n").find_map(|line| {
         let (name, value) = line.split_once(':')?;
         if name.trim().eq_ignore_ascii_case(SESSION_PROOF_HEADER) {
             Some(value.trim())
@@ -1230,59 +1199,7 @@ fn parse_session_proof(head: &str) -> Option<SessionProof> {
             None
         }
     })?;
-    // Three parts, and exactly three. A proof that omits the counter is not a
-    // proof from this version of the protocol, and parsing it leniently would
-    // hand the resolver a proof that costs no counter at all.
-    let mut parts = raw.split('.');
-    let key = base64_decode(parts.next()?)?;
-    let counter_text = parts.next()?;
-    let signature = base64_decode(parts.next()?)?;
-    if parts.next().is_some() {
-        return None;
-    }
-    let counter: u64 = counter_text.parse().ok()?;
-    // An empty half is not a malformed proof, it is *no* proof: accepting
-    // one would hand the resolver an empty signature to fail on later, at
-    // a point where the failure no longer says the client sent nonsense.
-    if key.is_empty() || signature.is_empty() {
-        return None;
-    }
-    Some(SessionProof {
-        key,
-        signature,
-        counter,
-    })
-}
-
-/// Standard base64, no padding, no external dependency.
-///
-/// Decoding is strict on purpose: this reads attacker-chosen bytes, and a
-/// decoder that skips unknown characters would let `key` and `signature`
-/// disagree with what was on the wire in a way no later check would notice.
-fn base64_decode(text: &str) -> Option<Vec<u8>> {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    // Unpadded base64 cannot have a group of one character: six bits do not
-    // make a byte. Refusing it here means two encodings of the same nonce
-    // cannot both be accepted, one of them truncated.
-    if text.len() % 4 == 1 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(text.len() / 4 * 3);
-    let mut buffer = 0u32;
-    let mut bits = 0u32;
-    for byte in text.bytes() {
-        if byte == b'=' {
-            break;
-        }
-        let value = ALPHABET.iter().position(|c| *c == byte)? as u32;
-        buffer = (buffer << 6) | value;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buffer >> bits) as u8);
-        }
-    }
-    Some(out)
+    SessionProof::decode(value)
 }
 
 /// Reads a CONNECT request head without reading past its terminator.
