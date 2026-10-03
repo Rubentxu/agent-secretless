@@ -396,6 +396,32 @@ impl Rig {
         port: u16,
         proofs: Arc<dyn SessionProofs + Send + Sync>,
     ) -> Result<(ClientSide, EstablishedTunnel), BridgeError> {
+        self.tunnel_on(policy(), proof, port, proofs)
+    }
+
+    /// A tunnel whose bridge can be interrupted from outside.
+    ///
+    /// Separate from `tunnel` because the cancellation cases need a signal the
+    /// test keeps a handle on, and every other case needs a bridge that is
+    /// never cancelled. Folding the signal into the shared helper would mean
+    /// every test naming one.
+    fn tunnel_cancellable(
+        &self,
+        proof: Option<String>,
+        port: u16,
+        cancel: Arc<dyn asv_broker::tls_bridge::Cancel>,
+    ) -> Result<(ClientSide, EstablishedTunnel), BridgeError> {
+        let proofs: Arc<dyn SessionProofs + Send + Sync> = self.store.clone();
+        self.tunnel_on(policy().with_cancel(cancel), proof, port, proofs)
+    }
+
+    fn tunnel_on(
+        &self,
+        bridge: Bridge,
+        proof: Option<String>,
+        port: u16,
+        proofs: Arc<dyn SessionProofs + Send + Sync>,
+    ) -> Result<(ClientSide, EstablishedTunnel), BridgeError> {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bridge binds");
         let mut client =
             TcpStream::connect(listener.local_addr().expect("bridge addr")).expect("connect");
@@ -409,7 +435,6 @@ impl Rig {
         client.write_all(head.as_bytes()).expect("write CONNECT");
         client.flush().expect("flush");
 
-        let bridge = policy();
         let leaves = SessionLeaves {
             ca: Arc::clone(&self.ca),
         };
@@ -1177,4 +1202,231 @@ fn the_substitution_is_observable_from_both_ends_and_not_vacuous() {
     );
     assert_eq!(audit.0[0].outcome, "substituted");
     assert_eq!(audit.0[0].destination, format!("{HOST}:443"));
+}
+
+// ---------------------------------------------------------------------------
+// C1 — a tunnel that already exists can be torn down (V1-C2)
+//
+// These are here rather than in `connect_listener_lifecycle.rs` because they
+// need what only this file has: a real ADR-0019 proof, a real session CA, a
+// real TLS client and a real origin. A stubbed cancellation test would prove
+// that a mock reports a mock's reason.
+//
+// The shape of all three is the same: establish a tunnel, put the relay in a
+// state where it is genuinely blocked, then change the world from outside and
+// require the relay to notice. The block is the part that carries the claim —
+// a relay that returned early would satisfy "the tunnel ended" without ever
+// having been cancelled, so every test below asserts the relay was **still
+// running** immediately before the signal.
+// ---------------------------------------------------------------------------
+
+/// What a relay decided, in the form the bridge reports it.
+///
+/// Named because the pair of `Result<SubstitutionOutcome, BridgeError>` in the
+/// signature below appeared twice, and a reader comparing the channel type with
+/// the join type has to check that they really are the same type.
+type RelayVerdict = Result<SubstitutionOutcome, BridgeError>;
+
+/// Runs a relay on a worker thread and reports its verdict.
+///
+/// The result comes back through a channel rather than a `join` so the test can
+/// ask the question that matters — *has it finished yet?* — at a moment of its
+/// choosing, which is the only way to tell a cancelled relay from one that
+/// failed on its own.
+fn relay_on_worker(
+    tunnel: EstablishedTunnel,
+    registry: SurrogateRegistry,
+) -> (
+    std::thread::JoinHandle<RelayVerdict>,
+    std::sync::mpsc::Receiver<RelayVerdict>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut tunnel = tunnel;
+        let mut registry = registry;
+        let mut audit = Collected::default();
+        let mut port = SubstitutionPort::new(
+            &mut registry,
+            &CanaryStore,
+            OperationFamily::GitHub,
+            "github",
+        );
+        let outcome = tunnel.relay_substituted(&mut port, &mut audit, RelayLimits::default());
+        let _ = tx.send(outcome.clone());
+        outcome
+    });
+    (handle, rx)
+}
+
+/// Nothing has arrived yet, so a later "it ended" is attributable to the signal
+/// rather than to the relay having failed or finished on its own.
+///
+/// `CANCEL_POLL` is 50 ms, so 200 ms is four poll intervals — long enough that
+/// a relay still blocked at 200 ms was blocked and not merely slow. Asserting
+/// the absence of an event is the one place a sleep is the honest tool: the
+/// alternative is a test that cannot tell "cancelled" from "already gone".
+fn assert_still_running<T>(rx: &std::sync::mpsc::Receiver<T>, what: &str) {
+    // The payload is deliberately not printed: `TryRecvError<T>` is only
+    // `Debug` when `T` is, and requiring that of a helper that only needs to
+    // know *whether* something arrived would push a pointless bound onto every
+    // caller.
+    match rx.try_recv() {
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            panic!("{what} finished before it was supposed to")
+        }
+        Ok(_) => panic!("{what} returned before it was supposed to"),
+    }
+}
+
+/// **C1.1.** A session revoked *after* its tunnel is established loses the
+/// tunnel.
+///
+/// The revocation lands while the relay is blocked reading the client's inner
+/// request head — the tunnel is real (session proven, TLS terminated, origin
+/// connected) and the client has simply not asked for anything yet. That is the
+/// state a session revocation is supposed to reach, and it is the state in which
+/// a broker that only checks the signal before the handshake is still serving.
+#[test]
+fn revoking_an_established_session_tears_down_its_tunnel() {
+    let rig = Rig::new();
+    let signal = Arc::new(asv_broker::connect_listener::ShutdownSignal::new());
+    let proof = rig.proof(Who::A, HOST, 443);
+
+    // The client never sends a request, so the relay blocks on the inner head.
+    let (_client, tunnel) = rig
+        .tunnel_cancellable(Some(proof), 443, signal.clone())
+        .expect("an authorised tunnel");
+
+    let (handle, rx) = relay_on_worker(tunnel, rig.registry);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_still_running(&rx, "the relay");
+
+    signal.revoke(rig.session_a.to_string().as_str());
+
+    let outcome = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a revoked session must not leave the relay blocked forever");
+    let _ = handle.join().expect("the relay thread must not panic");
+    assert!(
+        matches!(
+            outcome,
+            Err(BridgeError::Cancelled(
+                asv_broker::tls_bridge::CancelReason::SessionRevoked
+            ))
+        ),
+        "a revoked session must cancel its tunnel, got {outcome:?}"
+    );
+
+    // Nothing was forwarded, and nothing was substituted: the cancel arrived
+    // before the relay had a request to do anything with.
+    rig.origin.assert_nothing_received();
+}
+
+/// **C1.2.** Shutting the broker down tears down tunnels too, and says so.
+///
+/// The same teardown reached by a different door, and the reason is different:
+/// an operator who stopped the broker needs to read `shutdown`, because the
+/// session was perfectly valid and "revoked" would send them looking for a
+/// compromise that did not happen.
+#[test]
+fn shutting_down_tears_down_an_established_tunnel() {
+    let rig = Rig::new();
+    let signal = Arc::new(asv_broker::connect_listener::ShutdownSignal::new());
+    let proof = rig.proof(Who::A, HOST, 443);
+
+    let (_client, tunnel) = rig
+        .tunnel_cancellable(Some(proof), 443, signal.clone())
+        .expect("an authorised tunnel");
+
+    let (handle, rx) = relay_on_worker(tunnel, rig.registry);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_still_running(&rx, "the relay");
+
+    signal.stop();
+
+    let outcome = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("shutdown must not leave the relay blocked forever");
+    let _ = handle.join().expect("the relay thread must not panic");
+    assert!(
+        matches!(
+            outcome,
+            Err(BridgeError::Cancelled(
+                asv_broker::tls_bridge::CancelReason::Shutdown
+            ))
+        ),
+        "shutdown must cancel the tunnel and report itself as the reason, got {outcome:?}"
+    );
+}
+
+/// **C1.3.** Revocation is scoped: another session's tunnel keeps working.
+///
+/// The reciprocal, and the one that stops the previous two from being satisfied
+/// by a global kill. `revoke` takes a session id, and the easy wrong
+/// implementation — "any tunnel, cancelled" — passes both tests above while
+/// letting one agent's revocation take down every other agent's traffic. That
+/// is an availability bug that looks like a security feature, so it is tested
+/// against a tunnel that must then complete a **real** substitution: the origin
+/// has to receive the credential, or the test would pass just as happily on a
+/// tunnel that broke for an unrelated reason.
+///
+/// **The ordering here is the whole test, and the first version got it wrong.**
+/// It revoked session B and then sent session A's request, and the
+/// falsification run showed that arrangement is blind to a global kill: the
+/// request was already in the socket buffer, so `read_byte_cancellable`
+/// returned on its first successful read and never reached the `WouldBlock`
+/// branch — the only place `cancel_reason` is ever consulted. A relay that
+/// consults nothing at all, and a relay that consults it and is told "yes,
+/// cancelled" for somebody else's session, are indistinguishable from outside
+/// a tunnel that never has to wait.
+///
+/// So the revocation has to land while A is parked on the poll, and the request
+/// after it. The relay must still be running *after* B is revoked — that
+/// assertion is the one that a global kill cannot satisfy.
+#[test]
+fn revoking_another_session_leaves_this_tunnel_working() {
+    let rig = Rig::new();
+    let signal = Arc::new(asv_broker::connect_listener::ShutdownSignal::new());
+    let proof = rig.proof(Who::A, HOST, 443);
+
+    let (mut client, tunnel) = rig
+        .tunnel_cancellable(Some(proof), 443, signal.clone())
+        .expect("an authorised tunnel");
+
+    // Nothing has been sent, so the relay is parked in the poll.
+    let (handle, rx) = relay_on_worker(tunnel, rig.registry);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_still_running(&rx, "the relay before any revocation");
+
+    signal.revoke(rig.session_b.to_string().as_str());
+
+    // Four poll intervals later, an unrelated session's revocation has not
+    // reached this tunnel. This is the assertion a global kill fails.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_still_running(
+        &rx,
+        "the relay after *another* session was revoked — revocation is not scoped \
+         to the session it names",
+    );
+
+    // And the tunnel still works, all the way to a real credential at the origin.
+    client.send(request_with(&rig.surrogate_a).as_bytes());
+    let outcome = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("an unaffected tunnel must complete");
+    let _ = handle.join().expect("the relay thread must not panic");
+
+    assert!(
+        outcome.is_ok(),
+        "revoking session B cancelled session A's tunnel: {outcome:?}"
+    );
+
+    // Non-vacuity: the substitution really happened, from the origin's mouth.
+    let received = rig.origin.wait_for_received(Duration::from_secs(5));
+    let text = String::from_utf8_lossy(&received);
+    assert!(
+        text.contains(REAL),
+        "the origin did not receive the credential, so the tunnel did not work: {text}"
+    );
 }

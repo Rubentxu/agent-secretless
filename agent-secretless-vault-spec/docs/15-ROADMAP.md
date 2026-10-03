@@ -819,6 +819,12 @@ CURRENT: v0.28.0
   the protocol allows, a formal decision on freshness and replay, shutdown and
   revoke mid-tunnel, stress and cancellation, and observability that carries no
   sensitive material. The three limits recorded on M9's gate row are its scope.
+  **First delivery, measured** (`crates/broker/src/connect_listener.rs`, the
+  V1-C2 receipt): the listener and the lifecycle it owns are `implemented` and
+  their tests are `verified`; the wiring into `asv-brokerd` is **not** done, so
+  M9's third limit stands unchanged. See *V1-C2 — what is built and what is
+  not* below for the split, the two falsified claims this delivery corrected,
+  and the one claim that could not be made deterministically.
 - **V1-C3** turns M11 from a prototype into a vertical. The `ClientCredentialsIssuer`
   becomes a *reference implementation* rather than the evidence of closure, and
   the closure is an HTTPS POST to a real token endpoint producing a short-lived
@@ -838,6 +844,70 @@ no OAuth2 provider to point at and no TPM. That is a property of the work, not
 a blocker to route around, and it is why the two are late in the sequence
 rather than early: everything executable on an ordinary machine is executed
 first.
+
+### V1-C2 — what is built and what is not
+
+The first V1-C2 delivery adds `crates/broker/src/connect_listener.rs` and the
+cancellation surface it needs on `Bridge`. It is worth being exact about the
+split, because M9's gate row listed three limits and only one of them moved.
+
+**Delivered and `verified` — the lifecycle of a CONNECT listener.**
+
+- `ConnectListener` binds, accepts, and gives every connection its own task, so
+  one hostile client cannot stop the broker serving the next.
+- `read_connect_head` had **no deadline at all** before this. A client that
+  opened a socket and said nothing held a thread indefinitely, and no test could
+  catch it because no test ran a listener. It now has one, and it is bounded.
+- `ShutdownSignal` carries shutdown and per-session revocation as one mechanism,
+  because they are one poll, and the difference is only who asked.
+- A tunnel that is **already established** is torn down by a revocation or a
+  shutdown. `serve_connect` disarms the read timeout before handing the socket
+  to rustls, so without re-arming it a tunnel is a tunnel no signal can reach —
+  which is the shape a revoked agent actually produces.
+- Every connection produces a `ConnectionOutcome`, including the ones discarded
+  before a destination was parseable. A listener that cannot say what it dropped
+  is not auditable; the first version returned nothing for those, which is how a
+  dropped connection became invisible rather than recorded.
+
+**Not delivered — M9's third limit stands unchanged.**
+
+- Nothing in `asv-brokerd` starts this listener. The module is a capability with
+  a network surface that production does not yet call, which is the same
+  sentence M9's row said, one layer up. The flag is to be read from `argv`, not
+  the environment, because D9 forbids `std::env::var*` in broker production
+  sources.
+- One request per tunnel. Not yet decided, and the decision is a design question
+  about what a surrogate is worth, not a bug.
+- The destination-derived nonce is **not** freshness. A formal decision is
+  still owed.
+- Observability reaches `ListenerReport` and stops there. It is not yet wired to
+  the audit chain.
+
+**Two claims this delivery had to withdraw after falsifying itself.**
+
+1. The `head_deadline` arm of `Bridge::is_pollable` and `arm_read_timeout` was
+   **dead code**: `with_head_deadline` was called from exactly one place, and
+   always together with `with_cancel`, so `cancel.is_some()` was already true
+   and the deadline never decided anything. Dropping the arm left every test
+   green. The clause is now exercised by a bridge that has a deadline and
+   *nothing else* to interrupt its read.
+2. The reciprocal revocation test was **blind to a global kill**, which is the
+   mutation that mattered most. It revoked session B and then sent session A's
+   request — so the request was already in the socket buffer, `read_byte_cancellable`
+   returned on its first successful read, and the branch that consults
+   `cancel_reason` was never reached. A relay that consults nothing, and one
+   that is told "cancelled" for somebody else's session, are indistinguishable
+   from outside a tunnel that never has to wait. The revocation now lands while
+   the tunnel is parked on the poll, and the test asserts it is *still running*
+   afterwards.
+
+**One claim that could not be made deterministically, and is not claimed.**
+`ShutdownSignal::wait_stopped` calls `notified.enable()` before checking the
+stopped flag, which closes the window in which a `stop()` lands between the
+check and the `await`. Closing that window requires a yield between two
+statements *inside a single poll*, which cannot be provoked from a test, so
+there is no deterministic test for it. The `enable()` is correct and stays; the
+window is recorded as a residual rather than dressed up as covered.
 
 ## After v1.0 — M14 through M18
 

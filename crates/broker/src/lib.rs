@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 pub mod admission;
 pub mod audit;
+pub mod connect_listener;
 pub mod harden;
 pub mod inventory;
 pub mod isolated_exec;

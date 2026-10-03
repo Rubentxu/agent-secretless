@@ -148,9 +148,143 @@ pub enum BridgeError {
     /// The TLS handshake with the client failed.
     #[error("client handshake failed: {0}")]
     Handshake(String),
+    /// The tunnel was torn down deliberately: the broker is shutting down, or
+    /// the session behind this tunnel was revoked while it was in flight.
+    ///
+    /// Its own variant because it is neither a protocol error nor an I/O
+    /// failure, and an operator reading a log needs to tell "this tunnel was
+    /// cancelled" from "this tunnel broke". The first is a policy event and
+    /// often the *desired* one; the second is a fault.
+    #[error("tunnel cancelled: {0}")]
+    Cancelled(CancelReason),
     /// A socket operation failed.
     #[error("bridge io: {0}")]
     Io(String),
+}
+
+/// Why an in-flight tunnel was torn down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    /// The broker is shutting down.
+    Shutdown,
+    /// The session that owns this tunnel was revoked.
+    SessionRevoked,
+    /// A deadline on reading the request head elapsed.
+    DeadlineElapsed,
+}
+
+impl std::fmt::Display for CancelReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            CancelReason::Shutdown => "broker shutdown",
+            CancelReason::SessionRevoked => "session revoked",
+            CancelReason::DeadlineElapsed => "read deadline elapsed",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Something that can interrupt a tunnel that is in flight.
+///
+/// A trait for the same reason [`SessionProofs`] and [`LeafSource`] are
+/// traits: `tls_bridge` must not depend on the broker's state, its runtime or
+/// its vault (D2). The bridge only ever asks the question.
+///
+/// **The question is asked between socket reads, not instead of them.** A
+/// blocking `read_exact` on a socket with no timeout cannot be interrupted from
+/// outside the thread, so a cancellation that is only consulted *after* a read
+/// returns would never fire against a client that simply stops sending. The
+/// reads therefore run with a short socket timeout and loop, asking again on
+/// each timeout — which is also what makes a head deadline possible, and
+/// `read_connect_head` previously had none at all.
+pub trait Cancel: std::fmt::Debug + Send + Sync {
+    /// Whether a tunnel must stop now, and why.
+    ///
+    /// `session` is `None` while the CONNECT head is still being read: the
+    /// session is named *by* that head, so a tunnel cannot be revoked by
+    /// session before the head exists. Shutdown and the head deadline are
+    /// still answerable then, which is the point — a client that connects and
+    /// says nothing must be droppable.
+    fn cancel_reason(&self, session: Option<&AgentSessionId>) -> Option<CancelReason>;
+}
+
+impl Cancel for std::convert::Infallible {
+    fn cancel_reason(&self, _session: Option<&AgentSessionId>) -> Option<CancelReason> {
+        None
+    }
+}
+
+/// How long a single blocking read waits before the bridge re-asks whether the
+/// tunnel is cancelled or the head deadline has passed.
+///
+/// Short, because it bounds how quickly a revoke takes effect on a client that
+/// has gone quiet. Small, because it is a poll interval and costs a syscall
+/// per expiry rather than a timer per tunnel.
+pub const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The `Cancel` every bridge falls back to when none was configured.
+static NEVER_CANCELLED: NeverCancelled = NeverCancelled;
+
+/// The `Cancel` every bridge falls back to when none was configured.
+#[derive(Debug)]
+struct NeverCancelled;
+
+impl Cancel for NeverCancelled {
+    fn cancel_reason(&self, _session: Option<&AgentSessionId>) -> Option<CancelReason> {
+        None
+    }
+}
+
+/// Reads one byte, re-asking the poll on every timeout — but only when there
+/// is a poll to re-ask.
+///
+/// `retry_on_timeout` must be true **exactly when a socket read timeout was
+/// armed** for this read. That is not tidiness. The first version of this
+/// function retried unconditionally, and it hung the M9 CONNECT suite: those
+/// tests read sockets where a `WouldBlock` is a real answer, `read_exact`
+/// returned it as an error, and the retry turned that error into an infinite
+/// spin. The signature of that bug is a process blocked with **zero CPU**, and
+/// it is a worse failure than the error it replaced because nothing reports
+/// it.
+///
+/// The rule is symmetric: a timeout is ignorable only because this code chose
+/// to arm one. Where no timeout was armed, a timeout is an error, exactly as
+/// before.
+fn read_byte_cancellable<R: Read>(
+    reader: &mut R,
+    session: Option<&AgentSessionId>,
+    cancel: &dyn Cancel,
+    deadline: Option<std::time::Instant>,
+    retry_on_timeout: bool,
+) -> Result<Option<u8>, BridgeError> {
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(1) => return Ok(Some(byte[0])),
+            Ok(_) => {
+                return Err(BridgeError::Io("unexpected end of stream".into()));
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if !retry_on_timeout {
+                    return Err(BridgeError::Io(e.to_string()));
+                }
+                if let Some(reason) = cancel.cancel_reason(session) {
+                    return Err(BridgeError::Cancelled(reason));
+                }
+                if let Some(dl) = deadline {
+                    if std::time::Instant::now() >= dl {
+                        return Err(BridgeError::Cancelled(CancelReason::DeadlineElapsed));
+                    }
+                }
+            }
+            Err(e) => return Err(BridgeError::Io(e.to_string())),
+        }
+    }
 }
 
 /// A canonicalized (host, port) endpoint. The M9 prototype defines
@@ -567,12 +701,79 @@ pub fn issue_leaf(ca: &SessionCa, host: &str, now: Instant) -> Result<LeafCertif
 #[derive(Debug, Clone)]
 pub struct Bridge {
     policy: ConnectPolicy,
+    /// Injects the poll answer into every read the bridge performs. `None`
+    /// means "never cancelled", which is what the unit tests and the
+    /// pre-production callers get.
+    cancel: Option<std::sync::Arc<dyn Cancel>>,
+    /// How long a client may take to send its CONNECT head.
+    head_deadline: Option<std::time::Duration>,
 }
 
 impl Bridge {
     /// Build a bridge from a CONNECT policy.
     pub fn new(policy: ConnectPolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            cancel: None,
+            head_deadline: None,
+        }
+    }
+
+    /// Make this bridge interruptible.
+    ///
+    /// A builder rather than a constructor argument because the vast majority
+    /// of tests want a bridge that is never cancelled, and requiring them all
+    /// to name a `Cancel` would be a way of making the common case look like
+    /// the special one.
+    pub fn with_cancel(mut self, cancel: std::sync::Arc<dyn Cancel>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Bound how long a client may take to send its CONNECT head.
+    ///
+    /// This read was previously unbounded: a client that connected and said
+    /// nothing held a thread forever, and with a listener in front of it that
+    /// is a slow resource exhaustion rather than a slow client. No test caught
+    /// it because no test ran a listener — the function was only ever called
+    /// with a client that had already spoken.
+    pub fn with_head_deadline(mut self, d: std::time::Duration) -> Self {
+        self.head_deadline = Some(d);
+        self
+    }
+
+    /// The cancellation source, or a never-cancelled stand-in.
+    fn cancel(&self) -> &dyn Cancel {
+        match &self.cancel {
+            Some(c) => c.as_ref(),
+            None => &NEVER_CANCELLED,
+        }
+    }
+
+    /// Whether a socket read timeout is armed for this bridge, and therefore
+    /// whether a `WouldBlock` on its reads is a poll rather than a failure.
+    fn is_pollable(&self) -> bool {
+        self.cancel.is_some() || self.head_deadline.is_some()
+    }
+
+    /// Arm the socket read timeout this bridge needs, if it needs one.
+    ///
+    /// The timeout is what turns a blocking read into a pollable one. It is
+    /// cleared again before the stream is handed to rustls, because a
+    /// half-closed TLS session that also carries a socket deadline is a
+    /// connection that drops mid-stream for no visible reason.
+    fn arm_read_timeout(&self, client: &TcpStream) -> std::io::Result<()> {
+        if self.cancel.is_some() || self.head_deadline.is_some() {
+            client.set_read_timeout(Some(CANCEL_POLL))?;
+        }
+        Ok(())
+    }
+
+    fn disarm_read_timeout(&self, client: &TcpStream) {
+        // Best effort: a failure here leaves a timeout armed, which the
+        // handshake will surface as a dropped connection rather than as
+        // silence, so it is not worth failing the tunnel over.
+        let _ = client.set_read_timeout(None);
     }
 
     /// Authorise a CONNECT target. The runtime follow-up replaces this
@@ -672,6 +873,10 @@ pub struct EstablishedTunnel {
     /// own credential, with no session behind it. A type that cannot hold
     /// "no session" cannot be misread by the next caller who adds one.
     pub session: AgentSessionId,
+    /// Carried rather than passed, so `relay_substituted` keeps the signature
+    /// it already has and a caller cannot forget to supply the cancellation it
+    /// was configured with. `None` is the pre-production case.
+    cancel: Option<std::sync::Arc<dyn Cancel>>,
 }
 
 /// Where the bridge gets session proofs from.
@@ -1012,16 +1217,25 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
 /// past `\r\n\r\n` and swallow the first bytes of the client's TLS
 /// ClientHello, which then never reach the handshake. This reads one byte at a
 /// time and stops exactly at the terminator.
-fn read_connect_head(stream: &TcpStream) -> Result<String, BridgeError> {
+fn read_connect_head(
+    stream: &TcpStream,
+    cancel: &dyn Cancel,
+    deadline: Option<std::time::Instant>,
+    pollable: bool,
+) -> Result<String, BridgeError> {
     const MAX_HEAD: usize = 8 * 1024;
     let mut reader = stream;
     let mut head = Vec::new();
-    let mut byte = [0u8; 1];
     loop {
-        reader
-            .read_exact(&mut byte)
-            .map_err(|e| BridgeError::Io(e.to_string()))?;
-        head.push(byte[0]);
+        let byte = read_byte_cancellable(
+            &mut reader,
+            None,
+            cancel,
+            deadline,
+            pollable || deadline.is_some(),
+        )?
+        .ok_or_else(|| BridgeError::Io("empty CONNECT head".into()))?;
+        head.push(byte);
         if head.ends_with(b"\r\n\r\n") {
             return String::from_utf8(head)
                 .map_err(|_| BridgeError::Protocol("non-UTF-8 head".into()));
@@ -1089,7 +1303,14 @@ impl Bridge {
         proofs: Option<&dyn SessionProofs>,
         now: Instant,
     ) -> Result<EstablishedTunnel, BridgeError> {
-        let head = read_connect_head(&client)?;
+        self.arm_read_timeout(&client)
+            .map_err(|e| BridgeError::Io(e.to_string()))?;
+        let deadline = self.head_deadline.map(|d| Instant::now() + d);
+        let read = read_connect_head(&client, self.cancel(), deadline, self.is_pollable());
+        // Whatever happened, the timeout must not survive into the TLS
+        // session this call is about to return.
+        self.disarm_read_timeout(&client);
+        let head = read?;
         let target = parse_connect_target(&head)?;
 
         self.handle_connect(&target)?;
@@ -1149,6 +1370,7 @@ impl Bridge {
             upstream,
             target,
             session,
+            cancel: self.cancel.clone(),
         })
     }
 }
@@ -1163,14 +1385,18 @@ impl Bridge {
 /// Unlike the CONNECT head this runs *through* TLS, so each byte is a
 /// `StreamOwned` read. That is not a performance claim — it is a head, once
 /// per tunnel.
-fn read_inner_head<R: Read>(stream: &mut R, max: usize) -> Result<Vec<u8>, BridgeError> {
+fn read_inner_head<R: Read>(
+    stream: &mut R,
+    max: usize,
+    session: &AgentSessionId,
+    cancel: &dyn Cancel,
+    pollable: bool,
+) -> Result<Vec<u8>, BridgeError> {
     let mut head = Vec::new();
-    let mut byte = [0u8; 1];
     loop {
-        stream
-            .read_exact(&mut byte)
-            .map_err(|e| BridgeError::Io(e.to_string()))?;
-        head.push(byte[0]);
+        let byte = read_byte_cancellable(stream, Some(session), cancel, None, pollable)?
+            .ok_or_else(|| BridgeError::Io("empty inner head".into()))?;
+        head.push(byte);
         if head.ends_with(b"\r\n\r\n") {
             return Ok(head);
         }
@@ -1265,7 +1491,40 @@ impl EstablishedTunnel {
         let session = self.session;
         let destination = format!("{}:{}", self.target.host(), self.target.port());
 
-        let head = read_inner_head(&mut self.client, limits.max_head)?;
+        // Re-arm the poll timeout for the inner read. `serve_connect` disarmed
+        // it before handing the socket to rustls, and without it a revoke could
+        // not interrupt a client that connected, proved its session and then
+        // said nothing — which is the exact shape a revoked agent produces.
+        let cancellable = self.cancel.is_some();
+        if cancellable {
+            self.client
+                .sock
+                .set_read_timeout(Some(CANCEL_POLL))
+                .map_err(|e| BridgeError::Io(e.to_string()))?;
+        }
+        // The cancellation source is cloned out before the mutable borrow, so
+        // the tunnel is not borrowed twice in one call.
+        let cancel = self.cancel.clone();
+        let read = {
+            let source: &dyn Cancel = match &cancel {
+                Some(c) => c.as_ref(),
+                None => &NEVER_CANCELLED,
+            };
+            read_inner_head(
+                &mut self.client,
+                limits.max_head,
+                &session,
+                source,
+                cancellable,
+            )
+        };
+        if cancellable {
+            // Best effort, for the same reason as in `serve_connect`: a tunnel
+            // that dies with a timeout armed surfaces as a dropped connection
+            // rather than as silence, which is the safer of the two failures.
+            let _ = self.client.sock.set_read_timeout(None);
+        }
+        let head = read?;
         let token = bearer_token(&head).ok_or(SubstitutionError::NoCredential)?;
 
         let mut lent = Lending(Vec::new());
