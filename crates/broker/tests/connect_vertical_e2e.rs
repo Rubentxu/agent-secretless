@@ -531,8 +531,16 @@ permit (principal, action == Action::"connect_route", resource == Host::"host:{F
                 .arg(&policy)
                 .arg("--audit-file")
                 .arg(&audit)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                // The broker's tracing goes to *stdout*, not stderr, so a
+                // fixture that silences stdout is silently hiding the only
+                // account of why a tunnel was refused.
+                .stdout(
+                    std::fs::File::create(dir.join("broker.log")).expect("create the broker log"),
+                )
+                .stderr(
+                    std::fs::File::create(dir.join("broker.err"))
+                        .expect("create the broker error log"),
+                )
                 .spawn()
                 .expect("spawn the tunneling broker"),
         );
@@ -1038,6 +1046,132 @@ fn a_tunnel_serves_one_request_and_the_protocol_allows_more() {
     assert!(
         !stdout.contains(REAL) && !stderr.contains(REAL),
         "the real credential appeared outside the destination: \n{stdout}\n{stderr}"
+    );
+}
+
+/// How many CONNECTs one session sustains at once — and it is nowhere near the
+/// number the code claims.
+///
+/// **A characterization of a defect, not a claim.** The roadmap asks for
+/// "32/64/128 CONNECT simultáneos, misma sesión, counters fuera de orden" and
+/// the replay window's own comment reasons that the spread from N tunnels in
+/// flight is at most N counters, so a 128-wide window is generous. Measured
+/// against the real broker, it is not generous enough, and neither is the
+/// surrogate's budget:
+///
+/// ```text
+/// parallel=16  ok=8   failed=8
+/// parallel=32  ok=8   failed=24
+/// parallel=64  ok=8   failed=56
+/// ```
+///
+/// Eight, every time, whatever the client asked for. The broker's own account
+/// of the 64 splits the 56 refusals into two causes, and neither is a
+/// documented budget:
+///
+/// ```text
+/// 39  the presented surrogate was refused      -> SurrogateError::Exhausted
+/// 17  no session proof resolved for this tunnel
+/// ```
+///
+/// The second is the one that matters. Those 17 are freshly minted, correctly
+/// signed proofs from a session that did nothing wrong, refused by the
+/// anti-replay machinery — the exact liveness-versus-security tension the
+/// window's comment says it resolved, in the direction the honest client
+/// cannot tell apart from an attack.
+///
+/// The first says the surrogate's 32-use budget is spent by tunnels that never
+/// complete, so a session that is refused rather than served still burns
+/// budget. Both are liveness, not disclosure: the destination received the
+/// credential once per completed tunnel and never a surrogate, which is
+/// asserted here because a concurrency fix must not quietly change that.
+#[test]
+fn one_session_sustains_eight_of_the_tunnels_it_is_asked_for() {
+    const PARALLEL: usize = 64;
+
+    let f = Fixture::new_serving("concurrent", 1);
+    let variable = f.surrogate_env_name();
+    let out = f.dir.join("codes");
+    let script = format!(
+        "i=0; \
+         while [ $i -lt {n} ]; do \
+           ( curl -sS -k --max-time 60 -o /dev/null \
+               -w '%{{http_code}}\n' \
+               -H \"Authorization: Bearer ${{{variable}}}\" \
+               \"https://{FIXTURE_HOST}:{port}/r$i\" >> {out} ) & \
+           i=$((i+1)); \
+         done; \
+         wait",
+        n = PARALLEL,
+        port = f.origin.port,
+        out = out.display()
+    );
+    let child = Command::new(cargo_bin("asv"))
+        .arg("--socket")
+        .arg(&f.sock)
+        .arg("run")
+        .arg("sh")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("parallel tunnels from one session");
+    let codes = std::fs::read_to_string(&out).unwrap_or_default();
+    let ok = codes.lines().filter(|l| l.trim() == "200").count();
+
+    // The measurement. If this ever holds, the defect is fixed and this test,
+    // its name and its comment are all stale — which is the signal to rewrite
+    // all three rather than to relax the assertion.
+    assert!(
+        ok < PARALLEL,
+        "{ok} of {PARALLEL} concurrent tunnels succeeded from one session; the \
+         documented limit is stale, so this characterization and its comment \
+         have to be rewritten:\n{}",
+        child.stderr.is_empty()
+    );
+    assert!(
+        ok > 0,
+        "no tunnel succeeded at all, so this measured a broken setup rather \
+         than a limit:\n{codes}"
+    );
+
+    // The broker's own account, which is why the fixture captures its stdout:
+    // `tracing_subscriber::fmt()` writes to stdout, and a fixture that silences
+    // stdout hides the only record of why a tunnel was refused. An observer
+    // that is switched off is indistinguishable from one that does not exist.
+    let log = std::fs::read_to_string(f.dir.join("broker.log")).unwrap_or_default();
+    let proof_refusals = log.matches("no session proof resolved").count();
+    let surrogate_refusals = log.matches("the presented surrogate was refused").count();
+    assert!(
+        proof_refusals > 0,
+        "no tunnel was refused for want of a session proof, so the anti-replay \
+         half of the defect is no longer reproducing:\n{log}"
+    );
+    assert!(
+        surrogate_refusals > 0,
+        "no tunnel was refused for an exhausted surrogate:\n{log}"
+    );
+    assert_eq!(
+        proof_refusals + surrogate_refusals,
+        PARALLEL - ok,
+        "the broker refused {} tunnels but accounted for {} of them; a refusal \
+         with no reason in the log is one nobody can act on",
+        PARALLEL - ok,
+        proof_refusals + surrogate_refusals
+    );
+
+    // The part a concurrency fix must not break. The destination saw the
+    // credential once per completed tunnel and never a surrogate, so what is
+    // broken here is availability and not disclosure.
+    assert_eq!(
+        f.origin.real_credential_requests(),
+        ok,
+        "the destination saw the credential a different number of times than \
+         tunnels completed"
+    );
+    let seen = f.origin.saw();
+    assert!(
+        !seen.contains("asv1_"),
+        "a surrogate reached the destination:\n{seen}"
     );
 }
 
