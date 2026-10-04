@@ -233,7 +233,13 @@ pub enum OAuth2Error {
 
 /// The OAuth2 issuer trait. Implementations MUST return a fresh token
 /// without exposing the long-lived credential to the agent.
-pub trait OAuth2Issuer {
+///
+/// `Send + Sync` because a production holder needs it: the issuer is reached
+/// from the accept loop and from operation threads, and a port that could not
+/// be shared would be rebuilt per request — which, for an issuer holding a
+/// resolved address, is a second chance for the resolver to answer differently
+/// from the address that was vetted.
+pub trait OAuth2Issuer: Send + Sync {
     /// Issue a fresh access token using the configured client
     /// credentials (RFC 6749 §4.4).
     fn issue(&self, scope: &str) -> Result<OAuth2Token, OAuth2Error>;
@@ -1040,27 +1046,46 @@ mod tests {
 
     /// The guard that keeps the deterministic issuer a fixture.
     ///
-    /// Documentation is not a control, and this is the control: the name may
-    /// appear in this module and in test code, and nowhere else. A test that
-    /// only asserted the issuer worked would pass on a broker issuing
+    /// Documentation is not a control, and this is the control. A test that
+    /// only asserted the issuer *worked* would pass on a broker issuing
     /// well-formed tokens that grant nothing anywhere, which is the failure
     /// mode this whole work item exists to remove.
+    ///
+    /// Two things are deliberately allowed to name it: this file, which defines
+    /// it, and test code. Everything else is production code, and "is this name
+    /// in a test" is answered by where the `#[cfg(test)]` gate is rather than by
+    /// whether the file happens to be called `tests.rs` — a unit-test module
+    /// lives inside a source file, and treating that as production is the shape
+    /// of mistake that would have flagged `oauth2_port.rs`, whose only use of
+    /// the double is its own test module.
+    ///
+    /// The gate is the *first* `#[cfg(test)]` in a file, and only the text above
+    /// it is searched: that is exactly the region the compiler builds without
+    /// `cfg(test)`, for the layout this repository uses everywhere. A file that
+    /// put production code below its own test module would defeat this, and that
+    /// cost is named here rather than hidden — nothing else in the guard is
+    /// approximate, and inventing a parser to close the gap would be a larger
+    /// thing to trust than the convention it checks.
     #[test]
     fn deterministic_issuance_never_reaches_production() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let offenders: Vec<String> = walk(root)
-            .into_iter()
-            .filter(|path| {
-                let text = path.to_string_lossy();
-                if text.contains("/tests/") || text.ends_with("oauth2.rs") {
-                    return false;
-                }
-                std::fs::read_to_string(path)
-                    .map(|body| body.contains("DeterministicTokenIssuer"))
-                    .unwrap_or(false)
-            })
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect();
+        let mut offenders = Vec::new();
+        for path in walk(root) {
+            let text = path.to_string_lossy().replace('\\', "/");
+            if text.contains("/tests/") || text.ends_with("oauth2.rs") {
+                continue;
+            }
+            let Ok(body) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let production = match body.find("#[cfg(test)]") {
+                Some(gate) => &body[..gate],
+                None => body.as_str(),
+            };
+            if production.contains("DeterministicTokenIssuer") {
+                offenders.push(text);
+            }
+        }
         assert!(
             offenders.is_empty(),
             "the deterministic issuer is a test double and may not be named by: {offenders:?}"

@@ -33,6 +33,9 @@ pub mod identity;
 pub mod inventory;
 pub mod isolated_exec;
 pub mod oauth2;
+/// The production consumer of M11: a `SecretPort` that lends a short-lived
+/// access token rather than the stored client secret.
+pub mod oauth2_port;
 /// The RFC 6749 authorization server the OAuth2 tests run against.
 ///
 /// Feature-gated rather than `#[cfg(test)]` because the assertions that matter
