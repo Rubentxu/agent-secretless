@@ -79,13 +79,18 @@ Secuencia recomendada:
 ```text
 1. Implementar DX2 en ASV.
 2. Congelar ejemplos JSON con tests.
-3. Copiar/adaptar proposed-skill/agent-secretless.
+3. Publicar/actualizar skills/agent-secretless en Rubentxu/agent-skill.
 4. Ejecutar scripts/validate_skills.py.
 5. Añadir evals al CI afectado.
 6. Instalar selectivamente con npx skills add.
 7. Fusionar/publicar.
 8. Verificar indexación en skills.sh por separado.
 ```
+
+> **Los pasos 3 a 7 están ejecutados** (2026-10-04, commit `1778767` en
+> `Rubentxu/agent-skill`). El borrador ya no se copia desde este repositorio:
+> `tests/skill_contract.py` verifica la copia publicada, y falla si no la
+> encuentra. Queda pendiente sólo el paso 8, que depende de un índice externo.
 
 ## 6. Prompt corto para un agente implementador
 

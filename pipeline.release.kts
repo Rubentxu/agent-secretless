@@ -30,6 +30,19 @@ pipeline {
         stage("preflight") {
             sh("python3 scripts/check-release-config.py")
             sh("python3 scripts/check-gate-status.py")
+            // The published skill is part of the product, so a release that
+            // cannot see it is not a release that can be verified. The suite
+            // fails rather than skips when the skill is absent — a skip here
+            // would let the one thing R0.3 exists to establish be decided by
+            // whether this machine happened to have a sibling checkout.
+            //
+            // It is also a network step, and everything below this line is
+            // not. It sits here, in preflight, for that reason: a release that
+            // discovers at the publish stage that its own agent entry point is
+            // unpublished has already created a Release other people can
+            // fetch.
+            sh("if [ ! -d ../agent-skill/skills/agent-secretless ]; then git clone --depth 1 https://github.com/Rubentxu/agent-skill.git ../agent-skill; fi")
+            sh("python3 tests/skill_contract.py")
             // `dist plan` is the exact same code path the release CI would
             // run, minus the compilation. It resolves the tag, the targets
             // and the artifact list from the real configuration, so a

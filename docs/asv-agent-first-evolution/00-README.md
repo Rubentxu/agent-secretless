@@ -42,7 +42,11 @@ No se recomienda crear M14 para este trabajo: el cambio es transversal, pequeño
 - `10-MIGRATION-ADOPTION.md` — cómo adoptar el evolutivo sin romper usuarios actuales.
 - `11-RISKS-OPEN-QUESTIONS.md` — riesgos y decisiones futuras.
 - `12-TRACEABILITY.md` — trazabilidad entre requisitos, artefactos y pruebas.
-- `proposed-skill/agent-secretless/` — blueprint directamente integrable en `Rubentxu/agent-skill`.
+- La skill `agent-secretless` está **publicada** en
+  `Rubentxu/agent-skill/skills/agent-secretless` (commit `1778767`). El
+  `proposed-skill/agent-secretless/` de este directorio era el borrador y ya no
+  se mantiene aquí: ADR-05 la excluyó como fuente canónica y el contrato
+  rechaza ejecutarse contra cualquier ruta dentro de este repo.
 
 ## Baseline observado
 

@@ -39,9 +39,23 @@ mechanically decidable line rather than a matter of tone.
 
 It is a separate repository (`Rubentxu/agent-skill`, ADR-05), so this is a
 cross-repository guard and the path is an input. Override with `ASV_SKILL_DIR`;
-the default is a sibling checkout. When it is absent the suite exits 77 and
-says so in the summary: skipped is not passed, and the exit code is the
-difference.
+the default is a sibling checkout.
+
+**When it is absent, this suite fails.** It used to exit 77 and say "skipped",
+on the reasoning that a machine without a checkout cannot run a cross-repo
+check. That reasoning was sound and the consequence was not: a release pipeline
+read 77 as "nothing to do here", so the one thing R0.3 exists to establish — the
+official skill is published and matches the product — was decided by whether the
+build machine happened to have a sibling directory. A gate that goes green by
+not having the thing it gates is not a gate.
+
+**It also refuses to check the proposal in this repository.**
+`docs/asv-agent-first-evolution/proposed-skill/agent-secretless/` is a copy kept
+here for history, and pointing `ASV_SKILL_DIR` at it produces an entirely green
+run that means nothing: the copy an agent installs is the one in the other
+repository, and that is the copy that drifts. ADR-05 puts it there on purpose —
+"no se mete en el repo de ASV como fuente canónica" — so the guard enforces the
+separation instead of describing it.
 """
 
 from __future__ import annotations
@@ -580,9 +594,33 @@ def main() -> int:
     d = skill_dir()
     print(f"skill: {d}")
     if not (d / "SKILL.md").exists():
-        print(f"\nSKIP: no skill at {d}")
-        print("Set ASV_SKILL_DIR to the agent-skill checkout to run this suite.")
-        return 77
+        # Not a skip. A release that cannot see the published skill has not
+        # published one, and returning 77 made that indistinguishable from a
+        # run that passed. The old behaviour meant a machine without a sibling
+        # checkout reported "skipped" while the release pipeline read it as
+        # "nothing to do here" — which is the exact shape of a gate that can be
+        # made green by not having the thing it gates.
+        print(f"\nFAIL: no skill at {d}", file=sys.stderr)
+        print("  The published skill lives at Rubentxu/agent-skill/skills/agent-secretless.", file=sys.stderr)
+        print("  Clone it as a sibling checkout, or set ASV_SKILL_DIR to it.", file=sys.stderr)
+        print("  Absence is a failure, not a skip: a release cannot verify a", file=sys.stderr)
+        print("  skill it cannot see.", file=sys.stderr)
+        return 1
+
+    # The proposal that lives inside this repository is not the product. It is
+    # convenient to point this suite at it, and every run would be green, and
+    # the green would mean nothing: the thing an agent installs is the copy in
+    # the other repository, and that is the copy that can drift.
+    try:
+        inside_repo = d.is_relative_to(REPO)
+    except AttributeError:  # pragma: no cover - Python < 3.9
+        inside_repo = str(d).startswith(str(REPO) + os.sep)
+    if inside_repo:
+        print(f"\nFAIL: {d} is inside this repository", file=sys.stderr)
+        print("  That is the proposal, not the published skill. The contract", file=sys.stderr)
+        print("  guards the copy an agent installs, which lives at", file=sys.stderr)
+        print("  Rubentxu/agent-skill/skills/agent-secretless.", file=sys.stderr)
+        return 1
 
     truth = parse_truth()
     print(f"truth: {len(truth['rels'])} relations declared, "
