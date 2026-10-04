@@ -169,6 +169,29 @@
 //! without binding would be worse than refusing: the caller receives a
 //! `TpmSealed` carrying a `PcrPolicy` that nothing enforces, which is the
 //! mechanism that looks healthy while protecting nothing.
+//!
+//! ## How far the policy route got
+//!
+//! Two more commands were measured on a virgin device, each in its own instance
+//! so that an exhausted object or session slot could not be mistaken for a
+//! refusal:
+//!
+//! - `CreateLoaded` with a non-empty `authPolicy` answers `0` — and it **needs
+//!   an authorization session to create it**. Without one it answers
+//!   `TPM_RC_AUTH_MISSING` (0x125), which is what an object carrying a policy
+//!   is telling you: it has an admin role to satisfy.
+//! - `TPM2_StartAuthSession` with `TPM_SE_POLICY` answers `0` and returns a
+//!   session handle.
+//!
+//! **`TPM2_PolicyPCR` is not pinned.** It answers `0x184` in every formulation
+//! tried, including with `pcrDigest` given as the `TPM2B` it is rather than as
+//! bare bytes. Unlike the `Create` case, there is no reference capture to diff
+//! against: this host's `tpm2-tools` exits 0 from `tpm2_startauthsession` and
+//! prints nothing, and rejects a session context file with "expected
+//! [o|p|e|n|l] or a handle number", so it cannot be made to send the command
+//! whose bytes are wanted. The same lesson as the six dead-end matrices
+//! applies — do not guess a wire format, and do not treat a refusal from a
+//! shared, exhausted instance as a fact about the encoding.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
