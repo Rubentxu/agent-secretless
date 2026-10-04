@@ -127,6 +127,48 @@
 //! correct answer, not a symptom. So a read-only test asserts the frame, and
 //! the assertion that a write happened lives in the test that extends a PCR
 //! and checks the fold.
+//!
+//! # The seal and unseal path, measured as far as it goes
+//!
+//! The transport for sealing works. Measured on a virgin device, with this
+//! module's own encoding and no reference client involved:
+//!
+//! - `TPM2_CreateLoaded` (0x191) under `TPM_RH_OWNER` answers `0` and returns
+//!   an object handle, an 11-byte `outPrivate` and an 86-byte `outPublic` for
+//!   a keyedhash object holding 32 bytes of sensitive data.
+//! - `TPM2_Unseal` (0x15E) on that handle answers `0` and returns the 32 bytes
+//!   exactly, inside the response's `TPM2B`.
+//!
+//! Two findings about the wire, both of which cost time to find and are
+//! cheaper written down than rediscovered:
+//!
+//! - **`CreateLoaded` takes no `inPrivate` in this implementation.** The
+//!   reference client sends `inSensitive` and `inPublic` and stops. Adding the
+//!   two bytes for an empty `inPrivate` is answered `TPM_RC_SIZE`. The command
+//!   that tpm2-tools itself uses is 145 bytes, not 147.
+//! - **`TPM2_Create` is refused here, in every layout tried.** A virgin device
+//!   answers `0x184` for it under `TPM_RH_OWNER` with a `creationPCR`, with an
+//!   empty `TPML_PCR_SELECTION`, and with only `inSensitive` and `inPublic`
+//!   sent — while the identical `inSensitive` and `inPublic` through
+//!   `CreateLoaded` succeed. That is this implementation's behaviour and not
+//!   asserted here to be the specification's: what is established is that
+//!   `Create` was not usable as the way in on the device that was measured, and
+//!   that `CreateLoaded` was.
+//!
+//! **`CreateLoaded` has no `creationPCR` field.** So the command that works
+//! cannot bind an object to PCR values at creation, and that is the whole
+//! remaining problem. The route that does not need it is a **policy**: the
+//! object's `authPolicy` carries a `PolicyPCR` digest computed over the
+//! expected PCR values, and the digest is satisfied at `Unseal` time by a
+//! policy session rather than recorded at creation. That is the stronger
+//! binding, and it is also the larger piece of work, because the response to a
+//! command under a policy session is encrypted with the session's key and has
+//! to be decrypted with AES-CFB before the sealed data is visible.
+//!
+//! Until that exists, `seal` and `unseal` refuse. Shipping a `seal` that seals
+//! without binding would be worse than refusing: the caller receives a
+//! `TpmSealed` carrying a `PcrPolicy` that nothing enforces, which is the
+//! mechanism that looks healthy while protecting nothing.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -688,7 +730,10 @@ impl TpmDevice for Tpm2Device {
     /// here the honest answer is that it is not implemented on this device.
     fn seal(&self, _kek: &[u8; 32], _pcr_policy: &PcrPolicy) -> Result<TpmSealed, TpmError> {
         Err(TpmError::TpmRefused(
-            "this tpm2 device does not seal yet: object creation is not implemented".to_string(),
+            "this tpm2 device does not seal yet: CreateLoaded and Unseal work, but \
+             CreateLoaded has no creationPCR, and a policy-bound unseal needs a \
+             policy session and AES-CFB decryption of its response"
+                .to_string(),
         ))
     }
 
@@ -699,7 +744,10 @@ impl TpmDevice for Tpm2Device {
         _observed: &[(PcrSlot, Digest)],
     ) -> Result<[u8; 32], TpmError> {
         Err(TpmError::TpmRefused(
-            "this tpm2 device does not unseal yet: object loading is not implemented".to_string(),
+            "this tpm2 device does not unseal yet: the sealed path is measured to work \
+             up to Unseal, but binding it to PCR values needs a policy session whose \
+             response has to be decrypted before the data is visible"
+                .to_string(),
         ))
     }
 
