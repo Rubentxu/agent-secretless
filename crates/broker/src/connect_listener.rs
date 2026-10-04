@@ -322,6 +322,39 @@ fn on_accept_failure(shutdown: &ShutdownSignal) -> AcceptFailure {
     }
 }
 
+/// How many tunnels this broker is relaying right now.
+///
+/// **This exists because "wait for the tunnels to finish" needs something to
+/// wait for.** A shutdown that slept for a fixed window would either be slow on
+/// an idle broker or cut a real one short, and a broker that guesses which one
+/// to be is guessing about exactly the moment it least wants to. The count is
+/// what turns a bounded window into a real drain that also returns immediately
+/// when there is nothing to drain.
+///
+/// Deliberately not a `Mutex<usize>`: it is written from a detached task per
+/// connection and read from a shutdown thread, and there is no invariant worth
+/// protecting — a torn read would only make the drain window expire a
+/// fraction early, which is what the window is for.
+#[derive(Debug, Default)]
+pub struct InFlight(std::sync::atomic::AtomicUsize);
+
+impl InFlight {
+    /// One more tunnel is being relayed.
+    pub fn enter(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// That tunnel is over, whatever ended it.
+    pub fn leave(&self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many are open. Zero is the only value that means "drained".
+    pub fn count(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// A CONNECT listener.
 pub struct ConnectListener {
     bridge: Bridge,
@@ -329,6 +362,7 @@ pub struct ConnectListener {
     upstream: Arc<dyn UpstreamResolver + Send + Sync>,
     proofs: Arc<dyn SessionProofs + Send + Sync>,
     shutdown: Arc<ShutdownSignal>,
+    in_flight: Arc<InFlight>,
     config: ListenerConfig,
 }
 
@@ -355,8 +389,22 @@ impl ConnectListener {
             upstream,
             proofs,
             shutdown,
+            in_flight: Arc::new(InFlight::default()),
             config,
         }
+    }
+
+    /// Count the tunnels this listener serves, so a shutdown has something to
+    /// wait for.
+    ///
+    /// A builder rather than a constructor argument because every other caller
+    /// — the tests, and the path where a broker runs without a CONNECT listener
+    /// at all — wants a listener that counts into a gauge nobody reads, and
+    /// making them invent one to satisfy the type would be a worse trade than
+    /// one method.
+    pub fn with_in_flight(mut self, in_flight: Arc<InFlight>) -> Self {
+        self.in_flight = in_flight;
+        self
     }
 
     /// Say how each destination is reached, and against which anchors.
@@ -397,8 +445,12 @@ impl ConnectListener {
             upstream,
             proofs,
             shutdown,
+            in_flight,
             config: _,
         } = self;
+        // Cloned out of the destructure so the accept loop can keep handing it
+        // to each task while the original stays here.
+        let gauge = Arc::clone(&in_flight);
 
         loop {
             if shutdown.is_stopped() {
@@ -425,9 +477,23 @@ impl ConnectListener {
             let proofs = proofs.clone();
             let report = report.clone();
             let handler = handler.clone();
+            // Counted **here**, before the task is spawned rather than inside
+            // it, so a shutdown that arrives between the spawn and the task's
+            // first instruction cannot see zero while a tunnel is already on
+            // its way up. The window in the other direction — accepted, not yet
+            // counted — does not exist, because the two lines are adjacent.
+            in_flight.enter();
+            // Cloned per connection, like every other handle handed to the
+            // task: the accept loop has to outlive them all.
+            let gauge = Arc::clone(&gauge);
             tokio::spawn(async move {
                 let outcome = serve_one(bridge, stream, leaves, upstream, proofs, handler).await;
                 report.record(outcome);
+                // After `record`, deliberately: the audit entry is part of
+                // ending the tunnel, and a drain that returned before it was
+                // written would report a shutdown that lost the reason the
+                // tunnel ended — the one thing the drain exists to preserve.
+                gauge.leave();
             });
         }
     }

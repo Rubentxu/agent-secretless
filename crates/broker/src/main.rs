@@ -5,7 +5,9 @@
 //! milestones; nothing here can return a secret even in principle, because the
 //! response enum has no variant that could hold one.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use asv_broker::{BrokerState, VaultSecretPort};
 use asv_identity::WorkloadIdentity;
@@ -20,6 +22,139 @@ use zeroize::Zeroize;
 // one. Only the trait is imported; the type it is implemented for is named at
 // the call site.
 use rustls::pki_types::pem::PemObject as _;
+
+/// Set by the signal handler, read by the watcher thread.
+///
+/// A process-wide flag rather than something owned by `main`, because a signal
+/// handler receives no context and there is no way to hand it one. The handler
+/// is the only writer and the watcher is the only reader, so the atomic is the
+/// whole of the communication.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// How often the watcher asks whether a signal arrived.
+///
+/// The same order of magnitude as the bridge's own `CANCEL_POLL`, and for the
+/// same reason it is a poll rather than a wake-up: the work this gates is
+/// already happening on a timer, so the flag decides *when it is noticed*, not
+/// how often anything is checked.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
+
+/// How long a signalled broker waits for its tunnels before leaving anyway.
+///
+/// **A bound, not a promise.** A tunnel whose client has stopped reading cannot
+/// be made to finish, and a broker that waits forever for one is a broker an
+/// operator has to `SIGKILL` — which is the kernel teardown this whole path
+/// exists to replace. The window is long enough for a healthy relay to notice
+/// and end, and the log says when it expired so an operator can see a slow
+/// drain rather than infer one.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+
+/// The signal handler. Stores a flag and returns.
+///
+/// **Nothing else happens here, and that is the whole design.** A signal
+/// handler runs on whatever thread the signal landed on, in a context where
+/// allocating, locking a mutex, writing to a socket, or formatting a string is
+/// undefined behaviour. `ShutdownSignal::stop` does all four — it takes a
+/// `Mutex` and a `Notify` — so calling it from here would be a way to deadlock
+/// or corrupt the heap at exactly the moment the process is least able to
+/// survive it. One relaxed store is the whole of what is safe.
+extern "C" fn on_shutdown_signal(_signum: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// Make the operator's signals reach the broker's own cancellation mechanism,
+/// and leave afterwards.
+///
+/// **This is the caller `ShutdownSignal::stop` did not have.** The signal
+/// existed, the accept loop watched it, and the bridge polled it every 50 ms
+/// to tear down in-flight tunnels — and nothing in a running broker ever set
+/// it. An operator's `SIGTERM` therefore did what the kernel does to every
+/// process: it killed the broker, and every tunnel died with it as a side
+/// effect of the file descriptors closing. The product's own path to ending a
+/// tunnel was exercised only by tests, which is the same defect
+/// `ShutdownSignal::revoke` turned out to have one increment earlier, found
+/// again in the sibling method.
+///
+/// The difference this makes is not cosmetic and not about tidiness. A tunnel
+/// the kernel tears down is a tunnel that ends with no recorded reason: no
+/// `cancelled` class, no `shutdown` in the durable chain, and an operator
+/// reading the audit trail sees a connection that simply stopped. A tunnel
+/// ended through this path is recorded as the deliberate, classed event it is.
+fn install_ordered_shutdown(
+    shutdown: Arc<asv_broker::connect_listener::ShutdownSignal>,
+    in_flight: Arc<asv_broker::connect_listener::InFlight>,
+) {
+    // `libc::signal` rather than `tokio::signal`, and the reason is that the
+    // `signal` feature is not enabled for this workspace's tokio. Turning it on
+    // would add `signal-hook-registry` and its registry machinery to a product
+    // that deliberately runs under Landlock, seccomp and a dumpable-bit
+    // lockdown, to obtain something `libc` — already a direct dependency —
+    // provides in six lines. A dependency is a thing to spend, not a thing to
+    // spend on a reimplementation of a syscall.
+    //
+    // `SIGINT` as well as `SIGTERM`: an operator pressing Ctrl-C at a terminal
+    // is asking the same thing, and leaving Ctrl-C to kill the process while
+    // SIGTERM drains would make the two paths disagree for no reason.
+    // Through a data pointer, not straight from the function item: a bare
+    // `fn` item cast to an integer is a function pointer treated as an integer,
+    // and the two-step cast is what actually converts a function to an address.
+    // `sighandler_t` is `size_t` on this target, which is why the cast looks
+    // like a number at all.
+    let handler = on_shutdown_signal as *const () as libc::sighandler_t;
+    unsafe {
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+    }
+
+    std::thread::spawn(move || {
+        while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            std::thread::sleep(SHUTDOWN_POLL);
+        }
+        tracing::info!("shutdown signal received; ending every tunnel this broker authorised");
+        // The mechanism is the product's own: the accept loop stops accepting,
+        // and every tunnel in flight is cancelled through the bridge's poll
+        // rather than by its socket closing under it.
+        shutdown.stop();
+
+        // The drain, and the reason it is written this way.
+        //
+        // The first version of this loop waited for `shutdown.is_stopped()` to
+        // become false, which is a flag `stop` sets *before it returns* — so the
+        // window collapsed to nothing and the process left while its tunnels
+        // were still being torn down. Worse, leaving is what killed them: the
+        // outcome of a cancelled tunnel is appended to the audit chain by the
+        // task handling it, and `exit` does not wait for anybody. The test that
+        // watches for `cancelled`/`shutdown` in the chain caught exactly that,
+        // with a chain that ended mid-conversation.
+        //
+        // So the thing waited for is the *tunnels*, not the flag: zero in
+        // flight means every one of them has finished writing its outcome.
+        let deadline = std::time::Instant::now() + SHUTDOWN_DRAIN;
+        loop {
+            let open = in_flight.count();
+            if open == 0 {
+                tracing::info!("every tunnel has ended; the broker is leaving");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    open,
+                    "shutdown drain window elapsed with tunnels still in flight; \
+                     leaving anyway"
+                );
+                break;
+            }
+            std::thread::sleep(SHUTDOWN_POLL);
+        }
+        // Deliberately not a return through `main`: the Unix accept loop below
+        // is a blocking `accept` that no amount of waiting will unblock, and a
+        // process that refuses to leave is a worse outcome than one that leaves
+        // without unwinding a stack frame. Everything that needed to be written
+        // is written by this point — the audit log flushes per record — so
+        // there is nothing here to lose.
+        std::process::exit(0);
+    });
+}
 
 fn main() -> std::io::Result<()> {
     // R2 (16-SECURITY-RELEASE-GATES): "broker core dumps disabled". A core
@@ -526,6 +661,13 @@ fn main() -> std::io::Result<()> {
     // all. So the whole revocation path worked in tests and did not exist in
     // the product.
     let shutdown = Arc::clone(&state.shutdown);
+    // The gauge the drain waits on, created here rather than inside the listener
+    // because the watcher thread has to be able to read it and the listener is
+    // moved into the accept task.
+    let in_flight = Arc::new(asv_broker::connect_listener::InFlight::default());
+    // Installed before the listener rather than after it, so there is no window
+    // in which the broker is serving tunnels and cannot yet be told to stop.
+    install_ordered_shutdown(Arc::clone(&shutdown), Arc::clone(&in_flight));
     if let Some(addr) = connect_listen.as_deref() {
         let Some(secrets) = state.secrets.clone() else {
             eprintln!("asv: --connect-listen needs --vault; a tunnel with no credential behind it is refused");
@@ -692,7 +834,8 @@ fn main() -> std::io::Result<()> {
                 &routes,
             ))),
             Arc::new(destination_roots),
-        );
+        )
+        .with_in_flight(Arc::clone(&in_flight));
 
         let tcp = std::net::TcpListener::bind(bind).unwrap_or_else(|e| {
             eprintln!("asv: cannot bind the CONNECT listener on {bind}: {e}");

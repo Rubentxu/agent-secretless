@@ -2509,11 +2509,34 @@ loopback origin in `cleartext`**, so the end-to-end verticals exercise the
 `cleartext` declaration and not the `tls` one — the TLS leg is measured against
 a locally minted CA, which is honest and is not the same as a registry. Also
 still owed: **stress and cancellation under load** beyond the anti-replay
-property already measured. And **the broker has no ordered shutdown at all**:
-`main.rs` installs no signal handling, so tunnels dying when the process stops
-is carried entirely by the process dying. That is a real guarantee from the
-kernel and not one from this product, and it is recorded as owed rather than
-counted as delivered.
+property already measured. **And the broker has no ordered shutdown at all** was
+the last thing owed here, and it was a defect rather than a gap:
+`ShutdownSignal::stop` — the mechanism that ends a tunnel deliberately, the one
+the accept loop watches and the bridge polls every 50 ms — had **no caller
+outside tests**. An operator's `SIGTERM` therefore did what the kernel does to
+every process: it killed the broker, and the tunnels died with it as a side
+effect of their descriptors closing, recorded in the chain as nothing at all.
+**The same defect `revoke` turned out to have one increment earlier, found
+again in the method beside it**, which is the argument for asking what a
+mechanism's callers are rather than whether the mechanism works.
+
+`a_terminated_broker_ends_its_tunnels_by_shutdown_and_says_so` now signals a
+real broker with a real relay still pumping and asserts both halves: the process
+leaves with its own exit code rather than a signal's, and the chain carries
+`"outcome":"cancelled"` with `"detail":"shutdown"`. Falsified one half at a time
+— removing the handler fails the exit-code assertion, and leaving `stop()`
+uncalled while the process still exits cleanly fails the chain one. Measuring it
+needed a fixture shape the file did not have: every existing origin lets the
+relay *finish*, so a signal sent afterwards lands on an idle broker. The new
+`OriginMode::Stall` promises 64 response bytes and sends 2, which is the only
+way to leave the relay itself mid-copy — **a test that cannot put the product in
+the state it is about is a test about the fixture.**
+
+The drain waits on a real in-flight gauge, `InFlight`, which counts a tunnel as
+over only *after* its outcome reaches the chain. The first version waited on a
+flag `stop` sets before it returns, so the window collapsed to nothing and the
+process left before the outcome was written — the chain assertion caught exactly
+that, with a chain that ended mid-conversation.
 
 
 

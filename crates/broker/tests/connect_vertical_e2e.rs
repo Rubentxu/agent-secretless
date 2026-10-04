@@ -135,6 +135,25 @@ fn cargo_bin(name: &str) -> PathBuf {
 
 struct Broker(Child);
 
+impl Broker {
+    /// The pid, for a signal the test sends by hand.
+    ///
+    /// `Child::kill` is SIGKILL, which no handler can catch — so a test that
+    /// used it would be measuring the kernel's teardown no matter what the
+    /// broker installed, which is the opposite of what it is here to check.
+    fn pid(&self) -> i32 {
+        self.0.id() as i32
+    }
+
+    /// The exit status, if the broker has left. `None` while it has not.
+    ///
+    /// `try_wait` rather than `wait`, so the caller can bound the wait and
+    /// report a broker that never left as a failure instead of hanging.
+    fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
+        self.0.try_wait().expect("poll the broker")
+    }
+}
+
 impl Drop for Broker {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -221,6 +240,32 @@ struct Origin {
     handshook: Arc<Mutex<usize>>,
 }
 
+/// What an origin does once a request arrives.
+///
+/// An enum rather than a growing set of booleans on `spawn`, because the three
+/// shapes below are genuinely different fixtures and a caller naming one reads
+/// better than a caller decoding three booleans into one.
+#[derive(Debug, Clone, Copy)]
+enum OriginMode {
+    /// Answer `per_connection` requests, then close unless `holding`.
+    Serve {
+        per_connection: usize,
+        holding: bool,
+    },
+    /// Answer one request with a head that promises **more than it sends**, then
+    /// hold the connection open forever.
+    ///
+    /// **This is the only shape in which the relay — rather than the origin —
+    /// is the thing holding the tunnel open.** Every other fixture ends with
+    /// the relay already finished: the origin may still be holding its socket,
+    /// but the broker has returned from `relay_substituted` and the tunnel is
+    /// over as far as the product is concerned. A cancellation can only be
+    /// observed on a relay that is still pumping, so this one exists to put it
+    /// there: the client is left mid-response, blocked for bytes that never
+    /// come, and the broker is blocked copying a direction that never ends.
+    Stall,
+}
+
 impl Origin {
     /// An origin that answers `per_connection` requests on one connection
     /// before closing it.
@@ -230,7 +275,13 @@ impl Origin {
     /// shape the *protocol* allows, and it is a different question — see
     /// `a_tunnel_serves_one_request_and_the_protocol_allows_more`.
     fn start_serving(per_connection: usize) -> Self {
-        Self::spawn(per_connection, false, Some)
+        Self::spawn(
+            OriginMode::Serve {
+                per_connection,
+                holding: false,
+            },
+            Some,
+        )
     }
 
     /// An origin that answers one request and then *keeps the connection open*.
@@ -247,7 +298,13 @@ impl Origin {
     /// no for a reason that has nothing to do with the tunnel — which is how a
     /// lifecycle test ends up asserting a timer.
     fn start_holding() -> Self {
-        Self::spawn(1, true, Some)
+        Self::spawn(
+            OriginMode::Serve {
+                per_connection: 1,
+                holding: true,
+            },
+            Some,
+        )
     }
 
     /// An origin that speaks TLS with a certificate the operator minted.
@@ -276,14 +333,28 @@ impl Origin {
         .expect("leaf material");
         let config = Arc::new(material.server_config().expect("server config"));
 
-        Self::spawn(1, false, move |stream| {
-            let connection = rustls::ServerConnection::new(Arc::clone(&config)).ok()?;
-            let mut tls = rustls::StreamOwned::new(connection, stream);
-            if tls.conn.complete_io(&mut tls.sock).is_err() {
-                return None;
-            }
-            Some(tls)
-        })
+        Self::spawn(
+            OriginMode::Serve {
+                per_connection: 1,
+                holding: false,
+            },
+            move |stream| {
+                let connection = rustls::ServerConnection::new(Arc::clone(&config)).ok()?;
+                let mut tls = rustls::StreamOwned::new(connection, stream);
+                if tls.conn.complete_io(&mut tls.sock).is_err() {
+                    return None;
+                }
+                Some(tls)
+            },
+        )
+    }
+
+    /// An origin that leaves its client mid-response and never finishes.
+    ///
+    /// See [`OriginMode::Stall`]: the point is not the stall, it is that the
+    /// relay is still pumping when a signal arrives.
+    fn start_stalling() -> Self {
+        Self::spawn(OriginMode::Stall, Some)
     }
 
     /// Completed TLS handshakes. Meaningful only on a TLS origin.
@@ -291,7 +362,7 @@ impl Origin {
         *self.handshook.lock().expect("handshake counter")
     }
 
-    fn spawn<S, W>(per_connection: usize, holding: bool, wrap: W) -> Self
+    fn spawn<S, W>(mode: OriginMode, wrap: W) -> Self
     where
         S: OriginStream + Send + 'static,
         W: Fn(TcpStream) -> Option<S> + Send + Sync + 'static,
@@ -326,7 +397,13 @@ impl Origin {
                 let counter = Arc::clone(&counter);
                 std::thread::spawn(move || {
                     *counter.lock().expect("open counter") += 1;
-                    serve_connection(&mut wrapped, &sink, per_connection, holding);
+                    match mode {
+                        OriginMode::Serve {
+                            per_connection,
+                            holding,
+                        } => serve_connection(&mut wrapped, &sink, per_connection, holding),
+                        OriginMode::Stall => stall_connection(&mut wrapped, &sink),
+                    }
                     // The decrement is on the way out of every path, and there
                     // is no `return` in `serve_connection` to skip it. A counter
                     // that can be skipped is one the lifecycle test reads as
@@ -428,6 +505,49 @@ impl Origin {
         }
         false
     }
+}
+
+/// Serves one connection by promising more response than it sends, then holds
+/// it open forever.
+///
+/// The promise is the whole mechanism. A head with `Content-Length: 64` and two
+/// bytes behind it leaves the client waiting for 62 that never arrive, and
+/// leaves the broker copying a response direction that never ends — which is
+/// the only state in which a cancellation has something to cancel. A fixture
+/// that sent a well-formed short response instead would let the relay finish,
+/// and a signal sent afterwards would be measuring an idle broker.
+///
+/// The connection is never closed by this thread. It ends when the other end
+/// does, which for a cancellation is the point at which the test is asserting
+/// something.
+fn stall_connection<S: OriginStream>(stream: &mut S, sink: &Arc<Mutex<Vec<String>>>) {
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 2048];
+    while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => raw.extend_from_slice(&chunk[..n]),
+        }
+    }
+    if raw.is_empty() {
+        return;
+    }
+    sink.lock()
+        .expect("origin sink")
+        .push(String::from_utf8_lossy(&raw).into_owned());
+    if stream
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\nok")
+        .is_err()
+    {
+        return;
+    }
+    let _ = stream.flush();
+    // No deadline, same as the holding origin: from here the connection ends
+    // when the tunnel ends, and a read timeout would end the measurement with a
+    // timer instead of with the thing under measurement.
+    stream.set_origin_timeout(None);
+    let mut buf = [0u8; 256];
+    while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
 }
 
 /// Serves one connection, and returns when that connection is over.
@@ -575,7 +695,23 @@ struct Fixture {
     /// can verify, and an assertion that reaches for it over a flag that does
     /// not exist verifies nothing at all.
     audit: PathBuf,
+    /// Named with a leading underscore because nothing else in this file
+    /// *starts* the broker; they only stop it, through `Drop`. The shutdown
+    /// measurement has to signal and then observe it leaving, so the handle is
+    /// reachable and the field says so.
     _broker: Broker,
+}
+
+impl Fixture {
+    /// The running broker's pid.
+    fn broker_pid(&self) -> i32 {
+        self._broker.pid()
+    }
+
+    /// The broker's exit status, or `None` while it is still running.
+    fn try_wait_broker(&mut self) -> Option<std::process::ExitStatus> {
+        self._broker.try_wait()
+    }
 }
 
 impl Fixture {
@@ -633,6 +769,14 @@ impl Fixture {
 
     fn with_origin(tag: &str, origin: Origin) -> Self {
         Self::build(tag, origin, "cleartext", None)
+    }
+
+    /// A fixture whose origin never finishes answering.
+    ///
+    /// The only fixture whose tunnel is still being *relayed* when the test
+    /// signals it, which is what makes a cancellation observable at all.
+    fn new_stalling(tag: &str) -> Self {
+        Self::with_origin(tag, Origin::start_stalling())
     }
 
     /// A fixture whose route declares `upstream` and whose broker is handed
@@ -2052,4 +2196,126 @@ fn a_broker_given_no_destination_anchors_reaches_no_tls_destination() {
         "a destination whose certificate could not be verified received the credential: {}",
         unanchored.origin.saw()
     );
+}
+
+/// **An operator's SIGTERM ends tunnels the way this product ends them.**
+///
+/// `ShutdownSignal::stop` is how a tunnel is meant to be torn down deliberately:
+/// the accept loop stops accepting, and every tunnel in flight is cancelled
+/// through the bridge's poll, recorded in the durable chain as
+/// `cancelled`/`shutdown`. It had **no caller outside tests** — the sibling
+/// defect `revoke` turned out to have one increment earlier, found again in the
+/// method next to it. An operator's signal therefore did what the kernel does
+/// to every process: it killed the broker, and the tunnels died as a side
+/// effect of their file descriptors closing.
+///
+/// The difference is not tidiness and it is observable. A kernel teardown
+/// leaves **no recorded reason** — an operator reading the chain sees a
+/// connection that simply stopped. This test asserts the reason is there.
+///
+/// What it cannot show is a *drain*: the process leaves at the end of a bounded
+/// window whether or not every tunnel finished inside it, and the log says when
+/// the window elapsed. A true drain would need an in-flight gauge the product
+/// does not have, and inventing one to make a test pass would be the larger
+/// change.
+#[test]
+fn a_terminated_broker_ends_its_tunnels_by_shutdown_and_says_so() {
+    let mut f = Fixture::new_stalling("ordered-shutdown");
+    let variable = f.surrogate_env_name();
+    let release_path = f.dir.join("held.release");
+    // A single URL against an origin that promises 64 bytes and sends 2: curl
+    // is left waiting for a body that never completes, and the broker is left
+    // copying a response direction that never ends. That is the only state in
+    // which "an ordered shutdown ended this tunnel" is a statement about a
+    // relay rather than about a fixture.
+    let script = format!(
+        "curl -sS -k --max-time 60 -o /dev/null \
+           -H \"Authorization: Bearer ${{{variable}}}\" \
+           https://{FIXTURE_HOST}:{port}/resource; \
+         while [ ! -f {release} ]; do sleep 0.2; done",
+        port = f.origin.port,
+        release = release_path.display()
+    );
+
+    // `Session` rather than a bare `Child`: its `Drop` releases the script and
+    // reaps the process, and a test that signals a broker and then leaves a
+    // client behind is a slower test for whoever runs it next.
+    let session = Session {
+        child: Some(
+            Command::new(cargo_bin("asv"))
+                .arg("--socket")
+                .arg(&f.sock)
+                .arg("run")
+                .arg("sh")
+                .arg("-c")
+                .arg(&script)
+                .env("NO_PROXY", "should-be-removed")
+                .env("no_proxy", "should-be-removed")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("run the session under shutdown"),
+        ),
+        release: release_path.clone(),
+    };
+
+    // The destination is asked, not the client: a client inside its own tunnel
+    // cannot tell a live tunnel from a socket it is holding open by itself.
+    assert!(
+        f.origin.wait_for_open(1, Duration::from_secs(90)),
+        "the tunnel was never established, so a signal now would land on a broker \
+         with nothing to end; the destination holds {} connections",
+        f.origin.open_connections()
+    );
+    assert!(
+        f.origin.wait_for_requests(1),
+        "the destination never received a request, so the credential never crossed \
+         this leg and there is nothing here for a shutdown to have protected"
+    );
+
+    // The signal, and the wait for the process to leave on its own.
+    let pid = f.broker_pid();
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match f.try_wait_broker() {
+            Some(status) => {
+                assert_eq!(
+                    status.code(),
+                    Some(0),
+                    "a broker asked to stop left with {:?} rather than a clean exit; \
+                     a process killed by SIGTERM reports 128+15 and no code, and this \
+                     one is supposed to choose its own ending",
+                    status.code()
+                );
+                break;
+            }
+            None if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            None => panic!("the broker did not leave within 30s of SIGTERM"),
+        }
+    }
+
+    // The witness: the chain says *why* the tunnel ended, and it says the
+    // reason the operator caused. Both halves are required, and the spellings
+    // are the ones `ChainReport::record` writes — an outcome of `cancelled`
+    // with a `detail` of `shutdown`. Asserting on the pair rather than on
+    // either word alone is what keeps a test that passes for the wrong reason
+    // from looking like one that passes.
+    let chain = std::fs::read_to_string(&f.audit).expect("read the durable audit chain");
+    assert!(
+        chain.contains(r#""outcome":"cancelled""#) && chain.contains(r#""detail":"shutdown""#),
+        "no tunnel in the chain was recorded as cancelled by shutdown, so this \
+         broker's tunnels ended the way they always did — with the kernel closing \
+         the sockets and the chain saying nothing about it:\n{chain}"
+    );
+    assert!(
+        !chain.contains(REAL),
+        "the real credential reached the audit chain:\n{chain}"
+    );
+
+    drop(session);
 }
