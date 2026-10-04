@@ -241,6 +241,24 @@ impl PinnedClient {
         policy: AddressPolicy,
         extra_roots: &[reqwest::Certificate],
     ) -> Result<Self, TransportError> {
+        Self::build_timed(resolved, policy, extra_roots, None)
+    }
+
+    /// Builds a client with an explicit total timeout on each request.
+    ///
+    /// A client with no timeout is not "fast", it is *unbounded*: an origin
+    /// that accepts the connection and then says nothing holds the calling
+    /// thread until something else kills it. For a caller that has to answer
+    /// "may this operation proceed", that is the worst failure available,
+    /// because it is indistinguishable from a provider that is merely slow.
+    /// Passing `None` restores the unbounded behaviour for the callers that
+    /// already have a deadline of their own.
+    pub fn build_timed(
+        resolved: &ResolvedAudience,
+        policy: AddressPolicy,
+        extra_roots: &[reqwest::Certificate],
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Self, TransportError> {
         if resolved.port == 0 {
             return Err(TransportError::UnroutableAudience(
                 resolved.authority.to_string(),
@@ -266,6 +284,9 @@ impl PinnedClient {
             // accepting verifier, because the two settings are stated here.
             .danger_accept_invalid_certs(false)
             .danger_accept_invalid_hostnames(false);
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
+        }
         for root in extra_roots {
             builder = builder.add_root_certificate(root.clone());
         }
