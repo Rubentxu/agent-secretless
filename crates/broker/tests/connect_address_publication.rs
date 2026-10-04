@@ -43,30 +43,11 @@ impl Drop for Broker {
     }
 }
 
+/// Locates a workspace binary through the one locator, which also refuses one
+/// older than the sources of the package that produces it.
 fn cargo_bin(name: &str) -> PathBuf {
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(deps) = exe.parent() {
-            if let Some(profile_dir) = deps.parent() {
-                candidates.push(profile_dir.join(name));
-            }
-        }
-    }
-    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
-        candidates.push(PathBuf::from(dir).join(profile).join(name));
-    }
-    candidates.push(PathBuf::from("target").join(profile).join(name));
-    candidates
-        .into_iter()
-        .find(|p| p.exists())
-        .unwrap_or_else(|| panic!("could not locate the {name} binary"))
+    asv_broker::binary::locate(name)
 }
-
 /// Ask the broker to describe itself, over its real socket.
 fn agent_info(sock: &std::path::Path) -> serde_json::Value {
     let mut stream = UnixStream::connect(sock).expect("connect to broker");

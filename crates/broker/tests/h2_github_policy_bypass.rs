@@ -85,15 +85,11 @@ impl Drop for BrokerGuard {
     }
 }
 
+/// Locates a workspace binary through the one locator, which also refuses one
+/// older than the sources of the package that produces it.
 fn cargo_bin(name: &str) -> PathBuf {
-    let mut dir = std::env::current_exe().expect("test binary path");
-    dir.pop();
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    dir.join(name)
+    asv_broker::binary::locate(name)
 }
-
 fn roundtrip(sock: &std::path::Path, request: &Request) -> Response {
     let mut stream = UnixStream::connect(sock).expect("connect to broker");
     let payload = serde_json::to_vec(request).expect("serialize");

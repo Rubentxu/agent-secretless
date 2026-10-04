@@ -24,6 +24,14 @@ use std::sync::{Arc, Mutex};
 
 pub mod admission;
 pub mod audit;
+/// Where an integration test finds a binary, and why it may refuse one.
+///
+/// Feature-gated for the same reason as `oauth2_test_support` and for a
+/// different reason: a locator that can *fail a test* has no business in a
+/// production broker, and a production broker that could locate and check
+/// binaries would be a thing worth being suspicious of.
+#[cfg(any(test, feature = "test-support"))]
+pub mod binary;
 pub mod connect_listener;
 pub mod connect_routes;
 pub mod connect_runtime;

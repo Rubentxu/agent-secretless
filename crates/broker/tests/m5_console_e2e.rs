@@ -50,17 +50,11 @@ impl Drop for BrokerGuard {
     }
 }
 
+/// Locates a workspace binary through the one locator, which also refuses one
+/// older than the sources of the package that produces it.
 fn cargo_bin(name: &str) -> PathBuf {
-    // Same resolution the other integration tests use: the binary this
-    // workspace just built, not whatever is on PATH.
-    let mut dir = std::env::current_exe().expect("test binary path");
-    dir.pop();
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    dir.join(name)
+    asv_broker::binary::locate(name)
 }
-
 fn unique_socket(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("asv-m5e2e-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");

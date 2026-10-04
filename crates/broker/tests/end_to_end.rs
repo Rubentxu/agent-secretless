@@ -23,62 +23,11 @@ impl Drop for BrokerGuard {
     }
 }
 
-/// Locates a workspace binary.
-///
-/// Cargo only sets `CARGO_BIN_EXE_*` for binaries of the crate under test, so
-/// the broker test cannot rely on it for the `asv` CLI. It also does not expose
-/// `CARGO_TARGET_DIR` when the target dir comes from cargo's global config
-/// rather than the environment, so probing the env alone silently misses it.
-///
-/// The reliable anchor is this test binary's own path: it always lives in
-/// `<target>/<profile>/deps/`, so the profile directory two levels up holds
-/// every workspace binary that was built.
+/// Locates a workspace binary through the one locator, which also refuses one
+/// older than the sources of the package that produces it.
 fn cargo_bin(name: &str) -> PathBuf {
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-
-    let mut candidates: Vec<PathBuf> = Vec::new();
-
-    if let Ok(exe) = std::env::current_exe() {
-        // .../<target>/<profile>/deps/<test-bin>
-        if let Some(deps) = exe.parent() {
-            if let Some(profile_dir) = deps.parent() {
-                candidates.push(profile_dir.join(name));
-            }
-        }
-    }
-
-    // Fallbacks for environments where current_exe is redirected.
-    if let Ok(dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        let mut root = PathBuf::from(&dir);
-        while !root.join("crates").is_dir() && root.parent().is_some() {
-            root = root.parent().unwrap().to_path_buf();
-        }
-        candidates.push(root.join("target").join(profile).join(name));
-    }
-    if let Ok(target) = std::env::var("CARGO_TARGET_DIR") {
-        candidates.push(PathBuf::from(target).join(profile).join(name));
-    }
-    candidates.push(PathBuf::from("target").join(profile).join(name));
-
-    for c in &candidates {
-        if c.is_file() {
-            return c.clone();
-        }
-    }
-    panic!(
-        "cannot find binary `{name}`; looked in: {}",
-        candidates
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    asv_broker::binary::locate(name)
 }
-
 fn unique_socket(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("asv-it-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");

@@ -24,34 +24,11 @@ use std::process::{Command, Stdio};
 use asv_vault::{KdfParams, VaultStore};
 use secrecy::SecretString;
 
+/// Locates a workspace binary through the one locator, which also refuses one
+/// older than the sources of the package that produces it.
 fn cargo_bin(name: &str) -> PathBuf {
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(deps) = exe.parent() {
-            if let Some(profile_dir) = deps.parent() {
-                let candidate = profile_dir.join(name);
-                if candidate.is_file() {
-                    return candidate;
-                }
-            }
-        }
-    }
-    if let Ok(target) = std::env::var("CARGO_TARGET_DIR") {
-        let candidate = PathBuf::from(target).join(profile).join(name);
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    if let Ok(target) = std::env::var("CARGO_TARGET_DIR") {
-        return PathBuf::from(target).join(profile).join(name);
-    }
-    PathBuf::from("target").join(profile).join(name)
+    asv_broker::binary::locate(name)
 }
-
 fn unique_socket(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("asv-vault-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");

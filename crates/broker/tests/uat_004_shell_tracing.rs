@@ -88,49 +88,11 @@ impl Drop for BrokerGuard {
     }
 }
 
+/// Locates a workspace binary through the one locator, which also refuses one
+/// older than the sources of the package that produces it.
 fn cargo_bin(name: &str) -> PathBuf {
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    let mut candidates: Vec<PathBuf> = Vec::new();
-
-    if let Ok(exe) = std::env::current_exe() {
-        // .../<target>/<profile>/deps/<test-bin>
-        if let Some(deps) = exe.parent() {
-            if let Some(profile_dir) = deps.parent() {
-                candidates.push(profile_dir.join(name));
-            }
-        }
-    }
-    if let Ok(dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        let mut root = PathBuf::from(&dir);
-        while !root.join("crates").is_dir() && root.parent().is_some() {
-            root = root.parent().unwrap().to_path_buf();
-        }
-        candidates.push(root.join("target").join(profile).join(name));
-    }
-    if let Ok(target) = std::env::var("CARGO_TARGET_DIR") {
-        candidates.push(PathBuf::from(target).join(profile).join(name));
-    }
-    candidates.push(PathBuf::from("target").join(profile).join(name));
-
-    for c in &candidates {
-        if c.is_file() {
-            return c.clone();
-        }
-    }
-    panic!(
-        "cannot find binary `{name}`; looked in: {}",
-        candidates
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    asv_broker::binary::locate(name)
 }
-
 fn roundtrip(sock: &std::path::Path, request: &Request) -> Response {
     let mut stream = UnixStream::connect(sock).expect("connect to broker");
     let payload = serde_json::to_vec(request).expect("serialize");

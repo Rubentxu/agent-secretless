@@ -58,34 +58,11 @@ use secrecy::SecretString;
 /// Must not appear anywhere the planting process can be observed from.
 const CANARY: &str = "ASV-CANARY-ingest-boundary-7c1f-DO-NOT-LEAK";
 
+/// Locates a workspace binary through the one locator, which also refuses one
+/// older than the sources of the package that produces it.
 fn cargo_bin(name: &str) -> PathBuf {
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(deps) = exe.parent() {
-            if let Some(profile_dir) = deps.parent() {
-                candidates.push(profile_dir.join(name));
-            }
-        }
-    }
-    candidates.push(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
-            .join(profile)
-            .join(name),
-    );
-    for c in &candidates {
-        if c.is_file() {
-            return c.clone();
-        }
-    }
-    panic!("cannot find binary `{name}`; looked in {candidates:?}");
+    asv_broker::binary::locate(name)
 }
-
 struct Broker(Child);
 
 impl Drop for Broker {

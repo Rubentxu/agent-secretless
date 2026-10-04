@@ -34,28 +34,11 @@ use secrecy::SecretString;
 /// a log or an error would be caught rather than read past.
 const CANARY: &str = "ASV-CANARY-delete-e2e-91ac-DO-NOT-LEAK";
 
+/// Locates a workspace binary through the one locator, which also refuses one
+/// older than the sources of the package that produces it.
 fn cargo_bin(name: &str) -> PathBuf {
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(deps) = exe.parent() {
-            if let Some(profile_dir) = deps.parent() {
-                let candidate = profile_dir.join(name);
-                if candidate.is_file() {
-                    return candidate;
-                }
-            }
-        }
-    }
-    if let Ok(target) = std::env::var("CARGO_TARGET_DIR") {
-        return PathBuf::from(target).join(profile).join(name);
-    }
-    PathBuf::from("target").join(profile).join(name)
+    asv_broker::binary::locate(name)
 }
-
 /// A broker process the test owns. `Drop` kills it, so a failing assertion
 /// cannot leave a daemon holding a socket for the rest of the suite.
 struct Broker(Child);
