@@ -16,7 +16,7 @@ agent ──(surrogate / socket)──▶ broker ──(real credential)──�
 
 > **Status: pre-1.0, at v0.29.0. Not certified, and the gates say so.**
 >
-> The workspace compiles and **1077 tests are enumerated** (1077 pass, 0 ignored,
+> The workspace compiles and **1094 tests are enumerated** (1094 pass, 0 ignored,
 > 0 fail; the count is re-derived every CI run by the `R11 README test count`
 > gate, so this line cannot go stale again). Vault, SSH signing, the HTTP and
 > PostgreSQL brokers, Cedar policy, the operator console and the CONNECT TLS
@@ -99,15 +99,24 @@ type system:
 Stated plainly, because a security project that oversells itself is worthless.
 Each item says where its detail lives, because none of it is a guess.
 
-- **A dedicated broker uid is not used, so the claim about memory is the
-  narrower one.** The broker runs as you, which means a process running as you
-  can read its memory. What the tests now prove is the kernel-level fact
-  underneath: a process under the same uid **lacking `CAP_SYS_PTRACE`** is
-  refused by the kernel when it opens `/proc/<broker>/mem`, and the identical
-  attack against a *dumpable* sibling of the same uid succeeds — so the
-  refusal is attributable to the hardening rather than to the open having
-  failed for some unrelated reason. A separate uid (M7) is what makes the
-  denial unconditional, and it needs a system account, so it is not shipped.
+- **The claim about memory is still the narrower one, and that is now a
+  checked fact rather than a footnote.** The broker runs as you by default,
+  which means a process running as you can read its memory. What the tests
+  prove is the kernel-level fact underneath: a process under the same uid
+  **lacking `CAP_SYS_PTRACE`** is refused by the kernel when it opens
+  `/proc/<broker>/mem`, and the identical attack against a *dumpable* sibling
+  of the same uid succeeds — so the refusal is attributable to the hardening
+  rather than to the open having failed for some unrelated reason. A separate
+  uid is what makes the denial unconditional, and **the broker can now be made
+  to insist on one**: `--identity-uid` declares the uid the installation
+  expects and the binary refuses to start as any other, before it binds its
+  socket or reads the passphrase; `--require-dedicated-identity` makes the
+  *absence* of a declaration fatal too, so a packaged install cannot quietly
+  degrade into the development shape. `packaging/asv-brokerd.dedicated.service`
+  is the unit that declares one. **What is still host-dependent is creating the
+  system account and proving the unit on a machine that has one** — this host
+  has no `sudo`, and nothing in the repository can assert what `getent
+  passwd` answers on yours.
 - **The same-uid attack is now executed, not documented.** UAT-003's strongest
   clause was `#[ignore]`d for several milestones — its reason named the fix,
   *"requires a child process to attempt the open"*, and the fix was never
@@ -146,7 +155,7 @@ Each item says where its detail lives, because none of it is a guess.
 cargo build --release -p asv-broker
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# expected: passed=1077 failed=0 ignored=0
+# expected: passed=1094 failed=0 ignored=0
 ```
 
 That number was `passed=692` in this file for several milestones, and nothing

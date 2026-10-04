@@ -16,7 +16,7 @@ agente ──(sustituto / socket)──▶ broker ──(credencial real)──�
 
 > **Estado: pre-1.0, en v0.29.0. Sin certificar, y los gates lo dicen.**
 >
-> El workspace compila y hay **1077 tests enumerados** (1077 pasan, 0 ignorado, 0
+> El workspace compila y hay **1094 tests enumerados** (1094 pasan, 0 ignorado, 0
 > fallan; el conteo lo vuelve a derivar el gate `R11 README test count` en cada
 > corrida de CI, así que esta línea ya no puede quedarse vieja). El vault, la
 > firma SSH, los brokers HTTP y PostgreSQL, la política Cedar, la consola de
@@ -106,16 +106,24 @@ Dicho sin adornos, porque un proyecto de seguridad que se sobrevende a sí
 mismo no vale nada. Cada punto dice dónde vive su detalle, porque nada de eso
 es una suposición:
 
-- **No se usa un uid dedicado para el broker, así que la afirmación sobre
-  memoria es la más estrecha.** El broker corre como tú, luego un proceso que
-  corre como tú puede leerle la memoria. Lo que los tests demuestran ahora es
-  el hecho de kernel que hay debajo: un proceso con el mismo uid **sin
-  `CAP_SYS_PTRACE`** es rechazado por el kernel al abrir
+- **La afirmación sobre memoria sigue siendo la más estrecha, y eso ya es un
+  hecho comprobado y no una nota al pie.** Por defecto el broker corre como
+  tú, luego un proceso que corre como tú puede leerle la memoria. Lo que los
+  tests demuestran es el hecho de kernel que hay debajo: un proceso con el
+  mismo uid **sin `CAP_SYS_PTRACE`** es rechazado por el kernel al abrir
   `/proc/<broker>/mem`, y el ataque idéntico contra un *hermano* volcable con
   el mismo uid tiene éxito — así que el rechazo es atribuible al
   endurecimiento y no a que la apertura fallara por otra razón. Un uid aparte
-  (M7) es lo que hace la negación incondicional, y necesita una cuenta del
-  sistema, así que no se entrega.
+  es lo que hace la negación incondicional, y **ahora el broker puede exigir
+  uno**: `--identity-uid` declara el uid que la instalación espera y el binario
+  se niega a arrancar con cualquier otro, antes de enlazar su socket o de leer
+  la frase de acceso; `--require-dedicated-identity` hace que la *ausencia* de
+  una declaración también sea fatal, así que una instalación empaquetada no
+  puede degradarse en silencio a la forma de desarrollo.
+  `packaging/asv-brokerd.dedicated.service` es la unidad que declara uno. **Lo
+  que sigue dependiendo del host es crear la cuenta del sistema y probar la
+  unidad en una máquina que tenga una**: este host no tiene `sudo`, y nada en
+  el repositorio puede afirmar qué responde `getent passwd` en el tuyo.
 - **El ataque del mismo uid se ejecuta ahora, no se documenta.** La cláusula
   más fuerte de UAT-003 estuvo marcada `#[ignore]` durante varios milestones:
   su motivo nombraba el arreglo, *"requiere un proceso hijo que intente la
@@ -157,7 +165,7 @@ es una suposición:
 cargo build --release -p asv-broker
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# esperado: passed=1077 failed=0 ignored=0
+# esperado: passed=1094 failed=0 ignored=0
 ```
 
 Ese número era `passed=692` en este fichero durante varios milestones, y nada

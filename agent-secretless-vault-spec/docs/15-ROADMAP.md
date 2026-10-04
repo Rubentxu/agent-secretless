@@ -412,6 +412,95 @@ the neighbouring test had set the flag back. A test whose outcome depends on
 another test is not a test of the property. The scenario now runs entirely
 inside a forked child that owns its own state.
 
+### C1-R — the dedicated uid, from footnote to a checked fact
+
+The first item in M7's own scope was *dedicated broker UID production
+packaging*, and it stayed undelivered. The gate row said so in prose, which is
+the weakest possible place for a security claim: nobody reads a footnote, and
+nothing failed when it was ignored.
+
+**What the code actually said, read rather than quoted.** The socket is `0600`
+in a `0700` directory, the process is undumpable, Landlock and seccomp are
+installed — and **all of it lives inside the invoking user's own boundary**. So
+any other program that user runs is in the same uid, is outside the reach of
+`PR_SET_DUMPABLE` as far as this broker's `/proc/<pid>/mem` is concerned, and
+can open the socket, the vault and the audit log. UAT-003 proves the broker is
+unreadable by a process *lacking* `CAP_SYS_PTRACE`; a dedicated uid is what
+turns that into "unreadable by anything that is not root". The distance between
+those two sentences was the whole residual.
+
+**It is now enforced rather than described.** `crates/broker/src/identity.rs`
+decides the posture in one function, and the launch contract feeds it two
+numbers: `--identity-uid` declares the uid the installation expects, and
+`--require-dedicated-identity` can demand the guarantee. The decision is a
+comparison, not an inference. The tempting version of this module asks whether
+the uid *looks like* a service account — below 1000, no login shell, absent
+from the invoking user's session — and every one of those is a heuristic that
+agrees with the truth on the machine that wrote it and disagrees everywhere
+else with nothing failing. So the installation **declares** and the process
+**measures**, and the answer is whether they are the same number.
+
+**Two failures, with two different severities, which is the whole design.**
+
+- A declaration that is **not honoured is always fatal**. An operator who
+  declared `998` and got their own account believes they installed a service;
+  the credential is in the wrong domain and nothing about the process says so.
+  This is the "looks healthy while verifying nothing" shape, in a new place.
+- The **absence** of a declaration is not a fault. A developer on their own
+  machine has no dedicated uid, and a module that refused them would be refused
+  by the next person to run the tests. That asymmetry is why the guarantee is a
+  *flag* rather than a default: `--require-dedicated-identity` is what turns the
+  development posture into a refusal, which is exactly what stops a packaged
+  install from degrading into it quietly and reporting success.
+
+A third case sits alongside: the socket **path** is derived from `getuid()`,
+the real uid, while the socket's `0600` ownership is the **effective** uid.
+Under a setuid bit those disagree and the derivation is wrong in a way nothing
+else in the broker would notice, so both are read and a setuid broker is
+refused under the same demand that refuses a missing declaration. It is not a
+posture anyone asked for.
+
+**Falsified 5 of 5** by `tests/identity_falsification.py`, and against the
+**real binary** rather than the function — the decision being correct and
+`main` not calling it are different failures, and this repository has found
+that defect twice already on this very surface, in `ShutdownSignal::stop` and
+`ShutdownSignal::revoke`.
+
+**The campaign's fourth row found that the ordering witness was the weaker of
+the two, and that is the finding.** Moving the check to just after
+`VaultStore::open` still refuses, still exits non-zero and still names its
+declared and actual uid: every message assertion passes. What it does not do is
+refuse *first*, because `main` binds the socket at line 555 and opens the vault
+at 627, so the broker has been listening the whole time — and a client dialling
+that socket in the window gets a process that is about to die holding its
+credential, while an operator reading the log sees a refusal that looks as
+though it happened first. So `a_refused_broker_leaves_no_socket_and_no
+_listener` asserts the filesystem rather than the prose.
+
+The companion correction is a sentence in the test fixture. Its timeout said
+*"neither started nor exited"*, which is what a reader takes away and is wrong:
+what happens when the gate is absent is the more alarming thing, the broker
+starts, opens the vault and **keeps serving**. It now says so by name, because
+reporting an escape behind a word that reads like infrastructure is how an
+escape survives a campaign.
+
+**Packaging.** `packaging/asv-brokerd.dedicated.service` is the system unit that
+declares an identity, with `StateDirectory` and `RuntimeDirectory` at 0700 so
+systemd owns the vault and the socket without the installer `chown`ing anything.
+`DynamicUser` is **declined, with the reason written down**: a dynamically
+allocated uid is chosen at activation, so there is nothing an operator can put
+in `--identity-uid` beforehand and the check would be unreachable in the one
+configuration where it would be most convenient. A deployment that wants no
+account can still get most of the property by dropping `--identity-uid` and
+keeping `--require-dedicated-identity`, which proves nobody claimed a wrong
+identity rather than that a right one was claimed.
+
+**What this block does not close.** Creating the system account, and proving
+the unit on a host that has one. This machine has no `sudo`, and nothing in the
+repository can assert what `getent passwd` answers on a host that is not this
+one. The posture is now enforceable; it is not yet exercised on a real service
+account, and the gate row says that rather than rounding it up.
+
 ### The defect this found next to it
 
 Writing that proof turned up a real defect in the hardened path, in the code
