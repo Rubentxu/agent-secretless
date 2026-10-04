@@ -43,6 +43,12 @@ pipeline {
             // fetch.
             sh("if [ ! -d ../agent-skill/skills/agent-secretless ]; then git clone --depth 1 https://github.com/Rubentxu/agent-skill.git ../agent-skill; fi")
             sh("python3 tests/skill_contract.py")
+            // R0's own exit gate. It re-derives all four of R0's conditions
+            // from the repository rather than reading a status cell, and it
+            // runs the provenance campaign, so it costs about a minute and
+            // buys the statement "R0 is closed" backed by the same evidence
+            // that closed it.
+            sh("python3 tests/r0_gate.py")
             // `dist plan` is the exact same code path the release CI would
             // run, minus the compilation. It resolves the tag, the targets
             // and the artifact list from the real configuration, so a

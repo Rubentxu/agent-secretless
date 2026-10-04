@@ -8,6 +8,22 @@
 - release artifacts signed where supported,
 - no debug/development feature that enables secret dumping in production build.
 
+> **`R0` here is a release gate. `R0` in `15-ROADMAP.md` is a work block**, and
+> they are not the same thing. The build-and-provenance checklist above is the
+> long-standing gate; the rebaselined work block that *truthfulness,
+> distribution and skill* describes has its own exit gate, and that one is
+> measured rather than ticked: `tests/r0_gate.py` re-derives its four
+> conditions from the repository and reports `PASS`, `FAIL` or `UNAVAILABLE`,
+> where only the first is success. It runs in the release preflight, and it
+> answers a question this document's table cannot: not "is the build
+> reproducible" but "can a user verify what they installed, and is there an
+> official way in".
+>
+> The `UNAVAILABLE` state exists because a gate that passes by not running is
+> not a gate. The skill contract needs a checkout of `Rubentxu/agent-skill`, and
+> a machine without the network reports that honestly rather than dropping the
+> requirement.
+
 ## R1 — Secret API invariant
 
 Static/API review confirms no agent-accessible path equivalent to:
