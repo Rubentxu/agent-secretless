@@ -297,7 +297,7 @@ to signing or proxying, because that is how "secretless" quietly becomes a lie.
 
 ## Specification
 
-`agent-secretless-vault-spec/` holds the full pack: 20 documents, 19 ADRs, and a
+`agent-secretless-vault-spec/` holds the full pack: 20 documents, 20 ADRs, and a
 `SHA256SUMS` manifest (verified intact). It is imported as research and is not
 edited in place except where a decision it records has since been made — each
 such edit carries its date and its reason.

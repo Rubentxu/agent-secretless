@@ -21,3 +21,4 @@
 | 0017 | How an operator's revocation actually takes effect | Accepted |
 | 0018 | A credential carries the kind the operator chose, beside the one it is stored as | Accepted |
 | 0019 | A CONNECT client proves its session by signing, because the kernel does not know it | Accepted |
+| 0020 | Adoption before hardware: TPM2 leaves the v1.0 critical path | Accepted |

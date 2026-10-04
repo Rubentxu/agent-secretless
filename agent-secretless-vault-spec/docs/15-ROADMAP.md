@@ -10,6 +10,87 @@ what order. Whether something is actually true today is asserted in
 `scripts/check-gate-status.py` and `tools/check-gates.py`. A milestone in this
 file is not a claim about the world; a row in that file is.
 
+## Critical path — rebaselined
+
+**This file remains the single planning authority.** The blocks below fix the
+*order*; the `## M…` sections further down remain the authority for each
+milestone's scope and exit UATs, and they are not replaced by this section.
+Anything this section contradicts is a sequencing claim and loses.
+
+The decision, and why, is [ADR-0020](../adrs/0020-adoption-before-hardware-tpm2-leaves-the-v1-critical-path.md):
+**v1.0 is optimized for daily secretless work and ease of adoption, not for the
+completion percentage of historical milestones.**
+
+```text
+R0  Truthfulness + distribution + skill
+ │
+R1  M10 production reachability          isolated exec, reachable from a product surface
+ │
+R2  M11 providers worth having           Git/GitHub, OAuth2, STS, Kubernetes
+ │
+R3  M14 credential workflow adapters     npm, Maven, Gradle, curl
+ │
+R4  M15 plan-bound authority             ActionIntent, plan digest, receipts
+ │
+R5  M13 certification of the useful product
+ │
+ └────────────── v1.0 ──────────────────► tag
+                  │
+                  ▼
+R6  M16 durable automation + PipelineK   durable orchestration authority
+ │
+R7  ecosystem expansion                   adapters and providers by real use
+ │
+R8  M12 TPM2 hardware, for real          deferred validation, not a prototype
+ │
+R9  M17 attestation / trusted execution  depends on real M12 evidence
+ │
+ └────────────── R10 M18 stabilization of the next line
+```
+
+| Block | What it is | Exit |
+|---|---|---|
+| **R0** | Make the current product installable and consumable with verified provenance, and give an agent an official way in. | Signature verification reachable from a clean install; negative provenance tests that fail rather than warn; the official skill published outside this repository and checked as FAIL when absent; this roadmap updated. |
+| **R1** | One productive path from a public operation to the existing isolated worker. | A test that starts at the product surface: `public operation → IPC → broker → isolated process`, and no second executor, shell runtime or sandbox. |
+| **R2** | Providers as complete verticals, not as trait count. | Per provider: a real provider, a real operation, a real secretless property, and negative adversarial tests — or it does not count. |
+| **R3** | The adapter pipeline: `discover → safe parse → plan → adopt → binding → project → execute → verify → scrub → receipt`. | npm, Maven, Gradle and curl each with at least one real vertical, and a new adapter addable without touching broker or domain. |
+| **R4** | Authority bound to an operation, not to a session. | `discover → ActionIntent → plan → authorize → execute → receipt` demonstrated on npm and on a second, different family. |
+| **R5** | Certification of the useful product. Feature breadth freezes here. | The release matrix run clean, a distribution E2E from a machine with no source tree, and the full gate run with `PASS`/`FAIL`/`SKIPPED`/`UNAVAILABLE_SUBSTRATE` kept distinct — a requirement that cannot run is not a pass. |
+| **R6** | PipelineK as durable orchestration authority; ASV as identity, credential and policy authority. | Removing `pipelinek-asv` leaves PipelineK core functionally equivalent, and removing PipelineK leaves ASV able to perform every atomic operation by hand. |
+| **R7** | Ecosystem growth by use, not by catalogue. | Every new integration states which of `STRONG_SECRETLESS`, `SHORT_LIVED_EXPOSURE`, `RAW_PROCESS_EXPOSURE` it lands in. |
+| **R8** | Real hardware-backed vault. | On a physical host: `enroll → seal → reboot → unlock`, and `change measured state → unlock → DENIED`, plus software↔device-bound migration. |
+| **R9** | Attestation as a verdict the domain consumes, never a vendor API. | Attested secret release working end to end on real TPM evidence. |
+| **R10** | Stabilize adapters + plan-bound authority + durable automation + optional hardware trust together. | The compatibility, migration, failure and partial-cutover matrix green, with a TPM-less install remaining a supported configuration. |
+
+### What moved, and what stayed
+
+- **TPM2 is not a v1.0 gate.** M12 is `prototype` with hardware validation
+  deferred to **R8**. `TpmDevice`, `SoftwareTpm`, their contracts, their fast
+  tests and their documentation are kept, so the capability costs nothing to
+  carry. The M12 section below is unchanged and remains its specification.
+- **M14 and M15 are advanced**, to R3 and R4: they are what a person or an
+  agent adopts.
+- **M16 is post-v1.0**, at R6. Durable orchestration belongs to PipelineK.
+- **M17 depends on real M12**, at R9. Attestation is a claim about what
+  executed, and `swtpm` is not evidence of what executed.
+- **M18 stabilizes the next line**, at R10.
+- v1.0's security baseline rests on what already exists and runs on any host:
+  encrypted vault, no-exportability, broker boundary, policy, dedicated
+  identity, seccomp, Landlock, cgroups, session isolation.
+
+**M12 returns to the critical path when a requirement says so** — a customer
+requirement, an enterprise compliance obligation, a vault that must be
+physically bound to a device, attested secret release, a remote broker on an
+untrusted host, Keylime/Trustee, or confidential computing. It does not return
+because the work is half done, and no schedule brings it back on its own.
+
+### On the `R` in `R0`–`R10`
+
+This is a different series from the `R…` rows in
+`16-SECURITY-RELEASE-GATES.md`, which are release gates. `R0`–`R10` here are
+work blocks; `R0`, `R10`, `R11`, `R12` there are gates. **A work block is not a
+gate and a gate is not a work block**, and neither is derived from the other.
+
 ## Status vocabulary
 
 Every capability named in this roadmap carries exactly one of these four
@@ -910,6 +991,16 @@ item 1; the other six are unstarted.
 
 ## M12 — TPM/hardware-backed vault
 
+> **Deferred to R8; not a v1.0 gate.** This section is unchanged and remains
+> M12's specification — the scope, the exit and the exit UAT below are exactly
+> what R8 has to satisfy. What changed is its position in the order, and why:
+> a guarantee that needs `/dev/tpmrm0` cannot gate a release built on hosts that
+> do not have one, and `swtpm` is a TPM 2.0 implementation rather than silicon.
+> The software half is further along than "not started" — a real client, pinned
+> command encodings and a measured, durable seal path — and that measurement is
+> the R8 starting point, not an argument for v1.0 waiting.
+> See [ADR-0020](../adrs/0020-adoption-before-hardware-tpm2-leaves-the-v1-critical-path.md).
+
 ### Scope
 
 - hardware-keystore port,
@@ -1043,6 +1134,15 @@ starting point for the remaining work.
 
 ## v1.0 — Certified product line
 
+> **Sequenced by the rebaseline above; scope below unchanged.** `V1-C0`–`V1-C5`
+> below is the historical path and is kept as the record of what was planned.
+> The path actually followed to v1.0 is `R0`–`R5` in *Critical path — rebaselined*
+> ([ADR-0020](../adrs/0020-adoption-before-hardware-tpm2-leaves-the-v1-critical-path.md)):
+> TPM2 is **not** among the v1.0 blocks and sits at R8, and M14/M15 enter at R3/R4
+> ahead of the M11 residual this list puts third. `V1-C4` is superseded in
+> sequence only — M12's scope, exit criteria and exit UATs below are untouched,
+> and M12 remains open.
+
 Minimum supported story:
 
 - KeePass-like local dashboard,
@@ -1079,7 +1179,7 @@ CURRENT: v0.29.0
 ├─ V1-C1  M7 residual: agent uid != broker uid
 ├─ V1-C2  M9 productionization residuals
 ├─ V1-C3  M11 against a real OAuth2 provider
-├─ V1-C4  M12 against real TPM hardware
+├─ V1-C4  M12 against real TPM hardware   ← superseded: R8, not a v1.0 block
 │
 ├─ V1-C5  M13 final certification
 │

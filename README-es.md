@@ -315,7 +315,7 @@ convierte silenciosamente en una mentira.
 
 ## Especificación
 
-`agent-secretless-vault-spec/` contiene el pack completo: 20 documentos, 19
+`agent-secretless-vault-spec/` contiene el pack completo: 20 documentos, 20
 ADRs y un manifiesto `SHA256SUMS` (verificado intacto). Se importa como
 investigación y no se edita in situ salvo donde una decisión que registra ya se
 ha tomado — cada una de esas ediciones lleva su fecha y su motivo.

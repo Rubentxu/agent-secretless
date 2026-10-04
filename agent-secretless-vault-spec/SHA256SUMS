@@ -14,7 +14,7 @@ ffe12ee1a50466dd30c7aadb40a81a6e76551e4cf591b445a4fe7897b05e96ab  ./adrs/0011-se
 d05647dbbf3f19b91968fd1515bac79fff52bf6b092740f083eb53aec3d0e1f1  ./adrs/0012-session-scoped-tls-ca-only.md
 3d37a9d2880878c7f2a3d145be87552ee5b4776724aa17b19f930d974d4aae2d  ./adrs/0013-connectors-not-untrusted-inprocess-plugins.md
 e69dc48b70d7f8aaaeb51b1dd934023f4e981e0efab730605681e4ddee10455b  ./adrs/0014-explicit-integration-security-posture.md
-bad8c5ced9bdc87cc819dd8f888e4d2e6a9430d72c7f7d59aeafaf270127c812  ./adrs/adr-index.md
+45201cbf68211160fed21c16169a3f0b463c8138f0266e1db4c6cee40e2f03c2  ./adrs/adr-index.md
 9c619a3cad048b1c0fab61af62a54d2a03e192ef9f2c8b991ec00b0be620343f  ./docs/00-VISION-AND-PRINCIPLES.md
 441a0d3d6fd892bab5c1d1b0af209647e6d62b7aa6ab70bf62d6293270455810  ./docs/01-PRODUCT-SPEC.md
 9c6b59900d283e407dab5fc4227c8ac0dba7bf034e3f909b806687da49a07dd8  ./docs/02-THREAT-MODEL.md
@@ -30,8 +30,8 @@ d1f6d351175b1ac84934c844bb2cf0f4a0b5e27dc157a23bb0e22709c321c957  ./docs/08-IDEN
 928359508c12a37916ae15eb269f425898dca8001a02caa320b4c7a4a102a535  ./docs/12-COMPATIBILITY-MATRIX.md
 e41366fc92dee98cc839ef143fdc79f8597ddc5bb849010bc76bf4b097bfed12  ./docs/13-TEST-STRATEGY.md
 5e468928aaa289ef2b45ae2c731f484e6955e4e97a47ed914c5692059035fe60  ./docs/14-UAT-ADVERSARIAL.md
-903228418a53fdb1da26b9a27e9b98b55cc025d7047361c29dd7d038f1a046d0  ./docs/15-ROADMAP.md
-5fde6025c774a0babf37fa0a1d7053c092c2eafe703c34565ac50545d5b69ee4  ./docs/16-SECURITY-RELEASE-GATES.md
+87e0109a640a071ade2d2978be6854c4e9182272395f34acd390c2d8c988e571  ./docs/15-ROADMAP.md
+3ede90985ede119193d3bd96baddac29259b543a1f4abd951d70df101da7ab07  ./docs/16-SECURITY-RELEASE-GATES.md
 b05024977ff1885f4e8b441a74b152f4ca5b57dc138867d879ea4a51ab9689c9  ./docs/17-IMPLEMENTATION-BOOTSTRAP.md
 9b8a265728b26f108e8ed503aca6ffe218c5884123c47886a0f938964b10c2f1  ./docs/18-RESEARCH-SOURCES.md
 1923ae6cbf7ea8a63571b798eb0be0814a4b83b79d9d85bc3b666c051a6b7c03  ./docs/19-ALTERNATIVES-AND-REJECTIONS.md
@@ -40,3 +40,4 @@ ad9f56f11d51147b9237e73163d5dff9f5a3f42a826e19424d197f1f21d40e64  ./adrs/0016-ho
 611dca295d7819ce4bd7e2247d2b3463505fe462cb78df19b06147ebb8cc7966  ./adrs/0017-how-an-operators-revocation-takes-effect.md
 3009358f7cdd73f3550221da6af25d6cee7e2c03ca04b807e1505911bffd039a  ./adrs/0018-a-credential-carries-the-kind-the-operator-chose.md
 c989c8261f59a3389676c77010fbc67b7f84ffaf99104b26278bea13123908a2  ./adrs/0019-connect-client-proves-its-session-by-signing.md
+65a75a510fd32585099482fc6c24cb7e488976cddb0fad707a44ede6b6fc934d  ./adrs/0020-adoption-before-hardware-tpm2-leaves-the-v1-critical-path.md
