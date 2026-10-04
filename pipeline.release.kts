@@ -99,6 +99,18 @@ pipeline {
             sh("scripts/normalize-release-archives.sh")
         }
 
+        // The product boundary has to be inside the signed authority before the
+        // sign stage runs. `dist` does not know distribution/manifest.toml
+        // exists, so `sha256.sum` did not cover it, and the installer reads the
+        // manifest to decide what to install — meaning the signature could be
+        // perfectly valid over a set of bytes while the boundary deciding what
+        // ships was not among them. This stage publishes the manifest into the
+        // release directory and writes its digest into `sha256.sum`; the next
+        // stage signs the result.
+        stage("pin-manifest") {
+            sh("python3 scripts/pin-manifest-into-checksums.py")
+        }
+
         // Sign before upload. sha256.sum (which pins every artifact by
         // digest) and each archive get a minisign signature; the public key
         // is staged so a verifier can check without trusting this repo. The

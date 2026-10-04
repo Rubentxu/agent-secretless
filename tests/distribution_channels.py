@@ -63,8 +63,63 @@ MANIFEST = REPO / "distribution" / "manifest.toml"
 VERSION = "0.25.0"
 TARGET = "x86_64-unknown-linux-gnu"
 
+CHECKSUM_AUTHORITY = "sha256.sum"
+SIGNATURE_SUFFIX = ".minisig"
+
 _failures: list[str] = []
 _passes = 0
+
+# A throwaway signing key for this suite, generated once.
+#
+# The installer requires the release signature to verify against a key it
+# trusts, and by default that key is the project's real one — which lives
+# outside the repository and is not something a test may use. So the suite
+# makes its own and hands it over with `--trusted-key`, which is the same
+# affordance an operator has who obtained the public key out of band.
+#
+# The alternative — skipping verification in tests — is precisely the hole this
+# work exists to close, so there is no flag for it and no path that signs
+# nothing.
+_key_dir: Path | None = None
+_key_pair: tuple[Path, Path] | None = None
+
+
+def rsign() -> str:
+    found = shutil.which("rsign") or str(Path.home() / ".cargo" / "bin" / "rsign")
+    if not (Path(found).is_file() and os.access(found, os.X_OK)):
+        raise SystemExit(
+            "distribution_channels: rsign is not installed. The installer refuses "
+            "to install an unsigned release, so this suite cannot build one "
+            "either. Install it with: cargo install rsign2"
+        )
+    return found
+
+
+def test_keypair() -> tuple[Path, Path]:
+    """(secret, public), generated on first use and reused for the whole suite."""
+    global _key_dir, _key_pair
+    if _key_pair is not None:
+        return _key_pair
+    _key_dir = Path(tempfile.mkdtemp(prefix="asv-testkey-"))
+    secret, public = _key_dir / "release.key", _key_dir / "release.pub"
+    subprocess.run([rsign(), "generate", "-W", "-p", str(public), "-s", str(secret),
+                    "-c", "agent-secretless test key"], check=True, capture_output=True)
+    _key_pair = (secret, public)
+    return _key_pair
+
+
+def sign(path: Path) -> Path:
+    """The signature sidecar, produced by the same tool the installer verifies with."""
+    secret, _ = test_keypair()
+    sig = path.with_name(path.name + SIGNATURE_SUFFIX)
+    subprocess.run([rsign(), "sign", "-W", "-s", str(secret), "-x", str(sig), str(path)],
+                   check=True, capture_output=True)
+    return sig
+
+
+def cleanup_keys() -> None:
+    if _key_dir is not None and _key_dir.exists():
+        shutil.rmtree(_key_dir)
 
 
 def check(condition: bool, message: str) -> None:
@@ -125,13 +180,11 @@ def build_release(dest: Path) -> Path:
     shutil.rmtree(staging)
 
     # A release publishes its manifest next to the archive, and the installer
-    # fetches it rather than reading a checkout. It is checksummed like any
-    # other byte, because a substituted manifest is what decides which
-    # components get installed.
+    # fetches it rather than reading a checkout. It is listed in the signed
+    # authority like any other byte, because a substituted manifest is what
+    # decides which components get installed.
     shutil.copy2(MANIFEST, dest / "manifest.toml")
-    lines = [f"{sha256(archive)}  {archive_name}",
-             f"{sha256(dest / 'manifest.toml')}  manifest.toml"]
-    (dest / "checksums.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_checksums(dest)
     return archive
 
 
@@ -157,29 +210,46 @@ def tree_digest(root: Path) -> dict[str, str]:
 
 
 def write_checksums(release: Path) -> None:
-    """Re-publish checksums.txt for whatever is in the release directory now.
+    """Re-publish the signed authority for whatever is in the release directory now.
 
-    Every test that rebuilds the archive has to do this. The installer
-    verifies the manifest first, so a rewritten archive with a stale
-    checksums.txt is refused for the *manifest*, and the assertion about which
-    component was rejected never gets to run.
+    Every test that rebuilds the archive has to do this. The installer verifies
+    the manifest first, so a rewritten archive with a stale authority is refused
+    for the *manifest*, and the assertion about which component was rejected
+    never gets to run.
+
+    Re-signing matters as much as rewriting. Without it these tests would be
+    measuring a digest check against a file the release never signed, and the
+    signature layer would be the reason each of them failed — which would make
+    them look like tests of the signature rather than of the manifest
+    comparison they exist to exercise. Signing with the suite's own key keeps
+    the signature valid and the digests valid, so what is left to catch the
+    bundle is exactly the layer under test.
     """
     import hashlib
     lines = []
     for path in sorted(release.iterdir()):
-        if path.is_file() and path.name != "checksums.txt":
-            lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}")
-    (release / "checksums.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if not path.is_file():
+            continue
+        if path.name == CHECKSUM_AUTHORITY or path.name == "dist-manifest.json":
+            continue
+        if path.name.endswith(SIGNATURE_SUFFIX) or path.name == "release.pub":
+            continue
+        lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}")
+    authority = release / CHECKSUM_AUTHORITY
+    authority.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    sign(authority)
 
 
 def run_installer(prefix: Path, release: Path, via: str, extra: list[str] | None = None
                   ) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env.pop("ASV_INSTALLER", None)
+    _, public = test_keypair()
     return subprocess.run(
         [sys.executable, str(INSTALL_PY),
          "--version", VERSION, "--prefix", str(prefix),
-         "--from-dir", str(release), "--installed-via", via, "--no-setup"]
+         "--from-dir", str(release), "--installed-via", via, "--no-setup",
+         "--trusted-key", str(public)]
         + (extra or []),
         capture_output=True, text=True, env=env)
 
@@ -193,7 +263,22 @@ def test_no_toolchain_is_reachable() -> None:
         code = "\n".join(
             line for line in text.splitlines()
             if not line.lstrip().startswith("#"))
-        check("cargo " not in code and "cargo\"" not in code and "rustc" not in code,
+        # One carve-out, and it is a path rather than a command. The installer
+        # looks for `rsign` in `~/.cargo/bin` as well as on PATH, because
+        # `~/.cargo/bin` is routinely absent from PATH in exactly the
+        # non-interactive shells an installer runs in. Reading a verifier out
+        # of that directory is not compiling anything, and a check that could
+        # not tell the two apart would be a check somebody would eventually
+        # satisfy by deleting a correct lookup.
+        #
+        # The carve-out is asserted rather than assumed: if the path stops
+        # appearing where it is expected, `cargo` is scanned with no exclusion
+        # at all, so a future edit that smuggles a build in through some other
+        # spelling is still caught.
+        without_cargo_bin = code.replace('".cargo"', "").replace("~/.cargo", "")
+        scanned = without_cargo_bin if '".cargo"' in code or "~/.cargo" in code else code
+        check("cargo " not in scanned and "cargo\"" not in scanned
+              and "rustc" not in scanned,
               f"{script.relative_to(REPO)} cannot invoke a toolchain")
 
 
@@ -419,20 +504,23 @@ def test_an_installer_channel_install_reports_itself_to_doctor() -> None:
 
 def main() -> int:
     print(f"DX4 channel equivalence — release {VERSION} for {TARGET}\n")
-    print("-- the installer cannot build")
-    test_no_toolchain_is_reachable()
-    print("\n-- both channels, same bytes")
-    test_both_channels_install_the_same_bytes()
-    print("\n-- each channel names itself")
-    test_each_channel_names_itself_in_the_record()
-    print("\n-- UAT-DX-008: tampered bundle")
-    test_uat_dx_008_a_tampered_bundle_is_refused()
-    print("\n-- the bundle boundary holds at the destination")
-    test_an_archive_with_an_undeclared_binary_is_refused()
-    print("\n-- the record is evidence, and a broken one is not `source`")
-    test_a_broken_record_is_not_reported_as_source()
-    print("\n-- and the positive case, for contrast")
-    test_an_installer_channel_install_reports_itself_to_doctor()
+    try:
+        print("-- the installer cannot build")
+        test_no_toolchain_is_reachable()
+        print("\n-- both channels, same bytes")
+        test_both_channels_install_the_same_bytes()
+        print("\n-- each channel names itself")
+        test_each_channel_names_itself_in_the_record()
+        print("\n-- UAT-DX-008: tampered bundle")
+        test_uat_dx_008_a_tampered_bundle_is_refused()
+        print("\n-- the bundle boundary holds at the destination")
+        test_an_archive_with_an_undeclared_binary_is_refused()
+        print("\n-- the record is evidence, and a broken one is not `source`")
+        test_a_broken_record_is_not_reported_as_source()
+        print("\n-- and the positive case, for contrast")
+        test_an_installer_channel_install_reports_itself_to_doctor()
+    finally:
+        cleanup_keys()
 
     print(f"\n{_passes} checks passed, {len(_failures)} failed")
     for f in _failures:

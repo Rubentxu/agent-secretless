@@ -162,8 +162,18 @@ es una suposición:
   `harden::install_with` se llama desde `crates/broker/src/main.rs:195` tras
   `--harden`; el broker se envía solo con `RLIMIT_CORE=0` cuando no se pasa.
   *(Antes decía que no estaba cableado al binario, y era falso.)*
-- **Sin artefactos firmados todavía (R0).** El tooling de build reproducible y
-  firma (cosign/sigstore) es el siguiente gate.
+- **La ruta de instalación verifica una firma, y no se le puede decir que no.**
+  `scripts/install.py` exige que `sha256.sum` lleve una firma minisign válida de
+  la clave del proyecto antes de leer una sola línea suya, y el manifiesto que
+  decide qué componentes se instalan está dentro de esa autoridad firmada. Una
+  firma ausente, una inválida, un par archivo/checksums autoconsistente
+  publicado por otro, o una clave sustituida son todos rechazos — no hay
+  ninguna bandera que rebaje ninguno de ellos. Instalar exige por tanto el
+  verificador `rsign`; es una dependencia nueva y deliberada, y
+  `tests/provenance_falsification.py` es el recibo.
+- **La clave de firma no tiene contraseña.** La clave v0 se genera con
+  `rsign generate -W` y está protegida solo por permisos de fichero. Es una
+  carencia registrada para cerrar antes de 1.0, no una propiedad.
 - **El soporte TPM es un prototipo.** `SoftwareTpm` suplanta al hardware; no
   lo consideres ligado a hardware.
 - **Sin redirección de socket eBPF.** El gate de investigación M8 es NO-GO: no
@@ -181,6 +191,29 @@ es una suposición:
   cerrado.
 - **El 1.0 no ha sido declarado.** El mantenedor lo puerta explícitamente; la
   iteración continúa por debajo de 1.0.
+
+## Instalar una release
+
+```bash
+# el verificador es obligatorio: el instalador no sigue sin él
+cargo install rsign2          # o el gestor de paquetes de tu distribución
+curl -LsSf https://raw.githubusercontent.com/Rubentxu/agent-secretless/main/scripts/install.sh \
+  | sh -s -- --version 0.29.0 --prefix "$HOME/.local"
+```
+
+El instalador exige que `sha256.sum` lleve una firma minisign válida antes de
+leer una sola línea suya, y el manifiesto que decide qué componentes se instalan
+está dentro de esa autoridad firmada. **El key id de la clave de firma de las
+releases es `54CB5B8D3C7419FB`.** Compáralo con esta línea — un dato que puedes
+consultar sin descargar lo que estás comprobando. Una descarga que hubiera
+sustituido la clave estaría, si no, comprobándose a sí misma.
+
+`release.pub` viaja con la release y **no** es la autoridad: quien sustituye la
+descarga sustituye también ese fichero. La autoridad es la clave embebida en el
+instalador, y `--trusted-key PATH` acepta una obtenida fuera de banda.
+
+La clave en sí no tiene contraseña (`rsign generate -W`), protegida solo por
+permisos de fichero. Es una carencia registrada para cerrar antes de 1.0.
 
 ## Inicio rápido
 

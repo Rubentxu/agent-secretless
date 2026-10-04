@@ -117,6 +117,21 @@ for release in manifest.get("releases", []):
 pubkey = distrib / "release.pub"
 if pubkey.exists():
     print(pubkey)
+# The product boundary, published beside the archive. It is not a dist artifact
+# so it is not in dist-manifest.json, but the installer downloads it and decides
+# from it which components it is allowed to install — a release that omits it
+# serves an installer that cannot run. Its digest is in the signed sha256.sum
+# (scripts/pin-manifest-into-checksums.py runs before the sign stage), so it
+# arrives as a covered byte rather than as a second, unsigned declaration of
+# what the product is.
+manifest = distrib / "manifest.toml"
+if manifest.exists():
+    print(manifest)
+else:
+    sys.exit(f"publish-release: {manifest} is missing. Run "
+             f"scripts/pin-manifest-into-checksums.py before publishing: the "
+             f"installer downloads the manifest and a release without one is a "
+             f"release nobody can install.")
 PY
 )
 

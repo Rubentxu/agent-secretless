@@ -153,8 +153,18 @@ Each item says where its detail lives, because none of it is a guess.
   is called from `crates/broker/src/main.rs:195` behind `--harden`; the broker
   ships with `RLIMIT_CORE=0` only when it is not passed. *(This line previously
   said it was "not wired into the binary", which was false.)*
-- **No signed artifacts yet (R0).** Reproducible-build and signing tooling
-  (cosign/sigstore) is the next gate.
+- **The install path verifies a signature, and cannot be told not to.**
+  `scripts/install.py` requires `sha256.sum` to carry a valid minisign signature
+  from the project key before it reads a single line of it, and the manifest
+  that decides which components install is inside that signed authority. A
+  missing signature, an invalid one, a self-consistent archive/checksum pair
+  published by someone else, or a substituted key are all refusals — there is
+  no flag that downgrades any of them. Installing therefore requires the
+  `rsign` verifier; that is a new dependency and a deliberate one, and
+  `tests/provenance_falsification.py` is the receipt.
+- **The signing key is passwordless.** The v0 key is generated with
+  `rsign generate -W` and protected by file permissions alone. That is a
+  recorded gap to close before 1.0, not a property.
 - **TPM support is a prototype.** `SoftwareTpm` stands in for hardware; do not
   trust it as hardware-bound.
 - **No eBPF socket redirection.** The M8 research gate is NO-GO: no BPF program
@@ -170,6 +180,30 @@ Each item says where its detail lives, because none of it is a guess.
   the UI that an intercepting path exists. Carried forward, not closed.
 - **1.0 has not been declared.** The maintainer gates it explicitly; iteration
   continues below 1.0.
+
+## Installing a release
+
+```bash
+# the verifier is required: the installer refuses to proceed without it
+cargo install rsign2          # or your distribution's package manager
+curl -LsSf https://raw.githubusercontent.com/Rubentxu/agent-secretless/main/scripts/install.sh \
+  | sh -s -- --version 0.29.0 --prefix "$HOME/.local"
+```
+
+The installer requires `sha256.sum` to carry a valid minisign signature before
+it reads a single line of it, and the manifest that decides which components
+install is inside that signed authority. **The release signing key id is
+`54CB5B8D3C7419FB`.** Compare it against this line — a number you can reach
+without downloading the thing you are checking. A download that substituted the
+key would otherwise be checking itself.
+
+`release.pub` travels with the release and is *not* the authority: whoever
+substitutes the download substitutes that file too. The authority is the key
+embedded in the installer, and `--trusted-key PATH` takes one you obtained out
+of band.
+
+The key itself is passwordless (`rsign generate -W`), protected by file
+permissions alone. That is a recorded gap to close before 1.0.
 
 ## Quick start
 

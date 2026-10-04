@@ -68,10 +68,28 @@ Artefactos por target:
 ```text
 agent-secretless-vX.Y.Z-x86_64-unknown-linux-gnu.tar.zst
 agent-secretless-vX.Y.Z-aarch64-unknown-linux-gnu.tar.zst
-checksums.txt
-signature/provenance
+manifest.toml
+sha256.sum
+sha256.sum.minisig
+release.pub
 SBOM
 ```
+
+**`checksums.txt` fue sustituido por `sha256.sum` durante la implementación, y
+el motivo no es cosmético.** El Tren de release firmaba `sha256.sum` —que es lo
+que `dist` produce— mientras el instalador leía `checksums.txt`, un nombre que
+aparece en esta decisión y que **nada en el repositorio ha escrito nunca**. El
+arnés de tests lo sintetizaba, de modo que la suite verde era la prueba del
+hueco y no la razón de que fuese invisible. Con dos autoridades de checksum y
+ninguna comprobando a la otra, además, la firma no cubría lo que el consumidor
+leía. Hoy hay una sola autoridad y es la firmada: `scripts/install.py` verifica
+`rsign` sobre `sha256.sum` **antes** de abrirlo, y el manifiesto que decide qué
+componentes se instalan está dentro de esa autoridad mediante
+`scripts/pin-manifest-into-checksums.py`. Un `release.pub` que viaja con la
+descarga no es la autoridad: lo decide una clave embebida en el instalador, cuyo
+key id (`54CB5B8D3C7419FB`) se publica aquí y en el anuncio de release para
+compararlo fuera de banda. La recepción es
+`tests/provenance_falsification.py`.
 
 ### P0 — installer fino
 
