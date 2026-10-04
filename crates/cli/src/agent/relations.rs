@@ -95,21 +95,29 @@ pub enum AgentRel {
     Capabilities,
     CredentialList,
     SessionRun,
+    // Minted and spent inside a single `asv github` invocation, so the token
+    // itself is never in a process the caller owns. Published since R2.A;
+    // `operational()` carries the reason they were dark before that.
+    GithubIssueRead,
+    GithubIssueCreate,
+    GithubReleaseCreate,
     // Declared, not yet published. See `operational()` for why each is
     // waiting; the comment is the reason so that adding the capability later
     // is a one-line change with the reasoning still attached.
+    //
+    // Postgres and SSH sign have the same shape of gap the GitHub three had —
+    // the broker operation exists and `asv run` reaches it — but the answer is
+    // not the same. A GitHub call is one request the broker makes on the
+    // caller's behalf. `psql` and `git push` are *long-lived interactive
+    // protocols* over a socket the caller holds, and projecting a surrogate
+    // into them is the CONNECT problem, not the semantic-operation one. They
+    // wait for that to be settled rather than for a CLI verb, so no amount of
+    // adding a command here would be the missing piece.
     //
     // Approval and audit stay dark until their transport is complete
     // (`06-CLI-CONTRACT.md` §5): the broker's audit query exists, but
     // `asv audit` is denied by the control plane that has not shipped, and a
     // link an agent follows into a refusal teaches it that the link lied.
-    // GitHub, Postgres and SSH sign are implemented and reachable through
-    // `asv run`, but the relationship between "a session exists" and "this
-    // relation succeeds" is not yet one the CLI can state, so v1 does not
-    // claim it.
-    GithubIssueRead,
-    GithubIssueCreate,
-    GithubReleaseCreate,
     PostgresConnect,
     PostgresQuery,
     SshSign,
@@ -212,26 +220,26 @@ impl AgentRel {
             AgentRel::GithubIssueRead => AgentLink::new(
                 self.uri(),
                 self.operation(),
-                &["run", "--", "gh", "issue", "view", "--"],
+                &["github", "issue", "view"],
                 Safety::BoundedExecution,
                 true,
-                "Read a GitHub issue through a leased credential",
+                "Read a GitHub issue through a broker-leased credential",
             ),
             AgentRel::GithubIssueCreate => AgentLink::new(
                 self.uri(),
                 self.operation(),
-                &["run", "--", "gh", "issue", "create", "--"],
+                &["github", "issue", "create"],
                 Safety::BoundedExecution,
                 true,
-                "Create a GitHub issue through a leased credential",
+                "Create a GitHub issue through a broker-leased credential",
             ),
             AgentRel::GithubReleaseCreate => AgentLink::new(
                 self.uri(),
                 self.operation(),
-                &["run", "--", "gh", "release", "create", "--"],
+                &["github", "release", "create"],
                 Safety::BoundedExecution,
                 true,
-                "Create a GitHub release through a leased credential",
+                "Create a GitHub release through a broker-leased credential",
             ),
             AgentRel::PostgresConnect => AgentLink::new(
                 self.uri(),
@@ -280,13 +288,29 @@ impl AgentRel {
     ///
     /// This is a subset of the enum on purpose, and the subset is the claim.
     /// `06-CLI-CONTRACT.md` §5 names six core relations; DX2 completes all six
-    /// by shipping `asv capabilities`. The other eight are withheld for the
-    /// reasons in their variant comments.
+    /// by shipping `asv capabilities`. R2.A adds the three GitHub ones. The
+    /// other five are withheld for the reasons in their variant comments.
     ///
     /// A relation is in this list only if the command behind it parses. That
     /// is not a convention: `every_operational_relation_parses_as_a_real_command`
     /// runs the actual parser, and it is what caught `status --json` being
     /// advertised by a CLI that had no such flag.
+    ///
+    /// # Why GitHub joined in R2.A
+    ///
+    /// The three GitHub relations were withheld while their descriptor pointed
+    /// at `asv run -- gh issue view --`. That argv was a fiction twice over: the
+    /// CLI had no `gh` verb, and `asv run` is the *surrogate* path, which
+    /// substitutes a credential at a CONNECT tunnel rather than giving `gh` a
+    /// token — so a link that advertised it would have sent an agent to a tool
+    /// that cannot do what the link says, on a path that would not have let it
+    /// do it anyway.
+    ///
+    /// The replacement, `asv github …`, is the path where the token never
+    /// enters a process at all: the broker lends it to one HTTP header for one
+    /// request. Publishing the relation *and* repointing it in the same change
+    /// is deliberate — a published link is a promise about a command, and the
+    /// two halves of that promise cannot be shipped apart.
     pub fn operational() -> &'static [AgentRel] {
         &[
             AgentRel::Status,
@@ -295,6 +319,9 @@ impl AgentRel {
             AgentRel::Capabilities,
             AgentRel::CredentialList,
             AgentRel::SessionRun,
+            AgentRel::GithubIssueRead,
+            AgentRel::GithubIssueCreate,
+            AgentRel::GithubReleaseCreate,
         ]
     }
 
@@ -331,19 +358,88 @@ mod tests {
     /// followed by the argv elements, as separate items. Never joined into a
     /// string — see the module docs on why that field is an array.
     ///
-    /// A relation that ends at `--` is a *template*: the consumer supplies
-    /// what goes after it. The parser needs something there, so this supplies
-    /// a placeholder, and the distinction is recorded rather than papered over
-    /// — a link whose argv does not parse on its own is not broken, it is
-    /// waiting, and the test says which it found.
-    fn argv_of(link: &AgentLink) -> Vec<&str> {
-        let mut argv: Vec<&str> = std::iter::once(link.invoke.program.as_str())
-            .chain(link.invoke.argv.iter().map(String::as_str))
+    /// Then whatever the consumer has to supply, per [`completion_for`].
+    ///
+    /// # Two kinds of relation, and the argv says which
+    ///
+    /// A **template** ends at `--`: the consumer appends free-form elements,
+    /// and the `--` is what stops clap from reading them as flags. That is the
+    /// shape `session/run` has, and it exists because the consumer's own
+    /// command is the payload.
+    ///
+    /// A **complete command** has no `--` and no free-form text at all: every
+    /// input is a named flag. R2.A's GitHub relations are this shape, and the
+    /// trailing `--` had to come off for a concrete reason — behind it, clap
+    /// treats everything as trailing positional arguments, so
+    /// `asv github issue view -- --repo owner/repo` is rejected with
+    /// *unknown argument `--repo`*. A template marker is a promise that
+    /// positional text follows, and these verbs have no positional text to
+    /// promise.
+    fn argv_of(link: &AgentLink) -> Vec<String> {
+        let mut argv: Vec<String> = std::iter::once(link.invoke.program.clone())
+            .chain(link.invoke.argv.iter().cloned())
             .collect();
-        if link.invoke.argv.last().map(String::as_str) == Some("--") {
-            argv.push("echo");
+        if let Some(completion) = completion_for(&link.rel) {
+            argv.extend(completion.iter().map(|s| s.to_string()));
         }
         argv
+    }
+
+    /// What a consumer has to supply, or `None` when the link is already the
+    /// whole command.
+    ///
+    /// Keyed on the relation URI rather than on the argv, so a descriptor that
+    /// drifts away from its own completion is visibly wrong rather than
+    /// silently re-fitted. The credential value is a placeholder id, never a
+    /// token — which is also a small standing check that the link asks for a
+    /// *reference*.
+    fn completion_for(rel: &str) -> Option<&'static [&'static str]> {
+        Some(match rel {
+            // Already complete: `asv status --json` needs nothing from a
+            // consumer, and appending to it is how `asv status --json echo`
+            // became a parse failure unrelated to the link under test.
+            "asv://rels/status"
+            | "asv://rels/doctor"
+            | "asv://rels/setup"
+            | "asv://rels/capabilities"
+            | "asv://rels/credentials/list"
+            | "asv://rels/audit/read" => return None,
+            "asv://rels/session/run"
+            | "asv://rels/postgres/connect"
+            | "asv://rels/postgres/query"
+            | "asv://rels/ssh/sign" => &["echo"],
+            "asv://rels/github/issue/read" => &[
+                "--repo",
+                "owner/repo",
+                "--number",
+                "1",
+                "--credential",
+                "00000000-0000-4000-8000-000000000000",
+            ],
+            "asv://rels/github/issue/create" => &[
+                "--repo",
+                "owner/repo",
+                "--title",
+                "a title",
+                "--body",
+                "/dev/null",
+                "--credential",
+                "00000000-0000-4000-8000-000000000000",
+            ],
+            "asv://rels/github/release/create" => &[
+                "--repo",
+                "owner/repo",
+                "--tag",
+                "v1",
+                "--name",
+                "a name",
+                "--body",
+                "/dev/null",
+                "--credential",
+                "00000000-0000-4000-8000-000000000000",
+            ],
+            _ => return None,
+        })
     }
 
     /// Whether this relation is a template the consumer completes.
@@ -376,13 +472,12 @@ mod tests {
     }
 
     /// The URI set is the interface an agent persists, so a rename here is a
-    /// silent break for anything that stored the old string. Pinned against
-    /// the five DX1 implements out of the six in `06-CLI-CONTRACT.md` §5.
+    /// silent break for anything that stored the old string.
     ///
-    /// All six core relations from `06-CLI-CONTRACT.md` §5, spelled as the
-    /// contract spells them. DX1 held `capabilities` back because the command
-    /// did not exist; this is the moment it does, and the list is complete for
-    /// the first time.
+    /// Pinned in full, not just the six core relations: R2.A grew the set and
+    /// the growth is the kind of change that is supposed to be a decision
+    /// rather than a side effect. A test that only counted would have reported
+    /// nine and said nothing about *which* nine.
     #[test]
     fn the_core_relation_uris_are_pinned() {
         let uris: Vec<&str> = AgentRel::operational().iter().map(|r| r.uri()).collect();
@@ -395,8 +490,103 @@ mod tests {
                 "asv://rels/capabilities",
                 "asv://rels/credentials/list",
                 "asv://rels/session/run",
+                // R2.A. The surrogate is minted and spent inside `asv github`,
+                // so what a consumer completes is the repository, the number
+                // and the credential *id* — never a token.
+                "asv://rels/github/issue/read",
+                "asv://rels/github/issue/create",
+                "asv://rels/github/release/create",
             ]
         );
+    }
+
+    /// The GitHub relations must name the real verb, not a `gh` subprocess.
+    ///
+    /// This is the assertion that would catch the descriptor these three
+    /// carried before R2.A: `asv run -- gh issue view --`. Two things were
+    /// wrong with that argv and this test can only see one of them, which is
+    /// why the credential argument is pinned alongside it.
+    ///
+    /// The mutation this answers: put the `gh` argv back and this fails.
+    #[test]
+    fn github_links_name_the_typed_verb_not_a_gh_subprocess() {
+        for rel in [
+            AgentRel::GithubIssueRead,
+            AgentRel::GithubIssueCreate,
+            AgentRel::GithubReleaseCreate,
+        ] {
+            let link = rel.descriptor();
+            let argv = &link.invoke.argv;
+            assert_eq!(
+                argv.first().map(String::as_str),
+                Some("github"),
+                "{} does not start at `asv github`",
+                rel.uri()
+            );
+            assert!(
+                !argv.iter().any(|a| a == "gh" || a == "run"),
+                "{} routes through a subprocess: {:?}",
+                rel.uri(),
+                argv
+            );
+            // Asserted on the argv a consumer actually builds, not on the
+            // fixed prefix. The prefix is `["github", "issue", "view", "--"]`
+            // and cannot mention a credential, because the credential is
+            // exactly what the consumer supplies — so a test on the prefix
+            // alone would be asserting something that is not a property of
+            // the link.
+            let built = argv_of(&link);
+            assert!(
+                built.iter().any(|a| a == "--credential"),
+                "{} does not ask for a credential reference: {:?}",
+                rel.uri(),
+                built
+            );
+            assert!(
+                built.iter().any(|a| a == "--repo"),
+                "{} does not ask for the destination: {:?}",
+                rel.uri(),
+                built
+            );
+        }
+    }
+
+    /// Every GitHub link stops a human-less agent, including the read.
+    ///
+    /// `requires_human` is the only signal an agent has before acting, and all
+    /// three links keep the `true` they were declared with. The read is the
+    /// interesting one: reading an issue changes nothing upstream, so it looks
+    /// like the cheap case — and it is not, because it lends a credential to a
+    /// third party over the network. Relaxing it to `false` would have been a
+    /// one-word change made by the same commit that published the link, with
+    /// no policy decision behind it. So the value is pinned rather than
+    /// re-decided here, and relaxing it is a separate proposal.
+    ///
+    /// The mutation this answers: set `GithubIssueRead`'s flag to `false` and
+    /// this fails.
+    #[test]
+    fn github_links_flag_the_ones_that_change_something() {
+        for rel in [
+            AgentRel::GithubIssueRead,
+            AgentRel::GithubIssueCreate,
+            AgentRel::GithubReleaseCreate,
+        ] {
+            assert!(
+                rel.descriptor().requires_human,
+                "{} lends a credential off-box and must stop a human-less agent",
+                rel.uri()
+            );
+        }
+        // The two that write get the stronger statement: they must not read
+        // as read-only to anything deciding whether to prompt.
+        for rel in [AgentRel::GithubIssueCreate, AgentRel::GithubReleaseCreate] {
+            assert_eq!(
+                rel.descriptor().safety,
+                Safety::BoundedExecution,
+                "{} writes upstream, and its safety must not read as read-only",
+                rel.uri()
+            );
+        }
     }
 
     /// A stopped broker publishes only the two links that lead somewhere.

@@ -257,8 +257,9 @@ def c3_no_invented_rel(files: dict[str, str], truth: dict) -> None:
 def c4_withheld_rels_are_marked(files: dict[str, str], truth: dict) -> None:
     """A declared-but-unpublished rel may be named only as a non-option.
 
-    `relations.rs` holds fourteen relations and publishes six. A skill that
-    lists the other eight as things to follow is worse than one that omits
+    `relations.rs` holds fourteen relations and publishes nine as of R2.A,
+    which raised the three GitHub ones against a real command. A skill that
+    lists the remaining five as things to follow is worse than one that omits
     them: an agent trusts a list far more than it trusts a missing entry. So
     naming one is allowed, in a block that says out loud that it is not
     published.
@@ -554,9 +555,7 @@ def c14_argv_runs_on_the_real_parser(files: dict[str, str], truth: dict) -> None
             if not argv:
                 check(False, f"{variant} has an argv in the source")
                 continue
-            probe = list(argv)
-            if probe[:1] == ["run"]:
-                probe += ["--", "true"] if "--" not in probe else ["true"]
+            probe = list(argv) + _completion_for(variant, argv)
             _, out = run_cli(probe, home)
             parse_error = re.search(
                 r"unrecognized subcommand|unexpected argument|invalid value|"
@@ -565,6 +564,51 @@ def c14_argv_runs_on_the_real_parser(files: dict[str, str], truth: dict) -> None
                   f"`asv {' '.join(probe)}` is a command the parser accepts"
                   if parse_error is None else
                   f"`asv {' '.join(probe)}` does not parse: {out.strip()[:160]}")
+
+
+#: A vault id, for the same reason `relations.rs` uses one: the argv under test
+#: must carry a *reference*, and a placeholder is how that is shown without a
+#: real credential existing anywhere near a test.
+_PLACEHOLDER_ID = "00000000-0000-4000-8000-000000000000"
+
+
+def _completion_for(variant: str, argv: list[str]) -> list[str]:
+    """What a consumer appends to a published argv before running it.
+
+    The old version of this guard appended `["--", "true"]` to anything that
+    was not already a `run` link, which was correct for exactly one shape: a
+    template whose payload is free-form positional text. R2.A's GitHub links
+    are not that shape — they are complete commands whose every input is a
+    named flag — so the blanket completion appended a stray `true` to
+    `asv github issue view` and the guard reported a parse failure for a
+    command that parses fine. It would equally have appended `true` to
+    `asv status --json`, which is not a template at all.
+
+    That is the failure this whole file exists to prevent, in the mirror image:
+    not a link that works but is undocumented, but a real command reported as
+    broken because the *checker* was wrong. A guard that cries wolf gets
+    disabled, and a disabled guard is worth less than the bug it was hiding.
+
+    The shape is read off the argv itself rather than hardcoded per relation,
+    so a descriptor that changes shape is completed correctly without this
+    function being told.
+    """
+    if argv and argv[-1] == "--":
+        # A template: the payload is the consumer's own words.
+        return ["true"]
+    if variant.startswith("Github"):
+        # A complete command whose every input is a named flag. The credential
+        # is a vault *id*, which is the whole claim `asv github` makes.
+        common = ["--credential", _PLACEHOLDER_ID]
+        if variant == "GithubIssueRead":
+            return ["--repo", "owner/repo", "--number", "1", *common]
+        if variant == "GithubIssueCreate":
+            return ["--repo", "owner/repo", "--title", "a title",
+                    "--body", "/dev/null", *common]
+        return ["--repo", "owner/repo", "--tag", "v1", "--name", "a name",
+                "--body", "/dev/null", *common]
+    # Already the whole command.
+    return []
 
 
 def check_truth_is_not_vacuous(truth: dict) -> None:
@@ -581,8 +625,13 @@ def check_truth_is_not_vacuous(truth: dict) -> None:
     argv = truth["argv"]
     codes = set(truth["codes"]) | set(truth["warn_codes"])
     check(len(rels) >= 14, f"parsed {len(rels)} relations from relations.rs")
-    check(len(operational) == 6,
-          f"parsed {len(operational)} published relations")
+    # An exact count, not a floor. The number went 6 -> 9 in R2.A when the three
+    # GitHub relations were republished against a real command, and a `>=` here
+    # would have let the published set grow by any amount without this noticing.
+    # The tripwire is also the thing that makes the skill update mandatory: a
+    # release cannot pass with a skill that has not caught up.
+    check(len(operational) == 9,
+          f"parsed {len(operational)} published relations, expected 9")
     check(len(argv) == len(rels) and len(argv) >= 14,
           f"parsed an argv for every relation ({len(argv)} of {len(rels)})")
     check(len(codes) >= 5, f"parsed {len(codes)} error and warning codes")

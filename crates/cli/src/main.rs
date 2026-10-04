@@ -88,6 +88,24 @@ enum Command {
         #[arg(long)]
         timeout_ms: Option<u64>,
     },
+    /// GitHub operations through a broker-leased credential (M11, R2.A).
+    ///
+    /// The credential named by `--credential` is a **vault id**, not a token.
+    /// This process never holds the token: it asks the broker for a one-use
+    /// surrogate, hands that to the broker, and the broker lends the real
+    /// secret to the HTTP header for the length of one request. There is no
+    /// code path in which a GitHub token is in this process's memory, its
+    /// `argv`, its environment, or anything it prints.
+    ///
+    /// This is the *strong* path, and it is the default one to reach for. The
+    /// weaker alternative — running `gh` as a child with a token in its
+    /// environment — is never offered here, because offering both and calling
+    /// them equivalent is how a credential ends up in a process the operator
+    /// does not know is holding it.
+    Github {
+        #[command(subcommand)]
+        command: GithubCommand,
+    },
     /// List credential metadata. Never values.
     Credentials {
         /// Emit the `asv.agent/v1` envelope instead of prose.
@@ -184,6 +202,94 @@ enum AgentCommand {
     },
 }
 
+/// The GitHub verbs, grouped by the noun they act on.
+///
+/// Two levels rather than one flat list, so the noun in the published relation
+/// URI (`github/issue/read`, `github/release/create`) is the noun on the
+/// command line. A flat `asv github issue-view` would have been shorter to
+/// write and would have decoupled the two vocabularies.
+#[derive(Subcommand)]
+enum GithubCommand {
+    /// Act on an issue.
+    #[command(subcommand)]
+    Issue(GithubIssueCommand),
+    /// Act on a release.
+    #[command(subcommand)]
+    Release(GithubReleaseCommand),
+}
+
+#[derive(Subcommand)]
+enum GithubIssueCommand {
+    /// Read one issue. Returns only its title, body and state.
+    View {
+        /// `owner/repo`, e.g. `Rubentxu/agent-secretless`.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: String,
+        /// The issue number.
+        #[arg(long)]
+        number: u64,
+        /// Vault id of the GitHub credential, as `asv credentials` prints it.
+        /// A *reference*: the broker resolves it, and the token itself never
+        /// reaches this process.
+        #[arg(long, value_name = "ID")]
+        credential: String,
+        /// Emit the `asv.agent/v1` envelope instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create one issue.
+    Create {
+        /// `owner/repo`, e.g. `Rubentxu/agent-secretless`.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: String,
+        /// The issue title. Titles are short and single-line by convention, so
+        /// this one is an argument rather than a file.
+        #[arg(long)]
+        title: String,
+        /// The issue body: a path, or `-` for stdin. Never a literal.
+        ///
+        /// A literal body would be an `argv` entry, and `argv` is readable by
+        /// any same-uid peer through `/proc/<pid>/cmdline` — a kernel property
+        /// this product does not claim to control. The body is also the field
+        /// most likely to be long, and a release body is routinely a
+        /// multi-paragraph changelog, so "it was too long for argv" would have
+        /// been a reason that only applied sometimes.
+        #[arg(long, value_name = "FILE")]
+        body: String,
+        /// Vault id of the GitHub credential. A *reference*, never the token.
+        #[arg(long, value_name = "ID")]
+        credential: String,
+        /// Emit the `asv.agent/v1` envelope instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum GithubReleaseCommand {
+    /// Create one release.
+    Create {
+        /// `owner/repo`, e.g. `Rubentxu/agent-secretless`.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: String,
+        /// The tag the release names.
+        #[arg(long)]
+        tag: String,
+        /// The release's display name.
+        #[arg(long)]
+        name: String,
+        /// The release notes: a path, or `-` for stdin. Never a literal.
+        #[arg(long, value_name = "FILE")]
+        body: String,
+        /// Vault id of the GitHub credential. A *reference*, never the token.
+        #[arg(long, value_name = "ID")]
+        credential: String,
+        /// Emit the `asv.agent/v1` envelope instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
@@ -218,6 +324,12 @@ async fn main() -> std::io::Result<()> {
             credential,
             timeout_ms,
         } => return run_isolated(&socket, worker, args, credential.as_deref(), *timeout_ms),
+        // Like `run-isolated`, this is not one request. It is a session, a
+        // mint, the operation and an end, and the CLI is the only party that
+        // knows the id of the session it opened. Handled here so the lifetime
+        // of that session is a lexical scope rather than something spread
+        // across the single-request path below.
+        Command::Github { command } => return run_github(&socket, command),
         Command::Setup { json } => return run_setup(*json),
         Command::Doctor { json } => return run_doctor(&socket, *json),
         Command::Agent {
@@ -312,6 +424,9 @@ async fn main() -> std::io::Result<()> {
         Command::Run { .. } => unreachable!("run handled before broker IPC"),
         Command::RunIsolated { .. } => {
             unreachable!("run-isolated opens its own session and is handled before broker IPC")
+        }
+        Command::Github { .. } => {
+            unreachable!("github opens its own session and is handled before broker IPC")
         }
         Command::Setup { .. }
         | Command::Doctor { .. }
@@ -780,6 +895,290 @@ fn run_isolated(
     }
 }
 
+/// How long the one-use surrogate may live.
+///
+/// The mint and the spend are two calls over a local socket, back to back, so
+/// the only thing this has to outlast is process scheduling between them. A
+/// minute is orders of magnitude more than that and still short enough that a
+/// surrogate that is somehow captured rather than spent is dead before anyone
+/// could use it. A longer default would buy nothing and would make the
+/// "one operation" claim depend on a timer rather than on `max_uses`.
+const GITHUB_SURROGATE_TTL_SECS: u64 = 60;
+
+/// One GitHub operation, from the product surface to a typed answer.
+///
+///     asv github issue view        the product surface
+///         -> unix socket           versioned IPC, protocol 8
+///         -> CreateSession         a real session, owned by this process
+///         -> MintSurrogate         one use, one minute, from a vault *id*
+///         -> ReadIssue            the broker lends the secret per request
+///         -> EndSession           the grant cannot outlive the command
+///
+/// # What is deliberately not here
+///
+/// There is no path in this function that can produce a GitHub token, and
+/// that is not an omission to be filled in later — it is the reason the command
+/// exists. `--credential` names a vault entry; the broker decides what that
+/// entry is and lends it. So the strongest statement this code can make is
+/// negative, and a future change that wants to add a token here has to
+/// explain which of the four hops it removed.
+///
+/// # Why the surrogate is minted per invocation
+///
+/// One command, one operation, one use. A long-lived surrogate handed to an
+/// agent is a bearer capability that outlives the reason it was minted, and
+/// the "single-use" property is what makes the session's end meaningful: after
+/// `EndSession` there is nothing left to redeem even if the string were
+/// captured.
+fn run_github(socket: &std::path::Path, command: &GithubCommand) -> std::io::Result<()> {
+    // Parsed before anything opens a session. The broker keys the vault by the
+    // canonical wire spelling, so an id that is a valid UUID in some other
+    // spelling would be accepted here and then miss in the vault, and the
+    // operator would be told the credential does not exist. `CredentialId`'s
+    // parse error carries no text, so nothing they typed comes back out.
+    let credential = match CredentialId::from_wire(github_credential_arg(command)) {
+        Ok(id) => id,
+        Err(_) => {
+            // A usage error, and reported as one: this is the shape every
+            // other argument check in this CLI uses (`parse_credential_kind`,
+            // `CredentialId::from_wire` in `delete-credential`), so a script
+            // that distinguishes "you called me wrong" from "the broker said
+            // no" sees the same exit code here it sees everywhere else. The
+            // message quotes nothing, so nothing the operator typed comes back
+            // out.
+            eprintln!(
+                "asv: the --credential value is not a vault id; copy it from `asv credentials`"
+            );
+            std::process::exit(2);
+        }
+    };
+
+    // Bodies are read before the session exists, for the same reason
+    // `add-credential` reads its secret first: a payload this process is
+    // holding should not be sitting in a live grant's lifetime.
+    let body = match github_body_arg(command) {
+        Some(spec) => Some(match read_github_body(&spec) {
+            Ok(text) => text,
+            Err(error) => {
+                // The path is named because the operator supplied it and the
+                // kernel's `No such file or directory` does not say which of
+                // the three flags it was about. A body that is silently
+                // missing is a release published with empty notes.
+                eprintln!("asv: cannot read the body from {spec:?}: {error}");
+                std::process::exit(2);
+            }
+        }),
+        None => None,
+    };
+
+    let session = match github_call(
+        socket,
+        &Request::CreateSession {
+            workspace: std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        },
+    ) {
+        Response::SessionCreated { session, .. } => session,
+        other => {
+            return Err(std::io::Error::other(format!(
+                "asv github could not open a session: {other:?}"
+            )))
+        }
+    };
+
+    // From here on the session exists, so every exit path has to end it. The
+    // one that could skip it is the one where the operation itself failed, and
+    // that is precisely the case where a caller would otherwise leave a live
+    // grant behind.
+    let outcome = github_call(
+        socket,
+        &Request::MintSurrogate {
+            session,
+            credential,
+            max_uses: 1,
+            ttl_secs: GITHUB_SURROGATE_TTL_SECS,
+        },
+    );
+
+    let response = match &outcome {
+        Response::SurrogateMinted { surrogate, .. } => github_call(
+            socket,
+            &github_request(
+                command,
+                session,
+                surrogate,
+                body.as_deref().unwrap_or_default(),
+            ),
+        ),
+        // The mint itself was refused, or answered something else. Reporting
+        // that answer *is* the operation's outcome — there is no operation to
+        // run without a surrogate, and inventing one would be the whole bug
+        // this path exists to avoid.
+        other => other.clone(),
+    };
+
+    // Ended before the result is reported, so a report that never arrives is
+    // still bounded by the session's own lifetime. `github_call` would exit 2
+    // on a failure here, which would be wrong: a session that will not close
+    // does not unmake the answer the broker already gave, and turning a
+    // completed read into "connection failed" would be a worse lie than
+    // leaking the session. So the plain transport error is dropped and the
+    // grant is left to its own expiry.
+    let _ = call(socket, &Request::EndSession { session });
+
+    let json = github_json_flag(command);
+    match &response {
+        Response::IssueRead { .. }
+        | Response::IssueCreated { .. }
+        | Response::ReleaseCreated { .. } => {
+            if json {
+                let result = ipc::from_response(&response);
+                println!(
+                    "{}",
+                    render::json::envelope(&render::json::for_result(&result))
+                );
+            } else {
+                print_response(&response);
+            }
+            Ok(())
+        }
+        Response::Error { code, message } => {
+            if json {
+                let result = ipc::from_response(&response);
+                println!(
+                    "{}",
+                    render::json::envelope(&render::json::for_result(&result))
+                );
+            } else {
+                eprintln!("asv github refused ({code:?}): {message}");
+            }
+            // A distinct exit code from a connection failure (2). "The broker
+            // said no" and "there was no broker" are different events and a
+            // script that retries on one must not retry on the other.
+            std::process::exit(1);
+        }
+        other => Err(std::io::Error::other(format!(
+            "asv github got an unexpected answer: {other:?}"
+        ))),
+    }
+}
+
+/// Dials the broker, or reports the failure the way every other verb does.
+///
+/// A connection failure is exit 2 and the `ASV_CONNECTION_FAILED` line, not a
+/// `Response::Error` and not exit 1. Three reasons, and the first is the one
+/// that matters: "there was no broker" and "the broker refused" are different
+/// events, and a script that retries one must not retry the other.
+///
+/// The other two are consistency. Returning the `io::Error` up to `main`
+/// prints Rust's own `Debug` for it — `Error: Os { code: 2, kind: NotFound … }`
+/// — which is not a diagnostic a user can act on, and `main`'s error exit is
+/// 1, which is the code the refusal path below uses. The first draft of this
+/// function did exactly that, and both mistakes were visible only by running
+/// the binary.
+fn github_call(socket: &std::path::Path, request: &Request) -> Response {
+    match call(socket, request) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("ASV_CONNECTION_FAILED: {error}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// The `--credential` this invocation names, or a hard error naming which
+/// subcommand was wrong.
+///
+/// The three verbs all require it, so an `Option` here would mean a second
+/// code path where it is absent. It is not reachable: `clap` requires the flag
+/// on every variant — which is a property the pin test in `relations.rs`
+/// re-checks against the real parser rather than trusting.
+fn github_credential_arg(command: &GithubCommand) -> &str {
+    match command {
+        GithubCommand::Issue(GithubIssueCommand::View { credential, .. })
+        | GithubCommand::Issue(GithubIssueCommand::Create { credential, .. })
+        | GithubCommand::Release(GithubReleaseCommand::Create { credential, .. }) => credential,
+    }
+}
+
+/// The `--body` this invocation names, or `None` for the read verb.
+fn github_body_arg(command: &GithubCommand) -> Option<&str> {
+    match command {
+        GithubCommand::Issue(GithubIssueCommand::View { .. }) => None,
+        GithubCommand::Issue(GithubIssueCommand::Create { body, .. })
+        | GithubCommand::Release(GithubReleaseCommand::Create { body, .. }) => Some(body),
+    }
+}
+
+/// Whether this invocation asked for the machine envelope.
+fn github_json_flag(command: &GithubCommand) -> bool {
+    match command {
+        GithubCommand::Issue(GithubIssueCommand::View { json, .. })
+        | GithubCommand::Issue(GithubIssueCommand::Create { json, .. })
+        | GithubCommand::Release(GithubReleaseCommand::Create { json, .. }) => *json,
+    }
+}
+
+/// The IPC request for this verb.
+///
+/// A `read` sends no body at all, rather than an empty one. The wire types
+/// differ — `ReadIssue` has no `body` field — so a shared request with an
+/// optional body would be a type that means "either", and the broker would
+/// have to decide what a missing body is. Naming three constructions keeps the
+/// three shapes the protocol actually has.
+fn github_request(
+    command: &GithubCommand,
+    session: asv_domain::AgentSessionId,
+    surrogate: &str,
+    body: &str,
+) -> Request {
+    match command {
+        GithubCommand::Issue(GithubIssueCommand::View { repo, number, .. }) => Request::ReadIssue {
+            session,
+            surrogate: surrogate.to_string(),
+            repo: repo.clone(),
+            number: *number,
+        },
+        GithubCommand::Issue(GithubIssueCommand::Create { repo, title, .. }) => {
+            Request::CreateIssue {
+                session,
+                surrogate: surrogate.to_string(),
+                repo: repo.clone(),
+                title: title.clone(),
+                body: body.to_string(),
+            }
+        }
+        GithubCommand::Release(GithubReleaseCommand::Create {
+            repo, tag, name, ..
+        }) => Request::CreateRelease {
+            session,
+            surrogate: surrogate.to_string(),
+            repo: repo.clone(),
+            tag: tag.clone(),
+            name: name.clone(),
+            body: body.to_string(),
+        },
+    }
+}
+
+/// Reads a body from a file, or from stdin when the spec is `-`.
+///
+/// A path is the honest interface for these two fields: both are routinely
+/// multi-paragraph, and `argv` is world-readable to any same-uid peer through
+/// `/proc/<pid>/cmdline`. `-` is there because the other way to supply a body
+/// interactively is a shell heredoc, and a heredoc that a caller forgets is a
+/// body that silently is not what they meant.
+fn read_github_body(spec: &str) -> std::io::Result<String> {
+    if spec == "-" {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut text)?;
+        return Ok(text);
+    }
+    std::fs::read_to_string(spec)
+}
+
 fn run_command(socket: &std::path::Path, command: Vec<String>) -> std::io::Result<()> {
     let Some(program) = command.first() else {
         return Err(std::io::Error::new(
@@ -1078,8 +1477,21 @@ fn print_response(response: &Response) {
         Response::SurrogateRevoked { .. } => {
             println!("surrogate revoked");
         }
-        Response::IssueRead { title, state, .. } => {
-            println!("issue {title:?} [{state}]");
+        // The body is printed, and it is printed *after* the header. The
+        // response carries it on purpose — `IssueRead` promises title, body and
+        // state and nothing else — and the arm that used to be here matched
+        // `{ title, state, .. }` and dropped it. So the one field a human
+        // opened this command to read was the one the command threw away, and
+        // `asv github issue view` was an elaborate way to print a title.
+        //
+        // Header first, so `| head -1` yields the state and not a wall of
+        // prose, and the body is skipped when GitHub answered `"body": null`
+        // rather than printing a blank line that looks like an empty issue.
+        Response::IssueRead { title, body, state } => {
+            println!("{title} [{state}]");
+            if !body.is_empty() {
+                println!("{body}");
+            }
         }
         Response::IssueCreated { number, url } => {
             println!("issue {number} created: {url}");
