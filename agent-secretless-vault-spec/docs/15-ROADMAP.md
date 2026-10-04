@@ -1890,7 +1890,7 @@ fails for any other reason counts as an escape rather than as a pass.
 
 ## C2.8 — CONNECT in production, and the first thing that is not
 
-### Status: open. Four measurements in; the third found three defects and the fourth a fourth, all four sat under green tests and all four are fixed. The fifth is owed as a real increment: a multi-request relay needs an HTTP framing layer this broker does not have
+### Status: open. Six measurements in; the fifth built the multi-request loop and the measurement found four defects in it, the sixth falsified the loop and found two more, and every one of them sat under a green test
 
 V1-C2's scope, written when the block was opened and not narrowed since: *a
 production listener wiring `relay_substituted` into a running `asv-brokerd`,
@@ -2315,12 +2315,76 @@ the terminator" mistake `http_frame` was written to prevent, reproduced in twent
 lines of test fixture.** It is the better argument for the framing layer that this
 increment produced, and the fixture now says why it searches.
 
-**Still owed in this block.** Stress and cancellation under load beyond the
-anti-replay property already measured. And **the broker has no ordered shutdown at
-all**: `main.rs` installs no signal handling, so tunnels dying when the process
-stops is carried entirely by the process dying. That is a real guarantee from the
-kernel and not one from this product, and it is recorded as owed rather than
-counted as delivered.
+**Then the loop was falsified, and the campaign found two more defects and two
+rows that were lying about what they tested.** `tests/relay_loop_falsification.py`,
+**18 rows, 18 red for the named reason**, no residue in the tree. Its shape is the
+one this repository has settled on: each row breaks one thing the loop is supposed
+to get right and requires a *named* assertion to go red, and a row where the suite
+stays green is a property nothing is watching. A run that produced no `test result:`
+line at all is reported `KILLED`, never `ESCAPED` — inventing that verdict is the
+one thing a falsification campaign must not do, and the first version of this
+runner did exactly that to a suite that was merely slow.
+
+**The lifetime budget was spent after the bytes, not before them.** `max_response`
+was enforced by adding the body's length to `returned` *after* the copy finished.
+So a `Content-Length` — which is whatever the origin says — was forwarded in full
+before the tunnel noticed it had been over budget for some time. An origin
+declaring eight gigabytes got all eight gigabytes onto the wire to the client, and
+the budget that exists to stop exactly that was a number checked afterwards. The
+two sibling arms, chunked and close-delimited, had always bounded the copy itself;
+this one did not. The cap is now in front of the copy, and the response head is
+charged to it before the head is sent.
+
+**A close-delimited response that ran past the cap was cut at the cap and reported
+complete.** With no `Content-Length` and no `Transfer-Encoding` the body ends when
+the origin closes, so nothing in the message says how long it is — and a body that
+*exactly fills* the remaining budget is indistinguishable from one that is longer.
+The relay looked zero bytes past the cap, got nothing, and returned `Ok`. What the
+client held was a head promising 512 bytes, 181 of them, and a clean end: the one
+outcome this module refuses to produce anywhere else. It looks one byte past the
+cap now, and a byte there is a refusal. **The control is a test of its own**, because
+"refuse whenever the cap is reached" passes every test in the suite and every real
+streaming response.
+
+**And the campaign found a third thing, which is about how the code was written
+rather than what it did.** `let remaining = limits.max_response - returned` was a
+plain subtraction whose safety depended entirely on the head check three lines
+above. Delete the check — which is what row R16 does — and a tunnel that had gone
+over budget panicked on `usize` underflow in a worker thread; in a release build
+that is a wrap to `usize::MAX` and a budget of nothing. It is saturating now. A
+budget whose correctness depends on the line above it holding is one edit away from
+not being a budget, and the whole point of that block is that the cap does not come
+after the bytes.
+
+**Two of the eighteen rows were the same mutation under two names, and both were
+passing for the wrong reason.** L3 is "the CRLF that ends each chunk is read and
+dropped" and its replacement re-added the write it meant to delete, so it actually
+neutered the *check* — L4's defect, under L4's name. L4's own replacement was a
+bare `if false {`, which leaves the block unclosed and does not compile, so the
+runner skipped it and nobody noticed that the only row for it had never run. L3 now
+deletes the write and keeps the check; L4 empties the check and keeps the write.
+
+**And a row pointed at a test that could not fail for the reason it named.** L6
+claimed to isolate the per-chunk budget check, and the arithmetic says it never
+could: `body_end = total + size + 2` is compared *after* a size line, and every
+chunk sets `total = body_end` on the way out, so a body the per-chunk check refuses
+is refused again by the running total at the next line, always. No input reaches
+the running total on its own except one whose offending line is the **terminal**
+chunk's, because `size == 0` breaks out before `body_end` is computed at all. The
+row now names that input, and the assertion that fires is the byte count on the
+client side of the copy: the refused terminal size line was never written. The
+version of that test which claimed the opposite made an arithmetic claim about its
+own fixture that was simply false, and a test whose arithmetic has not been checked
+is a test that survives the defect it was written to catch.
+
+**Still owed in this block.** A real workload through this relay: `npm install`
+against `asv run` on this code, which is the one measurement that would say whether
+the loop carries a build rather than three `GET`s. Stress and cancellation under
+load beyond the anti-replay property already measured. And **the broker has no
+ordered shutdown at all**: `main.rs` installs no signal handling, so tunnels dying
+when the process stops is carried entirely by the process dying. That is a real
+guarantee from the kernel and not one from this product, and it is recorded as owed
+rather than counted as delivered.
 
 
 

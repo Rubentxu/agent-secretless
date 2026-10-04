@@ -1376,6 +1376,58 @@ mod relay_limit_tests {
         );
     }
 
+    /// A body refused by its **running total** is refused before the last chunk
+    /// is announced, and that check is the only one between a peer and an
+    /// unbounded body.
+    ///
+    /// There are two budget checks here and the falsification campaign deleted
+    /// the first of them with the whole suite green. The arithmetic says why, and
+    /// it is the reason the version of this test that claimed the opposite was
+    /// decoration. `body_end = total + size + 2` is compared *after* a chunk's
+    /// size line, and every chunk sets `total = body_end` on its way out — so a
+    /// body the per-chunk check refuses is refused again by the running total at
+    /// the next line, always. **No input reaches the running total on its own
+    /// except one whose offending line is the terminal chunk's**, because
+    /// `size == 0` breaks out before `body_end` is ever computed.
+    ///
+    /// So: one one-byte chunk and a terminal chunk, under a budget of eight. The
+    /// first chunk costs six bytes and fits, the terminal chunk's size line costs
+    /// three more and does not, and the running total is what refuses. The
+    /// assertion is the consequence rather than the error, because the error is
+    /// the same one either way: the relay has not written `0\r\n`, so the client
+    /// was never told the body ended.
+    #[test]
+    fn a_body_refused_by_its_running_total_is_refused_before_the_last_chunk_is_announced() {
+        let body = b"1\r\na\r\n0\r\n\r\n";
+        let mut from = std::io::Cursor::new(body.to_vec());
+        let mut to: Vec<u8> = Vec::new();
+        let error = relay_chunked(&mut from, &mut to, 8, &agent(), &NEVER_CANCELLED, false)
+            .expect_err("a terminal size line that crosses the budget must be refused");
+        assert!(
+            matches!(
+                error,
+                BridgeError::Limit {
+                    budget: "max_body",
+                    ..
+                }
+            ),
+            "a body over budget was refused as {error:?}"
+        );
+        assert_eq!(
+            to, b"1\r\na\r\n",
+            "the relay wrote the size line of the chunk it had just refused, so the \
+             client was told the body ended and then it did"
+        );
+
+        // The control, because a green result with the check deleted has to be
+        // distinguishable from a green result with it in place.
+        let mut from = std::io::Cursor::new(body.to_vec());
+        let mut to: Vec<u8> = Vec::new();
+        relay_chunked(&mut from, &mut to, 40, &agent(), &NEVER_CANCELLED, false)
+            .expect("the same body under a budget it fits inside is copied whole");
+        assert_eq!(to, body, "the control did not copy the body verbatim");
+    }
+
     /// A size line that never ends is refused rather than buffered.
     ///
     /// The reason `read_chunk_line` is bounded at all: it reads one byte at a
@@ -1938,14 +1990,33 @@ fn relay_chunked<R: Read, W: Write>(
         // against 22 written, with the missing four being the two CRLFs after
         // the chunk data. A client parsing that would have found the next
         // chunk's size line where its data was supposed to end.
-        let terminator = read_chunk_line(from, 2, session, cancel, pollable)?;
-        match terminator {
-            Some(ref t) if t.is_empty() => {
-                to.write_all(b"\r\n")
-                    .map_err(|e| BridgeError::Io(e.to_string()))?;
-            }
-            _ => return Err(BridgeError::Io("a chunk was not terminated by CRLF".into())),
+        // **Two bytes, read directly rather than through `read_chunk_line`.**
+        //
+        // The line reader takes a bound, and a bound of 2 meant the *buffer* ran
+        // out before the check could run: a peer whose chunk is not terminated by
+        // CRLF was refused for "a line of more than 2 bytes", which is a
+        // different answer with a different fix. The falsification campaign
+        // deleted the check below and the whole suite stayed green, because
+        // nothing could reach it — a test that cannot fail for the reason it
+        // names is decoration, and this was decoration wearing a refusal.
+        //
+        // Reading the two bytes straight from the stream is what makes the check
+        // the *only* thing that can refuse a malformed terminator.
+        let mut terminator = [0u8; 2];
+        for slot in terminator.iter_mut() {
+            let Some(byte) = read_byte_cancellable(from, Some(session), cancel, None, pollable)?
+            else {
+                return Err(BridgeError::Io(
+                    "connection closed before a chunk's CRLF".into(),
+                ));
+            };
+            *slot = byte;
         }
+        if &terminator != b"\r\n" {
+            return Err(BridgeError::Io("a chunk was not terminated by CRLF".into()));
+        }
+        to.write_all(b"\r\n")
+            .map_err(|e| BridgeError::Io(e.to_string()))?;
         total += copied + 2;
     }
     to.flush().map_err(|e| BridgeError::Io(e.to_string()))?;
@@ -2347,6 +2418,23 @@ impl EstablishedTunnel {
                 // keeps an interim response from looking like the end of the
                 // exchange, which is the mistake that turns a `100 Continue` into
                 // a tunnel that closes while both peers wait for the other.
+                //
+                // **And it is charged to the lifetime budget before it is sent.**
+                // A head is bounded by `max_head`, so this is not where a runaway
+                // lives, but a head is a message like any other and a tunnel that
+                // has already returned more than its budget must say so at the
+                // first byte rather than after the body it is refusing.
+                if response_head.len() > limits.max_response.saturating_sub(returned) {
+                    return Err(limit_spent(
+                        "max_response",
+                        format!(
+                            "a {} byte response head would take this tunnel past its {}-byte \
+                             lifetime budget",
+                            response_head.len(),
+                            limits.max_response
+                        ),
+                    ));
+                }
                 self.client
                     .write_all(&response_head)
                     .map_err(|e| BridgeError::Io(e.to_string()))?;
@@ -2359,10 +2447,43 @@ impl EstablishedTunnel {
                     continue;
                 }
 
+                // The head is accounted for, so what is left is the body's, and
+                // **every arm below is bounded by what is left**. That is the
+                // property the comparison which used to follow this `match` did
+                // not have: it added the body's length to `returned` *after* the
+                // copy, so an origin declaring a `Content-Length` of eight
+                // gigabytes had all eight gigabytes forwarded to the client
+                // before the tunnel noticed it had been over budget for some
+                // time. The other two arms have always bounded the copy itself;
+                // this one does too, and with that the comparison is not merely
+                // late but unreachable.
+                //
+                // **Saturating, and not a plain subtraction.** The check above
+                // makes `returned <= max_response` an invariant, so the plain
+                // form cannot underflow — as of writing. But it can only stay
+                // that way while that check is there, and the falsification
+                // campaign deleted it: a plain `-` then panicked on the second
+                // response of a tunnel that had already gone over, which in a
+                // release build would have been a wrap to `usize::MAX` and a
+                // budget of nothing. A budget whose correctness depends on the
+                // line above it holding is one edit away from being no budget,
+                // and the whole point of this block is that the cap does not
+                // come after the bytes.
+                let remaining = limits.max_response.saturating_sub(returned);
                 let body = match response.framing {
                     http_frame::Framing::None => 0,
                     http_frame::Framing::Length(n) => {
                         let want = n as usize;
+                        if want > remaining {
+                            return Err(limit_spent(
+                                "max_response",
+                                format!(
+                                    "a response body of {want} bytes would take this tunnel past \
+                                     its {}-byte lifetime budget",
+                                    limits.max_response
+                                ),
+                            ));
+                        }
                         let copied = relay_bytes(
                             &mut self.upstream,
                             &mut self.client,
@@ -2381,9 +2502,7 @@ impl EstablishedTunnel {
                     http_frame::Framing::Chunked => relay_chunked(
                         &mut self.upstream,
                         &mut self.client,
-                        limits
-                            .max_body
-                            .min(limits.max_response.saturating_sub(returned)),
+                        limits.max_body.min(remaining),
                         &session,
                         source,
                         cancellable,
@@ -2392,21 +2511,49 @@ impl EstablishedTunnel {
                     // closes — which is the only thing that ends it, and is why
                     // the lifetime budget rather than the per-message one is the
                     // cap that applies here.
-                    http_frame::Framing::UntilClose => relay_bytes(
-                        &mut self.upstream,
-                        &mut self.client,
-                        limits.max_response.saturating_sub(returned),
-                        &session,
-                        source,
-                        cancellable,
-                    )?,
+                    //
+                    // **A body that exactly fills what is left is a body that may
+                    // be longer**, and no arithmetic can tell those apart, so the
+                    // relay looks: one byte past the cap, not forwarded, and a byte
+                    // there means the response ran over the budget and the tunnel
+                    // ends saying so. Copying the cap and returning `Ok` — which is
+                    // what this did — handed the client half a body and a clean
+                    // end, the one outcome this module refuses to produce
+                    // anywhere else.
+                    //
+                    // The look reads the origin, and a close there is the normal end
+                    // of a close-delimited body: `Ok(None)` refuses nothing.
+                    http_frame::Framing::UntilClose => {
+                        let copied = relay_bytes(
+                            &mut self.upstream,
+                            &mut self.client,
+                            remaining,
+                            &session,
+                            source,
+                            cancellable,
+                        )?;
+                        if copied == remaining
+                            && read_byte_cancellable(
+                                &mut self.upstream,
+                                Some(&session),
+                                source,
+                                None,
+                                cancellable,
+                            )?
+                            .is_some()
+                        {
+                            return Err(limit_spent(
+                                "max_response",
+                                format!(
+                                    "a close-delimited response ran past this tunnel's {}-byte \
+                                     lifetime budget",
+                                    limits.max_response
+                                ),
+                            ));
+                        }
+                        copied
+                    }
                 };
-                if returned + body > limits.max_response {
-                    return Err(limit_spent(
-                        "max_response",
-                        format!("this tunnel returned {returned} bytes plus a {body}-byte body"),
-                    ));
-                }
                 returned += body;
                 requests += 1;
 

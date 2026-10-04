@@ -785,6 +785,30 @@ impl ClientSide {
         self.0.read_exact(&mut buffer).expect("client reads");
         buffer
     }
+
+    /// Whatever arrived, up to `n`, within `timeout` — without insisting on all
+    /// of it.
+    ///
+    /// `recv` panics when the count falls short, which is right for a body that
+    /// *should* be there and useless for one that should not: a relay that
+    /// refuses a body mid-flight leaves the client holding a head promising N
+    /// bytes and a body of M, and `M` is the whole observation. This cannot
+    /// report "nothing" and "most of it" the same way, which is the distinction
+    /// the two budgets on a response turn on.
+    fn recv_within(&mut self, n: usize, timeout: Duration) -> Vec<u8> {
+        let _ = self.0.sock.set_read_timeout(Some(timeout));
+        let mut buffer = vec![0u8; n];
+        let mut got = 0usize;
+        while got < n {
+            match self.0.read(&mut buffer[got..]) {
+                Ok(0) => break,
+                Ok(k) => got += k,
+                Err(_) => break,
+            }
+        }
+        buffer.truncate(got);
+        buffer
+    }
 }
 
 /// Reads a response head one byte at a time, stopping at the terminator.
@@ -2157,6 +2181,243 @@ fn a_body_over_the_per_message_limit_is_refused_and_named() {
         ),
         "an over-limit body was refused as {verdict:?}, which reports a deliberate \
          limit as something else"
+    );
+    drop(client);
+}
+
+/// A response that runs past the tunnel's lifetime budget is **refused before
+/// its body is forwarded**, not after.
+///
+/// The distinction this whole `BridgeError::Limit` distinction rests on, and the
+/// one the falsification campaign found unwatched. The budget used to be spent by
+/// adding the body's length to `returned` once the copy was finished, which meant
+/// an origin declaring a `Content-Length` of eight gigabytes had all eight
+/// gigabytes forwarded to the client before the tunnel noticed. The copy is
+/// bounded now, and the observation that proves it is the byte count on the
+/// client: a refused response delivers its head and nothing else.
+///
+/// The limits are ordered so the *parser's* bound cannot be what refuses:
+/// `max_body` is above the declared length and `max_response` below it but above
+/// the head, so the lifetime budget is the only one that can fire and the check
+/// that fires is the body's rather than the head's.
+#[test]
+fn a_response_past_the_lifetime_budget_is_refused_before_its_body_is_forwarded() {
+    let body = "x".repeat(512);
+    let scripted = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes();
+    let head_len = scripted.len() - body.len();
+    let rig = Rig::with_script(vec![scripted], 8);
+    let (mut client, tunnel) = rig
+        .tunnel(Some(rig.proof(Who::A, HOST, 443)), 443)
+        .expect("an authorised tunnel");
+    let relay = start_relay(
+        tunnel,
+        &rig,
+        RelayLimits {
+            // Above the declared length, so the per-message bound cannot refuse.
+            max_body: 4096,
+            // Below the head plus the declared length and above the head alone.
+            max_response: 200,
+            ..RelayLimits::default()
+        },
+    );
+    client.send(&get("/big", &rig.surrogate_a.clone()));
+    let verdict = relay.finish("a response over the lifetime budget");
+    // Read after the relay has finished, so what the client sees is the whole
+    // story rather than a race with a thread that is still writing.
+    let head = client.read_head_str();
+    let seen = client.recv_within(body.len(), Duration::from_millis(500));
+
+    assert_eq!(
+        head,
+        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()),
+        "a refused response still relays the origin's head verbatim"
+    );
+    assert!(
+        matches!(
+            verdict,
+            Err(BridgeError::Limit {
+                budget: "max_response",
+                ..
+            })
+        ),
+        "a response past the lifetime budget ended as {verdict:?}, so the budget \
+         was spent after the copy: the tunnel put the {} byte head on the wire and \
+         {} of the {} body bytes the origin declared before it noticed",
+        head_len,
+        seen.len(),
+        body.len()
+    );
+    assert!(
+        seen.is_empty(),
+        "the relay forwarded {} body bytes it had already refused to afford",
+        seen.len()
+    );
+    drop(client);
+}
+
+/// A close-delimited response that runs past the lifetime budget is **refused**,
+/// not cut at the cap and reported as a complete one.
+///
+/// The framing with no `Content-Length` and no `Transfer-Encoding` ends when the
+/// origin closes, so nothing in the message says how long it is. The cap is
+/// therefore the copy itself — and a body that *exactly fills* the cap is
+/// indistinguishable from one that is longer, so the relay looks one byte past
+/// it. Without that look the copy stopped at the budget, the loop asked for the
+/// next head, the origin had closed, and the tunnel returned `Ok`: the client
+/// held a head promising 512 bytes, 181 of them, and a clean end. That is the
+/// one outcome this relay refuses to produce anywhere else.
+#[test]
+fn a_close_delimited_response_past_the_lifetime_budget_is_refused_rather_than_cut() {
+    let head_text = "HTTP/1.1 200 OK\r\n\r\n";
+    let body = "y".repeat(512);
+    let rig = Rig::with_script(vec![format!("{head_text}{body}").into_bytes()], 8);
+    let (mut client, tunnel) = rig
+        .tunnel(Some(rig.proof(Who::A, HOST, 443)), 443)
+        .expect("an authorised tunnel");
+    let relay = start_relay(
+        tunnel,
+        &rig,
+        RelayLimits {
+            max_body: 4096,
+            max_response: 200,
+            ..RelayLimits::default()
+        },
+    );
+    client.send(&get("/stream", &rig.surrogate_a.clone()));
+    let verdict = relay.finish("a close-delimited response over the lifetime budget");
+    let head = client.read_head_str();
+    let seen = client.recv_within(body.len(), Duration::from_millis(500));
+
+    assert_eq!(
+        head, head_text,
+        "the origin's head was not relayed verbatim"
+    );
+    assert!(
+        matches!(
+            verdict,
+            Err(BridgeError::Limit {
+                budget: "max_response",
+                ..
+            })
+        ),
+        "a close-delimited response past the lifetime budget ended as {verdict:?}, so \
+         it was cut at the cap and reported as complete"
+    );
+    assert_eq!(
+        seen,
+        vec![b'y'; 200 - head_text.len()],
+        "the client should hold exactly the body the budget allowed, and the refusal \
+         is the byte after it"
+    );
+    drop(client);
+}
+
+/// **The control for the probe the row above needs**: a close-delimited response
+/// that lands exactly on the budget is complete, and a look one byte past the cap
+/// that finds nothing must not turn a finished message into a refusal.
+///
+/// Without this, "always refuse when the cap is reached" passes every test in the
+/// suite and every real response. The body is sized from the head and the budget
+/// rather than written as a number, so a drift in either shows up here instead of
+/// as a tunnel that refuses every streaming response.
+#[test]
+fn a_close_delimited_response_that_lands_exactly_on_the_budget_is_not_refused() {
+    let head_text = "HTTP/1.1 200 OK\r\n\r\n";
+    let budget = 200usize;
+    let body = "z".repeat(budget - head_text.len());
+    let rig = Rig::with_script(vec![format!("{head_text}{body}").into_bytes()], 8);
+    let (mut client, tunnel) = rig
+        .tunnel(Some(rig.proof(Who::A, HOST, 443)), 443)
+        .expect("an authorised tunnel");
+    let relay = start_relay(
+        tunnel,
+        &rig,
+        RelayLimits {
+            max_body: 4096,
+            max_response: budget,
+            ..RelayLimits::default()
+        },
+    );
+    client.send(&get("/exact", &rig.surrogate_a.clone()));
+    client.read_head_str();
+    let seen = client.recv_within(body.len(), Duration::from_millis(500));
+    // The client hangs up before the relay is asked how it ended, and that is
+    // load-bearing rather than tidiness: a completed response leaves the loop
+    // waiting for the *client's* next request, so a test that holds the client
+    // open is measuring its own patience. The first version of this did exactly
+    // that and reported the socket's read timeout as a verdict.
+    drop(client);
+    let outcome = relay
+        .finish("a close-delimited response landing on the budget")
+        .expect("a body that fills the budget exactly is a complete body");
+
+    assert_eq!(
+        seen,
+        body.as_bytes().to_vec(),
+        "a body that lands on the budget was not delivered whole"
+    );
+    assert_eq!(
+        outcome.returned, budget,
+        "the head and the body together are the budget, and the count says so"
+    );
+    assert_eq!(outcome.requests, 1, "one request, one response");
+}
+
+/// A response **head** is charged to the lifetime budget before it is sent, and
+/// a tunnel that has already returned more than its budget says so at the first
+/// byte rather than after the body it is refusing.
+///
+/// A head cannot run away — `max_head` bounds it — but it is a message like any
+/// other and the budget governing the body it introduces has to govern it too.
+/// The limits are chosen so the first response fits and the second head does
+/// not: two 37 byte heads against a 60 byte budget, so the second is 23 bytes of
+/// head over the line and has nothing else about it worth mentioning.
+#[test]
+fn a_response_head_past_the_lifetime_budget_is_refused_before_it_is_sent() {
+    let empty = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    let rig = Rig::with_script(
+        vec![empty.as_bytes().to_vec(), empty.as_bytes().to_vec()],
+        8,
+    );
+    let (mut client, tunnel) = rig
+        .tunnel(Some(rig.proof(Who::A, HOST, 443)), 443)
+        .expect("an authorised tunnel");
+    let relay = start_relay(
+        tunnel,
+        &rig,
+        RelayLimits {
+            max_response: 60,
+            ..RelayLimits::default()
+        },
+    );
+    let surrogate = rig.surrogate_a.clone();
+
+    client.send(&get("/one", &surrogate));
+    client.read_head_str();
+    client.send(&get("/two", &surrogate));
+    let verdict = relay.finish("a second head past the lifetime budget");
+    let leaked = client.recv_within(empty.len(), Duration::from_millis(500));
+
+    assert!(
+        matches!(
+            verdict,
+            Err(BridgeError::Limit {
+                budget: "max_response",
+                ..
+            })
+        ),
+        "a second response head past the lifetime budget ended as {verdict:?}, so \
+         the head went on the wire past the lifetime budget and the tunnel noticed \
+         only afterwards"
+    );
+    assert!(
+        leaked.is_empty(),
+        "the client holds {} bytes of the head the relay was supposed to refuse",
+        leaked.len()
     );
     drop(client);
 }

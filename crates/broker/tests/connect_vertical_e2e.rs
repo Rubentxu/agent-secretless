@@ -1149,6 +1149,27 @@ fn one_tunnel_carries_every_request_and_the_destination_sees_the_credential_on_e
         "the destination did not receive the credential on both requests, so at \
          least one was forwarded with something else in the header: \n{seen}"
     );
+
+    // **And the operator can tell a two-request tunnel from a one-request one.**
+    //
+    // The relay's own log line is the only place the request count exists outside
+    // the outcome struct, and nothing asserted it — the falsification campaign
+    // deleted `requests = outcome.requests` from the log and every test in the
+    // suite stayed green, because a number nobody reads is a number nobody
+    // maintains. This is a real operator surface: a tunnel that carried two
+    // requests and a tunnel that carried one look identical in every other field.
+    let log_path = f.dir.join("broker.log");
+    assert!(
+        log_gains(&log_path, "CONNECT tunnel relayed", Duration::from_secs(30)),
+        "the broker never logged a relayed tunnel, so there is no line to read"
+    );
+    let log = strip_ansi(&std::fs::read_to_string(&log_path).expect("read the broker log"));
+    assert!(
+        log.contains("requests=2"),
+        "the operator's line does not say the tunnel carried two requests, which is \
+         the one fact that distinguishes this from the one-request tunnel it \
+         replaced:\n{log}"
+    );
     assert!(
         !seen.contains(&f.surrogate_env_name()),
         "a variable name in the destination's bytes would mean a token arrived: \n{seen}"
