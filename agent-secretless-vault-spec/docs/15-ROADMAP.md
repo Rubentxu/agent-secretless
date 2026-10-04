@@ -592,6 +592,25 @@ bridge negotiate `h2` over a tunnel it does not parse and cannot relay. The
 matrix pins it with a test and records the falsification that proves the test
 can fail.
 
+**The matrix measured one leg, and C2.8 added a second.** The sentence in the
+artefact claiming its rows describe "both TLS surfaces in the workspace" was
+true when written and C2.8 made it false: making the broker-to-destination hop
+TLS introduced a `rustls::ClientConfig` of its own, and the ALPN hazard the
+matrix pinned for the server side has a **mirror** on the client side that
+nothing watched. A broker that *offered* `h2` to the destination would get one
+that believes it is speaking HTTP/2, and then relay `curl`'s HTTP/1.1 bytes
+into it.
+
+The client leg now has its own table (rows 19-26), its own witnesses in
+`crates/broker/tests/connect_upstream_negotiation.rs`, and its own campaign in
+`tests/upstream_negotiation_falsification.py` — **3 of 3 red on the assertion
+each row names, with no residue**. Two limits are recorded in the same table
+rather than left out: the client-auth row is falsified by a **control pair**
+rather than a mutation, because the bridge holds no key material one could use,
+and the cipher/provider row is **not pinnable at all** with `ring` as the only
+enabled provider. A matrix that gave those two the same weight as the ALPN row
+would be claiming a symmetry that does not exist.
+
 This closed one exit criterion. It did not move UAT-010 on the CONNECT path,
 and it does not touch UAT-012/013, which are superseded by the M8 NO-GO rather
 than blocked: the feature they gate will not ship, so the question they posed

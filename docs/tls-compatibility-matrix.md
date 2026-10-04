@@ -18,8 +18,16 @@ Substrate, from `Cargo.lock` at the commit that published this:
 The server configuration is built in one place,
 `crates/tls-acceptor/src/config.rs:113`, and both the acceptor and the bridge
 consume it — `crates/broker/src/tls_bridge.rs:739-742` calls the same
-`server_config()`. So these rows describe **both** TLS surfaces in the
-workspace, which is why the acceptor's own tests count as witnesses.
+`server_config()`. So these rows describe **both TLS surfaces in the
+workspace**, which is why the acceptor's own tests count as witnesses.
+
+> **That sentence was true when written and C2.8 made it false.** Rows 1-18
+> describe the **server** leg — the TLS the bridge presents to the agent. The
+> broker-to-destination hop is now TLS too, built from a `rustls::ClientConfig`
+> of its own at `crates/broker/src/tls_bridge.rs:883`, and it is a **third**
+> surface that rows 1-18 do not describe. Those rows are numbered as the server
+> leg below, and the client leg has its own table further down, because merging
+> them into one would let a reader take row 4 as a statement about both.
 
 ## The matrix
 
@@ -43,6 +51,91 @@ workspace, which is why the acceptor's own tests count as witnesses.
 | 16 | SNI-driven leaf selection | per target, from the CONNECT authority | measured (indirectly) | the leaf is minted for `target.host()`, and row 7 covers the binding |
 | 17 | HTTP/2 on this path | **not supported** | derived from row 4 | row 4 plus the "does not own the relay" fact below |
 | 18 | Cross-implementation interop | a real OpenSSL client completes | measured | `tls-acceptor/tests/openssl_client.rs`, three tests shelling out to `openssl s_client` |
+
+## The client leg — the hop C2.8 added
+
+`Bridge::dial_upstream` builds the broker's side of the second hop:
+
+```text
+crates/broker/src/tls_bridge.rs:883
+    rustls::ClientConfig::builder()
+        .with_root_certificates(self.destination_roots.as_ref().clone())
+        .with_no_client_auth();
+```
+
+Three cells are set. The three that are **not** — the protocol version range,
+the ALPN protocols offered, and the crypto provider — are inherited from a
+library default, and `connect_upstream_tls.rs` measures what this leg *trusts*
+while saying nothing about what it *negotiates*. So the ALPN hazard row 4 pins
+for the server side was, on the client side, unwatched, and **the two are mirror
+images**:
+
+- server side (row 4): a bridge that *selected* `h2` would hand an `h2`-capable
+  agent a connection the bridge cannot parse;
+- client side (row 21): a broker that *offered* `h2` would get a destination
+  that believes it is speaking HTTP/2, and then relay `curl`'s HTTP/1.1 bytes
+  into it — a tunnel whose inner bytes are framed for a protocol the
+  destination chose and the agent never agreed to.
+
+`curl` and `reqwest` both offer `h2`, so this is the shape a routine request
+takes rather than an edge case.
+
+Every row below is read off the **destination's** `ServerConnection`. A broker
+reporting its own `ClientConfig` would be the broker agreeing with itself, and
+this repository has already been bitten by two empty positive assertions.
+
+| # | Property | Value | How it is known | Witness |
+|---|---|---|---|---|
+| 19 | Verified name | the route's host, never the resolved address | measured, and falsified by the sibling campaign | `connect_upstream_tls.rs`, T4 |
+| 20 | Trust anchors | the operator's, from `--connect-roots`; an empty store verifies nothing | measured, and falsified by the sibling campaign | `connect_upstream_tls.rs`, T3; the real-binary default in `main.rs` |
+| 21 | ALPN offered | **no protocol offered** | measured + falsified | `connect_upstream_negotiation.rs::a_destination_offering_alpn_is_given_no_selection_by_the_broker` |
+| 22 | TLS 1.3 | reached against a TLS-1.3-only destination (the ceiling) | measured + falsified | `the_broker_reaches_a_destination_offering_only_tls13` |
+| 23 | TLS 1.2 | reached against a TLS-1.2-only destination (the floor) | measured + falsified | `the_broker_reaches_a_destination_offering_only_tls12` |
+| 24 | Observed version, ordinary destination | TLS 1.3 on this host | **observed, not pinned** | `the_broker_negotiates_tls13_against_a_destination_taking_the_defaults` — coherence of the default, not a guarantee about tomorrow |
+| 25 | Client authentication | the broker presents **none** | measured, **falsified by a control pair rather than a mutation** | `the_broker_presents_no_client_certificate_to_a_destination_that_demands_one`, with `a_client_holding_the_issuers_certificate_completes_against_a_destination_that_demands_one` |
+| 26 | Cipher suites, key-exchange groups, signature algorithms, resumption | — | **not pinned, and not testable here** | the workspace enables `rustls` with `ring` and no alternative provider, so there is no second value to move and no test that could notice the first one moving |
+
+### Row 25 is weaker than row 4, and says so
+
+Row 4 is falsified by a mutation that sets `alpn_protocols` on the server.
+Row 25 has **no such mutation**: the only change that could redden it is one
+that gives the broker a client certificate, and the bridge holds no key
+material it could use, so the mutation does not exist as a one-line edit.
+
+What it has instead is a **mutually falsifying pair**, which is a weaker
+instrument and is labelled as one. The pin goes red if the destination's demand
+were not real, because a destination accepting anything would record
+`handshook=true`. The control goes red if the certificate were not verifiable,
+because a destination accepting nothing would never handshook. Two tests, each
+reddening when the other's premise is removed, with no production change.
+
+That control was wrong twice before it was right, and both failures are worth
+recording because both read as *the anchor is wrong*:
+
+1. it presented the leaf without the intermediate, so the verifier could not
+   build a path to the root it held and answered `UnknownIssuer`;
+2. it presented the destination's own leaf, which `issue_leaf` stamps
+   `ExtendedKeyUsage: serverAuth` and nothing else — a verifier is right to
+   reject a server certificate presented as a client one.
+
+The control now mints a real `clientAuth` leaf from the same intermediate, so
+it differs from the broker in exactly the one respect under test.
+
+### A TLS 1.3 fact this row had to be written around
+
+`the_broker_presents_no_client_certificate_to_a_destination_that_demands_one`
+does **not** assert that `establish` returns an error, and cannot. In TLS 1.3
+the client sends its `Finished` and considers the handshake over before the
+server has processed the empty certificate message, so `dial_upstream` returns
+`Ok` and `serve_connect` hands back a tunnel the destination has already
+refused. Asserting on the broker's return value would be asserting a property
+of the protocol rather than of the broker, and it would break — correctly, but
+uninformatively — the day the negotiation falls to TLS 1.2.
+
+The first version of that test did exactly that, and it failed with the
+destination's record reading `handshook=false version=None client_certs=0`
+while `establish` had returned `Ok`. The witness is the destination's record and
+nothing else.
 
 ## What an independent implementation actually negotiated
 
@@ -126,6 +219,35 @@ M2 and M3 also reddened
 that control drives the same shared `server_config()` with a TLS-1.3-only
 client. That is the mutation's reach, not a defect in the control.
 
+### The client leg's own campaign
+
+The rows above all mutate the **server** configuration. The client leg has a
+separate campaign, `tests/upstream_negotiation_falsification.py`, because the
+two configurations are different code and a campaign that edited one while
+citing the other's rows would be measuring nothing. **3 of 3 red on the
+assertion each row names, with no mutation residue in the tree:**
+
+| ID | Mutation | Expected to break | Observed |
+|---|---|---|---|
+| N1 | `tls_bridge.rs:883`: set `config.alpn_protocols = [h2, http/1.1]` on the **client** config | row 21 | **red**: `a_destination_offering_alpn_is_given_no_selection_by_the_broker` — the destination recorded a selection, the exact mirror of M1 |
+| N2 | pin the client to `TLS12` only | row 22 | **red**: `the_broker_reaches_a_destination_offering_only_tls13` — `expect` on `establish`, fatal `ProtocolVersion` |
+| N3 | pin the client to `TLS13` only | row 23 | **red**: `the_broker_reaches_a_destination_offering_only_tls12` — `expect` on `establish`, fatal `ProtocolVersion` |
+
+Three things about how those ran are worth more than the pass count:
+
+1. **N1's first attempt did not compile**, and the runner reported `SKIP`, not a
+   pass. `with_alpn_protocols` is a *server*-side builder method in rustls
+   0.23; the client's is a public field. A row that cannot compile has measured
+   nothing while looking like it had, which is why a `SKIP` is never counted.
+2. **N2 and N3 are caught by the `expect` on `establish`, not by the version
+   assertion behind it**, for the same reason T3 and T4 above name theirs: a
+   destination that answers with a fatal alert means no tunnel comes back, so
+   there is no version left to read off it.
+3. **N3 is invisible to the cell this document quotes most.** The
+   observed-ceiling test still passes, because it negotiates TLS 1.3, which is
+   all it ever claimed. The mutation is visible only to the floor row — a limit
+   quoted as a limit.
+
 ## Why the negative control exists
 
 `a_client_offering_h2_and_http11_gets_no_alpn_selected` asserts `None`. An
@@ -155,6 +277,20 @@ of finding them was a false green, not a red. The control is not decoration.
   remain unwatched. Observed is not pinned: a default can change without
   failing a single test, and the OpenSSL pair quoted above is a measurement of
   this host today, not a guarantee about tomorrow.
+- **That the client leg is as pinned as the server leg.** It is not, in two
+  ways, and both are structural rather than unfinished. **Row 25 is falsified
+  by a control pair, not by a mutation**, because the bridge holds no key
+  material a mutation could use to present a certificate. **Row 26 is not
+  pinnable at all**, because the workspace enables `ring` with no alternative
+  provider, so there is no second value to move into and no test that could
+  notice the first one moving. A matrix that presented rows 25 and 26 with the
+  same weight as row 21 would be claiming a symmetry that does not exist.
+- **That the two legs agree by construction.** They do not share a builder.
+  `LeafMaterial::server_config()` produces the server side; the client side is
+  three chained calls written separately. The `session_config` rows describe
+  the first, the `client leg` rows the second, and nothing in the build fails
+  if one is changed and the other is not — which is exactly what N1 through N3
+  had to be written to notice.
 - **That this is the same document as
   `agent-secretless-vault-spec/docs/12-COMPATIBILITY-MATRIX.md`.** It is not.
   That one is a catalogue of which tools work with which mechanism and is a
