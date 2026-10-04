@@ -788,7 +788,7 @@ deliberate: C0 first, because writing more code on top of an authority that
 misdescribes the product compounds the error.
 
 ```text
-CURRENT: v0.28.0
+CURRENT: v0.29.0
 │
 ├─ V1-C0  Rebaseline / truthfulness        ← this document, this cycle
 ├─ V1-C1  M7 residual: agent uid != broker uid

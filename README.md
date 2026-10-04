@@ -14,7 +14,7 @@ agent ──(surrogate / socket)──▶ broker ──(real credential)──�
         no secret material                the only holder
 ```
 
-> **Status: pre-1.0, at v0.28.0. Not certified, and the gates say so.**
+> **Status: pre-1.0, at v0.29.0. Not certified, and the gates say so.**
 >
 > The workspace compiles and **1059 tests are enumerated** (1059 pass, 0 ignored,
 > 0 fail; the count is re-derived every CI run by the `R11 README test count`

@@ -14,7 +14,7 @@ agente ──(sustituto / socket)──▶ broker ──(credencial real)──�
         sin material secreto              único poseedor
 ```
 
-> **Estado: pre-1.0, en v0.28.0. Sin certificar, y los gates lo dicen.**
+> **Estado: pre-1.0, en v0.29.0. Sin certificar, y los gates lo dicen.**
 >
 > El workspace compila y hay **1059 tests enumerados** (1059 pasan, 0 ignorado, 0
 > fallan; el conteo lo vuelve a derivar el gate `R11 README test count` en cada
