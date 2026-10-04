@@ -77,7 +77,7 @@ enum Command {
         /// The registered worker name, as declared in the broker's worker file.
         worker: String,
         /// Arguments appended to the template's own, after `--`.
-        #[arg(required = true, trailing_var_arg = true)]
+        #[arg(trailing_var_arg = true)]
         args: Vec<String>,
         /// Credential to inject, by id. A *reference*: the broker resolves it,
         /// so no secret is ever an argument to this process.

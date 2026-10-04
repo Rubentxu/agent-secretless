@@ -250,6 +250,22 @@ pub fn spawn(
         secret_bytes = provider();
     }
 
+    // The redactor the child's output will pass through on its way back to a
+    // caller, seeded with the value the runtime just resolved.
+    //
+    // This is the leak the productive path exposed. A worker that prints its
+    // own environment hands the credential straight back, and the redactor
+    // that used to scrub it was built from the template — which cannot know
+    // the value, because the template is a file and a file holding the secret
+    // is exactly what this product exists to prevent. So the injection path
+    // resolved a credential and the output path had no idea what it was.
+    //
+    // `effective_redactor` holds one extra copy of the value for the lifetime
+    // of the run and is dropped with it; the zeroed copy in `secret_bytes` is
+    // the one that reaches `is_executable_file`'s caller paths, and neither
+    // ever reaches the audit log, which records names and outcomes only.
+    let effective_redactor = template.redactor.extended_with(&secret_bytes);
+
     // The env bytes travel into the Command's map; the broker's own
     // environment is never touched (std::env is not read or written).
     let plan = template.secret_injection.clone();
@@ -389,8 +405,8 @@ pub fn spawn(
         return Err(SpawnError::Timeout(timeout));
     }
 
-    let stdout_redacted = template.redactor.redact(&stdout_bytes);
-    let stderr_redacted = template.redactor.redact(&stderr_bytes);
+    let stdout_redacted = effective_redactor.redact(&stdout_bytes);
+    let stderr_redacted = effective_redactor.redact(&stderr_bytes);
 
     audit_worker(
         audit,

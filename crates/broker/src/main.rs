@@ -231,6 +231,7 @@ fn main() -> std::io::Result<()> {
     // and a destination an operator cannot see in the launch contract is a
     // destination they cannot audit.
     let mut connect_routes: Option<PathBuf> = None;
+    let mut workers_file: Option<PathBuf> = None;
     // C2.6: Cedar policy text. A route file declares what should be reachable;
     // this is the permission that makes it so. They are separate flags on
     // purpose — a route with no policy rule is refused, and that refusal is the
@@ -324,6 +325,13 @@ fn main() -> std::io::Result<()> {
                 connect_routes = args.next().map(PathBuf::from);
                 if connect_routes.is_none() {
                     eprintln!("asv: --connect-routes requires a path argument");
+                    std::process::exit(1);
+                }
+            }
+            "--workers" => {
+                workers_file = args.next().map(PathBuf::from);
+                if workers_file.is_none() {
+                    eprintln!("asv: --workers requires a path argument");
                     std::process::exit(1);
                 }
             }
@@ -586,10 +594,19 @@ fn main() -> std::io::Result<()> {
             set_socket_dir_mode(parent)?;
         }
     }
-    let listener = UnixListener::bind(&socket_path)?;
-    set_socket_mode(&socket_path)?;
-    tracing::info!(path = %socket_path.display(), protocol = asv_ipc_protocol::PROTOCOL_VERSION, "broker listening");
-
+    // Configuration is built and validated **before** the socket is bound.
+    //
+    // It used to be bound first, which meant a broker that refused its own
+    // `--policy` or `--workers` file exited non-zero and left a socket on
+    // disk. A client that finds that socket connects, gets nothing, and has no
+    // way to tell "the broker is not configured" from "the broker is not
+    // there" — the same shape this codebase already calls out for a proxy that
+    // looks alive and can never establish a tunnel, except here the process is
+    // gone and the socket it left behind still answers.
+    //
+    // Binding last also means a configuration error costs nothing: no
+    // directory, no socket, no window in which a half-configured broker is
+    // reachable.
     let mut state = BrokerState::default();
 
     // C2.6: the operator's Cedar text, if they supplied one. Loaded before the
@@ -615,6 +632,38 @@ fn main() -> std::io::Result<()> {
         });
         tracing::info!(path = %path.display(), "Cedar policy loaded");
     }
+
+    // The operator's worker declarations, loaded before anything can be run
+    // and refused as a whole. A file that half-parses is not a worker file an
+    // operator wrote, and starting with the subset that happened to be valid
+    // would give the process an authority nobody declared.
+    if let Some(path) = workers_file.as_deref() {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("asv: cannot read --workers {}: {e}", path.display());
+            std::process::exit(1);
+        });
+        let registry = asv_broker::worker_file::load(&text).unwrap_or_else(|e| {
+            eprintln!("asv: --workers {}: {e}", path.display());
+            std::process::exit(1);
+        });
+        tracing::info!(
+            path = %path.display(),
+            workers = ?registry.names(),
+            "isolated worker registry loaded"
+        );
+        state.workers = std::sync::Arc::new(registry);
+    }
+
+    // Bound only now: everything the operator declared has been read, and
+    // everything that could refuse has refused.
+    let listener = UnixListener::bind(&socket_path)?;
+    set_socket_mode(&socket_path)?;
+    tracing::info!(
+        path = %socket_path.display(),
+        protocol = asv_ipc_protocol::PROTOCOL_VERSION,
+        workers = ?state.workers.names(),
+        "broker listening"
+    );
 
     if let Some(report) = self_report {
         state.self_report = report;

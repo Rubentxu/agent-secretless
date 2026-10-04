@@ -226,6 +226,24 @@ impl Redactor {
         self.secrets.is_empty()
     }
 
+    /// A copy of this redactor that also knows `secret`.
+    ///
+    /// Added for the case the template cannot cover: the runtime resolves an
+    /// injected credential *after* the template was built, so a redactor
+    /// declared in a worker file structurally cannot know the value — and a
+    /// worker file that did know it would be a plaintext secret on disk, which
+    /// is the thing this product exists to prevent. The runtime already holds
+    /// the value in `secret_bytes` at that moment, so it seeds the redactor
+    /// from its own resolution rather than from a file.
+    pub fn extended_with(&self, secret: &[u8]) -> Self {
+        if secret.is_empty() {
+            return self.clone();
+        }
+        let mut secrets = self.secrets.clone();
+        secrets.push(secret.to_vec());
+        Self { secrets }
+    }
+
     /// Replace every occurrence of every registered secret with
     /// `[REDACTED]`. The result is the input bytes with each match
     /// replaced. Non-overlapping matches are replaced left-to-right.

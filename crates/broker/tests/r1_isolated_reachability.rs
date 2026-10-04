@@ -45,6 +45,44 @@ use asv_domain::AgentSessionId;
 use asv_identity::{PeerCredentials, WorkloadIdentity};
 use asv_ipc_protocol::{AuditEventDto, ErrorCode, Request, Response};
 
+/// A vault that lends one known value. The value is a fixture constant and not
+/// a real credential, which is the only reason it can sit in a source file.
+const LENT: &[u8] = b"asv1-fixture-value-that-must-never-come-back";
+
+struct FixturePort;
+
+impl asv_connector_http::SecretPort for FixturePort {
+    fn lend(
+        &self,
+        _credential: &str,
+        sink: &mut dyn asv_connector_http::SecretSink,
+    ) -> Result<(), asv_connector_http::SecretError> {
+        // Keyed on nothing: the vault is addressed by wire id, and a fixture
+        // that tried to match the label returned "not found" and lent the
+        // empty string, which made the redaction row pass without the child
+        // ever having held anything. A fixture that cannot be addressed wrong
+        // is the honest shape for this row.
+        sink.accept(LENT)
+    }
+}
+
+/// A worker that is handed a credential and prints it, which is what an
+/// accidentally verbose tool does.
+fn echo_secret_template() -> WorkerTemplate {
+    WorkerTemplate {
+        name: "leaky".into(),
+        binary: "/bin/sh".into(),
+        arguments: vec!["-c".into(), "printf %s \"$LEAK_TEST\"".into()],
+        secret_injection: SecretInjectionPlan::EnvVar {
+            name: "LEAK_TEST".into(),
+        },
+        egress_policy: EgressPolicy::Deny,
+        landlock_profile: LandlockProfile::default(),
+        seccomp_profile: SeccompProfile::ClosedAllowList,
+        redactor: Redactor::empty(),
+    }
+}
+
 /// A peer whose process is pinned. The pin is real: `pin_pidfd` on this very
 /// process, because the verb hands a process tree a credential and D4's bar is
 /// the one the surrogate path already meets.
@@ -389,4 +427,118 @@ fn r1_a_refused_isolated_run_is_also_audited() {
 fn r1_the_audit_log_type_is_the_one_the_broker_holds() {
     let log = AuditLog::new(8);
     assert!(log.query(0).is_empty(), "a fresh chain is empty");
+}
+
+// ------------------------------------------------- the credential coming back
+
+/// A credential the broker lent to a worker does not come back out of it.
+///
+/// This is the row that made the second half of R1 necessary. The runtime
+/// resolves the injected secret into `secret_bytes`, hands it to the child, and
+/// zeroizes its own copy — and then redacts the child's output with a redactor
+/// built from the *template*, which has no way to know the value. So a tool
+/// that echoes its own environment hands the credential straight back through
+/// `IsolatedResult`, and the caller receives the very bytes the broker
+/// resolved a moment earlier.
+///
+/// The ADR-0008 caveat is about a process *transforming* a secret, which
+/// redaction cannot help with. Echoing is not a transformation: it is the
+/// identity, and redaction is exactly the right tool for it. If this row is
+/// red, the isolation pipeline is not merely weaker than the strong path, it
+/// is a credential exfiltration path with a sandbox attached.
+#[test]
+fn r1_a_lent_credential_does_not_come_back_in_the_response() {
+    if !userns_available() {
+        eprintln!("skipping: unprivileged user namespaces are unavailable on this host");
+        return;
+    }
+    let peer = pinned_peer();
+    let mut state = state_with(vec![echo_secret_template()]);
+    state.secrets = Some(std::sync::Arc::new(FixturePort));
+    let credential =
+        asv_domain::CredentialMetadata::new("fixture", asv_domain::CredentialKind::GenericSecret);
+    // The reference a caller sends is the credential's wire id, which is what
+    // the vault is keyed by — not its label.
+    let credential_ref = credential.id.to_wire();
+    state.credentials.push(credential);
+    let session = open_session(&mut state, &peer);
+
+    let response = handle(
+        &mut state,
+        &peer,
+        Request::RunIsolated {
+            session,
+            worker: "leaky".into(),
+            args: vec![],
+            credential: Some(credential_ref),
+            timeout_ms: Some(60_000),
+        },
+    );
+
+    match response {
+        Response::IsolatedResult { stdout, .. } => {
+            let echoed = String::from_utf8_lossy(&stdout).into_owned();
+            assert!(
+                !echoed.contains(std::str::from_utf8(LENT).unwrap()),
+                "the worker echoed the credential the broker lent it, and the \
+                 broker returned it to the caller verbatim: {echoed:?}"
+            );
+        }
+        other => panic!("expected an isolated result, got {other:?}"),
+    }
+}
+
+/// The credential the redaction row depends on actually arrives.
+///
+/// Paired with the row above, and the pair is what makes either of them
+/// meaningful on its own. `r1_a_lent_credential_does_not_come_back_in_the_response`
+/// passes trivially if the child was handed nothing, because `printf %s ""`
+/// prints nothing; this one fails loudly if injection breaks, because it
+/// measures what the child received rather than what the broker withheld.
+///
+/// Reporting the length rather than the value is the point: the assertion
+/// cannot itself become a place the secret is written down.
+#[test]
+fn r1_the_injected_credential_reaches_the_child() {
+    if !userns_available() {
+        eprintln!("skipping: unprivileged user namespaces are unavailable on this host");
+        return;
+    }
+    let peer = pinned_peer();
+    let mut template = echo_secret_template();
+    template.arguments = vec!["-c".into(), r#"printf %s "$LEAK_TEST" | wc -c"#.into()];
+    let mut state = state_with(vec![template]);
+    state.secrets = Some(std::sync::Arc::new(FixturePort));
+    let credential =
+        asv_domain::CredentialMetadata::new("fixture", asv_domain::CredentialKind::GenericSecret);
+    let credential_ref = credential.id.to_wire();
+    state.credentials.push(credential);
+    let session = open_session(&mut state, &peer);
+
+    let response = handle(
+        &mut state,
+        &peer,
+        Request::RunIsolated {
+            session,
+            worker: "leaky".into(),
+            args: vec![],
+            credential: Some(credential_ref),
+            timeout_ms: Some(60_000),
+        },
+    );
+
+    match response {
+        Response::IsolatedResult { stdout, .. } => {
+            let reported = String::from_utf8_lossy(&stdout);
+            let reported = reported.trim();
+            assert_eq!(
+                reported,
+                LENT.len().to_string(),
+                "the child must have received the credential in full: a broken \
+                 injection would also make the redaction row pass, and for the \
+                 wrong reason"
+            );
+        }
+        other => panic!("expected an isolated result, got {other:?}"),
+    }
 }

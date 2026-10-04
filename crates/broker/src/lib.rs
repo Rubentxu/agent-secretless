@@ -60,6 +60,7 @@ pub mod surrogate;
 pub mod tls_bridge;
 pub mod vault_port;
 pub mod worker;
+pub mod worker_file;
 
 pub use pg_session::{BorrowedSecret, PgRuntime, PgSessionError, PgSessionMap, StatementOutcome};
 pub use surrogate::{
