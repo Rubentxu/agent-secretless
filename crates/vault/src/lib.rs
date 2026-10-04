@@ -42,6 +42,8 @@ pub mod ingest;
 pub mod memfd;
 pub mod store;
 pub mod tpm;
+/// A real TPM 2.0 client: the wire protocol, not a placeholder for it.
+pub mod tpm2;
 
 pub use envelope::{EnvelopeError, KdfParams, VaultHeader, VaultKey, ENVELOPE_VERSION};
 pub use store::{

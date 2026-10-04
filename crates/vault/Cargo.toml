@@ -7,6 +7,16 @@ license.workspace = true
 repository.workspace = true
 description = "Versioned encrypted vault for Agent Secretless Vault: Argon2id KEK, XChaCha20-Poly1305 records, no agent retrieval path."
 
+[features]
+# The tests that need a real TPM 2.0 implementation on `PATH` — `swtpm` — live
+# behind this. They are not `#[ignore]`d: an ignored test is a test nobody
+# ran, and a row that cannot execute is not a pass. What the feature does is
+# keep the default suite honest about what it measures. `cargo test -p asv-vault`
+# runs everything that needs no device; `cargo test -p asv-vault --features
+# tpm-device` adds the device path, and the M12 gate row names both commands and
+# says which host ran the second.
+tpm-device = []
+
 [dependencies]
 asv-domain.workspace = true
 argon2.workspace = true
