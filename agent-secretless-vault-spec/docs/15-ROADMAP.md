@@ -1890,7 +1890,7 @@ fails for any other reason counts as an escape rather than as a pass.
 
 ## C2.8 — CONNECT in production, and the first thing that is not
 
-### Status: open. Six measurements in; the fifth built the multi-request loop and the measurement found four defects in it, the sixth falsified the loop and found two more, and every one of them sat under a green test
+### Status: open. Seven measurements in; the fifth built the multi-request loop and found four defects in it, the sixth falsified the loop and found two more, and the seventh carried a real `npm install` through it and found the boundary of the design. Every defect so far sat under a green test
 
 V1-C2's scope, written when the block was opened and not narrowed since: *a
 production listener wiring `relay_substituted` into a running `asv-brokerd`,
@@ -2377,14 +2377,73 @@ version of that test which claimed the opposite made an arithmetic claim about i
 own fixture that was simply false, and a test whose arithmetic has not been checked
 is a test that survives the defect it was written to catch.
 
-**Still owed in this block.** A real workload through this relay: `npm install`
-against `asv run` on this code, which is the one measurement that would say whether
-the loop carries a build rather than three `GET`s. Stress and cancellation under
-load beyond the anti-replay property already measured. And **the broker has no
-ordered shutdown at all**: `main.rs` installs no signal handling, so tunnels dying
-when the process stops is carried entirely by the process dying. That is a real
-guarantee from the kernel and not one from this product, and it is recorded as owed
-rather than counted as delivered.
+**And the workload this block kept deferring: a real `npm install` through the
+real relay, with the real client.** Not a harness and not three scripted `GET`s
+— `npm` on this machine, which has never heard of Agent Secretless, handed a
+registry URL and an `HTTPS_PROXY` and nothing else, against a real `asv-brokerd`
+with a real vault, route and policy, through a real session shim. The origin is
+a process the driver starts and it is the **witness**: it decides whether the
+bytes it was handed are the real credential or the surrogate, which is the only
+vantage point from which that question has an answer
+(`tests/connect_workload_e2e.py`).
+
+```text
+npm install          exit 0, node_modules/asv-workload present, 8.4 s
+origin requests      242
+tunnels              4
+requests per tunnel  60.5
+bytes                2 264 191  (40 572 packument + 2 223 619 tarball)
+real credential      242 of 242
+surrogate            0
+```
+
+**Both limits this block raised are load-bearing rather than theoretical, and
+this is the number that says so.** 242 requests is 2.6× the 93 that the session
+budget died at, and 2.26 MiB is past the 2.1 MiB that the response cap used to
+refuse. A relay that could carry three scripted requests and could not carry this
+would look identical in every test the block had written. The four-tunnel,
+sixty-per-tunnel shape is also the thing no scripted fixture can produce: `npm`
+opens a bounded number of connections and reuses each of them for dozens of
+messages, which is exactly the reuse the one-request relay could not survive.
+
+**And the measurement found the boundary of what this path can reach, which is
+not a limit but an architectural gap.** The broker dials its upstream with a
+plain `TcpStream::connect`
+(`crates/broker/src/tls_bridge.rs`, `serve_connect`): the leg from the broker to
+the destination is **cleartext**. A real `registry.npmjs.org` speaks TLS only, so
+pointing this at the real registry fails at the first byte for a reason that has
+nothing to do with the loop. The registry here is therefore a local one serving
+a synthetic dependency tree, and the claim is scoped to that: a real client, a
+real workload, real connection reuse, a chunked response on a real client's path,
+and the credential property measured at the destination. What it does **not**
+establish is that a real HTTPS destination is reachable, because today it is not.
+That is owed, and it is owed as TLS on the upstream leg rather than as a bug.
+
+Two smaller things the driver had to learn, both of which is the shape of this
+block. A CONNECT route must name a **host**, not a literal address — the product
+refuses `127.0.0.1` with *"a route must name a host it can pin"*, which is a
+correct refusal and not something a fixture should route around. And `npm`
+ignores `NODE_TLS_REJECT_UNAUTHORIZED=0` in favour of its own `strict-ssl`, so
+the child needs `--strict-ssl=false`, which is npm's `curl -k` and the same
+relaxation the Rust vertical makes and for the same reason.
+
+**A cross-check that was not a second count, after it disagreed with one.** The
+broker logs a request total per tunnel, but only for a tunnel that *finishes*;
+one still open when the session ends is revoked instead, and produces no line.
+One run reported 199 against the origin's 242 and another reported 242. The gap
+is the revocation path working, and reading it as a lost log line would have
+turned a correct behaviour into a phantom discrepancy. It is reported as an upper
+bound now, and the origin remains the witness: it counts what it was handed, and
+nothing the broker says about itself can move that number.
+
+**Still owed in this block.** **TLS on the leg from the broker to the
+destination**, without which a real HTTPS registry is unreachable and every claim
+above is scoped to a local origin. Stress and cancellation under load beyond the
+anti-replay property already measured. And **the broker has no ordered shutdown at
+all**: `main.rs` installs no signal handling, so tunnels dying when the process
+stops is carried entirely by the process dying. That is a real guarantee from the
+kernel and not one from this product, and it is recorded as owed rather than
+counted as delivered.
 
 
 
