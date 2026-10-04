@@ -72,30 +72,61 @@
 //! whole milestone exists because a mechanism that looks healthy while
 //! protecting nothing is the failure being removed.
 //!
-//! `TPM2_PCR_Extend` is also absent, and the reason is worth more than the
-//! absence: writing a PCR needs an authorization session, and this client's
-//! encoding of one has not been made to work.
+//! `TPM2_PCR_Extend` needed an authorization session, and this client's encoding
+//! of one refused. It no longer does, and the answer is one line of structure
+//! that six matrices of session fields never varied.
 //!
-//! **What was measured, so the next attempt does not repeat it.** A password
-//! session is `TPM_ST_SESSIONS` plus an authorization area of
-//! `TPM2B_AUTH authorization`, `TPM2B_NONCE nonceCaller`, then
-//! `sessionHandle = TPM_RS_PW (0x4000_0009)`, a second nonce, a
-//! `TPMA_SESSION` byte and a `TPM2B_DIGEST hmac` — and, for a command whose
-//! header carries sessions, a `u32 authorizationSize` ahead of all of it.
-//! Against a TPM 2.0 implementation, `TPM2_Clear` and `TPM2_PCR_Extend` refuse
-//! that encoding with `0x184` and `TPM_RC_SIZE` respectively, across the whole
-//! matrix of nonce size (0, 16, 20, 32), hmac size, `TPMA_SESSION` value
-//! (0x00 and 0x01), with and without `authorizationSize`, and with the session
-//! handle before the authorization. **The same commands, on the same device,
-//! through `tpm2-tools` succeed** — so the device, the command codes and the
-//! object encodings are not what is wrong here; this client's session area is.
-//! A dimension that is missing from that list is a dimension still untried.
+//! **A command with one password session is built like this:**
+//!
+//! ```text
+//! TPM_ST_SESSIONS
+//! UINT32 commandSize
+//! TPM_CC commandCode
+//! <the command's handles, in order>
+//! UINT32 authorizationSize
+//!     TPMI_DH sessionHandle   (TPM_RS_PW)
+//!     TPM2B_AUTH              the password
+//!     TPM2B_NONCE             nonceCaller
+//!     TPMA_SESSION            sessionAttributes
+//! <the command's parameters, in order>
+//! ```
+//!
+//! The authorization area goes **between the handles and the parameters**.
+//! That is the whole finding. Every earlier attempt placed the area at one end
+//! or the other and then varied what was inside it — nonce size over
+//! {0, 16, 20, 32}, hmac size, `TPMA_SESSION` over {0x00, 0x01}, with and
+//! without `authorizationSize`, and the session handle before or after the
+//! authorization — sixteen combinations, all refused, with `0x184` and
+//! `TPM_RC_SIZE`. None of them tried the one dimension that was wrong, because
+//! each of them had already decided where the area went.
+//!
+//! **`0x184` was never about the session.** It names the first *handle*, and
+//! `TPM2_Clear` has an `authHandle` parameter that those requests did not send.
+//! With `TPM_RH_LOCKOUT` in front of the same session area, `Clear` answers
+//! `0`. `Clear` is the smallest command in the specification, which is exactly
+//! why it was the one to reach for, and it is kept in the client because
+//! `PCR_Extend` alone would not have found the missing handle.
+//!
+//! **How the ground truth was obtained**, for the next person who needs bytes
+//! this file does not have. Not a proxy: `swtpm socket --log file=<path>,
+//! level=9` writes every request it reads, hex-dumped, so running the
+//! reference client against a logging device and reading the log is a command
+//! away. Three earlier attempts to capture these bytes through a proxy failed
+//! for three unrelated reasons — a unix-socket proxy with a control channel, an
+//! mssim proxy that assumed symmetric framing, and a bridge with two bugs of
+//! its own. The device was logging the answer the whole time.
+//!
+//! Measured against the reference client, the 65 bytes of a `PCR_Extend` for
+//! PCR 1 are pinned by a test that transcribes them rather than generating
+//! them with the code it checks. Against a device, `PCR_Extend` answers `0` and
+//! the PCR reaches `sha256(previous ‖ digest)` — computed independently in the
+//! test, not read back and compared with itself.
 //!
 //! The consequence for the tests below is honest rather than convenient: on a
 //! device that has just been started every PCR is zero, and that is the
-//! correct answer, not a symptom. A test that demanded a non-zero digest would
-//! be asserting a fiction. Writing a PCR is what makes the read falsifiable,
-//! and that is the next protocol work rather than a line to add.
+//! correct answer, not a symptom. So a read-only test asserts the frame, and
+//! the assertion that a write happened lives in the test that extends a PCR
+//! and checks the fold.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -129,6 +160,31 @@ const TPM_ALG_SHA256: u16 = 0x000B;
 /// refused rather than read with a bitmap of the wrong size, which would come
 /// back as a PCR that reads as zero rather than as an error.
 const PC_CLIENT_PCR_SELECTION_BYTES: u8 = 3;
+
+/// `TPM_ST_SESSIONS`: the request carries an authorization area. Every other
+/// command this module sends uses `TPM_ST_NO_SESSIONS` and has no area at all.
+const TPM_ST_SESSIONS: u16 = 0x8002;
+
+/// `TPM_RS_PW`: the authorization session that presents a password rather than
+/// a computed HMAC. An empty password is the common case — a PCR's authValue is
+/// empty unless something set one — which is what makes a password session the
+/// right one for a first write and an HMAC session, which needs a negotiated
+/// key, the wrong one.
+const TPM_RS_PW: u32 = 0x4000_0009;
+
+/// `TPM2_PCR_Extend`.
+const TPM2_PCR_EXTEND: u32 = 0x0000_0182;
+
+/// `TPM2_Clear`.
+const TPM2_CLEAR: u32 = 0x0000_0126;
+
+/// `TPM_RH_LOCKOUT`: the authorization handle `TPM2_Clear` requires.
+///
+/// A handle, not a session. It is the first thing in `Clear`'s body, which is
+/// why a request that omits it is answered `0x184` — a refusal naming the first
+/// handle, not a complaint about the session that follows. The two were read as
+/// one failure for six attempts; see the module docs.
+const TPM_RH_LOCKOUT: u32 = 0x4000_000A;
 
 /// A TPM this module can reach, named by how it is reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,6 +349,26 @@ trait Channel: std::fmt::Debug + Send {
     fn exchange(&mut self, request: &[u8]) -> Result<Tpm2Response, Tpm2Error>;
 }
 
+/// One password session's authorization area: nine bytes.
+///
+/// `TPM_RS_PW`, an empty authorization value, an empty nonce, and a
+/// `TPMA_SESSION` of zero. The sizes are the `TPM2B` size fields themselves —
+/// `0x0000` is a present, empty `TPM2B`, not a missing field, and a session
+/// that omits them is a different length on the wire.
+///
+/// `continueSession` is clear, which tells the TPM not to keep the session's
+/// state afterwards. A password session has no state worth keeping, and the
+/// byte is here because the structure has a slot for it, not because the value
+/// is interesting.
+fn password_session_area() -> Vec<u8> {
+    let mut area = Vec::with_capacity(9);
+    area.extend_from_slice(&TPM_RS_PW.to_be_bytes());
+    area.extend_from_slice(&0u16.to_be_bytes()); // TPM2B_AUTH: the password
+    area.extend_from_slice(&0u16.to_be_bytes()); // TPM2B_NONCE: nonceCaller
+    area.push(0x00); // TPMA_SESSION
+    area
+}
+
 /// A TPM answered over a Unix socket: a TPM 2.0 implementation such as
 /// `swtpm`, reachable without privileges.
 #[derive(Debug)]
@@ -430,6 +506,40 @@ impl Tpm2Device {
         channel.exchange(&request)
     }
 
+    /// Sends one command carrying a single password session.
+    ///
+    /// The three parts are separate because the wire order is not the order the
+    /// command's own description suggests: `handles`, then the authorization
+    /// area, then `parameters`. The area does not lead the body and it does not
+    /// follow it — it sits between the two, which is the fact six matrices of
+    /// nonce size, hmac size, `TPMA_SESSION` and `authorizationSize` never
+    /// varied, because every one of them placed the area at one end or the other
+    /// and then varied what was inside it.
+    fn authorized_command(
+        &self,
+        code: u32,
+        handles: &[u8],
+        parameters: &[u8],
+    ) -> Result<Tpm2Response, Tpm2Error> {
+        let area = password_session_area();
+        let size = 10 + handles.len() + 4 + area.len() + parameters.len();
+        let mut request = Vec::with_capacity(size);
+        request.extend_from_slice(&TPM_ST_SESSIONS.to_be_bytes());
+        request.extend_from_slice(&(size as u32).to_be_bytes());
+        request.extend_from_slice(&code.to_be_bytes());
+        request.extend_from_slice(handles);
+        request.extend_from_slice(&(area.len() as u32).to_be_bytes());
+        request.extend_from_slice(&area);
+        request.extend_from_slice(parameters);
+        let mut channel = self
+            .channel
+            .as_ref()
+            .ok_or(Tpm2Error::Unsupported("this device has no channel"))?
+            .lock()
+            .map_err(|_| Tpm2Error::Unreachable("the tpm2 channel lock was poisoned".into()))?;
+        channel.exchange(&request)
+    }
+
     /// `TPM2_Startup`, for a device that has not been started.
     ///
     /// `TPM_RC_INITIALIZE` (0x100) means it already was, which is the normal
@@ -493,6 +603,52 @@ impl Tpm2Device {
             .copied()
             .zip(answer.digests)
             .collect::<Vec<_>>())
+    }
+
+    /// `TPM2_PCR_Extend`: folds `digest` into `slot` in the SHA-256 bank.
+    ///
+    /// The first command in this module that needs an authorization session,
+    /// and the one whose session encoding took six matrices and three failed
+    /// capture attempts to get right. The device folds the value and nothing
+    /// here computes the new digest: a caller that wants to know the result
+    /// reads it back, and a caller that computed it here would be asserting the
+    /// TPM's arithmetic rather than checking it.
+    ///
+    /// A refusal is a refusal, not a warning. A write that appeared to succeed
+    /// and left the PCR unchanged is the failure this milestone exists to
+    /// remove, so the response code is propagated rather than swallowed.
+    pub fn pcr_extend(&self, slot: PcrSlot, digest: &Digest) -> Result<(), Tpm2Error> {
+        // `pcrHandle` is a handle, so it precedes the authorization area;
+        // `digests` is a parameter, so it follows it.
+        let handles = (slot.index() as u32).to_be_bytes();
+        let mut parameters = Vec::with_capacity(4 + 2 + 32);
+        parameters.extend_from_slice(&1u32.to_be_bytes()); // TPML_DIGEST_VALUES.count
+        parameters.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+        parameters.extend_from_slice(digest);
+        self.authorized_command(TPM2_PCR_EXTEND, &handles, &parameters)?
+            .into_body()
+            .map(|_| ())
+    }
+
+    /// `TPM2_Clear`, authorized against the lockout hierarchy.
+    ///
+    /// Present because it is the command that named the bug: sent without its
+    /// `authHandle` it answers `0x184`, and read as a session that no
+    /// combination of session fields could satisfy. It is the smallest command
+    /// in the TPM 2.0 specification, which is exactly why it was the one to
+    /// reach for, and it is kept because a test that only exercised `PCR_Extend`
+    /// would not have caught the missing handle.
+    ///
+    /// What a clear does to this device's PCRs is **not** asserted anywhere in
+    /// this module. Measured once against `swtpm`, a `Clear` answered `0` and
+    /// left the extended PCRs at their extended values, and whether that is
+    /// `swtpm`'s behaviour, a consequence of the flags it was started with, or
+    /// a misreading of which PCRs are resettable was not established. So the
+    /// method reports what the device said and nothing more.
+    pub fn clear(&self) -> Result<(), Tpm2Error> {
+        self.authorized_command(TPM2_CLEAR, &TPM_RH_LOCKOUT.to_be_bytes(), &[])?
+            .into_body()
+            .map(|_| ())
     }
 
     /// One `PCR_Read` round trip, parsed and checked against what was asked.
@@ -1221,5 +1377,146 @@ mod tests {
         assert!(device
             .pcr_read(&[PcrSlot::Pcr0, PcrSlot::Pcr4, PcrSlot::Pcr7])
             .is_ok());
+    }
+
+    // ---------------------------------------------------------------------
+    // The session encoding, pinned without a device.
+    //
+    // The bytes below were captured from `tpm2-tools` talking to `swtpm`, with
+    // the device's own log as the source rather than a proxy: `swtpm socket
+    // --log file=<path>,level=9` prints every request it reads. Three earlier
+    // attempts to capture them through a proxy failed, and the log made the
+    // ground truth a command away.
+    //
+    // This test is here so the layout is checked without a device in the loop,
+    // and so a mutation of the encoder fails *here*, naming the bytes, instead
+    // of failing three layers away as a `TPM_RC_SIZE` from the TPM.
+    // ---------------------------------------------------------------------
+
+    /// The 65 bytes a correct `PCR_Extend` for PCR 1 is, spelled out.
+    ///
+    /// Transcribed from the capture, not generated by the code under test: a
+    /// test that built its expectation with the same helper it is testing would
+    /// agree with any layout, including a wrong one.
+    #[test]
+    fn a_password_session_sits_between_the_handles_and_the_parameters() {
+        let area = password_session_area();
+        assert_eq!(area.len(), 9, "the area is nine bytes and the size says so");
+
+        let handles = 1u32.to_be_bytes();
+        let mut parameters = Vec::new();
+        parameters.extend_from_slice(&1u32.to_be_bytes());
+        parameters.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+        parameters.extend_from_slice(&[0u8; 32]);
+
+        let size = 10 + handles.len() + 4 + area.len() + parameters.len();
+        let mut request = Vec::new();
+        request.extend_from_slice(&TPM_ST_SESSIONS.to_be_bytes());
+        request.extend_from_slice(&(size as u32).to_be_bytes());
+        request.extend_from_slice(&TPM2_PCR_EXTEND.to_be_bytes());
+        request.extend_from_slice(&handles);
+        request.extend_from_slice(&(area.len() as u32).to_be_bytes());
+        request.extend_from_slice(&area);
+        request.extend_from_slice(&parameters);
+
+        let mut expected: Vec<u8> = vec![
+            0x80, 0x02, // TPM_ST_SESSIONS
+            0x00, 0x00, 0x00, 0x41, // commandSize = 65
+            0x00, 0x00, 0x01, 0x82, // TPM2_PCR_Extend
+            0x00, 0x00, 0x00, 0x01, // pcrHandle = PCR 1
+            0x00, 0x00, 0x00, 0x09, // authorizationSize = 9
+            0x40, 0x00, 0x00, 0x09, // TPM_RS_PW
+            0x00, 0x00, // empty authorization
+            0x00, 0x00, // empty nonce
+            0x00, // TPMA_SESSION
+            0x00, 0x00, 0x00, 0x01, // one digest
+            0x00, 0x0B, // TPM_ALG_SHA256
+        ];
+        expected.extend_from_slice(&[0u8; 32]);
+        assert_eq!(request, expected, "the wire layout changed");
+    }
+
+    // ---------------------------------------------------------------------
+    // The session encoding, against a device.
+    // ---------------------------------------------------------------------
+
+    /// A password session is accepted and the write is visible.
+    ///
+    /// The expected digest is **computed here** from the digest the device held
+    /// before and the one this test folded in, not read back and echoed. A test
+    /// that read the PCR after writing it and compared it with itself would
+    /// pass on a device that ignored the write entirely, which is the defect
+    /// this milestone exists to catch. `sha256(previous || new)` is the
+    /// definition of a PCR extend, so computing it is asserting the TPM's
+    /// arithmetic, not trusting it.
+    #[cfg(feature = "tpm-device")]
+    #[test]
+    fn a_password_session_writes_a_pcr_and_the_device_folds_it() {
+        use sha2::{Digest as _, Sha256};
+
+        let swtpm = Swtpm::start();
+        let device = swtpm.device();
+        let slot = PcrSlot::Pcr7;
+
+        let before = device
+            .pcr_read(&[slot])
+            .expect("PCR_Read before the write")
+            .remove(0)
+            .1;
+        let folded = [0xABu8; 32];
+        device
+            .pcr_extend(slot, &folded)
+            .expect("PCR_Extend with a password session is accepted");
+
+        let after = device
+            .pcr_read(&[slot])
+            .expect("PCR_Read after the write")
+            .remove(0)
+            .1;
+        let mut hasher = Sha256::new();
+        hasher.update(before);
+        hasher.update(folded);
+        let expected: Digest = hasher.finalize().into();
+        assert_eq!(
+            after, expected,
+            "the device did not fold the digest the way a PCR extend is defined to"
+        );
+        assert_ne!(
+            after, before,
+            "a write that left the PCR unchanged would pass a test that only \
+             compared the device with itself"
+        );
+    }
+
+    /// `Clear` is accepted, and the `0x184` is gone.
+    ///
+    /// `0x184` names the first handle, not the session, and this is the test
+    /// that says so. Sent without `TPM_RH_LOCKOUT` the same session encoding is
+    /// refused with exactly that code, which is how six matrices of session
+    /// fields came to vary nonce sizes for a failure that had nothing to do
+    /// with the session.
+    #[cfg(feature = "tpm-device")]
+    #[test]
+    fn clear_is_accepted_and_the_missing_handle_was_the_whole_bug() {
+        let swtpm = Swtpm::start();
+        let device = swtpm.device();
+        device
+            .clear()
+            .expect("Clear with its authHandle is accepted");
+
+        // The same command, with the same session area, minus the handle. If
+        // this ever stops being `0x184` then the account of the bug in the
+        // module docs has stopped being true, and the honest response is to
+        // find out what else refuses it.
+        let without_handle = device
+            .authorized_command(TPM2_CLEAR, &[], &[])
+            .expect("a refused command is still an answer")
+            .into_body()
+            .expect_err("a Clear without its authHandle is refused");
+        assert!(
+            matches!(without_handle, Tpm2Error::Refused { code: 0x184, .. }),
+            "the refusal should still name the missing handle, not the session; \
+             it was {without_handle:?}"
+        );
     }
 }

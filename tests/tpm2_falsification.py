@@ -7,6 +7,19 @@ speaks to a real device rather than to a mock.
 
     crates/vault/src/tpm2.rs   R1, R2, R3, R4, R5
 
+and, for the authorization session that `TPM2_PCR_Extend` needs and six
+matrices of session fields could not produce:
+
+    crates/vault/src/tpm2.rs   R6, R7, R8, R9, R10
+
+**The wire layout is pinned without a device** by
+`a_password_session_sits_between_the_handles_and_the_parameters`, which
+transcribes the 65 bytes `tpm2-tools` sends rather than generating them with
+the code under test. R6 to R8 are the three placements of the authorization
+area — ahead of the handles, behind the parameters, or in the one place that
+works — and each is required to put the *device* test in red, which is the
+claim: a layout the device accepts is not a layout the client should ship.
+
 ## Why these five rows and not others
 
 *   **R1** puts `pcrUpdateCounter` back into the `PCR_Read` request. It is the
@@ -37,13 +50,15 @@ software TPM 2.0 implementation. It speaks the real protocol, which is what the
 rows exercise; it is not hardware, and `is_hardware` is false throughout. A host
 with a real TPM would be a different run on a different machine.
 
-**That the authorization for a real sealed object works.** `TPM2_CreatePrimary`,
+**That a sealed object can be created and unsealed.** `TPM2_CreatePrimary`,
 `TPM2_Create` and `TPM2_Load` are not implemented. R5 measures that the refusal
-is real, not that sealing works.
+is real, not that sealing works. A working password session (R6 to R8) is the
+transport that sealing would ride on, not the sealing itself: a session that
+authorises a PCR write has not been shown to authorise an object.
 
-**That a PCR can be written.** `TPM2_PCR_Extend` is absent, which is why the
-device tests assert the frame and not that a digest is non-zero: on a device
-that has just been started every PCR *is* zero, and that is the correct answer.
+**That a PCR write is durable.** R6 to R8 and R10 run against `swtpm`, whose
+PCRs live in a process that the fixture kills. What they establish is that the
+write was accepted and folded in, not that it survives a reboot.
 
 ## Running it
 
@@ -77,6 +92,7 @@ class Mutation:
     why: str
     path: Path
     suite: str
+    must_fail: str = ""
     edits: list[tuple[str, str]] = field(default_factory=list)
 
 
@@ -166,6 +182,103 @@ MUTATIONS = [
                 "            policy_version: 1,\n"
                 "        })\n"
                 "    }",
+            )
+        ],
+    ),
+    Mutation(
+        name="R6 the session area moves ahead of the command's handles",
+        why="the layout six matrices of session fields never tried, because all "
+            "six put the area at one end and varied what was inside it",
+        path=TARGET,
+        suite="device",
+        must_fail="a_password_session_writes_a_pcr_and_the_device_folds_it",
+        edits=[
+            (
+                "        request.extend_from_slice(&code.to_be_bytes());\n"
+                "        request.extend_from_slice(handles);\n"
+                "        request.extend_from_slice(&(area.len() as u32).to_be_bytes());\n"
+                "        request.extend_from_slice(&area);\n"
+                "        request.extend_from_slice(parameters);",
+                "        request.extend_from_slice(&code.to_be_bytes());\n"
+                "        request.extend_from_slice(&(area.len() as u32).to_be_bytes());\n"
+                "        request.extend_from_slice(&area);\n"
+                "        request.extend_from_slice(handles);\n"
+                "        request.extend_from_slice(parameters);",
+            )
+        ],
+    ),
+    Mutation(
+        name="R7 authorizationSize stops being sent",
+        why="the field whose presence was one axis of the dead-end matrix",
+        path=TARGET,
+        suite="device",
+        must_fail="a_password_session_writes_a_pcr_and_the_device_folds_it",
+        edits=[
+            (
+                # The `handles` line is in the anchor because the byte-layout
+                # test rebuilds the same three lines from its own transcription.
+                # That duplication is deliberate — a test that built its
+                # expectation with the helper it is testing would agree with any
+                # layout — so the anchor needs the line that differs to be
+                # unique.
+                "        request.extend_from_slice(handles);\n"
+                "        request.extend_from_slice(&(area.len() as u32).to_be_bytes());\n"
+                "        request.extend_from_slice(&area);",
+                "        request.extend_from_slice(handles);\n"
+                "        request.extend_from_slice(&area);",
+            )
+        ],
+    ),
+    Mutation(
+        name="R8 the session area moves behind the command's parameters",
+        why="the other end, which is where the area does not go either",
+        path=TARGET,
+        suite="device",
+        must_fail="a_password_session_writes_a_pcr_and_the_device_folds_it",
+        edits=[
+            (
+                "        request.extend_from_slice(handles);\n"
+                "        request.extend_from_slice(&(area.len() as u32).to_be_bytes());\n"
+                "        request.extend_from_slice(&area);\n"
+                "        request.extend_from_slice(parameters);",
+                "        request.extend_from_slice(handles);\n"
+                "        request.extend_from_slice(parameters);\n"
+                "        request.extend_from_slice(&(area.len() as u32).to_be_bytes());\n"
+                "        request.extend_from_slice(&area);",
+            )
+        ],
+    ),
+    Mutation(
+        name="R9 Clear stops sending its authHandle",
+        why="the missing first handle, which is what 0x184 was naming all along",
+        path=TARGET,
+        suite="device",
+        must_fail="clear_is_accepted_and_the_missing_handle_was_the_whole_bug",
+        edits=[
+            (
+                "        self.authorized_command(TPM2_CLEAR, &TPM_RH_LOCKOUT.to_be_bytes(), &[])?",
+                "        self.authorized_command(TPM2_CLEAR, &[], &[])?",
+            )
+        ],
+    ),
+    Mutation(
+        name="R10 pcr_extend reports success without writing",
+        why="a write that appears to have worked and changed nothing is the "
+            "failure this milestone exists to remove",
+        path=TARGET,
+        suite="device",
+        must_fail="a_password_session_writes_a_pcr_and_the_device_folds_it",
+        # The first formulation of this row discarded the command's *response*
+        # and still sent the command, so the PCR was written and the test
+        # correctly stayed green: the row was measuring nothing. A claim about
+        # "reports success without writing" has to stop writing.
+        edits=[
+            (
+                "        self.authorized_command(TPM2_PCR_EXTEND, &handles, &parameters)?\n"
+                "            .into_body()\n"
+                "            .map(|_| ())",
+                "        let _ = (handles, parameters, self.channel.is_none());\n"
+                "        Ok(())",
             )
         ],
     ),
@@ -270,6 +383,14 @@ def main() -> int:
             continue
         if code == 0:
             say(f"ESCAPE {m.name}: the suite stayed green")
+            continue
+        # A red suite is not the same as the named assertion going red. Another
+        # test in the file can fail for an unrelated reason and satisfy a
+        # campaign that only looks at the exit code, which is how a mutation
+        # gets reported as falsified when nothing tested it.
+        if m.must_fail and f"{m.must_fail} ... FAILED" not in out:
+            say(f"ESCAPE {m.name}: the suite went red but {m.must_fail} did not")
+            say("      the mutation was not exercised by the assertion that names it")
             continue
         say(f"RED   {m.name}")
         say(f"      {m.why}")
