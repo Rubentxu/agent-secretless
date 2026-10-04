@@ -345,7 +345,17 @@ impl AuthorizationServer {
     /// Expiry is measured against the clock, not simulated: a token issued here
     /// really does stop being live after `ttl`, and a test that sleeps past it
     /// is observing a time-based refusal rather than being told about one.
+    ///
+    /// The floor is one second, and it is a floor on the *honesty* of the
+    /// response rather than on the test. `expires_in` is whole seconds
+    /// (RFC 6749 §5.1), so a sub-second lifetime cannot be reported at all. The
+    /// alternatives were to report `0` — which a conforming client is right to
+    /// refuse as "not short-lived access" — or to round up and hand out a token
+    /// claiming a second it will not have. Neither is a server worth testing
+    /// against, so the floor lives here and a test that wants to watch expiry
+    /// waits for the second it was promised.
     pub fn with_ttl(client: AsClient, ttl: Duration) -> Self {
+        let ttl = ttl.max(Duration::from_secs(1));
         let state = Arc::new(AsState {
             client,
             ttl,
@@ -396,6 +406,16 @@ impl AuthorizationServer {
     /// Everything the server logged, oldest first.
     pub fn audit(&self) -> Vec<AuditEntry> {
         self.state.store.lock().expect("poisoned").audit.clone()
+    }
+
+    /// The last request as it arrived, headers and body verbatim.
+    ///
+    /// For the assertion a log cannot support: where the client secret *did*
+    /// and did not travel. The audit records what the server decided; this
+    /// records what the client sent, which is the question "the secret stayed
+    /// in the broker" is actually asking.
+    pub fn last_request(&self) -> Option<Observed> {
+        self.origin.last()
     }
 
     /// The log entries for one outcome, for a test that does not care about
@@ -1253,7 +1273,7 @@ mod tests {
     /// Expiry is real time, not a flag.
     #[test]
     fn a_token_stops_being_live_when_its_time_is_up() {
-        let server = AuthorizationServer::with_ttl(AsClient::plain(), Duration::from_millis(150));
+        let server = AuthorizationServer::with_ttl(AsClient::plain(), Duration::from_secs(1));
         let body: serde_json::Value = form_request(
             &server,
             "/token",
@@ -1265,8 +1285,8 @@ mod tests {
         .expect("json");
         let token = body["access_token"].as_str().expect("token").to_string();
         assert_eq!(
-            body["expires_in"], 0,
-            "a sub-second TTL reports zero whole seconds"
+            body["expires_in"], 1,
+            "the reported lifetime is the one the server honours"
         );
 
         let during = client_for(&server)
@@ -1276,7 +1296,7 @@ mod tests {
             .expect("TLS completes");
         assert_eq!(during.status().as_u16(), 200);
 
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(1200));
         let after = client_for(&server)
             .get(server.url("/resource"))
             .header("authorization", format!("Bearer {token}"))

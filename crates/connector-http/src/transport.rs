@@ -187,6 +187,12 @@ fn resolve(host: &str) -> Result<Vec<IpAddr>, String> {
 }
 
 /// A client whose DNS answers are pinned to vetted addresses.
+///
+/// `Clone` because the underlying client is reference-counted and cloning is
+/// free, while an issuer that cannot be shared has to be rebuilt per operation
+/// -- and a rebuilt issuer is a second chance for the resolver to answer
+/// differently from the address that was vetted.
+#[derive(Clone)]
 pub struct PinnedClient {
     inner: reqwest::blocking::Client,
 }
