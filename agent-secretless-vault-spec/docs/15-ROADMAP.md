@@ -987,6 +987,58 @@ The freeze is therefore not yet a constraint anyone has had to respect,
 because the certification work that would justify it has not been done. Saying
 so is cheaper than a v1.0 tag that a release host immediately contradicts.
 
+### Certification measured on this host
+
+A count without the command that produced it is a number in a document. These
+two are recorded with their commands, their commit, and the exit code of the
+process that ran them.
+
+**Release — the exact command the quick-start documents**
+(`cargo test --workspace --release -- --test-threads=1 --skip uat_028 --skip
+one_hundred_brokered_reads`), at `539269d`, on this host: **87 blocks, 1192
+passed, 0 failed, 0 ignored, 2 filtered out**, `CARGO_EXIT=0`. 1194 enumerated
+less the two the command skips is 1192, which is the number both READMEs state
+and the number `scripts/check-doc-claims.py` re-derives on every run. The p95
+budget is in the skipped set for that command and is asserted on its own
+instead: measured in release at p95=1490us against a 6000us budget.
+
+**Debug — plain `cargo test --workspace --locked`**, at `8032dfe`, on this host:
+**87 blocks, 1193 passed, 0 failed, 1 ignored, 0 measured, 0 filtered out**,
+`CARGO_EXIT=0`. The one ignored test is `uat_030_perf.rs`'s p95 budget, which
+carries `#[cfg_attr(debug_assertions, ignore)]` because a latency budget
+measured against debug ed25519 is a statement about `debug_assertions` rather
+than about the product. 1193 + 1 is the same 1194 the release run reaches by a
+different route, which is the useful part: the enumeration is one number and the
+passed/ignored split is per profile. That is why neither README may say
+"0 ignored" without naming the profile — the sentence is the claim, and the
+claim is true in one build and false in the other.
+
+### What this freeze is, and what it is not
+
+It is a constraint on new work: no adapters, no planners, no new providers, and
+the four open items above stay open rather than being closed by shipping around
+them. It is not a v1.0 tag, and nothing in this section should be read as one.
+
+Two of the four open items cannot be earned from this machine at all — the
+third-party review needs a reviewer who is not the author, and signed
+reproducible artifacts need a release host that holds a signing key. The other
+two are work, not obstacles: the UAT matrix and a release-to-release upgrade and
+rollback test are both things this machine could do, and neither has been
+started. The distinction matters, because "not performable here" is an excuse
+and "not started" is a debt.
+
+### One number in this section is not yet a number
+
+The UAT coverage figure above — "29 of 40 ids claimed" — is not a single
+well-defined quantity, and a freeze should not cite it as if it were measured.
+Three readings of the same 40 defined ids give three answers: the pipeline
+guard reports 29 claimed by a test header plus 5 more implied by filename, and
+a wider reading of the same header region finds 35. The difference is entirely
+in how much of a test file counts as its header. Until one definition is
+written down and the guard implements that one, the coverage claim is
+`unmeasured`, and the 5 ids with no evidence under any reading are the honest
+starting point for the remaining work.
+
 ---
 
 ## v1.0 — Certified product line
