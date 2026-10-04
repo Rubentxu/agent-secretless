@@ -72,6 +72,12 @@ landlock = "0.4"
 # R9 audit chain: record digests (sha2) and the operator-facing redacted DTO
 # re-export (serde). Both already workspace-wide via the vault and protocol.
 sha2 = { workspace = true }
+# R2.C.1 SigV4: the four-step signing-key derivation is a chain of HMACs, and
+# `hmac` is already resolved in the lock through the vault. This promotes it to
+# a direct broker dependency rather than adding anything to the graph, which is
+# the reason `aws-sigv4` is not used instead — a new name in a signed SBOM to
+# avoid writing the chain by hand.
+hmac = { workspace = true }
 serde = { workspace = true }
 # M9 runtime: the per-session CA and its leaves are real x509. `rcgen` and
 # `time` are already in the lock through connector-http's test-support, so this

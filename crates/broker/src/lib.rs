@@ -24,6 +24,8 @@ use std::sync::{Arc, Mutex};
 
 pub mod admission;
 pub mod audit;
+/// R2.C: the AWS provider plane. The signing core first, in `aws::sigv4`.
+pub mod aws;
 /// Where an integration test finds a binary, and why it may refuse one.
 ///
 /// Feature-gated for the same reason as `oauth2_test_support` and for a
