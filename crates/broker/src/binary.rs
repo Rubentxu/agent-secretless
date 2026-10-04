@@ -86,6 +86,19 @@ pub fn locate(name: &str) -> PathBuf {
 
 /// The same search the ten per-file copies performed, kept here so that fixing
 /// it fixes all of them.
+///
+/// **No environment is read**, which is a rule rather than a preference: D9 and
+/// `uat_017_env_scan` forbid `std::env::var*` in the broker's sources, because
+/// every such read is a candidate anonymous fallback that bypasses the vault.
+/// The first version of this function read `CARGO_TARGET_DIR`, and the guard
+/// caught it — correctly, and a day earlier than a reviewer would have.
+///
+/// The first candidate is also the one that works: cargo puts an integration
+/// test in `<target>/<profile>/deps/` and the workspace binaries in
+/// `<target>/<profile>/`, so two levels up from the running test binary is the
+/// directory that holds them, whatever `CARGO_TARGET_DIR` happens to be. The
+/// second candidate is for a test binary run from somewhere unusual, and it
+/// derives from a compile-time constant rather than from the environment.
 fn find(name: &str) -> Option<PathBuf> {
     let profile = if cfg!(debug_assertions) {
         "debug"
@@ -93,8 +106,6 @@ fn find(name: &str) -> Option<PathBuf> {
         "release"
     };
     let mut candidates: Vec<PathBuf> = Vec::new();
-    // Beside the test binary is the most reliable answer: cargo puts a package's
-    // binaries in the profile directory the test binary's `deps` lives in.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(deps) = exe.parent() {
             if let Some(profile_dir) = deps.parent() {
@@ -102,10 +113,7 @@ fn find(name: &str) -> Option<PathBuf> {
             }
         }
     }
-    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
-        candidates.push(PathBuf::from(dir).join(profile).join(name));
-    }
-    candidates.push(PathBuf::from("target").join(profile).join(name));
+    candidates.push(crate_root().join("target").join(profile).join(name));
     candidates.into_iter().find(|p| p.exists())
 }
 
