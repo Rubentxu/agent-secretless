@@ -73,6 +73,7 @@ is not listed, and a block with a residual says so in its own row.
 | **R0** | closed | `tests/r0_gate.py` — 4 passed, 0 failed, 0 unavailable. Signature verification reachable from a clean install, 46 negative provenance checks, the official skill published outside this repository and cross-repo verified at 105 checks. |
 | **R1** | closed | `r1_isolated_reachability` 11/11 and `r1_isolated_e2e` 6/6, both from the product surface. One caveat, recorded because it changes how the evidence should be read: 21 tests across three files return early when unprivileged user namespaces are unavailable, and Cargo reports that as **passed**, not as skipped. The R1 full-suite result was therefore re-opened and is being corrected (`bl-bl-01M44FDFNF0003888YSWEGPXM0`). |
 | **R2.A** | closed, with one half `host-dependent` | `r2a_github_vertical` 11/11 in-process against a real TLS origin, and `r2a_cli_reachability` 4/4 against the real binaries. The live call against the real `api.github.com` is **not** measured and is not claimed; see *Status of item 1* below. |
+| **R2.B** | partial, with the strong form `host-dependent` | `r2b_oauth2_revocation` 5/5 with four falsifications run. The revocation gap is closed and the property is structural — `forget` is required on `SecretPort` with no default. Two things are **not** closed: compatibility with an operator's real IdP needs a host that has one, and the requested scope is still operator-configured rather than policy-derived, which is R4's work. |
 
 **The R1 row is the one worth reading twice.** `uat_040`'s file-injection row was
 asserting that the staged secret reached the redacted channel in cleartext — a
@@ -1061,15 +1062,42 @@ self-hosted, not a third-party IdP, and the documents say `self-hosted` in the
 status field rather than `real` in the prose. Establishing compatibility with an
 operator's actual identity provider needs a host that has one, so **V1-C3 stays
 host-dependent in its strong form** and the difference is a fact about the
-work rather than an excuse. Two further limits are named as limits rather than
-as controls: the requested scope is operator-configured rather than
-policy-derived, and while `forget()` makes a revocation immediate when called,
-the credential-removal path does not call it yet, so a revocation's real effect
-is bounded by the token's `expires_in`.
+work rather than an excuse. One further limit is named as a limit rather than
+as a control: the requested scope is operator-configured rather than
+policy-derived, so an operation can ask for a scope the policy never agreed to.
+That one is **R4's work, not R2.B's** — a scope the operator wrote down is a
+weaker property than a scope a plan was bound to, and closing it means binding
+the request to the authority rather than to a file.
 
-Items 1, 2, 3, 5, 6 and 7 are untouched. The GitHub surface is the one
-semantic connector that has been exercised against a real socket, and it is
-item 1; the other six are unstarted.
+**R2.B.1 closed the revocation gap, and the limit it named was worse than the
+wording suggested.** This section used to say that "while `forget()` makes a
+revocation immediate when called, the credential-removal path does not call it
+yet, so a revocation's real effect is bounded by the token's `expires_in`". That
+undersold it: `DeleteCredential` answered `CredentialDeleted` while a cached
+access token kept being lent to requests for the rest of its life, so the
+operator was told a credential was gone and the broker kept spending it.
+
+The call was not reachable as written, and that is the part worth keeping.
+`BrokerState` holds `Arc<dyn SecretPort>`, the concrete type is erased behind a
+`RoutingSecretPort`, and the trait had no method to call. `forget` is now
+**required on `SecretPort`, with no default**: a default no-op would have been
+one line and would have left the property resting on every future port author
+remembering to override it. Required, a new `SecretPort` does not compile until
+it has said what it does with derived secrets.
+
+What it is not: this is not a provider-side revoke. It is "stop answering from
+what I already hold", which bounds the window to nothing locally; a token the
+IdP already issued stays valid there until it expires or is revoked there.
+
+Measured by `crates/broker/tests/r2b_oauth2_revocation.rs` (5 rows) with four
+falsifications run: `forget` as a no-op reds two rows; `DeleteCredential`
+stopping to call it reds one and only the one about the delete path; `forget`
+as a blanket `cache.clear()` reds the row about a sibling credential staying
+served; and `forget` on the refusal path reds the row about a refused deletion
+— because the vault write is what decides, and a refusal must cost nothing.
+
+Items 1, 2, 3, 5, 6 and 7 are unstarted. Item 1 is the one semantic connector
+exercised against a real socket, as *Status of item 1* above records.
 
 ---
 
