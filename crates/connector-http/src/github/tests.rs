@@ -44,6 +44,13 @@ impl RecordingPort {
 }
 
 impl SecretPort for RecordingPort {
+    /// A fixture holding nothing derived, so a deletion has nothing to drop.
+    ///
+    /// Written out rather than left to a default, because the trait requires
+    /// this on purpose: a port that never considered revocation is the exact
+    /// shape of bug that made `DeleteCredential` a no-op for cached tokens.
+    fn forget(&self, _credential: &str) {}
+
     fn lend(&self, credential: &str, sink: &mut dyn SecretSink) -> Result<(), SecretError> {
         self.lent
             .lock()
@@ -57,6 +64,13 @@ impl SecretPort for RecordingPort {
 struct ClosedPort;
 
 impl SecretPort for ClosedPort {
+    /// A fixture holding nothing derived, so a deletion has nothing to drop.
+    ///
+    /// Written out rather than left to a default, because the trait requires
+    /// this on purpose: a port that never considered revocation is the exact
+    /// shape of bug that made `DeleteCredential` a no-op for cached tokens.
+    fn forget(&self, _credential: &str) {}
+
     fn lend(&self, credential: &str, _sink: &mut dyn SecretSink) -> Result<(), SecretError> {
         Err(SecretError::Unavailable(credential.to_string()))
     }
@@ -67,6 +81,13 @@ impl SecretPort for ClosedPort {
 struct AbsentPort;
 
 impl SecretPort for AbsentPort {
+    /// A fixture holding nothing derived, so a deletion has nothing to drop.
+    ///
+    /// Written out rather than left to a default, because the trait requires
+    /// this on purpose: a port that never considered revocation is the exact
+    /// shape of bug that made `DeleteCredential` a no-op for cached tokens.
+    fn forget(&self, _credential: &str) {}
+
     fn lend(&self, credential: &str, _sink: &mut dyn SecretSink) -> Result<(), SecretError> {
         Err(SecretError::NotFound(credential.to_string()))
     }

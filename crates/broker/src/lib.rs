@@ -1544,6 +1544,24 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                 tracing::info!(%revoked, "surrogates revoked with their credential");
             }
 
+            // And so does anything a *port* derived from it — the one removal
+            // could not reach on its own.
+            //
+            // The order matters and it is the reason this is not a line earlier:
+            // the vault write has already succeeded, so a broker that fails
+            // here would be refusing a deletion that has already happened. A
+            // port that cannot drop what it holds is therefore reported and not
+            // hidden, and the operator is told the credential is gone from the
+            // vault *and* that a derived value may survive to its expiry. The
+            // gap this closes was real and worse than it looked: the reply said
+            // `CredentialDeleted` while an OAuth2 access token kept being
+            // served out of `OAuth2SecretPort`'s cache for the remainder of its
+            // `expires_in`, because the port lives behind an `Arc<dyn
+            // SecretPort>` and there was no trait method to call.
+            if let Some(secrets) = state.secrets.as_ref() {
+                secrets.forget(&id.to_wire());
+            }
+
             Response::CredentialDeleted { id }
         }
 
@@ -5989,6 +6007,12 @@ mod e2e {
     struct RefusingPort;
 
     impl SecretPort for RefusingPort {
+        /// A fixture holding nothing derived, so a deletion has nothing to drop.
+        ///
+        /// Written out rather than left to a default, because the trait requires
+        /// this on purpose: a port that never considered revocation is the exact
+        /// shape of bug that made `DeleteCredential` a no-op for cached tokens.
+        fn forget(&self, _credential: &str) {}
         fn lend(
             &self,
             credential: &str,
@@ -6013,6 +6037,12 @@ mod e2e {
     }
 
     impl SecretPort for CountingPort {
+        /// A fixture holding nothing derived, so a deletion has nothing to drop.
+        ///
+        /// Written out rather than left to a default, because the trait requires
+        /// this on purpose: a port that never considered revocation is the exact
+        /// shape of bug that made `DeleteCredential` a no-op for cached tokens.
+        fn forget(&self, _credential: &str) {}
         fn lend(
             &self,
             credential: &str,

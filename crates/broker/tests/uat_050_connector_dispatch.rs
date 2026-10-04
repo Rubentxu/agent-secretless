@@ -34,6 +34,13 @@ fn self_peer() -> WorkloadIdentity {
 struct OpenVault;
 
 impl SecretPort for OpenVault {
+    /// A fixture holding nothing derived, so a deletion has nothing to drop.
+    ///
+    /// Written out rather than left to a default, because the trait requires
+    /// this on purpose: a port that never considered revocation is the exact
+    /// shape of bug that made `DeleteCredential` a no-op for cached tokens.
+    fn forget(&self, _credential: &str) {}
+
     fn lend(&self, _credential: &str, _sink: &mut dyn SecretSink) -> Result<(), SecretError> {
         Err(SecretError::NotFound("no credential in this test".into()))
     }

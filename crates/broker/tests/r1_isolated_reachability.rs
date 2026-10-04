@@ -52,6 +52,13 @@ const LENT: &[u8] = b"asv1-fixture-value-that-must-never-come-back";
 struct FixturePort;
 
 impl asv_connector_http::SecretPort for FixturePort {
+    /// A fixture holding nothing derived, so a deletion has nothing to drop.
+    ///
+    /// Written out rather than left to a default, because the trait requires
+    /// this on purpose: a port that never considered revocation is the exact
+    /// shape of bug that made `DeleteCredential` a no-op for cached tokens.
+    fn forget(&self, _credential: &str) {}
+
     fn lend(
         &self,
         _credential: &str,

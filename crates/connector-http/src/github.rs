@@ -62,6 +62,45 @@ pub trait SecretPort: Send + Sync {
     /// without giving up the guarantee: `accept` receives borrowed bytes valid
     /// only for the call, so there is still nothing a caller can store.
     fn lend(&self, credential: &str, sink: &mut dyn SecretSink) -> Result<(), SecretError>;
+
+    /// Drops anything this port is holding that was *derived* from
+    /// `credential`, so that a deletion stops being served immediately.
+    ///
+    /// # Why it is required, with no default
+    ///
+    /// A port that holds a derived secret — an exchanged token, a minted
+    /// short-lived credential — is serving authority after the operator was
+    /// told the credential is gone. `DeleteCredential` removes the vault record
+    /// and revokes the session's surrogates, but a cache inside the port is
+    /// invisible to both. So the broker has to be able to reach it, and the
+    /// only handle it holds is `Arc<dyn SecretPort>`: the concrete type is
+    /// erased behind a `RoutingSecretPort`, which is exactly why this call was
+    /// unreachable when the gap was found.
+    ///
+    /// A `forget` with a default no-op would have been one line instead of this
+    /// paragraph, and it would have left the property resting on every future
+    /// port author remembering to override it. Requiring it moves the guarantee
+    /// into the type system: **a new `SecretPort` does not compile until it has
+    /// said what it does with derived secrets.** An implementation with nothing
+    /// derived implements it as an explicit no-op with a reason, which is
+    /// different from an implementation that never considered it.
+    ///
+    /// # What it is not
+    ///
+    /// This is not a network revocation, and a port must not pretend to be
+    /// one. It is "stop answering from what I already hold", which bounds the
+    /// window to nothing locally. A token the *provider* has already issued
+    /// stays valid at the provider until it expires or is revoked there, and
+    /// only the port's own cache is this port's to drop. A connector that needs
+    /// a real provider-side revoke belongs behind a different operation.
+    ///
+    /// # Scope
+    ///
+    /// Deliberately the credential, and nothing else. Ending a *session* must
+    /// not call this: the derived secret belongs to the credential, which
+    /// outlives every session, and a session ending would otherwise silently
+    /// re-exchange a token for a client that is still perfectly valid.
+    fn forget(&self, credential: &str);
 }
 
 /// One use of a borrowed credential.

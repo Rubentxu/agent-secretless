@@ -184,6 +184,13 @@ fn uat_039_m6_s5_policy_decision_is_in_db_action_strings() {
 struct NoSecrets;
 
 impl asv_connector_http::SecretPort for NoSecrets {
+    /// A fixture holding nothing derived, so a deletion has nothing to drop.
+    ///
+    /// Written out rather than left to a default, because the trait requires
+    /// this on purpose: a port that never considered revocation is the exact
+    /// shape of bug that made `DeleteCredential` a no-op for cached tokens.
+    fn forget(&self, _credential: &str) {}
+
     fn lend(
         &self,
         _credential: &str,

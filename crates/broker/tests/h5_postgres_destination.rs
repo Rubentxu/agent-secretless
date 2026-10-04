@@ -65,6 +65,13 @@ struct CountingPort {
 }
 
 impl SecretPort for CountingPort {
+    /// A fixture holding nothing derived, so a deletion has nothing to drop.
+    ///
+    /// Written out rather than left to a default, because the trait requires
+    /// this on purpose: a port that never considered revocation is the exact
+    /// shape of bug that made `DeleteCredential` a no-op for cached tokens.
+    fn forget(&self, _credential: &str) {}
+
     fn lend(&self, _credential: &str, sink: &mut dyn SecretSink) -> Result<(), SecretError> {
         self.lends.fetch_add(1, Ordering::SeqCst);
         sink.accept(b"not-a-real-password")

@@ -136,6 +136,13 @@ impl UpstreamResolver for FixedUpstream {
 struct CanaryStore;
 
 impl SecretPort for CanaryStore {
+    /// A fixture holding nothing derived, so a deletion has nothing to drop.
+    ///
+    /// Written out rather than left to a default, because the trait requires
+    /// this on purpose: a port that never considered revocation is the exact
+    /// shape of bug that made `DeleteCredential` a no-op for cached tokens.
+    fn forget(&self, _credential: &str) {}
+
     fn lend(&self, credential: &str, sink: &mut dyn SecretSink) -> Result<(), SecretError> {
         if credential != CRED {
             return Err(SecretError::NotFound(credential.to_string()));

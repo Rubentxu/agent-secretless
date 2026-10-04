@@ -78,6 +78,21 @@ impl SecretPort for VaultSecretPort {
             .with_secret(&self.key, credential, |secret| sink.accept(secret))
             .map_err(|error| translate(error, credential))?
     }
+
+    /// Nothing to drop, and that is a fact about this port rather than an
+    /// omission.
+    ///
+    /// `lend` here opens the record, hands the bytes to `sink` and closes it
+    /// again; the store is the source of truth and this port holds no derived
+    /// copy of anything. So by the time `DeleteCredential` calls this, the
+    /// record it is deleting is already gone from the only place it was ever
+    /// held, and a later `lend` answers `NotFound` on its own.
+    ///
+    /// Written out explicitly, with the reason, because the trait requires it:
+    /// a required method is only a structural guarantee if an implementation
+    /// with nothing to do says so on purpose. An empty body here means "this
+    /// port keeps nothing", not "nobody thought about it".
+    fn forget(&self, _credential: &str) {}
 }
 
 /// The only path by which a credential enters the vault from a running broker.

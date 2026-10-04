@@ -226,20 +226,29 @@ impl OAuth2SecretPort {
         let issuer = self.factory.issuer(config).map_err(unavailable)?;
         issuer.issue(&client.scope).map_err(unavailable)
     }
+}
 
-    /// Forgets every cached token.
+impl SecretPort for OAuth2SecretPort {
+    /// Forgets the cached token for `credential`, so a deleted client stops
+    /// being served immediately rather than at its `expires_in`.
     ///
-    /// Called when a session ends or a credential is removed. Without it a
-    /// revoked client keeps being served for the rest of the token's lifetime,
-    /// which is bounded but not zero.
-    pub fn forget(&self, credential: &str) {
+    /// This is the call the gap was about. The operator was told
+    /// `CredentialDeleted` while this cache kept answering `lend` for the rest
+    /// of the token's life, and nothing in the tree could reach in here to say
+    /// otherwise, because the broker holds an `Arc<dyn SecretPort>`.
+    ///
+    /// Scope note, because the method it replaces said more than it should:
+    /// this is a *credential*-level operation and deliberately not a
+    /// session-level one. The derived token belongs to the client, which
+    /// outlives every session; ending a session must not drop it, or a
+    /// perfectly valid client would be re-exchanged on the next operation for
+    /// no reason the operator asked for.
+    fn forget(&self, credential: &str) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.remove(credential);
         }
     }
-}
 
-impl SecretPort for OAuth2SecretPort {
     fn lend(&self, credential: &str, sink: &mut dyn SecretSink) -> Result<(), SecretError> {
         let Some(client) = self.clients.get(credential) else {
             // Not "unavailable" and not a provider error: this port simply is
@@ -410,6 +419,21 @@ impl SecretPort for RoutingSecretPort {
             Err(SecretError::NotFound(_)) => self.vault.lend(credential, sink),
         }
     }
+
+    /// Forwarded to both wrapped ports, not to whichever one served last.
+    ///
+    /// Routing only happens on a `NotFound`, so "ask the OAuth2 port" would be
+    /// the natural-looking implementation and it would be wrong: a credential
+    /// that was never OAuth2-registered may still have something derived
+    /// sitting in a port further down, and this router cannot tell which
+    /// wrapped port holds what. Forwarding to both is idempotent — `forget` on
+    /// a name nobody holds is a no-op in both — so the uncertainty costs
+    /// nothing and the alternative costs a credential that outlives its
+    /// deletion.
+    fn forget(&self, credential: &str) {
+        self.oauth2.forget(credential);
+        self.vault.forget(credential);
+    }
 }
 
 /// A sink that keeps a copy, for reading a secret out of the vault.
@@ -446,6 +470,12 @@ mod tests {
     struct FixedSecret(&'static [u8]);
 
     impl SecretPort for FixedSecret {
+        /// A fixture holding nothing derived, so a deletion has nothing to drop.
+        ///
+        /// Written out rather than left to a default, because the trait requires
+        /// this on purpose: a port that never considered revocation is the exact
+        /// shape of bug that made `DeleteCredential` a no-op for cached tokens.
+        fn forget(&self, _credential: &str) {}
         fn lend(&self, _credential: &str, sink: &mut dyn SecretSink) -> Result<(), SecretError> {
             sink.accept(self.0)
         }
@@ -611,6 +641,12 @@ mod tests {
     fn a_provider_failure_never_falls_through_to_the_vault() {
         struct Broken;
         impl SecretPort for Broken {
+            /// A fixture holding nothing derived, so a deletion has nothing to drop.
+            ///
+            /// Written out rather than left to a default, because the trait requires
+            /// this on purpose: a port that never considered revocation is the exact
+            /// shape of bug that made `DeleteCredential` a no-op for cached tokens.
+            fn forget(&self, _credential: &str) {}
             fn lend(&self, _c: &str, _s: &mut dyn SecretSink) -> Result<(), SecretError> {
                 Err(SecretError::Unavailable("the provider is down".into()))
             }
