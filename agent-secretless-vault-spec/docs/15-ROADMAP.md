@@ -2486,23 +2486,32 @@ the secret". Row T2 deletes the eager handshake and the suite stays green on the
 buffer alone — which is why the test was split, and why the split is the
 assertion rather than a convenience.
 
-**Still owed in this block.** **The default for `--connect-roots` is asserted by
-a log line.** A broker started without the flag has an empty anchor store and
-verifies nothing; that is the right reading, and no test starts the real binary
-without the flag to watch it happen. It is a cheap test and it is not written.
-**No public HTTPS destination has been reached through this**, because that needs
-the bundled-roots decision, and that decision is still open: a fixed public root
-set would verify `registry.npmjs.org` with this product's credentials and refuse
-every destination an operator runs on a private CA. `webpki-roots` is in
-`Cargo.lock` only transitively, so choosing it is a new dependency and the
-campaign could not falsify that choice. And **every fixture in this repository
-still dials a loopback origin in `cleartext`**, so the end-to-end verticals
-exercise the `cleartext` declaration and not the `tls` one — the TLS leg is
-measured against a locally minted CA, which is honest and is not the same as a
-registry. Also still owed: **stress and cancellation under load** beyond the
-anti-replay property already measured. And **the broker has no ordered shutdown at
-all**: `main.rs` installs no signal handling, so tunnels dying when the process
-stops is carried entirely by the process dying. That is a real guarantee from the
+**Still owed in this block.** **Half the default for `--connect-roots` is now
+measured and half is not.** `a_broker_given_no_destination_anchors_reaches_no
+_tls_destination` starts the **real binary with the flag absent** and watches a
+route declaring `tls` reach nothing — zero handshakes at a real TLS origin, no
+request, no credential — with a control that runs the same fixture against the
+same CA, flag present, and asserts a 200 and the real credential. Falsified:
+discarding the anchors the broker loaded turns the *control* red, which is the
+half that had to move first. The half still owed is the **public-roots
+fallback**: proving the absence of anchors never quietly becomes a trust-everyone
+set needs an origin holding a **publicly-issued** certificate, and every origin
+in this repository trusts a CA the test minted itself, which a public bundle
+would refuse exactly as an empty store does. That is why the campaign called the
+gap unclosable here rather than closing it with a test that cannot see it.
+**No public HTTPS destination has been reached through this**, for the same
+reason plus the open bundled-roots decision: a fixed public root set would verify
+`registry.npmjs.org` with this product's credentials and refuse every destination
+an operator runs on a private CA. `webpki-roots` is in `Cargo.lock` only
+transitively, so choosing it is a new dependency and the campaign could not
+falsify that choice. And **every fixture in this repository still dials a
+loopback origin in `cleartext`**, so the end-to-end verticals exercise the
+`cleartext` declaration and not the `tls` one — the TLS leg is measured against
+a locally minted CA, which is honest and is not the same as a registry. Also
+still owed: **stress and cancellation under load** beyond the anti-replay
+property already measured. And **the broker has no ordered shutdown at all**:
+`main.rs` installs no signal handling, so tunnels dying when the process stops
+is carried entirely by the process dying. That is a real guarantee from the
 kernel and not one from this product, and it is recorded as owed rather than
 counted as delivered.
 

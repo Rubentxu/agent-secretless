@@ -79,6 +79,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use asv_broker::tls_bridge::{issue_leaf, SessionCa};
+use asv_tls_acceptor::LeafMaterial;
 use asv_vault::{KdfParams, VaultStore};
 use secrecy::SecretString;
 
@@ -209,6 +211,14 @@ struct Origin {
     /// there*", and a request counter cannot answer it: a tunnel that is
     /// established and idle looks exactly like one that never existed.
     open: Arc<Mutex<usize>>,
+    /// Completed TLS handshakes.
+    ///
+    /// **Always zero on a plain origin**, because a plain origin has no
+    /// handshake to complete. It is a field rather than a separate struct so
+    /// the fixture does not care which origin it got, and reading it on a plain
+    /// origin would say "no handshake" about a connection that never wanted
+    /// one — so only the TLS assertions below consult it.
+    handshook: Arc<Mutex<usize>>,
 }
 
 impl Origin {
@@ -220,7 +230,7 @@ impl Origin {
     /// shape the *protocol* allows, and it is a different question — see
     /// `a_tunnel_serves_one_request_and_the_protocol_allows_more`.
     fn start_serving(per_connection: usize) -> Self {
-        Self::spawn(per_connection, false)
+        Self::spawn(per_connection, false, Some)
     }
 
     /// An origin that answers one request and then *keeps the connection open*.
@@ -237,10 +247,55 @@ impl Origin {
     /// no for a reason that has nothing to do with the tunnel — which is how a
     /// lifecycle test ends up asserting a timer.
     fn start_holding() -> Self {
-        Self::spawn(1, true)
+        Self::spawn(1, true, Some)
     }
 
-    fn spawn(per_connection: usize, holding: bool) -> Self {
+    /// An origin that speaks TLS with a certificate the operator minted.
+    ///
+    /// **The origin is TLS because the question is about trust.** A plain one
+    /// would refuse a broker with no anchors and would also refuse one *with*
+    /// the wrong anchors, and a test that cannot tell those apart is measuring
+    /// "the handshake failed" rather than "the anchors were not there".
+    ///
+    /// `None` from the wrapper means the handshake did not complete, and the
+    /// connection carries nothing — which is exactly the state the refusing
+    /// broker leaves this origin in, and the reason the counter is separate
+    /// from `open`: a connection that was dialled and refused is not a tunnel.
+    fn start_tls_serving(ca: &SessionCa) -> Self {
+        let leaf = issue_leaf(ca, FIXTURE_HOST, Instant::now()).expect("issue the origin's leaf");
+        // **The chain, not just the leaf.** A session CA is root,
+        // intermediate, leaf, and a store holding only the root can only build
+        // a path if the peer presents the intermediate. Passing the end-entity
+        // alone fails with `UnknownIssuer`, which reads as "your anchors are
+        // wrong" and is not.
+        let material = LeafMaterial::new(
+            ca.root_der.clone(),
+            vec![leaf.leaf_der.clone(), ca.intermediate_der.clone()],
+            leaf.leaf_key.serialize_der(),
+        )
+        .expect("leaf material");
+        let config = Arc::new(material.server_config().expect("server config"));
+
+        Self::spawn(1, false, move |stream| {
+            let connection = rustls::ServerConnection::new(Arc::clone(&config)).ok()?;
+            let mut tls = rustls::StreamOwned::new(connection, stream);
+            if tls.conn.complete_io(&mut tls.sock).is_err() {
+                return None;
+            }
+            Some(tls)
+        })
+    }
+
+    /// Completed TLS handshakes. Meaningful only on a TLS origin.
+    fn completed_handshakes(&self) -> usize {
+        *self.handshook.lock().expect("handshake counter")
+    }
+
+    fn spawn<S, W>(per_connection: usize, holding: bool, wrap: W) -> Self
+    where
+        S: OriginStream + Send + 'static,
+        W: Fn(TcpStream) -> Option<S> + Send + Sync + 'static,
+    {
         // `[::]` is dual-stack on Linux, so one port answers on both `::1` and
         // `127.0.0.1`. The broker takes the first address the resolver returns,
         // and which one that is has changed between hosts; a single-family bind
@@ -252,15 +307,26 @@ impl Origin {
         let sink = Arc::clone(&requests);
         let open: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
         let counter = Arc::clone(&open);
+        let handshook: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let shakes = Arc::clone(&handshook);
 
         std::thread::spawn(move || {
             for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
+                let Ok(stream) = stream else { continue };
+                // The request-phase deadline, applied before any wrapper hides
+                // the socket. A connection that is dialled and never speaks
+                // must not pin a thread for the life of the run, and a broker
+                // that dialled and then refused is exactly that connection.
+                OriginStream::set_origin_timeout(&stream, Some(Duration::from_secs(20)));
+                let Some(mut wrapped) = wrap(stream) else {
+                    continue;
+                };
+                *shakes.lock().expect("handshake counter") += 1;
                 let sink = Arc::clone(&sink);
                 let counter = Arc::clone(&counter);
                 std::thread::spawn(move || {
                     *counter.lock().expect("open counter") += 1;
-                    serve_connection(&mut stream, &sink, per_connection, holding);
+                    serve_connection(&mut wrapped, &sink, per_connection, holding);
                     // The decrement is on the way out of every path, and there
                     // is no `return` in `serve_connection` to skip it. A counter
                     // that can be skipped is one the lifecycle test reads as
@@ -275,6 +341,7 @@ impl Origin {
             port,
             requests,
             open,
+            handshook,
         }
     }
 
@@ -373,15 +440,39 @@ impl Origin {
 /// carried a request is the bridge's dial-before-the-head behaviour, not a
 /// tunnel; holding it open forever would pin a thread and inflate the open
 /// count with something no session authorised.
-fn serve_connection(
-    stream: &mut TcpStream,
+/// What a connection has to be able to do, so one server body serves both a
+/// plain socket and a TLS one.
+///
+/// `Read + Write` is the whole of the HTTP an origin here speaks. The timeout
+/// is a method rather than something the body sets for itself because
+/// `StreamOwned` does not forward it: the deadline lives on the socket
+/// underneath it, and getting that wrong turns a bounded fixture into one that
+/// pins a thread for the life of the run.
+trait OriginStream: Read + Write {
+    fn set_origin_timeout(&self, timeout: Option<Duration>);
+}
+
+impl OriginStream for TcpStream {
+    fn set_origin_timeout(&self, timeout: Option<Duration>) {
+        let _ = self.set_read_timeout(timeout);
+    }
+}
+
+impl OriginStream for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
+    fn set_origin_timeout(&self, timeout: Option<Duration>) {
+        OriginStream::set_origin_timeout(&self.sock, timeout);
+    }
+}
+
+fn serve_connection<S: OriginStream>(
+    stream: &mut S,
     sink: &Arc<Mutex<Vec<String>>>,
     per_connection: usize,
     holding: bool,
 ) {
     // This deadline covers the request phase only, so a client that connects
-    // and says nothing cannot pin a thread for the life of the suite.
-    stream.set_read_timeout(Some(Duration::from_secs(20))).ok();
+    // and says nothing cannot pin a thread for the life of the suite. It is
+    // applied by the accepting loop, before a TLS wrapper hides the socket.
     let mut served_any = false;
     for served in 0..per_connection {
         let mut raw = Vec::new();
@@ -421,7 +512,7 @@ fn serve_connection(
         // No deadline. From here the connection ends when the tunnel ends and
         // for no other reason, which is what lets `open_connections` answer
         // "is the tunnel still there" instead of "has the timeout fired".
-        stream.set_read_timeout(None).ok();
+        stream.set_origin_timeout(None);
         let mut buf = [0u8; 256];
         while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
     }
@@ -430,6 +521,46 @@ fn serve_connection(
 // ---------------------------------------------------------------------------
 // The fixture
 // ---------------------------------------------------------------------------
+
+/// Minimal DER-to-PEM, and the base64 under it.
+///
+/// Copied rather than shared from `crates/tls-acceptor/tests/openssl_client.rs`,
+/// which does the same thing for the same reason: `rustls`'s `PemObject` is
+/// decode-only, so writing a certificate out costs either a dependency or
+/// twenty lines, and one call does not justify a dependency in the test surface.
+/// Written out here because a test helper shared across crates is a coupling
+/// that buys nothing and costs a public API.
+fn pem_encode(der: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut body = String::with_capacity(der.len().div_ceil(3) * 4);
+    for chunk in der.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        body.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        body.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        body.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        body.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in body.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).expect("base64 is ascii"));
+        out.push('\n');
+    }
+    out.push_str("-----END CERTIFICATE-----\n");
+    out
+}
 
 struct Fixture {
     dir: PathBuf,
@@ -486,10 +617,49 @@ impl Fixture {
         Self::with_origin(tag, Origin::start_holding())
     }
 
+    /// A fixture whose route declares `upstream: "tls"` and whose origin
+    /// presents a certificate minted from `ca`.
+    ///
+    /// With `anchored`, the broker is pointed at `ca`'s root through
+    /// `--connect-roots` and the tunnel is expected to work. Without it, the
+    /// flag is absent and the tunnel is expected to be refused. Both halves use
+    /// the same CA on purpose: the difference between the two runs is the flag
+    /// and nothing else, so "no anchors" is the only variable.
+    fn new_tls(tag: &str, ca: &SessionCa, anchored: bool) -> Self {
+        let origin = Origin::start_tls_serving(ca);
+        let anchors = anchored.then_some(ca.root_der.as_slice());
+        Self::build(tag, origin, "tls", anchors)
+    }
+
     fn with_origin(tag: &str, origin: Origin) -> Self {
+        Self::build(tag, origin, "cleartext", None)
+    }
+
+    /// A fixture whose route declares `upstream` and whose broker is handed
+    /// `connect_roots` — or, with `None`, is given **no** `--connect-roots` at
+    /// all, which is the product's default and the thing under test.
+    ///
+    /// The anchors arrive as DER and are written here rather than by the
+    /// caller, because `build` clears the working directory before it starts.
+    /// A caller that wrote the file itself would watch it disappear, and the
+    /// broker would refuse for want of a path — a failure shaped exactly like
+    /// the one this test is looking for, which is how the first version of it
+    /// reported a green control as a red assertion.
+    ///
+    /// `None` is not "an empty anchor file": it is the flag absent, so this
+    /// reaches the branch in `main.rs` that an operator reaches by forgetting
+    /// an argument. A fixture that wrote an empty PEM would exercise a
+    /// different line and would go on passing if that line regressed.
+    fn build(tag: &str, origin: Origin, upstream: &str, connect_roots: Option<&[u8]>) -> Self {
         let dir = std::env::temp_dir().join(format!("asv-e2e-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create the working dir");
+
+        let anchor_file = connect_roots.map(|der| {
+            let path = dir.join("roots.pem");
+            std::fs::write(&path, pem_encode(der)).expect("write the anchor file");
+            path
+        });
 
         let vault = dir.join("vault.asv");
         let passphrase = dir.join("passphrase.txt");
@@ -599,9 +769,10 @@ impl Fixture {
   "operation_family": "git_hub",
   "credential": "{credential_id}",
   "minimum_posture": "STRONG_SECRETLESS",
-  "upstream": "cleartext"
+  "upstream": "{upstream}"
 }}]"#,
-                origin.port
+                origin.port,
+                upstream = upstream
             ),
         )
         .expect("write the route file");
@@ -622,21 +793,29 @@ permit (principal, action == Action::"connect_route", resource == Host::"host:{F
         .expect("write the policy file");
 
         let audit = dir.join("audit.jsonl");
+        let mut broker_command = Command::new(cargo_bin("asv-brokerd"));
+        broker_command
+            .arg(&sock)
+            .arg("--vault")
+            .arg(&vault)
+            .arg("--passphrase-file")
+            .arg(&passphrase)
+            .arg("--connect-listen")
+            .arg("127.0.0.1:0")
+            .arg("--connect-routes")
+            .arg(&routes)
+            .arg("--policy")
+            .arg(&policy)
+            .arg("--audit-file")
+            .arg(&audit);
+        // **Only when there is something to hand it.** Omitting the argument
+        // altogether is the state under test, and building the command with an
+        // empty value would not be the same state at all.
+        if let Some(roots) = anchor_file.as_ref() {
+            broker_command.arg("--connect-roots").arg(roots);
+        }
         let broker = Broker(
-            Command::new(cargo_bin("asv-brokerd"))
-                .arg(&sock)
-                .arg("--vault")
-                .arg(&vault)
-                .arg("--passphrase-file")
-                .arg(&passphrase)
-                .arg("--connect-listen")
-                .arg("127.0.0.1:0")
-                .arg("--connect-routes")
-                .arg(&routes)
-                .arg("--policy")
-                .arg(&policy)
-                .arg("--audit-file")
-                .arg(&audit)
+            broker_command
                 // The broker's tracing goes to *stdout*, not stderr, so a
                 // fixture that silences stdout is silently hiding the only
                 // account of why a tunnel was refused.
@@ -684,6 +863,36 @@ permit (principal, action == Action::"connect_route", resource == Host::"host:{F
                 })
                 .collect::<String>()
         )
+    }
+
+    /// One ordinary `curl` through the whole path, run to completion.
+    ///
+    /// Returns what `curl` reported. **`000` is a real answer here**, not an
+    /// absent one: it is what `curl -w '%{http_code}'` prints when the transfer
+    /// never produced a response, which is what a refused tunnel looks like from
+    /// the client. A helper that swallowed that would turn the property under
+    /// test into a shape nothing could fail.
+    fn one_shot_status(&self) -> String {
+        let variable = self.surrogate_env_name();
+        let out = Command::new(cargo_bin("asv"))
+            .arg("--socket")
+            .arg(&self.sock)
+            .arg("run")
+            .arg("sh")
+            .arg("-c")
+            .arg(format!(
+                "curl -sS -k --max-time 25 -o /dev/null -w '%{{http_code}}' \
+                   -H \"Authorization: Bearer ${variable}\" \
+                   https://{FIXTURE_HOST}:{port}/resource",
+                port = self.origin.port,
+                variable = variable
+            ))
+            // Inherited bypasses, planted so their removal is observable.
+            .env("NO_PROXY", "should-be-removed")
+            .env("no_proxy", "should-be-removed")
+            .output()
+            .expect("run the session");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
     }
 
     /// The child script. A shell, because `curl` cannot read an environment
@@ -1770,5 +1979,77 @@ fn a_client_with_no_credential_cannot_write_its_own_text_into_the_operator_log()
         "a client that proved nothing, presented no surrogate and sent a malformed \
          request wrote its own text into the operator's log; the broker logs what \
          it cannot attribute to state it validated"
+    );
+}
+
+/// **The default for `--connect-roots` is not "trust the internet".**
+///
+/// Until this test existed, that default was asserted by a line the broker
+/// logs at startup and by nothing else. A log line is not a gate: it says what
+/// the process believes, and the property is about what it *does*. The
+/// campaign that guarded this increment said so in its own docstring and left
+/// the gap open rather than dressing it up; this is the cheap half of closing
+/// it, and the cheap half is the half that can be written.
+///
+/// **What it does and does not establish.** It shows that a broker started
+/// without the flag reaches no TLS destination, while the same broker, the same
+/// route and the same origin certificate are reached when the flag names that
+/// certificate's CA. The difference between the two runs is the flag and
+/// nothing else.
+///
+/// What it *cannot* show is that the absence of anchors never falls back to a
+/// public root set, because that would need an origin holding a
+/// **publicly-issued** certificate: every origin here trusts a CA this test
+/// minted, and a bundled public bundle would refuse all of them exactly as an
+/// empty store does. The mutation is also not expressible today, since
+/// `webpki-roots` is not a dependency of this workspace. That half stays owed
+/// and is written down in `15-ROADMAP.md`; claiming this test closes it would
+/// be the same move the campaign refused to make.
+#[test]
+fn a_broker_given_no_destination_anchors_reaches_no_tls_destination() {
+    let ca = SessionCa::new("vertical-roots", 37, Duration::from_secs(3600));
+
+    // The control, first and in its own scope. A refusal with nothing to
+    // refuse is not a measurement, and running it first means the asserting
+    // broker is already gone when the second one starts — two brokers sharing
+    // a machine is not a failure mode worth designing in.
+    {
+        let anchored = Fixture::new_tls("anchored", &ca, true);
+        assert_eq!(
+            anchored.one_shot_status(),
+            "200",
+            "a broker pointed at the origin's own CA did not reach it, so the refusal \
+             measured below would prove nothing about the absence of anchors"
+        );
+        assert!(
+            anchored.origin.saw().contains(REAL),
+            "the anchored run reached the origin without the real credential, so this \
+             fixture is not exercising the substitution it is meant to control for"
+        );
+        assert_eq!(
+            anchored.origin.completed_handshakes(),
+            1,
+            "the anchored broker did not complete exactly one TLS handshake with the origin"
+        );
+    }
+
+    // The default: the flag is absent, not present-and-empty.
+    let unanchored = Fixture::new_tls("unanchored", &ca, false);
+    assert_ne!(
+        unanchored.one_shot_status(),
+        "200",
+        "a broker with no destination anchors served a TLS route anyway, so its empty \
+         anchor store fell back to trusting something"
+    );
+    assert_eq!(
+        unanchored.origin.completed_handshakes(),
+        0,
+        "the origin completed a TLS handshake although this broker was given no anchors, \
+         so what was refused was the request rather than the connection"
+    );
+    assert!(
+        !unanchored.origin.saw().contains(REAL),
+        "a destination whose certificate could not be verified received the credential: {}",
+        unanchored.origin.saw()
     );
 }
