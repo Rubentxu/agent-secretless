@@ -63,6 +63,31 @@ enum Command {
         #[arg(required = true, trailing_var_arg = true)]
         command: Vec<String>,
     },
+    /// Run a registered compatibility worker under the M10 isolation
+    /// pipeline (ADR-0008).
+    ///
+    /// This is the *weaker* of the two ways to run a tool holding a
+    /// credential. `asv run` never gives the child the secret — it gets a
+    /// surrogate and the broker substitutes at the destination — and that is
+    /// the strong path. This verb exists for a legacy tool that cannot use a
+    /// surrogate, and it hands the child a real credential inside a sandbox.
+    /// The posture is named on every run because a caller that has to ask
+    /// which path it is on will assume the strong one.
+    RunIsolated {
+        /// The registered worker name, as declared in the broker's worker file.
+        worker: String,
+        /// Arguments appended to the template's own, after `--`.
+        #[arg(required = true, trailing_var_arg = true)]
+        args: Vec<String>,
+        /// Credential to inject, by id. A *reference*: the broker resolves it,
+        /// so no secret is ever an argument to this process.
+        #[arg(long)]
+        credential: Option<String>,
+        /// Requested lifetime in milliseconds. Can only shorten the runtime's
+        /// own cap, never raise it.
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+    },
     /// List credential metadata. Never values.
     Credentials {
         /// Emit the `asv.agent/v1` envelope instead of prose.
@@ -187,6 +212,12 @@ async fn main() -> std::io::Result<()> {
     // Matched by reference: the arms below consume `command`, and the rest of
     // `main` still needs it.
     match &command {
+        Command::RunIsolated {
+            worker,
+            args,
+            credential,
+            timeout_ms,
+        } => return run_isolated(&socket, worker, args, credential.as_deref(), *timeout_ms),
         Command::Setup { json } => return run_setup(*json),
         Command::Doctor { json } => return run_doctor(&socket, *json),
         Command::Agent {
@@ -279,6 +310,9 @@ async fn main() -> std::io::Result<()> {
             Request::AuditQuery { since_secs }
         }
         Command::Run { .. } => unreachable!("run handled before broker IPC"),
+        Command::RunIsolated { .. } => {
+            unreachable!("run-isolated opens its own session and is handled before broker IPC")
+        }
         Command::Setup { .. }
         | Command::Doctor { .. }
         | Command::Capabilities { .. }
@@ -355,6 +389,7 @@ pub fn observe_broker_socket_at(socket: &std::path::Path) -> doctor::SocketOutco
 
 pub fn response_kind(response: &Response) -> &'static str {
     match response {
+        Response::IsolatedResult { .. } => "IsolatedResult",
         Response::Pong { .. } => "Pong",
         Response::BrokerInfo { .. } => "BrokerInfo",
         Response::SessionCreated { .. } => "SessionCreated",
@@ -675,6 +710,76 @@ fn env_name_for_label(label: &str) -> String {
 /// socket every other verb uses, and the agent's public key is bound to
 /// it. If any of that fails the child is **not** launched: a child with no
 /// real session is exactly the state this function used to create.
+/// Run a registered compatibility worker, inside a session that is opened and
+/// ended here.
+///
+/// Two properties are structural rather than checked. The session is opened
+/// before the request and ended after it, so a run cannot outlive the
+/// authority that authorised it. And the arguments cross as elements, so there
+/// is no argument from which the broker could be asked to run a shell.
+fn run_isolated(
+    socket: &std::path::Path,
+    worker: &str,
+    args: &[String],
+    credential: Option<&str>,
+    timeout_ms: Option<u64>,
+) -> std::io::Result<()> {
+    let session = match call(
+        socket,
+        &Request::CreateSession {
+            workspace: std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        },
+    )? {
+        Response::SessionCreated { session, .. } => session,
+        other => {
+            return Err(std::io::Error::other(format!(
+                "asv run-isolated could not open a session: {other:?}"
+            )))
+        }
+    };
+
+    let outcome = call(
+        socket,
+        &Request::RunIsolated {
+            session,
+            worker: worker.to_string(),
+            args: args.to_vec(),
+            credential: credential.map(|s| s.to_string()),
+            timeout_ms,
+        },
+    );
+
+    // Ended before the result is reported, so a report that never arrives is
+    // still bounded by the session's own lifetime.
+    let _ = call(socket, &Request::EndSession { session });
+    let response = outcome?;
+
+    match &response {
+        Response::IsolatedResult { exit_code, .. } => {
+            print_response(&response);
+            match exit_code {
+                Some(0) => Ok(()),
+                Some(code) => Err(std::io::Error::other(format!(
+                    "worker `{worker}` exited {code}"
+                ))),
+                None => Err(std::io::Error::other(format!(
+                    "worker `{worker}` did not exit normally"
+                ))),
+            }
+        }
+        Response::Error { message, .. } => Err(std::io::Error::other(format!(
+            "asv run-isolated refused: {}: {message}",
+            response_kind(&response).to_string(),
+        ))),
+        other => Err(std::io::Error::other(format!(
+            "asv run-isolated got an unexpected answer: {other:?}"
+        ))),
+    }
+}
+
 fn run_command(socket: &std::path::Path, command: Vec<String>) -> std::io::Result<()> {
     let Some(program) = command.first() else {
         return Err(std::io::Error::new(
@@ -856,6 +961,33 @@ fn print_response(response: &Response) {
     match response {
         Response::Pong { protocol } => {
             println!("broker reachable, protocol v{protocol}");
+        }
+        // The compatibility path (ADR-0008), printed with its posture on the
+        // same line as the result. A caller reading only the exit code of a
+        // run that touched a real credential would otherwise have no way to
+        // learn it was on the weaker of the two paths, and the default
+        // assumption for anyone who did not ask is the stronger one.
+        Response::IsolatedResult {
+            worker,
+            outcome,
+            exit_code,
+            stdout,
+            stderr,
+            duration_ms,
+            posture,
+        } => {
+            println!(
+                "{worker}: {outcome} ({}, {duration_ms}ms, {posture})",
+                exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "-".into())
+            );
+            if !stdout.is_empty() {
+                print!("{}", String::from_utf8_lossy(stdout));
+            }
+            if !stderr.is_empty() {
+                eprint!("{}", String::from_utf8_lossy(stderr));
+            }
         }
         // The broker's self-description. Every field here was already
         // obtainable by asking, which is what makes printing it safe: nothing

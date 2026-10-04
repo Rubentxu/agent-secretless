@@ -175,13 +175,19 @@ impl BrokerIdentity {
     }
 }
 
-/// Bumped to 7 for the `BrokerInfo::identity` field.
+/// Bumped to 8 for `RunIsolated` / `IsolatedResult`.
 ///
 /// A `u16` that only ever goes up, and a bump is a deliberate protocol change
 /// rather than a refactor: an old peer cannot read the new field and a new peer
 /// must not read an old answer as a missing one, which is what `None` here
 /// would mean.
-pub const PROTOCOL_VERSION: u16 = 7;
+///
+/// The bump is not cosmetic. Before it, a client that could not isolate
+/// anything had exactly one way to run a tool holding a credential, and it was
+/// the unisolated one; a peer speaking protocol 7 does not know this verb
+/// exists, and a broker that answered its absence with something else would be
+/// inventing an operation it does not have.
+pub const PROTOCOL_VERSION: u16 = 8;
 
 /// Hard ceiling on a single inbound message. Bounded allocation is required for
 /// any IPC that faces an untrusted peer (`docs/17-IMPLEMENTATION-BOOTSTRAP.md` §9).
@@ -238,6 +244,48 @@ pub enum Request {
     EndSession { session: AgentSessionId },
     /// Returns credential *metadata* only. Never values (ADR-0001).
     ListCredentialMetadata,
+    /// Runs a registered compatibility worker under the M10 isolation
+    /// pipeline (ADR-0008, M10).
+    ///
+    /// This is the request that makes the isolated runtime reachable, and
+    /// every field in it is chosen for what it refuses to carry.
+    ///
+    /// **There is no program here.** The caller names a *worker*, and the
+    /// binary, its arguments, its sandbox and its egress policy come from the
+    /// registry the operator built at install time. A request that carried a
+    /// program path would be a general "run this with a credential" verb, and
+    /// the registry is the thing that makes the set of runnable things a
+    /// statement rather than an inventory.
+    ///
+    /// **There are no secret bytes here.** `credential` is a *reference*: the
+    /// broker resolves it inside the spawn, so the value never crosses the
+    /// socket, is never in a `Debug` of this request, and never reaches the
+    /// caller. The one request that does carry a secret is
+    /// `CreateCredential`, and it is the reason this one is not it.
+    ///
+    /// **The posture is weaker than `asv run` and the response says so.**
+    /// ADR-0008: a process that legitimately holds a bearer secret can encode
+    /// or transform it, so redaction cannot provide non-disclosure. This is
+    /// `ISOLATED_PROCESS_EXPOSURE`, the compatibility fallback for a legacy
+    /// tool that cannot use a surrogate — never the strong path.
+    RunIsolated {
+        /// The session this run is charged to. Required: an isolated worker
+        /// that could not be revoked by ending a session would outlive the
+        /// authority that authorised it.
+        session: AgentSessionId,
+        /// Tool identity — the registered worker name.
+        worker: String,
+        /// Arguments appended after the template's own. Elements, never a
+        /// shell string: a caller that could pass `sh -c "..."` would be
+        /// asking the broker to honour a command line rather than a program.
+        args: Vec<String>,
+        /// Credential *reference* to inject, resolved broker-side at spawn.
+        credential: Option<String>,
+        /// Requested lifetime. The broker clamps it; `None` takes the
+        /// runtime's own short default, which is not a value the caller can
+        /// raise.
+        timeout_ms: Option<u64>,
+    },
     /// Plants a new credential in the vault (ADR-0016).
     ///
     /// The only request in this protocol that carries secret material, and it
@@ -549,6 +597,25 @@ pub enum Response {
         session: AgentSessionId,
         backend_terminated: bool,
     },
+    /// An isolated worker finished. Both streams are the **redacted** bytes
+    /// the runtime captured, never the raw pipe, so a worker that echoes its
+    /// injected secret does not hand it back through the response.
+    ///
+    /// `posture` is carried on every run rather than documented once, because
+    /// a caller that has to go looking for whether it is on the strong path or
+    /// the compatibility path will assume the strong one.
+    IsolatedResult {
+        worker: String,
+        /// The terminal state as the runtime named it: exited, signalled,
+        /// timed out, or killed with the tree.
+        outcome: String,
+        exit_code: Option<i32>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        duration_ms: u64,
+        /// Always `ISOLATED_PROCESS_EXPOSURE` (ADR-0008).
+        posture: String,
+    },
     Error {
         code: ErrorCode,
         message: String,
@@ -781,6 +848,7 @@ impl Request {
             Request::PostgresQuery { .. } => "postgres_query",
             Request::PostgresRevoke { .. } => "postgres_revoke",
             Request::CreateCredential { .. } => "create_credential",
+            Request::RunIsolated { .. } => "run_isolated",
         }
     }
 }

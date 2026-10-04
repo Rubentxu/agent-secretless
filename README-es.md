@@ -16,14 +16,14 @@ agente ──(sustituto / socket)──▶ broker ──(credencial real)──�
 
 > **Estado: pre-1.0, en v0.29.0. Sin certificar, y los gates lo dicen.**
 >
-> El workspace compila y hay **1199 tests enumerados**. Con `cargo test`, 1198
+> El workspace compila y hay **1208 tests enumerados**. Con `cargo test`, 1207
 > se ejecutan y pasan y 1 queda fuera de las compilaciones de depuración por
 > construcción: el presupuesto de latencia p95 lleva
 > `#[cfg_attr(debug_assertions, ignore)]`, porque un presupuesto de latencia
 > medido contra ed25519 en depuración es una afirmación sobre
 > `debug_assertions`, no sobre el producto. Ese test sí se ejecuta y pasa con
 > `--release` — medido aquí en 1490us contra un presupuesto de 6000us — así que
-> la corrida en release de abajo ejecuta los 1199. El conteo y la aritmética
+> la corrida en release de abajo ejecuta los 1208. El conteo y la aritmética
 > del inicio rápido los vuelve a derivar en cada corrida de CI el gate
 > `R11 README test count`, que resta los filtros `--skip` que documenta el propio
 > inicio rápido en vez de comprobar una suma, de modo que un bloque que se salta
@@ -75,7 +75,7 @@ imposición es del sistema de tipos:
   una passphrase de recuperación *separada*. **Rekey** de passphrase que
   re-envuelve la misma clave de datos, de modo que los backups previos a la
   rotación siguen funcionando (`crates/vault`).
-- **Daemon broker** (`asv-brokerd`) — IPC por socket Unix (protocolo v7),
+- **Daemon broker** (`asv-brokerd`) — IPC por socket Unix (protocolo v8),
   identidad `SO_PEERCRED`, política Cedar con **deny-by-default**, arranque
   fail-closed: abre `--vault`/`--passphrase-file` al arrancar o niega toda
   operación brokered. Los core dumps se desactivan con `RLIMIT_CORE=0` antes
@@ -221,14 +221,14 @@ permisos de fichero. Es una carencia registrada para cerrar antes de 1.0.
 cargo build --release -p asv-broker
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# esperado: passed=1197 failed=0 ignored=0
+# esperado: passed=1206 failed=0 ignored=0
 ```
 
-1197 y no 1199 porque el comando de arriba se salta dos: `uat_028` levanta un
+1206 y no 1208 porque el comando de arriba se salta dos: `uat_028` levanta un
 `sshd` real y necesita un host donde correr, y el presupuesto p95 se afirma por
 separado en `--release` para que el inicio rápido siga siendo rápido. Los dos
-saltos se cuentan como filtrados, no como ignorados, así que 1197 + 2
-filtrados son los 1199 enumerados.
+saltos se cuentan como filtrados, no como ignorados, así que 1206 + 2
+filtrados son los 1208 enumerados.
 
 Ese número era `passed=692` en este fichero durante varios milestones, y nada
 lo comprobaba: un conteo viejo en un README es una afirmación como cualquier
@@ -266,7 +266,7 @@ pisar una instancia en marcha. Si solo se pasa una de `--vault` /
 ```text
 crates/
   domain/         tipos core, SecretBytes, canonicalización de Authority
-  ipc-protocol/   request/response versionado y acotado por longitud (protocolo v7)
+  ipc-protocol/   request/response versionado y acotado por longitud (protocolo v8)
   identity/       identidad de carga de trabajo SO_PEERCRED + pidfd
   vault/          envelope cifrado, backup/restore, rekey, prototipo TPM
   policy/         integración Cedar, decisiones deny-by-default

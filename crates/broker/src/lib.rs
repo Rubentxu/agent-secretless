@@ -837,6 +837,21 @@ pub struct BrokerState {
     /// is what makes the wiring observable at all — see
     /// `connect_session_revocation_wiring.rs`.
     pub shutdown: Arc<crate::connect_listener::ShutdownSignal>,
+    /// M10 / ADR-0008: the compatibility workers this broker may run.
+    ///
+    /// Empty by default, and empty is a denial rather than a gap: a broker
+    /// that was given no worker file has nothing to run, and `worker::spawn`
+    /// refuses an unknown name before it touches the filesystem. That is the
+    /// fail-closed reading, and it is also the accurate one — the default
+    /// broker on this machine has no operator-declared workers.
+    ///
+    /// This field is why the isolated runtime is a product surface at all.
+    /// Until it existed, `worker::spawn` and everything behind it — Landlock,
+    /// seccomp, namespaces, the lifetime cap, the process-tree teardown, the
+    /// redactor — were reachable only from integration tests, and the one
+    /// command the product ships for running a tool holding a credential,
+    /// `asv run`, bypassed all of it by spawning the child in the CLI process.
+    pub workers: Arc<crate::isolated_exec::WorkerRegistry>,
 }
 
 impl Default for BrokerState {
@@ -867,6 +882,9 @@ impl Default for BrokerState {
             // unmeasurable — the wiring tests need to see a session go from
             // live to revoked, and a broker born revoked cannot show that.
             shutdown: Arc::new(crate::connect_listener::ShutdownSignal::new()),
+            // No workers unless the operator declares them. A registry
+            // fabricated here would be a set of runnable things nobody chose.
+            workers: Arc::new(crate::isolated_exec::WorkerRegistry::default()),
         }
     }
 }
@@ -1100,6 +1118,18 @@ pub fn session_surrogate_budget() -> u32 {
 }
 
 pub fn handle(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request) -> Response {
+    // The method is read *before* the request is consumed, and this is the
+    // whole reason the audit names a verb on a refusal.
+    //
+    // The previous version recovered the name from the response shape, because
+    // by then the request was gone. That works for successes and is wrong for
+    // every refusal: a refused request answers `Error`, `Error` cannot say what
+    // was refused, and the record fell through to the literal "(error)". So an
+    // operator asking "who tried to run an isolated worker" was told that
+    // *something* was denied, by whom, and nothing else — which is precisely
+    // the question an audit chain exists to answer. The request already knew
+    // its own name; it was being thrown away one line too early.
+    let method = request.method_name();
     let response = handle_inner(state, peer, request);
 
     // The record is metadata-only by construction: `AuditEventDto` has no
@@ -1110,7 +1140,7 @@ pub fn handle(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request
         _ => "ok".to_string(),
     };
     let event = AuditEventDto::RequestHandled {
-        method: request_method_name(state, &response),
+        method: method.to_string(),
         session: None,
         peer_uid: peer.credentials.uid,
         pinned: peer.is_pidfd_pinned(),
@@ -1119,34 +1149,6 @@ pub fn handle(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request
     };
     let _ = audit_chain!(state).append(event, now_secs());
     response
-}
-
-/// Wire name of the method that produced `response`. The request has been
-/// consumed by the dispatcher, so the method is recovered from the response
-/// shape; unknown shapes (future variants) audit as "other" rather than lying.
-fn request_method_name(_state: &BrokerState, response: &Response) -> String {
-    match response {
-        Response::Pong { .. } => "ping".into(),
-        Response::BrokerInfo { .. } => "agent_info".into(),
-        Response::SessionCreated { .. } => "create_session".into(),
-        Response::SessionEnded { .. } => "end_session".into(),
-        Response::SessionKeyRegistered { .. } => "register_session_key".into(),
-        Response::CredentialMetadata { .. } => "list_credential_metadata".into(),
-        Response::CredentialDeleted { .. } => "delete_credential".into(),
-        Response::CredentialCreated { .. } => "create_credential".into(),
-        Response::Authorization { .. } => "authorize/explain".into(),
-        Response::ApprovalIssued { .. } => "submit_approval".into(),
-        Response::SurrogateMinted { .. } => "mint_surrogate".into(),
-        Response::SurrogateRevoked { .. } => "revoke_surrogate".into(),
-        Response::IssueRead { .. } => "read_issue".into(),
-        Response::IssueCreated { .. } => "create_issue".into(),
-        Response::ReleaseCreated { .. } => "create_release".into(),
-        Response::AuditRecords { .. } => "audit_query".into(),
-        Response::PostgresConnected { .. } => "postgres_connect".into(),
-        Response::PostgresResult { .. } => "postgres_query".into(),
-        Response::PostgresRevoked { .. } => "postgres_revoke".into(),
-        Response::Error { .. } => "(error)".into(),
-    }
 }
 
 /// Stable name of an error code for audit records.
@@ -1163,6 +1165,46 @@ fn error_code_name(code: ErrorCode) -> String {
         ErrorCode::Upstream => "UPSTREAM",
     };
     name.to_string()
+}
+
+/// The posture every `Request::RunIsolated` answer carries (ADR-0008).
+///
+/// A single constant rather than prose, and carried on **every** response
+/// rather than documented once: a caller that has to go looking for whether it
+/// is on the strong surrogate path or on the compatibility path will assume the
+/// strong one, and that assumption is the one this label exists to stop.
+pub const ISOLATED_POSTURE: &str = "ISOLATED_PROCESS_EXPOSURE";
+
+/// The runtime's own name for a terminal state, for the wire.
+///
+/// `RunOutcome`'s variants are a closed enum and this is a total function over
+/// it, so a new outcome cannot be added without deciding what a caller sees.
+fn outcome_name(outcome: crate::worker::RunOutcome) -> &'static str {
+    use crate::worker::RunOutcome::*;
+    match outcome {
+        Completed => "completed",
+        Failed => "failed",
+        Signaled => "signaled",
+        TimedOut => "timed_out",
+    }
+}
+
+/// A spawn refusal is a typed answer, not a string.
+///
+/// The mapping is chosen so a caller can branch on the code: an unknown worker
+/// and a missing binary are the caller's mistake and stay `InvalidRequest`; an
+/// isolation the kernel refused is not the caller's mistake, and pretending
+/// otherwise would have it retry a configuration that will never work.
+fn spawn_error_code(error: &crate::worker::SpawnError) -> ErrorCode {
+    use crate::worker::SpawnError::*;
+    match error {
+        UnknownWorker(_) | BinaryMissing(_) | InjectionMismatch(_) => ErrorCode::InvalidRequest,
+        EgressAllowUnsupported | SeccompProfileNotProduction | IsolationUnavailable => {
+            ErrorCode::Denied
+        }
+        Timeout(_) => ErrorCode::Upstream,
+        Io(_) => ErrorCode::Upstream,
+    }
 }
 
 /// The pre-R9 dispatcher. Unchanged in behavior; every request reaches it
@@ -1647,6 +1689,149 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                 Err(error) => Response::Error {
                     code: ErrorCode::InvalidRequest,
                     message: error.to_string(),
+                },
+            }
+        }
+
+        Request::RunIsolated {
+            session,
+            worker,
+            args,
+            credential,
+            timeout_ms,
+        } => {
+            // R1. Three checks before anything is spawned, in this order, and
+            // the first two are the same two every other session-scoped verb
+            // makes for the same reason.
+            if !sessions!(state).belongs_to(session, peer) {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: "session is not owned by the authenticated peer".into(),
+                };
+            }
+            if !sessions!(state).is_pinned(session) {
+                // Same bar as surrogate minting, and for the same reason: this
+                // verb hands a process tree a real credential, so a peer we
+                // can only weakly attribute is not one to do that on.
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: "isolated execution requires a pidfd-pinned session".into(),
+                };
+            }
+
+            // The worker name is resolved here, before the credential is
+            // touched. An unknown worker must not be able to make the broker
+            // open the vault on its way to being refused.
+            if state.workers.get(&worker).is_none() {
+                // `InvalidRequest`, not `Denied`: this is the caller's
+                // mistake and not a policy decision, and it is the same
+                // mapping `spawn_error_code` gives `UnknownWorker` — so a
+                // refusal means the same thing whichever layer produced it.
+                return Response::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: format!("unknown worker `{worker}`; nothing was executed"),
+                };
+            }
+
+            // The credential is a *reference*, resolved inside the spawn. The
+            // value is produced by the closure the runtime calls at spawn
+            // time and dropped there; it is never a field of this request,
+            // never a local that outlives the call, and never in the audit
+            // record the runtime appends.
+            let secret = match credential {
+                None => None,
+                Some(id) => {
+                    // The metadata lookup is the same one `MintSurrogate`
+                    // makes. An unknown id would otherwise be discovered by
+                    // the vault at spawn time, after the plan was accepted.
+                    if !state.credentials.iter().any(|c| c.id.to_wire() == id) {
+                        return Response::Error {
+                            code: ErrorCode::InvalidRequest,
+                            message: format!("unknown credential `{id}`"),
+                        };
+                    }
+                    let Some(secrets) = state.secrets.clone() else {
+                        return Response::Error {
+                            code: ErrorCode::Denied,
+                            message:
+                                "no vault is open; refusing to resolve a credential for an isolated run"
+                                    .into(),
+                        };
+                    };
+                    Some(Box::new(move || {
+                        let mut taken: Vec<u8> = Vec::new();
+                        struct Take<'a>(&'a mut Vec<u8>);
+                        impl asv_connector_http::SecretSink for Take<'_> {
+                            fn accept(
+                                &mut self,
+                                secret: &[u8],
+                            ) -> Result<(), asv_connector_http::SecretError>
+                            {
+                                self.0.clear();
+                                self.0.extend_from_slice(secret);
+                                Ok(())
+                            }
+                        }
+                        if let Err(e) = secrets.lend(&id, &mut Take(&mut taken)) {
+                            tracing::warn!(error = %e, "credential lend failed at spawn");
+                            taken.clear();
+                        }
+                        taken
+                    }) as crate::worker::SecretProvider)
+                }
+            };
+
+            // The caller's timeout is a request, not a limit. The runtime keeps
+            // its own short default and this value can only shorten it, because
+            // a client able to raise the ceiling would make the lifetime cap
+            // advisory for the one verb that hands out a real credential.
+            let opts = crate::worker::SpawnOptions {
+                secret,
+                timeout: timeout_ms.map(std::time::Duration::from_millis),
+            };
+
+            // `args` are appended to the template's own arguments. They are
+            // elements and never a command line, so there is no shape in which
+            // a caller can hand the broker a string to split — the `sh -c`
+            // question is answered by the type, not by a check.
+            //
+            // The per-run registry below is a *view*, not a second allow-list:
+            // the templates are the operator's, cloned so the argument vector
+            // of exactly one of them can be extended. A caller cannot add a
+            // template, change a binary, or loosen a profile, because the only
+            // field it moves is the argv of a template it already selected.
+            let mut view = (*state.workers).clone();
+            if let Some(t) = view.templates.iter_mut().find(|t| t.name == worker) {
+                t.arguments.extend(args.iter().cloned());
+            }
+
+            let audit = state.audit.clone();
+            let Ok(mut guard) = audit.lock() else {
+                return Response::Error {
+                    code: ErrorCode::Upstream,
+                    message: "audit log is poisoned; refusing to run an isolated worker unrecorded"
+                        .into(),
+                };
+            };
+
+            match crate::worker::spawn(&view, &worker, opts, &mut guard) {
+                Ok(run) => {
+                    // The streams returned are already the redactor's output.
+                    // The broker never holds the raw pipe, so there is no path
+                    // here that could send an unredacted byte to a caller.
+                    Response::IsolatedResult {
+                        worker,
+                        outcome: outcome_name(run.outcome).to_string(),
+                        exit_code: run.exit_code,
+                        stdout: run.stdout_redacted,
+                        stderr: run.stderr_redacted,
+                        duration_ms: run.duration.as_millis() as u64,
+                        posture: ISOLATED_POSTURE.to_string(),
+                    }
+                }
+                Err(e) => Response::Error {
+                    code: spawn_error_code(&e),
+                    message: e.to_string(),
                 },
             }
         }
