@@ -72,11 +72,30 @@
 //! whole milestone exists because a mechanism that looks healthy while
 //! protecting nothing is the failure being removed.
 //!
-//! `TPM2_PCR_Extend` is also absent, and that has a consequence a reader should
-//! not have to discover: on a device that has just been started, every PCR
-//! reads as zero, and that is the correct answer, not a symptom. Writing a PCR
-//! needs an authorization session whose nonce is sized by the digest of the
-//! entity's bank, which is the next protocol work rather than a line to add.
+//! `TPM2_PCR_Extend` is also absent, and the reason is worth more than the
+//! absence: writing a PCR needs an authorization session, and this client's
+//! encoding of one has not been made to work.
+//!
+//! **What was measured, so the next attempt does not repeat it.** A password
+//! session is `TPM_ST_SESSIONS` plus an authorization area of
+//! `TPM2B_AUTH authorization`, `TPM2B_NONCE nonceCaller`, then
+//! `sessionHandle = TPM_RS_PW (0x4000_0009)`, a second nonce, a
+//! `TPMA_SESSION` byte and a `TPM2B_DIGEST hmac` — and, for a command whose
+//! header carries sessions, a `u32 authorizationSize` ahead of all of it.
+//! Against a TPM 2.0 implementation, `TPM2_Clear` and `TPM2_PCR_Extend` refuse
+//! that encoding with `0x184` and `TPM_RC_SIZE` respectively, across the whole
+//! matrix of nonce size (0, 16, 20, 32), hmac size, `TPMA_SESSION` value
+//! (0x00 and 0x01), with and without `authorizationSize`, and with the session
+//! handle before the authorization. **The same commands, on the same device,
+//! through `tpm2-tools` succeed** — so the device, the command codes and the
+//! object encodings are not what is wrong here; this client's session area is.
+//! A dimension that is missing from that list is a dimension still untried.
+//!
+//! The consequence for the tests below is honest rather than convenient: on a
+//! device that has just been started every PCR is zero, and that is the
+//! correct answer, not a symptom. A test that demanded a non-zero digest would
+//! be asserting a fiction. Writing a PCR is what makes the read falsifiable,
+//! and that is the next protocol work rather than a line to add.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
