@@ -274,6 +274,144 @@ impl SecretPort for OAuth2SecretPort {
     }
 }
 
+/// Why a set of client registrations could not be loaded.
+///
+/// Every variant is a refusal that stops the broker. A registration that is
+/// half-understood is worse than none: the operator believes a credential is
+/// traded for a token, and the failure would otherwise surface as a mystery at
+/// the first operation instead of at startup.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientConfigError {
+    /// The file could not be read.
+    #[error("cannot read {path}: {reason}")]
+    Unreadable { path: String, reason: String },
+    /// The file is not the shape this expects.
+    #[error("malformed OAuth2 client list: {0}")]
+    Malformed(String),
+    /// Two registrations claim the same credential.
+    #[error("credential {0} is registered more than once")]
+    Duplicate(String),
+    /// A registration cannot be used as written.
+    #[error("client for {credential}: {reason}")]
+    Unusable { credential: String, reason: String },
+}
+
+/// The on-disk shape of one registration.
+///
+/// `#[serde(deny_unknown_fields)]` so a typo in a field name is a refusal
+/// rather than a registration that quietly has an empty scope and asks the
+/// provider for whatever its default is.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawClient {
+    credential: String,
+    client_id: String,
+    token_url: String,
+    #[serde(default)]
+    audience: String,
+    #[serde(default)]
+    scope: String,
+}
+
+/// Loads client registrations from a JSON file.
+///
+/// Validated here rather than at first use, with one deliberate exception:
+/// whether the *name* resolves is not checked, because a provider that is down
+/// at startup is a normal thing and the broker must still start. What is
+/// checked is everything that can be known without the network — a credential
+/// with no name, a token URL that is not HTTPS, two registrations fighting over
+/// one credential.
+pub fn load_clients(path: &std::path::Path) -> Result<Vec<OAuth2Client>, ClientConfigError> {
+    let text = std::fs::read_to_string(path).map_err(|error| ClientConfigError::Unreadable {
+        path: path.display().to_string(),
+        reason: error.to_string(),
+    })?;
+    let raw: Vec<RawClient> = serde_json::from_str(&text)
+        .map_err(|error| ClientConfigError::Malformed(error.to_string()))?;
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut clients = Vec::with_capacity(raw.len());
+    for entry in raw {
+        if entry.credential.trim().is_empty() {
+            return Err(ClientConfigError::Malformed(
+                "a registration has an empty credential".to_string(),
+            ));
+        }
+        if seen.contains(&entry.credential) {
+            return Err(ClientConfigError::Duplicate(entry.credential));
+        }
+        if entry.client_id.trim().is_empty() {
+            return Err(ClientConfigError::Unusable {
+                credential: entry.credential,
+                reason: "empty client_id".to_string(),
+            });
+        }
+        // Checked here so an operator is told at startup rather than at the
+        // first operation. The issuer refuses it too; this is the earlier of
+        // the two refusals, and the cheaper one.
+        if !entry.token_url.starts_with("https://") {
+            return Err(ClientConfigError::Unusable {
+                credential: entry.credential,
+                reason: format!(
+                    "the token endpoint is not https, so the client secret would travel in the clear: {}",
+                    entry.token_url
+                ),
+            });
+        }
+        seen.push(entry.credential.clone());
+        clients.push(OAuth2Client {
+            credential: entry.credential,
+            client_id: entry.client_id,
+            token_url: entry.token_url,
+            audience: entry.audience,
+            scope: entry.scope,
+        });
+    }
+    Ok(clients)
+}
+
+/// Answers from the OAuth2 port for registered credentials and from the vault
+/// for everything else.
+///
+/// # The rule that matters
+///
+/// **Only [`SecretError::NotFound`] falls through.** Every other failure is a
+/// refusal, and a refusal is not a licence to try something else.
+///
+/// The tempting version falls back on any error, and it is a catastrophic
+/// leak dressed as resilience: the provider is down, the OAuth2 port cannot
+/// obtain a token, the router asks the vault, the vault hands over the stored
+/// **client secret**, and the operation proceeds with exactly the long-lived
+/// credential M11 exists to keep inside the broker. The failure is silent, the
+/// operation succeeds, and the only evidence is afterwards.
+///
+/// So the fall-through is keyed on the one error that means "nobody is
+/// registered here", and `unavailable_falls_through_to_nothing` pins it.
+pub struct RoutingSecretPort {
+    oauth2: Arc<dyn SecretPort>,
+    vault: Arc<dyn SecretPort>,
+}
+
+impl RoutingSecretPort {
+    /// Routes registered credentials to `oauth2` and the rest to `vault`.
+    pub fn new(oauth2: Arc<dyn SecretPort>, vault: Arc<dyn SecretPort>) -> Self {
+        Self { oauth2, vault }
+    }
+}
+
+impl SecretPort for RoutingSecretPort {
+    fn lend(&self, credential: &str, sink: &mut dyn SecretSink) -> Result<(), SecretError> {
+        match self.oauth2.lend(credential, sink) {
+            Ok(()) => Ok(()),
+            // The sink has already been handed bytes by a port that then
+            // failed, so there is nothing to clean up and nothing to retry: the
+            // operation either has its credential or it does not.
+            Err(SecretError::Unavailable(reason)) => Err(SecretError::Unavailable(reason)),
+            Err(SecretError::NotFound(_)) => self.vault.lend(credential, sink),
+        }
+    }
+}
+
 /// A sink that keeps a copy, for reading a secret out of the vault.
 ///
 /// The shape is forced by [`SecretPort`]: the only way to get bytes out of a
@@ -439,6 +577,154 @@ mod tests {
             grants.0.load(Ordering::SeqCst),
             2,
             "after forgetting, a new grant is asked for"
+        );
+    }
+
+    /// A registered credential is answered by the OAuth2 port, and nothing
+    /// reaches the vault.
+    #[test]
+    fn a_registered_credential_is_answered_by_the_oauth2_port() {
+        let (oauth2, _grants) = port(b"the-client-secret", Duration::ZERO);
+        // The vault holds a value the operation would recognise, so "the vault
+        // was not consulted" is readable off the bytes rather than off a
+        // counter.
+        let router = RoutingSecretPort::new(Arc::new(oauth2), Arc::new(FixedSecret(b"from-vault")));
+        let mut seen = Seen::default();
+        router.lend("cred-1", &mut seen).expect("lend");
+        assert_ne!(seen.bytes, b"from-vault", "the vault must not be consulted");
+    }
+
+    /// An unregistered credential is the vault's business.
+    #[test]
+    fn an_unregistered_credential_falls_through_to_the_vault() {
+        let (oauth2, _grants) = port(b"the-client-secret", Duration::ZERO);
+        let router = RoutingSecretPort::new(Arc::new(oauth2), Arc::new(FixedSecret(b"from-vault")));
+        let mut seen = Seen::default();
+        router.lend("cred-2", &mut seen).expect("lend");
+        assert_eq!(seen.bytes, b"from-vault");
+    }
+
+    /// The one that matters. A provider that is down must not send the router
+    /// back to the vault, because the vault holds the client secret and the
+    /// whole point of the OAuth2 port is that the operation does not.
+    #[test]
+    fn a_provider_failure_never_falls_through_to_the_vault() {
+        struct Broken;
+        impl SecretPort for Broken {
+            fn lend(&self, _c: &str, _s: &mut dyn SecretSink) -> Result<(), SecretError> {
+                Err(SecretError::Unavailable("the provider is down".into()))
+            }
+        }
+        let router = RoutingSecretPort::new(
+            Arc::new(Broken),
+            Arc::new(FixedSecret(b"THE-CLIENT-SECRET")),
+        );
+        let mut seen = Seen::default();
+        assert!(matches!(
+            router.lend("cred-1", &mut seen),
+            Err(SecretError::Unavailable(_))
+        ));
+        assert_eq!(seen.calls, 0, "the vault must never be consulted");
+    }
+
+    /// A well-formed file loads, and `audience` and `scope` may be omitted
+    /// because both have honest defaults: no audience means the issuer's own
+    /// resource, and no scope means whatever the provider considers default.
+    #[test]
+    fn a_well_formed_file_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clients.json");
+        std::fs::write(
+            &path,
+            r#"[
+                 {"credential":"cred-1","client_id":"asv-broker",
+                  "token_url":"https://idp.example.com/token",
+                  "audience":"https://api.example.com","scope":"read"},
+                 {"credential":"cred-2","client_id":"other",
+                  "token_url":"https://idp2.example.com/token"}
+               ]"#,
+        )
+        .expect("write");
+        let clients = load_clients(&path).expect("loads");
+        assert_eq!(clients.len(), 2);
+        assert_eq!(clients[0].scope, "read");
+        assert_eq!(clients[1].audience, "", "omitted means the issuer's own");
+        assert_eq!(clients[1].scope, "", "omitted means the provider's default");
+    }
+
+    /// Every way the file can be wrong is a refusal, and none of them is a
+    /// partial load. A registration that is half-understood is worse than none.
+    #[test]
+    fn a_wrong_file_is_a_refusal_rather_than_a_partial_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cases: Vec<(&str, &str)> = vec![
+            (
+                "two registrations, one credential",
+                r#"[{"credential":"c1","client_id":"a","token_url":"https://x.example/t"},
+                    {"credential":"c1","client_id":"b","token_url":"https://y.example/t"}]"#,
+            ),
+            (
+                "a token endpoint that is not https",
+                r#"[{"credential":"c1","client_id":"a","token_url":"http://x.example/t"}]"#,
+            ),
+            (
+                "an empty client id",
+                r#"[{"credential":"c1","client_id":"  ","token_url":"https://x.example/t"}]"#,
+            ),
+            (
+                "an empty credential",
+                r#"[{"credential":"","client_id":"a","token_url":"https://x.example/t"}]"#,
+            ),
+            (
+                "a misspelled field name",
+                r#"[{"credential":"c1","client_id":"a","token_url":"https://x.example/t","scpoe":"read"}]"#,
+            ),
+            ("not json at all", "clients = []"),
+        ];
+        for (name, body) in cases {
+            let path = dir.path().join("clients.json");
+            std::fs::write(&path, body).expect("write");
+            assert!(
+                load_clients(&path).is_err(),
+                "{name} must be refused rather than loaded"
+            );
+        }
+        assert!(
+            load_clients(&dir.path().join("absent.json")).is_err(),
+            "a missing file is a refusal, not an empty list"
+        );
+    }
+
+    /// The secret is not in this file, and a configuration that is readable by
+    /// anyone who can read the operator's config directory must not be the
+    /// place a long-lived credential lives.
+    #[test]
+    fn the_registration_file_never_carries_the_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clients.json");
+        std::fs::write(
+            &path,
+            r#"[{"credential":"c1","client_id":"a","token_url":"https://x.example/t"}]"#,
+        )
+        .expect("write");
+        let text = std::fs::read_to_string(&path).expect("read");
+        for forbidden in ["secret", "password", "token_value"] {
+            assert!(
+                !text.contains(forbidden),
+                "{forbidden} has no business here"
+            );
+        }
+        // And the loader has nowhere to put one: `deny_unknown_fields` means a
+        // `client_secret` key is a refusal, not a silently ignored field.
+        std::fs::write(
+            &path,
+            r#"[{"credential":"c1","client_id":"a","token_url":"https://x.example/t",
+                 "client_secret":"leaked"}]"#,
+        )
+        .expect("write");
+        assert!(
+            load_clients(&path).is_err(),
+            "a secret field must be refused"
         );
     }
 

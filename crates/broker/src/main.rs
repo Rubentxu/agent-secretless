@@ -239,6 +239,13 @@ fn main() -> std::io::Result<()> {
     // C2.8: the anchors a *destination's* certificate is verified against. Not
     // the public root set and not defaulted — see `Bridge::with_upstream`.
     let mut connect_roots: Option<PathBuf> = None;
+    // M11: the credentials this installation trades for short-lived tokens.
+    // A file rather than flags because it is structured, and because the
+    // other structured operator inputs here are files too — a flag carrying
+    // four colon-separated fields is a field separator waiting to be wrong.
+    // It carries no secret: the client secret stays in the vault and the
+    // loader refuses a file that tries to name one.
+    let mut oauth2_clients: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         let arg = match arg.into_string() {
             Ok(s) => s,
@@ -334,6 +341,13 @@ fn main() -> std::io::Result<()> {
                     std::process::exit(1);
                 }
             }
+            "--oauth2-clients" => {
+                oauth2_clients = args.next().map(PathBuf::from);
+                if oauth2_clients.is_none() {
+                    eprintln!("asv: --oauth2-clients requires a path argument");
+                    std::process::exit(1);
+                }
+            }
             "--identity-uid" => {
                 // The launch contract, flag-not-env like every other operator
                 // setting in this binary: the broker's env quarantine scans for
@@ -357,7 +371,7 @@ fn main() -> std::io::Result<()> {
             "--require-dedicated-identity" => require_dedicated_identity = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH] [--audit-max-records N] [--audit-file PATH] [--enrol-principal PATH] [--harden] [--connect-listen ADDR] [--identity-uid N] [--require-dedicated-identity]"
+                    "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH] [--audit-max-records N] [--audit-file PATH] [--enrol-principal PATH] [--harden] [--connect-listen ADDR] [--identity-uid N] [--require-dedicated-identity] [--oauth2-clients PATH]"
                 );
                 eprintln!();
                 eprintln!("  --identity-uid N       the uid this installation expects the");
@@ -396,6 +410,13 @@ fn main() -> std::io::Result<()> {
                     "                         no CONNECT route at all, so a route file alone"
                 );
                 eprintln!("                         authorizes nothing.");
+                eprintln!("  --oauth2-clients PATH  JSON list of credentials this broker");
+                eprintln!("                         trades for short-lived tokens, each with a");
+                eprintln!("                         credential, client_id, token_url and");
+                eprintln!("                         optional audience and scope.");
+                eprintln!("                         Carries no secret: the client secret");
+                eprintln!("                         stays in the vault, and a file that");
+                eprintln!("                         names one is refused.");
                 std::process::exit(0);
             }
             other if other.starts_with("--") || other.starts_with('-') => {
@@ -408,6 +429,16 @@ fn main() -> std::io::Result<()> {
             }
         }
     }
+    // Declaring OAuth2 clients without a vault is refused, in the same place and
+    // for the same reason as `--connect-listen`: the registrations name vault
+    // credentials, and a broker with no vault has nothing to exchange them
+    // against. Without this the flag would be accepted and then silently
+    // ignored, which is the one outcome an operator cannot detect.
+    if oauth2_clients.is_some() && vault_path.is_none() {
+        eprintln!("asv: --oauth2-clients needs --vault; there is no client secret to trade");
+        std::process::exit(1);
+    }
+
     // The identity check runs before the vault, the passphrase and the harden
     // profile, and before the enrolment branch: every one of those acts on a
     // credential or writes a record, and a broker that is going to refuse over
@@ -682,12 +713,47 @@ fn main() -> std::io::Result<()> {
             Arc::clone(&store),
             Arc::clone(&key),
         )));
-        state.secrets = Some(Arc::new(VaultSecretPort::new(Arc::clone(&store), key)));
+        let vault_port: Arc<dyn asv_connector_http::SecretPort> =
+            Arc::new(VaultSecretPort::new(Arc::clone(&store), key));
+        state.secrets = Some(match &oauth2_clients {
+            None => vault_port,
+            Some(path) => {
+                // Refusing to start on a bad registration file is the point.
+                // A registration the broker half-understands would leave an
+                // operator believing a credential is traded for a token when
+                // the failure surfaces later, as a mystery, at the first
+                // operation instead of here.
+                let clients = match asv_broker::oauth2_port::load_clients(path) {
+                    Ok(clients) => clients,
+                    Err(error) => {
+                        eprintln!(
+                            "asv: --oauth2-clients {} cannot be used: {error}",
+                            path.display()
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                let registered = clients.len();
+                let oauth2: Arc<dyn asv_connector_http::SecretPort> =
+                    Arc::new(asv_broker::oauth2_port::OAuth2SecretPort::new(
+                        Arc::clone(&vault_port),
+                        clients,
+                    ));
+                // Only a credential that is *not registered* reaches the vault.
+                // A provider failure is a refusal, so a temporary outage cannot
+                // be answered by handing the operation the client secret.
+                tracing::info!(registered, "OAuth2 clients registered");
+                Arc::new(asv_broker::oauth2_port::RoutingSecretPort::new(
+                    oauth2, vault_port,
+                ))
+            }
+        });
         tracing::info!(
             vault = %vault_path.display(),
             credentials = inventory.loaded,
             skipped = inventory.skipped,
             collisions = inventory.collisions,
+            oauth2_clients = oauth2_clients.as_ref().map(|p| p.display().to_string()),
             "vault opened and unlocked"
         );
     }
