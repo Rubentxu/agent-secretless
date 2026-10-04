@@ -2509,7 +2509,27 @@ loopback origin in `cleartext`**, so the end-to-end verticals exercise the
 `cleartext` declaration and not the `tls` one — the TLS leg is measured against
 a locally minted CA, which is honest and is not the same as a registry. Also
 still owed: **stress and cancellation under load** beyond the anti-replay
-property already measured. **And the broker has no ordered shutdown at all** was
+property already measured — and **that is now measured too**.
+`a_revocation_under_load_ends_one_sessions_tunnels_and_nobody_elses` stands up
+twelve real tunnels in flight against a destination that promises 64 response
+bytes and sends 2, so every relay is mid-copy, and revokes one session. Its
+eight tunnels all end inside 20s, all reporting `Cancelled(SessionRevoked)`
+rather than an I/O error or a budget; the other session's four are untouched.
+**The scoping is the half that is new.** With one tunnel there is nothing to
+spare, so every earlier revocation test would have passed against a `revoke`
+that cancelled everything. Falsified both ways: dropping the session from the
+relay's cancel check leaves `0 of 8` ending, and making `is_revoked` answer true
+for any non-empty revoked set ends the *untouched* session's tunnels too.
+
+It is measured in process for a structural reason, not a preference: `asv run`
+stops its shim *before* it ends a session, so end to end a tunnel closing is
+equally consistent with the shim dying and with the broker cancelling. The
+first run of this test reported `1 of 8` and the reason is worth keeping — the
+fixture minted a session per rig, so seven of the eight belonged to sessions
+nobody had revoked. **A correct product refusing to cancel tunnels it had no
+authority over, read as a cancellation that did not scale.**
+
+**And the broker had no ordered shutdown at all** was
 the last thing owed here, and it was a defect rather than a gap:
 `ShutdownSignal::stop` — the mechanism that ends a tunnel deliberately, the one
 the accept loop watches and the bridge polls every 50 ms — had **no caller

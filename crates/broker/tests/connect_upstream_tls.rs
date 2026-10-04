@@ -66,7 +66,6 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
 const HOST: &str = "origin.example.com";
 const PORT: u16 = 443;
-const ANY_PROOF: &str = "AAAA.1.BBBB";
 
 /// The credential the operator planted, and the only one the destination may
 /// ever see. Shaped so "it came from us" is not a coincidence.
@@ -205,17 +204,66 @@ impl LeafSource for SessionLeaves {
     }
 }
 
-struct AnyProof {
-    session: AgentSessionId,
+/// Resolves a proof to a session by its counter, so one listener can carry
+/// tunnels belonging to **different** sessions at the same time.
+///
+/// The counter is the only part of a proof a fixture can choose freely, and it
+/// is enough: the test needs N tunnels from N sessions, not N verified
+/// signatures. What is under test is what happens to a set of tunnels when one
+/// session is revoked while the rest keep running.
+/// A counter no two rigs share.
+///
+/// `fetch_add` rather than a `Cell` on each rig: the rigs are created in a loop
+/// from one place, and a counter that could repeat would let a second tunnel
+/// silently answer to the first one's session — which is precisely the mistake
+/// the scoping assertion exists to catch, so the fixture must not be able to
+/// make it by accident.
+fn next_counter() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
 }
 
-impl SessionProofs for AnyProof {
+#[derive(Default)]
+struct ProofsByCounter {
+    sessions: std::sync::Mutex<std::collections::HashMap<u64, AgentSessionId>>,
+}
+
+impl ProofsByCounter {
+    fn register(&self, counter: u64, session: AgentSessionId) {
+        self.sessions
+            .lock()
+            .expect("proof map")
+            .insert(counter, session);
+    }
+}
+
+/// A newtype, because `SessionProofs` is not object-safe to hand to the bridge
+/// as a reference to a trait object and the test needs a table it can share
+/// between rigs it creates one after another.
+struct SessionProofsRef(Arc<ProofsByCounter>);
+
+impl SessionProofs for SessionProofsRef {
     fn authenticate(
         &self,
-        _proof: &asv_broker::tls_bridge::SessionProof,
+        proof: &asv_broker::tls_bridge::SessionProof,
+        target: &AuthorityEndpoint,
+    ) -> Result<AgentSessionId, asv_broker::ProofRejection> {
+        self.0.authenticate(proof, target)
+    }
+}
+
+impl SessionProofs for ProofsByCounter {
+    fn authenticate(
+        &self,
+        proof: &asv_broker::tls_bridge::SessionProof,
         _target: &AuthorityEndpoint,
     ) -> Result<AgentSessionId, asv_broker::ProofRejection> {
-        Ok(self.session)
+        self.sessions
+            .lock()
+            .expect("proof map")
+            .get(&proof.counter)
+            .copied()
+            .ok_or(asv_broker::ProofRejection::NoSuchSession)
     }
 }
 
@@ -290,16 +338,62 @@ struct Rig {
     listener: TcpListener,
     origin_addr: SocketAddr,
     session: AgentSessionId,
+    /// The counter this rig's proof spends, which is also how the shared
+    /// [`ProofsByCounter`] knows which session a tunnel belongs to.
+    counter: u64,
+    proofs: Arc<ProofsByCounter>,
 }
 
 impl Rig {
     fn new(ca: SessionCa, origin_addr: SocketAddr) -> Self {
+        Self::with_proofs(
+            Arc::new(ca),
+            origin_addr,
+            Arc::new(ProofsByCounter::default()),
+            AgentSessionId::new(),
+        )
+    }
+
+    /// A rig sharing a proof table, so several tunnels can be in flight at once
+    /// and each can belong to a different session.
+    ///
+    /// The CA arrives as an `Arc` because [`SessionCa`] is not `Clone` — it owns
+    /// a `rcgen::KeyPair` — and a dozen rigs each minting their own CA would make
+    /// the client handshake a second variable in a test whose subject is the
+    /// revocation.
+    /// `session` is an argument because several tunnels have to belong to
+    /// **one** session for a revocation to have something to cancel. Minting a
+    /// session per rig looks equivalent and is the opposite: revoking one of
+    /// them then leaves the rest legitimately untouched, and the first version
+    /// of this test reported `1 of 8` for exactly that reason — a correct
+    /// product refusing to cancel tunnels it had no authorisation over, read as
+    /// a cancellation that did not scale.
+    fn with_proofs(
+        ca: Arc<SessionCa>,
+        origin_addr: SocketAddr,
+        proofs: Arc<ProofsByCounter>,
+        session: AgentSessionId,
+    ) -> Self {
+        let counter = next_counter();
+        proofs.register(counter, session);
         Self {
-            ca: Arc::new(ca),
+            ca,
             listener: TcpListener::bind("127.0.0.1:0").expect("bridge binds"),
             origin_addr,
-            session: AgentSessionId::new(),
+            session,
+            counter,
+            proofs,
         }
+    }
+
+    /// The wire form of this rig's proof: `<key>.<counter>.<signature>`.
+    ///
+    /// The key and the signature are the same fixed blob in every rig. Only the
+    /// counter carries meaning, and that is enough: what is under test is what
+    /// happens to a set of tunnels when one session is revoked, not whether a
+    /// signature verifies — which the broker's own verifier tests cover.
+    fn proof_value(&self) -> String {
+        format!("QUFB.{}.QkJC", self.counter)
     }
 
     fn bridge(&self, transport: UpstreamTransport, roots: Arc<RootCertStore>) -> Bridge {
@@ -307,6 +401,28 @@ impl Rig {
             allowed: vec![endpoint()],
         })
         .with_upstream(Arc::new(Always(transport)), roots)
+    }
+
+    /// The same bridge, cancellable by a signal shared with other tunnels.
+    ///
+    /// A separate constructor rather than a defaulted argument, because the
+    /// tests above deliberately build bridges that **cannot** be cancelled: a
+    /// bridge with no cancel source is the shape that makes "the relay ended"
+    /// mean "the relay finished", and giving every rig a signal would quietly
+    /// remove the distinction those tests rest on.
+    fn cancellable_bridge(
+        &self,
+        transport: UpstreamTransport,
+        cancel: Arc<asv_broker::connect_listener::ShutdownSignal>,
+    ) -> Bridge {
+        Bridge::new(ConnectPolicy {
+            allowed: vec![endpoint()],
+        })
+        .with_upstream(
+            Arc::new(Always(transport)),
+            Arc::new(RootCertStore::empty()),
+        )
+        .with_cancel(cancel)
     }
 
     /// Establish the tunnel and nothing else, returning the relay's two inputs.
@@ -345,7 +461,8 @@ impl Rig {
             .write_all(
                 format!(
                     "CONNECT {HOST}:{PORT} HTTP/1.1\r\nHost: {HOST}\r\n\
-                     {SESSION_PROOF_HEADER}: {ANY_PROOF}\r\n\r\n"
+                     {SESSION_PROOF_HEADER}: {proof}\r\n\r\n",
+                    proof = self.proof_value()
                 )
                 .as_bytes(),
             )
@@ -362,9 +479,10 @@ impl Rig {
             FixedUpstream {
                 addr: self.origin_addr,
             },
-            AnyProof {
-                session: self.session,
-            },
+            // The shared table, not a fixed session: the cancellation test
+            // stands up several rigs at once and each tunnel has to belong to
+            // the session the test will revoke.
+            SessionProofsRef(Arc::clone(&self.proofs)),
         );
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
@@ -806,5 +924,215 @@ fn a_destination_no_route_declares_is_not_dialled() {
         !origin.handshook(),
         "the origin completed a handshake although no route declared how to reach it, so \
          the broker dialled a destination nothing had authorized"
+    );
+}
+
+/// A destination that never finishes answering.
+///
+/// **Promises more than it sends, on purpose.** A head with
+/// `Content-Length: 64` and two bytes behind it leaves the relay copying a
+/// response direction that never ends, which is the only state in which there
+/// is anything to cancel. An origin that answered properly would let the relay
+/// return, and a revocation sent afterwards would be measured against a broker
+/// that had already finished the work — the same mistake the shutdown test made
+/// before `OriginMode::Stall` existed in the vertical.
+struct StallingOrigin {
+    addr: SocketAddr,
+    received: Arc<Mutex<usize>>,
+}
+
+impl StallingOrigin {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("stalling origin binds");
+        let addr = listener.local_addr().expect("stalling origin addr");
+        let received: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let counter = Arc::clone(&received);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let counter = Arc::clone(&counter);
+                thread::spawn(move || {
+                    let mut head = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    *counter.lock().expect("received") += 1;
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\nok");
+                    let _ = stream.flush();
+                    // Never ends, and never times out: this connection is
+                    // ended by the other side, which is the event under test.
+                    let _ = stream.set_read_timeout(None);
+                    let mut buf = [0u8; 256];
+                    while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+                });
+            }
+        });
+        Self { addr, received }
+    }
+
+    fn requests(&self) -> usize {
+        *self.received.lock().expect("received")
+    }
+
+    /// Bounded, because the origin is on its own threads and an unbounded
+    /// wait is a hung test rather than a failed one.
+    fn wait_for_requests(&self, n: usize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.requests() >= n {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+}
+
+/// **8.** A revocation that lands while a dozen tunnels are in flight ends that
+/// session's tunnels and nobody else's.
+///
+/// This is the last thing C2.8 owed, and it could not be measured through the
+/// binaries: `asv run` stops its shim *before* it ends a session, so end to end
+/// a tunnel closing is equally consistent with the shim dying and with the
+/// broker cancelling. That is a structural reason, not a preference, and it is
+/// why the file about revocation wiring says so in its own header. So the
+/// subject here is the broker, with the client half held still.
+///
+/// Three properties, and the third is the one the earlier measurements could
+/// not see:
+///
+/// 1. **Every** tunnel of the revoked session ends, and reports
+///    `SessionRevoked` rather than an I/O error or a budget.
+/// 2. They end *promptly* — a cancellation that arrives whenever the relay next
+///    happens to write is not a cancellation under load.
+/// 3. **The other session's tunnels are untouched.** A `revoke` that cancelled
+///    everything, or that matched on something coarser than the session, would
+///    satisfy 1 and 2 perfectly while refusing paying clients. This is the
+///    half a single-tunnel revocation test cannot see, because with one tunnel
+///    there is nothing to spare.
+#[test]
+fn a_revocation_under_load_ends_one_sessions_tunnels_and_nobody_elses() {
+    const REVOKED: usize = 8;
+    const UNTOUCHED: usize = 4;
+    const TOTAL: usize = REVOKED + UNTOUCHED;
+
+    let ca = Arc::new(SessionCa::new(
+        "revoke-under-load",
+        41,
+        Duration::from_secs(3600),
+    ));
+    let origin = StallingOrigin::start();
+    let proofs = Arc::new(ProofsByCounter::default());
+    let signal = Arc::new(asv_broker::connect_listener::ShutdownSignal::new());
+
+    // One rig per tunnel, all sharing a proof table so each tunnel belongs to
+    // the session the test will revoke — and therefore to a session the test
+    // will *not*, for the second group.
+    // Two sessions, and the tunnels distributed across them: REVOKED of the
+    // first, UNTOUCHED of the second. Every counter is distinct, so each tunnel
+    // resolves to its own session through the shared table.
+    let revoked_session = AgentSessionId::new();
+    let untouched_session = AgentSessionId::new();
+    let rigs: Vec<Rig> = (0..TOTAL)
+        .map(|i| {
+            let session = if i < REVOKED {
+                revoked_session
+            } else {
+                untouched_session
+            };
+            Rig::with_proofs(Arc::clone(&ca), origin.addr, Arc::clone(&proofs), session)
+        })
+        .collect();
+    assert_ne!(
+        revoked_session, untouched_session,
+        "both groups resolved to the same session, so nothing here could distinguish \
+         a scoped revoke from one that cancels everything"
+    );
+
+    // Establish and start each tunnel on its own thread, in one pass:
+    // `establish` answers the client handshake and returns, and `relay` then
+    // blocks until the tunnel is cancelled, so the two cannot be one call.
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<SubstitutionOutcome, BridgeError>)>();
+    for (index, rig) in rigs.into_iter().enumerate() {
+        let bridge = rig.cancellable_bridge(UpstreamTransport::Cleartext, Arc::clone(&signal));
+        let established = rig.establish(bridge).expect("a tunnel to be established");
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send((index, rig.relay(established)));
+        });
+    }
+    drop(tx);
+
+    // Every tunnel is relaying before anything is revoked. Without this the
+    // revocation could land on tunnels that have already finished, and the
+    // test would measure nothing while being green.
+    assert!(
+        origin.wait_for_requests(TOTAL, Duration::from_secs(30)),
+        "only {} of {TOTAL} tunnels reached the destination, so the revocation below \
+         would not be landing on a full set of in-flight tunnels",
+        origin.requests()
+    );
+
+    // The revocation, and nothing else.
+    signal.revoke(&revoked_session.to_string());
+
+    // 1 and 2: the revoked session's tunnels end, promptly, with the right reason.
+    let mut revoked_ended = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while revoked_ended < REVOKED {
+        let Ok((index, outcome)) = rx.recv_timeout(Duration::from_millis(200)) else {
+            if Instant::now() >= deadline {
+                break;
+            }
+            continue;
+        };
+        if index >= REVOKED {
+            // A tunnel of the other session finished. Nothing in this
+            // measurement expects that, and it is the failure the scoping
+            // assertion is about — recorded here so the message below can say
+            // which one ended.
+            panic!(
+                "tunnel {index} belongs to the session that was not revoked and ended \
+                 anyway: {outcome:?}"
+            );
+        }
+        match outcome {
+            Err(BridgeError::Cancelled(reason)) => {
+                assert_eq!(
+                    reason,
+                    asv_broker::tls_bridge::CancelReason::SessionRevoked,
+                    "the tunnel was cancelled, but for {reason} rather than for the \
+                     revocation this test performed"
+                );
+                revoked_ended += 1;
+            }
+            other => panic!(
+                "a revoked session's tunnel ended as {other:?}, which blames something \
+                 other than the revocation — an operator reading this would go looking \
+                 in the wrong place"
+            ),
+        }
+    }
+    assert_eq!(
+        revoked_ended, REVOKED,
+        "{revoked_ended} of {REVOKED} tunnels of the revoked session ended within 20s; a \
+         cancellation that arrives whenever the relay next writes is not a cancellation \
+         under load"
+    );
+
+    // 3: the other session's tunnels are still running, and still holding the
+    // credential. This is the assertion with no control in the tests before it.
+    assert!(
+        rx.try_recv().is_err(),
+        "a tunnel of the untouched session ended when another session was revoked"
+    );
+    assert!(
+        !signal.is_revoked(&untouched_session.to_string()),
+        "revoking one session marked another one revoked, so a client paying for a \
+         concurrent session cannot tell that from an attack"
     );
 }
