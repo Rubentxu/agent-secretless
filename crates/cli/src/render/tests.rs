@@ -268,13 +268,74 @@ fn a_ready_installation_says_what_it_could_not_check() {
         !human.contains("blocking:"),
         "a ready installation listed something as blocking:\n{human}"
     );
+    // **Two, not one**, and the second is `broker.identity`. This test's
+    // fixture reaches the broker over the socket without facts, so the
+    // identity check is `Unknown` beside `broker.dumpable` — and the count
+    // moving from one to two is the check existing at all, which is the whole
+    // reason this assertion is a count rather than a fixed phrase.
     assert!(
-        human.contains("1 not observable"),
-        "the summary did not report the one fact it could not check:\n{human}"
+        human.contains("2 not observable"),
+        "the summary did not report the two facts it could not check:\n{human}"
     );
     assert!(
         human.contains("broker.dumpable"),
         "the unknown check is not in the body at all:\n{human}"
+    );
+
+    // A state that is neither a warning nor unknown has to be *counted* here,
+    // or it reaches the operator only by scrolling. Asserted because the first
+    // version of the identity check did not exist and this line would have
+    // passed unchanged.
+    assert!(
+        human.contains("broker.identity"),
+        "the identity check is missing from the body:\n{human}"
+    );
+}
+
+/// **A note does not degrade.** This is the property the `Info` state exists
+/// for, and it is worth its own test because the failure it prevents is
+/// invisible: every `asv doctor` on a development machine reading `Degraded`
+/// for a state the product documents as its own.
+#[test]
+fn a_note_is_stated_without_degrading_the_installation() {
+    let mut obs = sample(false);
+    obs.data_dir = DirState::Present { mode: 0o700 };
+    obs.service_unit = FileState::Present { mode: 0o644 };
+    obs.hardening = Hardening {
+        landlock: TriState::Yes,
+        seccomp: TriState::Yes,
+        broker_dumpable: TriState::Unknown,
+    };
+    // A broker that measured a shared uid and declared nothing: `Info`.
+    obs.socket = SocketOutcome::SelfReported(Box::new(crate::ipc::BrokerFacts {
+        protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+        product_version: "0.29.0".into(),
+        dumpable_disabled: true,
+        no_new_privs: true,
+        landlock_installed: true,
+        seccomp_installed: true,
+        capabilities: vec![],
+        connect_listen: None,
+        identity: Some(asv_ipc_protocol::BrokerIdentity::measured(1000, None)),
+    }));
+
+    let report = DoctorReport::judge(obs);
+    assert_eq!(
+        report.status(),
+        EnvelopeStatus::Ready,
+        "a shared uid on an unpackaged deployment is the documented posture, and a \
+         status that always reads Degraded is a status nobody reads"
+    );
+    assert_eq!(
+        report.check("broker.identity").map(|c| c.state),
+        Some(CheckState::Info),
+        "the check must carry the state that does not degrade"
+    );
+    let human = human::doctor(&report);
+    assert!(
+        human.contains("1 note(s)"),
+        "the note is not counted in the summary, so it only reaches the operator by \
+         scrolling:\n{human}"
     );
 }
 

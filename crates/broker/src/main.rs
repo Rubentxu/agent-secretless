@@ -414,15 +414,18 @@ fn main() -> std::io::Result<()> {
     // its own identity should refuse before it has touched any of them. A
     // refusal that arrives after the passphrase has been read is a refusal
     // that has already had the secret.
-    if let Err(error) = asv_broker::identity::check(
+    let identity_verdict = match asv_broker::identity::check(
         unsafe { libc::getuid() },
         unsafe { libc::geteuid() },
         declared_uid,
         require_dedicated_identity,
     ) {
-        eprintln!("asv: {error}");
-        std::process::exit(1);
-    }
+        Ok(verdict) => verdict,
+        Err(error) => {
+            eprintln!("asv: {error}");
+            std::process::exit(1);
+        }
+    };
     // Enrolment runs before the vault checks, because it is not a vault
     // operation: it locates the record by the vault's path, writes it, and
     // exits. Requiring `--passphrase-file` here would be asking the operator
@@ -584,6 +587,16 @@ fn main() -> std::io::Result<()> {
 
     if let Some(report) = self_report {
         state.self_report = report;
+    }
+    {
+        // Set unconditionally, and **after** the conditional block above: a
+        // broker run without `--harden` has no Landlock ruleset and no
+        // `PR_SET_DUMPABLE`, and the temptation to report "no protections
+        // measured, no identity either" is exactly the conflation this field
+        // exists to prevent. The identity was measured either way.
+        let (uid, declared) = identity_verdict.as_measured();
+        state.self_report.identity =
+            Some(asv_ipc_protocol::BrokerIdentity::measured(uid, declared));
     }
     if let Some(path) = audit_file.as_deref() {
         // Durable audit (R9 follow-up). Fail-closed: a chain that does not

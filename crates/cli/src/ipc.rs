@@ -41,6 +41,14 @@ pub struct BrokerFacts {
     /// bound, and a client told an address by a flag could disagree with it
     /// without either side noticing.
     pub connect_listen: Option<String>,
+    /// Which OS identity the broker is running as, and whether that is the one
+    /// its installation declared.
+    ///
+    /// Carried rather than re-derived, and it is the field that lets `doctor`
+    /// answer a measured question about the one protection the broker cannot
+    /// give itself: every other protection in this record is established by
+    /// `main` at startup, while the identity belongs to whoever launched it.
+    pub identity: Option<asv_ipc_protocol::BrokerIdentity>,
 }
 
 impl BrokerFacts {
@@ -55,6 +63,7 @@ impl BrokerFacts {
                 seccomp_installed,
                 capabilities,
                 connect_listen,
+                identity,
                 ..
             } => Some(Self {
                 protocol: *protocol,
@@ -65,6 +74,7 @@ impl BrokerFacts {
                 seccomp_installed: *seccomp_installed,
                 capabilities: capabilities.clone(),
                 connect_listen: connect_listen.clone(),
+                identity: *identity,
             }),
             _ => None,
         }

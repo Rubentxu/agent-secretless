@@ -134,7 +134,54 @@ pub struct SessionSurrogate {
     pub max_uses: u32,
 }
 
-pub const PROTOCOL_VERSION: u16 = 6;
+/// The OS identity the broker is running as, and whether it is the one the
+/// installation declared.
+///
+/// Three states, not two, and the third is the point:
+///
+/// * `declared_uid: None` — nobody declared an identity. This is every
+///   development run and every unpackaged deployment, and it is **not**
+///   dedicated. The socket is `0600` and the process is undumpable, both real
+///   and both stopping at the edge of the invoking user's own processes.
+/// * `declared_uid: Some(uid)` where `uid` matches — a broker is running as the
+///   identity its installation named, and it refuses to start otherwise.
+/// * `declared_uid: Some(other)` — **unreachable on a running broker**, because
+///   `identity::check` treats a declaration that is not honoured as always
+///   fatal. It is spelled out so that a peer can tell the two `Some` cases
+///   apart rather than inferring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokerIdentity {
+    /// The uid the broker's writes and its socket belong to, from `geteuid()`.
+    pub uid: u32,
+    /// What the installation declared, if it declared anything.
+    pub declared_uid: Option<u32>,
+    /// Whether the declared identity is the one in force.
+    pub dedicated: bool,
+}
+
+impl BrokerIdentity {
+    /// The honest construction for a measurement, with `dedicated` derived
+    /// rather than passed.
+    ///
+    /// Taking `dedicated` as an argument would let a caller build a report that
+    /// says "dedicated" about a broker that declared a different uid, which is
+    /// precisely the claim this field exists to stop being unfalsifiable.
+    pub fn measured(uid: u32, declared_uid: Option<u32>) -> Self {
+        Self {
+            uid,
+            declared_uid,
+            dedicated: declared_uid == Some(uid),
+        }
+    }
+}
+
+/// Bumped to 7 for the `BrokerInfo::identity` field.
+///
+/// A `u16` that only ever goes up, and a bump is a deliberate protocol change
+/// rather than a refactor: an old peer cannot read the new field and a new peer
+/// must not read an old answer as a missing one, which is what `None` here
+/// would mean.
+pub const PROTOCOL_VERSION: u16 = 7;
 
 /// Hard ceiling on a single inbound message. Bounded allocation is required for
 /// any IPC that faces an untrusted peer (`docs/17-IMPLEMENTATION-BOOTSTRAP.md` §9).
@@ -357,6 +404,25 @@ pub enum Response {
         seccomp_installed: bool,
         /// The kernel offers cgroup v2, and a session slice was created.
         cgroup_v2: bool,
+        /// Which OS identity the broker is actually running as, and whether that
+        /// is the identity the installation declared.
+        ///
+        /// **This is a measured field and it is the reason it exists on the
+        /// wire.** The broker's protections — a `0600` socket, an undumpable
+        /// process, Landlock, seccomp — are all real, and all of them live
+        /// inside the *invoking user's* boundary, so a second program running as
+        /// that user is in the same uid and outside the reach of
+        /// `PR_SET_DUMPABLE` as far as this broker's `/proc/<pid>/mem` is
+        /// concerned. Before this field that fact lived in a gate-row footnote,
+        /// which is the one place nobody reads. `asv doctor` can now answer a
+        /// measured question about it, and the honest answer on a development
+        /// machine is "not dedicated" rather than "unknown".
+        ///
+        /// `None` means **this report did not measure an identity**, which is
+        /// the same reading as `connect_listen: None` and for the same reason: a
+        /// broker assembled without the launch contract genuinely has no
+        /// answer, and "not measured" must not be read as "dedicated".
+        identity: Option<BrokerIdentity>,
         /// Where this broker's CONNECT listener is bound, as `addr:port`, or
         /// `None` when it is not running.
         ///

@@ -17,6 +17,10 @@ fn facts(names: &[&str]) -> crate::ipc::BrokerFacts {
         seccomp_installed: true,
         capabilities: names.iter().map(|s| s.to_string()).collect(),
         connect_listen: None,
+        // Shared, because these tests are about the capability list and the
+        // identity check must still run beside them rather than be switched
+        // off by a value that happens to pass.
+        identity: Some(asv_ipc_protocol::BrokerIdentity::measured(1000, None)),
     }
 }
 

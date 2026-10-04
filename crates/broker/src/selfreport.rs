@@ -40,6 +40,15 @@ pub struct SelfReport {
     pub seccomp_installed: bool,
     pub cgroup_v2: bool,
     pub capabilities: Vec<String>,
+    /// Which OS identity this broker is running as, and whether that is the one
+    /// the installation declared.
+    ///
+    /// `None` means **not measured**, which is the truth for a broker assembled
+    /// in a test or through [`crate::identity`]'s absence from the path, and it
+    /// is deliberately not a default of "shared with the invoking user": a
+    /// report that claimed to know would be guessing, and `unknown` in a
+    /// diagnostic is worse than a measured `not dedicated`.
+    pub identity: Option<asv_ipc_protocol::BrokerIdentity>,
     /// Where this broker's CONNECT listener is bound, as `addr:port`.
     ///
     /// `None` means the listener is not running — which is the default, and is
@@ -69,6 +78,10 @@ impl Default for SelfReport {
             seccomp_installed: false,
             cgroup_v2: false,
             capabilities: compiled_capabilities(),
+            // Not measured rather than "shared". See the field's docs: the
+            // default is what a broker that never ran the check can honestly
+            // say, and it is not the same as having measured a shared uid.
+            identity: None,
             // No listener unless one was started. See the field's docs: a
             // default that named an address would send `asv run`'s shim
             // somewhere that is not a broker.
@@ -151,6 +164,14 @@ mod tests {
         assert!(!d.landlock_installed);
         assert!(!d.seccomp_installed);
         assert!(!d.cgroup_v2);
+    }
+
+    /// The default does not claim an identity, and the reason is the module's
+    /// own: a default that said "shared" would be asserting a measurement that
+    /// was never taken.
+    #[test]
+    fn the_default_claims_no_identity() {
+        assert!(SelfReport::default().identity.is_none());
     }
 
     /// The default still names the build. A report with no version would make

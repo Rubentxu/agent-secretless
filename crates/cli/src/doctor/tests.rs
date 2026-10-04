@@ -377,6 +377,7 @@ fn the_broker_version_is_never_the_clis_own() {
         seccomp_installed: true,
         capabilities: vec!["system.health".into()],
         connect_listen: None,
+        identity: Some(asv_ipc_protocol::BrokerIdentity::measured(1000, None)),
     };
     let measured = DoctorReport::judge(Observation {
         socket: SocketOutcome::SelfReported(Box::new(facts)),
@@ -398,6 +399,7 @@ fn a_broker_that_describes_itself_gets_a_measured_dumpable_check() {
         landlock_installed: true,
         seccomp_installed: true,
         capabilities: vec![],
+        identity: Some(asv_ipc_protocol::BrokerIdentity::measured(1000, None)),
         connect_listen: None,
     };
     let report = DoctorReport::judge(Observation {
@@ -443,6 +445,11 @@ fn a_debuggable_broker_is_a_warning_with_a_remedy() {
         landlock_installed: false,
         seccomp_installed: false,
         capabilities: vec![],
+        // This broker is unhardened in every other way too, so its identity is
+        // also unmeasured. That is the honest pairing: a broker from a build
+        // with no identity check cannot report one, and claiming it could
+        // would be the invention this field exists to prevent.
+        identity: None,
         connect_listen: None,
     };
     let report = DoctorReport::judge(Observation {
@@ -633,4 +640,145 @@ fn a_unit_with_an_unexpanded_specifier_is_not_silently_accepted() {
         Some(PathBuf::from("%h/.local/libexec/asv/asv-brokerd")),
         "the specifier was resolved instead of being reported"
     );
+}
+
+/// The identity check, in the three states it is allowed to be in.
+///
+/// **Three, and not two, is the point.** "Not measured" and "measured and not
+/// dedicated" are different facts with different remedies, and the diagnostic
+/// that merged them is the reassuring one: a broker that cannot report its uid
+/// would otherwise be read as a broker whose uid is fine. The M7 row spent a
+/// milestone narrowing a claim precisely because that distinction had nowhere
+/// to live, and this is where it lives now.
+#[test]
+fn the_identity_check_distinguishes_not_measured_from_not_dedicated() {
+    let mut states = Vec::new();
+    for identity in [
+        None,
+        Some(asv_ipc_protocol::BrokerIdentity::measured(1000, None)),
+        Some(asv_ipc_protocol::BrokerIdentity::measured(998, Some(998))),
+    ] {
+        let report = DoctorReport::judge(Observation {
+            socket: SocketOutcome::SelfReported(Box::new(crate::ipc::BrokerFacts {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                product_version: "0.26.0".into(),
+                dumpable_disabled: true,
+                no_new_privs: true,
+                landlock_installed: true,
+                seccomp_installed: true,
+                capabilities: vec![],
+                connect_listen: None,
+                identity,
+            })),
+            broker_facts: None,
+            ..healthy()
+        });
+        let check = report
+            .check("broker.identity")
+            .expect("the identity check must exist in every state");
+        states.push((check.state, check.detail.clone(), check.remedy.clone()));
+    }
+
+    let (not_measured, shared, dedicated) = (&states[0], &states[1], &states[2]);
+
+    // The three states are three *named* states, and the naming is the point:
+    // `Unknown` because this build does not report an identity, `Info` because
+    // a shared uid on an unpackaged deployment is what the product documents
+    // rather than a fault in it, and `Ok` because there is nothing to advise.
+    assert_eq!(
+        not_measured.0,
+        CheckState::Unknown,
+        "a broker that reports no identity is not observable, not defective"
+    );
+    assert_eq!(
+        shared.0,
+        CheckState::Info,
+        "a shared uid on an unpackaged deployment must not degrade the status: \
+         a doctor that always reads Degraded is a doctor nobody reads"
+    );
+
+    // A broker that reported nothing is not a pass and not the same as shared.
+    assert_ne!(
+        not_measured.0, shared.0,
+        "not measured and measured-and-shared must not be the same state"
+    );
+    assert_ne!(
+        not_measured.1, shared.1,
+        "the two states must not share a sentence, or the JSON would too"
+    );
+    assert_ne!(
+        shared.0, dedicated.0,
+        "a shared identity and a dedicated one are not the same verdict"
+    );
+    assert_eq!(
+        dedicated.0,
+        CheckState::Ok,
+        "a dedicated identity is the one state that needs no remedy: {dedicated:?}"
+    );
+    assert!(
+        dedicated.2.is_none(),
+        "a check with nothing to advise must not invent advice: {dedicated:?}"
+    );
+    // And the remedy has to be actionable, because an operator cannot act on
+    // "not dedicated" and can act on this.
+    let remedy = shared.2.as_deref().unwrap_or_default();
+    assert!(
+        remedy.contains("--identity-uid") && remedy.contains("--require-dedicated-identity"),
+        "the remedy must name both flags: {remedy:?}"
+    );
+}
+
+/// The machine-readable half says the same three things, and says them by name.
+///
+/// Separate from the prose because this is the half a script reads, and a
+/// script that cannot tell `not_measured` from `shared` will pick the
+/// reassuring one.
+#[test]
+fn the_envelope_names_the_identity_state() {
+    for (identity, expected) in [
+        (None, "not_measured"),
+        (
+            Some(asv_ipc_protocol::BrokerIdentity::measured(1000, None)),
+            "shared",
+        ),
+        (
+            Some(asv_ipc_protocol::BrokerIdentity::measured(998, Some(998))),
+            "dedicated",
+        ),
+    ] {
+        let report = DoctorReport::judge(Observation {
+            socket: SocketOutcome::SelfReported(Box::new(crate::ipc::BrokerFacts {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                product_version: "0.26.0".into(),
+                dumpable_disabled: true,
+                no_new_privs: true,
+                landlock_installed: true,
+                seccomp_installed: true,
+                capabilities: vec![],
+                connect_listen: None,
+                identity,
+            })),
+            broker_facts: None,
+            ..healthy()
+        });
+        let value: serde_json::Value =
+            serde_json::from_str(&report.to_envelope().to_json()).unwrap();
+        assert_eq!(
+            value["data"]["identity"]["state"], expected,
+            "wrong state in the envelope: {value}"
+        );
+        // A measured state carries the numbers; an unmeasured one carries no
+        // `uid` at all, because reporting 0 there would read as root.
+        if identity.is_none() {
+            assert!(
+                value["data"]["identity"].get("uid").is_none(),
+                "an unmeasured identity must not report a uid: {value}"
+            );
+        } else {
+            assert!(
+                value["data"]["identity"]["uid"].is_number(),
+                "a measured identity must carry the uid: {value}"
+            );
+        }
+    }
 }

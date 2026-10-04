@@ -72,7 +72,12 @@ pub enum IdentityVerdict {
     /// than a placeholder: the socket is `0600` and the process is undumpable,
     /// both of which are real, and both of which stop meaning "private" at the
     /// boundary of the invoking user's own processes.
-    Undeclared,
+    ///
+    /// The measured uid is carried rather than left implicit, because a report
+    /// that had to supply it would supply *something* — and `0` is what a
+    /// default would give, which reads as root and is the one value here that
+    /// would be a lie rather than a simplification.
+    Undeclared { uid: u32 },
     /// The declared uid is the one in force.
     Dedicated { uid: u32 },
     /// The installation declared one uid and the process is another.
@@ -91,7 +96,7 @@ pub enum IdentityVerdict {
 /// the same.
 pub fn identity_verdict(actual: u32, declared: Option<u32>) -> IdentityVerdict {
     match declared {
-        None => IdentityVerdict::Undeclared,
+        None => IdentityVerdict::Undeclared { uid: actual },
         Some(declared) if declared == actual => IdentityVerdict::Dedicated { uid: actual },
         Some(declared) => IdentityVerdict::Mismatch { declared, actual },
     }
@@ -139,13 +144,32 @@ pub fn check(
                 },
             ));
         }
-        if let IdentityVerdict::Undeclared = verdict {
+        if let IdentityVerdict::Undeclared { .. } = verdict {
             return Err(BrokerIdentityError::MissingDedicatedIdentity(
                 MissingDedicatedIdentity::Undeclared,
             ));
         }
     }
     Ok(verdict)
+}
+
+impl IdentityVerdict {
+    /// The measured `(uid, declared)` pair, for the wire.
+    ///
+    /// The verdict already carries both numbers, so this is a re-shaping rather
+    /// than a second measurement — and it is kept as a method so that the
+    /// report cannot be assembled from a *different* pair of numbers than the
+    /// one the decision was made on. A caller that passed the real uid here and
+    /// a declared uid from somewhere else would produce a report that disagrees
+    /// with the refusal it just issued, which is the one thing this module
+    /// exists to make impossible.
+    pub fn as_measured(self) -> (u32, Option<u32>) {
+        match self {
+            IdentityVerdict::Undeclared { uid } => (uid, None),
+            IdentityVerdict::Dedicated { uid } => (uid, Some(uid)),
+            IdentityVerdict::Mismatch { declared, actual } => (actual, Some(declared)),
+        }
+    }
 }
 
 /// Why the broker refused to start over its own identity.
@@ -241,7 +265,7 @@ mod tests {
     fn nobody_declared_an_identity_and_nobody_asked_for_one() {
         assert_eq!(
             check(1000, 1000, None, false),
-            Ok(IdentityVerdict::Undeclared)
+            Ok(IdentityVerdict::Undeclared { uid: 1000 })
         );
     }
 
@@ -315,7 +339,10 @@ mod tests {
     /// about.
     #[test]
     fn the_verdict_is_the_comparison() {
-        assert_eq!(identity_verdict(1000, None), IdentityVerdict::Undeclared);
+        assert_eq!(
+            identity_verdict(1000, None),
+            IdentityVerdict::Undeclared { uid: 1000 }
+        );
         assert_eq!(
             identity_verdict(998, Some(998)),
             IdentityVerdict::Dedicated { uid: 998 }
@@ -345,6 +372,36 @@ mod tests {
                 actual: 2000
             }),
             "the declaration is the fault the operator can act on directly"
+        );
+    }
+
+    /// The report carries the same numbers the decision was made on.
+    ///
+    /// Its own test because this is where a lie would be *published* rather
+    /// than merely written: the undeclared arm is the one that could quietly
+    /// acquire a different uid, and `0` is what a default would give — which
+    /// reads as root, the one answer here that inverts the meaning rather than
+    /// approximating it.
+    #[test]
+    fn the_wire_carries_the_measured_uid_in_every_case() {
+        assert_eq!(
+            IdentityVerdict::Undeclared { uid: 1000 }.as_measured(),
+            (1000, None),
+            "an undeclared broker still runs as somebody; reporting 0 would be root"
+        );
+        assert_eq!(
+            IdentityVerdict::Dedicated { uid: 998 }.as_measured(),
+            (998, Some(998))
+        );
+        assert_eq!(
+            IdentityVerdict::Mismatch {
+                declared: 998,
+                actual: 1000
+            }
+            .as_measured(),
+            (1000, Some(998)),
+            "a mismatch is unreachable on a running broker, and if one does reach \
+             the report it must name both numbers rather than one"
         );
     }
 

@@ -149,6 +149,26 @@ impl Discovery {
                     "landlock_installed": b.landlock_installed,
                     "seccomp_installed": b.seccomp_installed,
                 })),
+                // **Beside the hardening, not inside it**, and only here
+                // because it would otherwise have no consumer at all. The
+                // falsification campaign caught exactly that: dropping the
+                // field where the CLI reads the response left every test green,
+                // because a value that travels from the broker and dies in the
+                // CLI is decoration wearing the shape of a measurement — the
+                // same defect as a mechanism with no caller, found three times
+                // in this repository now.
+                //
+                // `agent discover` is the surface an autonomous caller reads
+                // rather than a human, so the three states are named rather
+                // than left to be inferred from a missing key.
+                "identity": self.broker.as_ref().map(|b| match &b.identity {
+                    None => json!({ "state": "not_measured" }),
+                    Some(identity) => json!({
+                        "state": if identity.dedicated { "dedicated" } else { "shared" },
+                        "uid": identity.uid,
+                        "declared_uid": identity.declared_uid,
+                    }),
+                }),
             },
             "installation": {
                 "ready": self.installation_ready,

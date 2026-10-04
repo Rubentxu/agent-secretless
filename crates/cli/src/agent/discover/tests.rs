@@ -208,6 +208,9 @@ fn spawn_broker(socket: &std::path::Path, protocol: u16) {
                         // No listener in this fixture. Stated rather than left
                         // implicit so a future test that needs one says so.
                         connect_listen: None,
+                        // Measured, and shared, which is what a broker started
+                        // by a developer's own shell reports.
+                        identity: Some(asv_ipc_protocol::BrokerIdentity::measured(1000, None)),
                         capabilities: vec![
                             "credentials.metadata".into(),
                             "session.run".into(),
@@ -251,6 +254,22 @@ fn cold_discovery_reaches_an_operation_from_one_command() {
     assert_eq!(
         value["data"]["broker"]["hardening"]["dumpable_disabled"],
         true
+    );
+
+    // **And so does the identity, over the same socket and the same
+    // translation.** This assertion is the whole reason the field has a
+    // consumer: `tests/identity_wire_falsification.py` row W2 made the CLI drop
+    // `identity` where it reads the response, and every other test in the
+    // workspace stayed green, because the doctor tests build `BrokerFacts` by
+    // hand and never cross the wire. Asserted on the envelope rather than on
+    // the struct so it covers the serialisation as well as the mapping.
+    assert_eq!(
+        value["data"]["broker"]["identity"]["state"], "shared",
+        "the identity did not survive the trip from the broker: {value}"
+    );
+    assert_eq!(
+        value["data"]["broker"]["identity"]["uid"], 1000,
+        "the measured uid did not survive the trip from the broker: {value}"
     );
 
     // And there is a link to a real operation.

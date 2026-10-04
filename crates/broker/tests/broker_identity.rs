@@ -338,6 +338,78 @@ fn the_identity_refusal_happens_before_the_vault_is_opened() {
     let _ = std::fs::remove_dir_all(&s.dir);
 }
 
+/// Ask the broker to describe itself, and read the identity out of the answer.
+fn reported_identity(sock: &Path) -> Option<asv_ipc_protocol::BrokerIdentity> {
+    let info = agent_info(sock);
+    info["identity"]
+        .as_object()
+        .map(|_| serde_json::from_value(info["identity"].clone()).expect("parse the identity"))
+}
+
+#[test]
+fn the_broker_reports_the_uid_it_is_actually_running_as() {
+    // **The field the whole increment exists for.** The enforcement half landed
+    // in the previous commit and was proved against the binary; this proves the
+    // other half — that an operator can *ask* and get a measured answer instead
+    // of reading a footnote in a gate row.
+    let s = Sandbox::new("reported-shared");
+    let broker = s.start(&[]).unwrap_or_else(|e| panic!("start: {e}"));
+
+    let identity = reported_identity(&s.sock)
+        .expect("a broker started by this binary has measured an identity");
+    assert_eq!(
+        identity.uid,
+        my_uid(),
+        "the broker reported a uid it is not running as: {identity:?}"
+    );
+    assert_eq!(
+        identity.declared_uid, None,
+        "nobody declared an identity, so none may be reported: {identity:?}"
+    );
+    assert!(
+        !identity.dedicated,
+        "a broker with no declared identity is not a dedicated one, and this is \
+         the claim the M7 row spent a milestone narrowing to: {identity:?}"
+    );
+    drop(broker);
+    let _ = std::fs::remove_dir_all(&s.dir);
+}
+
+#[test]
+fn a_broker_reporting_a_declared_identity_says_it_is_dedicated() {
+    let s = Sandbox::new("reported-dedicated");
+    let mine = my_uid().to_string();
+    let broker = s
+        .start(&["--identity-uid", &mine])
+        .unwrap_or_else(|e| panic!("start: {e}"));
+
+    let identity = reported_identity(&s.sock).expect("a measured identity");
+    assert!(
+        identity.dedicated,
+        "a broker running as the uid it declared must say so: {identity:?}"
+    );
+    assert_eq!(identity.declared_uid, Some(my_uid()), "{identity:?}");
+    drop(broker);
+    let _ = std::fs::remove_dir_all(&s.dir);
+}
+
+#[test]
+fn the_report_carries_the_measured_uid_rather_than_a_default() {
+    // The re-shaping test in `identity.rs` covers the function; this covers the
+    // wire, which is where a wrong number would be *read by an operator* rather
+    // than merely asserted. `0` is the value a default gives and it reads as
+    // root, so it is the one that must not appear.
+    let s = Sandbox::new("not-root");
+    let broker = s.start(&[]).unwrap_or_else(|e| panic!("start: {e}"));
+    let identity = reported_identity(&s.sock).expect("a measured identity");
+    assert_ne!(
+        identity.uid, 0,
+        "a broker that measured no identity would default to 0, which reads as root"
+    );
+    drop(broker);
+    let _ = std::fs::remove_dir_all(&s.dir);
+}
+
 #[test]
 fn a_refused_broker_leaves_no_socket_and_no_listener() {
     // **The ordering property, stated as its own test because the falsification

@@ -81,10 +81,21 @@ fn summary(report: &DoctorReport) -> String {
         .iter()
         .filter(|c| c.state == CheckState::Unknown)
         .count();
+    // Counted, and not folded into the warnings: a state that is neither a
+    // warning nor unknown would be listed nowhere, which is the silent way to
+    // add a check that never reaches the operator.
+    let info = report
+        .checks
+        .iter()
+        .filter(|c| c.state == CheckState::Info)
+        .count();
 
     let mut parts = Vec::new();
     if !blocking.is_empty() {
         parts.push(format!("blocking: {}", blocking.join(", ")));
+    }
+    if info > 0 {
+        parts.push(format!("{info} note(s)"));
     }
     if warnings > 0 {
         parts.push(format!("{warnings} warning(s)"));
@@ -104,9 +115,20 @@ mod tests {
 
     #[test]
     fn the_state_column_is_wide_enough_for_its_longest_word() {
-        // "unknown" is seven characters. If this ever fails, the parser in
-        // `render::tests` starts reading states out of the id column and every
-        // equivalence check becomes quietly wrong.
-        assert!(STATE_WIDTH > CheckState::Unknown.as_str().len());
+        // Wide enough for the **longest** spelling, not for one of them. The
+        // parser in `render::tests` recognises a check line by testing the
+        // first token against `CheckState::ALL`, so a state whose name is too
+        // wide for the column stops being recognised and every equivalence
+        // check becomes quietly wrong. Asserting one spelling is how that
+        // slips through: `info` is four characters and would have passed a
+        // test pinned to `unknown`, while breaking nothing — until a sixth
+        // state longer than seven arrives.
+        for state in CheckState::ALL {
+            assert!(
+                STATE_WIDTH > state.as_str().len(),
+                "STATE_WIDTH={STATE_WIDTH} cannot hold {:?}",
+                state.as_str()
+            );
+        }
     }
 }

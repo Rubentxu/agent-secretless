@@ -58,6 +58,23 @@ pub enum CheckState {
     Fail,
     /// Not observable from the CLI. Neither degrades nor blocks.
     Unknown,
+    /// Observed, stated, and **not a defect in this installation**.
+    ///
+    /// Added for the broker's identity, and the reason is a mistake this
+    /// increment would otherwise have shipped. A broker started by a
+    /// developer's own shell shares that shell's uid, and that is the
+    /// *documented* posture of an unpackaged deployment — the M7 gate row
+    /// narrows its own claim to exactly this. Reporting it as `Warn` made every
+    /// `asv doctor` on a development machine read `Degraded`, and a status that
+    /// is permanently degraded is a status nobody reads, which is the same
+    /// failure as a check that always passes.
+    ///
+    /// It is not `Unknown`, because it *is* observable and the number matters;
+    /// it is not `Ok`, because `ok` next to a shared uid reads as a clean bill
+    /// of health for the one property the broker cannot give itself. So it is
+    /// its own state, carrying a remedy the operator can act on without being
+    /// told their installation is broken.
+    Info,
 }
 
 impl CheckState {
@@ -68,6 +85,7 @@ impl CheckState {
             CheckState::Warn => "warn",
             CheckState::Fail => "fail",
             CheckState::Unknown => "unknown",
+            CheckState::Info => "info",
         }
     }
 
@@ -75,11 +93,12 @@ impl CheckState {
     /// `render::tests` recognises a check line by testing the first token
     /// against this, so it lives next to the spellings rather than being
     /// spelled out a second time over there.
-    pub const ALL: [CheckState; 4] = [
+    pub const ALL: [CheckState; 5] = [
         CheckState::Ok,
         CheckState::Warn,
         CheckState::Fail,
         CheckState::Unknown,
+        CheckState::Info,
     ];
 }
 
@@ -436,6 +455,75 @@ impl DoctorReport {
             },
         });
 
+        // **The one protection the broker cannot establish for itself.** Every
+        // other fact in this report is something `main` set at startup; the
+        // identity belongs to whoever launched the process, and a broker running
+        // as the invoking user is inside that user's own boundary no matter how
+        // undumpable it is. So it gets its own check with its own remedy, and
+        // the three states stay three states: not measured is not the same as
+        // measured-and-shared, and neither is the same as dedicated.
+        checks.push(match &obs.socket {
+            SocketOutcome::SelfReported(facts) => match facts.identity {
+                None => Check {
+                    id: "broker.identity".into(),
+                    label: "Broker identity".into(),
+                    // `Unknown`, which is what this is: this build does not
+                    // report an identity. Not `Warn`, because an older broker
+                    // is version skew and `broker.protocol` already says so.
+                    state: CheckState::Unknown,
+                    detail: "this broker did not report which uid it runs as".into(),
+                    remedy: None,
+                },
+                Some(identity) if identity.dedicated => Check {
+                    id: "broker.identity".into(),
+                    label: "Broker identity".into(),
+                    state: CheckState::Ok,
+                    detail: format!(
+                        "uid {}, and it is the identity the installation declared",
+                        identity.uid
+                    ),
+                    remedy: None,
+                },
+                Some(identity) => Check {
+                    id: "broker.identity".into(),
+                    label: "Broker identity".into(),
+                    // `Info`, and this is the state that earned its existence:
+                    // a shared uid on an unpackaged deployment is what the
+                    // product documents, not a fault in the installation.
+                    state: CheckState::Info,
+                    detail: match identity.declared_uid {
+                        None => format!(
+                            "uid {}, shared with the account that started it, and no \
+                             installation declared an identity",
+                            identity.uid
+                        ),
+                        Some(declared) => {
+                            format!("uid {} running, with {} declared", identity.uid, declared)
+                        }
+                    },
+                    // Naming the flag is the whole difference between a finding
+                    // and a note: the operator cannot act on "not dedicated"
+                    // and can act on this.
+                    remedy: Some(
+                        "every process running as this uid is outside the broker's \
+                         hardening, because PR_SET_DUMPABLE only reaches other \
+                         uids. Run the broker as a service account and declare it \
+                         with --identity-uid, adding \
+                         --require-dedicated-identity so a deployment that \
+                         forgets cannot start."
+                            .into(),
+                    ),
+                },
+            },
+            _ => Check {
+                id: "broker.identity".into(),
+                label: "Broker identity".into(),
+                state: CheckState::Unknown,
+                detail: "could not ask the broker which uid it runs as".into(),
+                remedy: None,
+            },
+        });
+
         let protocol_compatible = match obs.socket.observed_protocol() {
             Some(protocol) => {
                 if protocol == asv_ipc_protocol::PROTOCOL_VERSION {
@@ -646,6 +734,22 @@ impl DoctorReport {
             },
             "protocol_compatible": protocol_compatible,
             "socket": { "reachable": socket_reachable },
+            // The identity beside the hardening rather than inside it,
+            // because it is not something `main` established. Measured, never
+            // inferred: `not_measured` is a distinct answer from `not
+            // dedicated`, and merging them is how a diagnostic ends up
+            // reassuring.
+            "identity": match &self.socket {
+                SocketOutcome::SelfReported(facts) => match facts.identity {
+                    None => serde_json::json!({ "state": "not_measured" }),
+                    Some(identity) => serde_json::json!({
+                        "state": if identity.dedicated { "dedicated" } else { "shared" },
+                        "uid": identity.uid,
+                        "declared_uid": identity.declared_uid,
+                    }),
+                },
+                _ => serde_json::json!({ "state": "not_measured" }),
+            },
             "hardening": {
                 "dumpable_disabled": match &self.socket {
                     SocketOutcome::SelfReported(facts) => {
