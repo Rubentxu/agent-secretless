@@ -819,12 +819,16 @@ CURRENT: v0.29.0
   the protocol allows, a formal decision on freshness and replay, shutdown and
   revoke mid-tunnel, stress and cancellation, and observability that carries no
   sensitive material. The three limits recorded on M9's gate row are its scope.
-  **First delivery, measured** (`crates/broker/src/connect_listener.rs`, the
-  V1-C2 receipt): the listener and the lifecycle it owns are `implemented` and
-  their tests are `verified`; the wiring into `asv-brokerd` is **not** done, so
-  M9's third limit stands unchanged. See *V1-C2 — what is built and what is
-  not* below for the split, the two falsified claims this delivery corrected,
-  and the one claim that could not be made deterministically.
+  **Delivered in full, measured.** The listener, the wiring into a running
+  `asv-brokerd`, real CONNECT lifecycle, multi-request tunnels, a formal
+  freshness decision, shutdown and revoke mid-tunnel, stress and cancellation,
+  and observability that carries no sensitive material. The six criteria are
+  stated with their witnesses in *V1-C2 — the six criteria* below, and each one
+  names the test that carries it rather than the feature that was intended. Two
+  things are **not** claimed there and neither is small: the destination leg is
+  verified against a locally minted CA rather than a public one, and the default
+  for `--connect-roots` is only half falsifiable. See *V1-C2 — what is built and
+  what is not* below for the history.
 - **V1-C3** turns M11 from a prototype into a vertical. The `ClientCredentialsIssuer`
   becomes a *reference implementation* rather than the evidence of closure, and
   the closure is an HTTPS POST to a real token endpoint producing a short-lived
@@ -2557,6 +2561,51 @@ over only *after* its outcome reaches the chain. The first version waited on a
 flag `stop` sets before it returns, so the window collapsed to nothing and the
 process left before the outcome was written — the chain assertion caught exactly
 that, with a chain that ended mid-conversation.
+
+### V1-C2 — the six criteria, and what each one rests on
+
+The criterion is a property of the product, not a feature that was intended, so
+every line below names the test that carries it. A criterion whose witness is a
+document is not a criterion; a criterion whose witness is a log line is not
+either, and two of these were log lines until this block replaced them.
+
+| criterion | VERIFIED by |
+|---|---|
+| **freshness** | `a_proof_replayed_with_the_same_counter_is_refused`, `a_counter_arriving_out_of_order_after_a_gap_is_accepted`, `a_counter_replayed_after_a_gap_is_still_refused`, `a_counter_older_than_the_window_is_refused_rather_than_accepted`, `ending_a_session_releases_its_replay_window` in `crates/broker/src/lib.rs`; `uat_005_replay` 6/6; and `the_anti_replay_window_refuses_no_honest_proof_under_load` in the vertical, where 64 concurrent CONNECTs from one session had **zero** honest proofs refused |
+| **identity** | `an_unauthorised_destination_is_refused_before_the_proof_is_looked_at` and `an_unauthorised_target_opens_no_upstream_socket` in `crates/broker/tests/uat_010_connect_substitution.rs` and `connect_serve.rs` — a CONNECT with no session opens no socket, which is the fail-closed case as a type rather than as a comment |
+| **policy** | `a_route_the_policy_does_not_permit_is_refused_at_load` in the vertical, and `a_route_must_say_how_its_destination_is_reached` beside `an_unknown_field_is_refused_rather_than_ignored` in `crates/broker/src/connect_routes.rs` (18/18). Every route is authorized against Cedar **at load**, one refusal fails the whole load, and the fields an operator must state — `minimum_posture` and `upstream` — have no defaults, so neither can be chosen by omission |
+| **revocation** | `a_revocation_under_load_ends_one_sessions_tunnels_and_nobody_elses` — twelve real tunnels in flight, one session revoked, that session's eight ending as `Cancelled(SessionRevoked)` and the other session's four untouched; `connect_session_revocation_wiring` 4/4; and `a_tunnel_does_not_outlive_the_session_that_authorised_it`. **The scoping is the part no earlier test could see**, and both of its mutations were run: dropping the session from the cancel check leaves 0 of 8 ending, and an unscoped `is_revoked` ends the *untouched* session's tunnels |
+| **audit** | `connect_audit_chain` 9/9, plus `a_client_with_no_credential_cannot_write_its_own_text_into_the_operator_log` and `the_brokers_own_log_carries_neither_the_credential_nor_a_surrogate` in the vertical. A CONNECT outcome and the requests around it verify against one durable chain, the chain carries a **class** rather than the error's text, and the text a client controls reaches neither surface |
+| **secretlessness** | `asv_run_curl_reaches_the_origin_with_the_real_credential_and_nobody_else` in the vertical, `no_replay_path_exposes_the_real_credential`, and `a_tracing_script_cannot_dump_a_real_credential` (1/1). The real credential reaches the destination and nothing else; the origin is the witness, and the argument to that, the audit record and the operator's log, is what makes it a property rather than a reading of the broker's own account of itself |
+
+The vertical behind most of them is the one that makes the rest mean anything:
+a real `asv-brokerd`, a real vault, a real route file and policy, a real
+`asv run` opening a real session and starting a real shim, an ordinary `curl`
+told nothing but a proxy URL, and a real destination on a real socket — with the
+credential planted through `asv add-credential`, because a route names a
+canonical id only the product mints.
+
+**Three things this block does not claim, and two of them are not small.**
+
+1. **The destination leg is verified against a locally minted CA.** No public
+   HTTPS destination has been reached through this path, because that needs a
+   decision about bundled roots that is a threat-model question and not an
+   implementation one. A fixed public root set would verify
+   `registry.npmjs.org` with this product's credentials and refuse every
+   destination an operator runs on a private CA.
+2. **Half the `--connect-roots` default is unfalsifiable here.** A broker with
+   no anchors reaching no TLS destination is measured with the real binary and
+   the flag absent, control included. Proving that the absence never falls back
+   to a public root set needs an origin holding a **publicly-issued**
+   certificate, and every origin in this repository trusts a CA the test minted —
+   which a public bundle would refuse exactly as an empty store does.
+3. **The drain is a bound, not a latency claim.** A signalled broker waits at
+   most 5 s for its tunnels and logs when the window expires. No run has
+   triggered that, and the figure is a safety valve rather than a measurement.
+
+With those written down, V1-C2 is `verified`. The next block is **C1-R** — a
+dedicated OS identity for the broker, which is M7's residual and which removes
+a class of attack this product currently only mitigates.
 
 
 
