@@ -74,6 +74,7 @@ is not listed, and a block with a residual says so in its own row.
 | **R1** | closed | `r1_isolated_reachability` 11/11 and `r1_isolated_e2e` 6/6, both from the product surface. One caveat, recorded because it changes how the evidence should be read: 21 tests across three files return early when unprivileged user namespaces are unavailable, and Cargo reports that as **passed**, not as skipped. The R1 full-suite result was therefore re-opened and is being corrected (`bl-bl-01M44FDFNF0003888YSWEGPXM0`). |
 | **R2.A** | closed, with one half `host-dependent` | `r2a_github_vertical` 11/11 in-process against a real TLS origin, and `r2a_cli_reachability` 4/4 against the real binaries. The live call against the real `api.github.com` is **not** measured and is not claimed; see *Status of item 1* below. |
 | **R2.B** | partial, with the strong form `host-dependent` | `r2b_oauth2_revocation` 5/5 with four falsifications run. The revocation gap is closed and the property is structural — `forget` is required on `SecretPort` with no default. Two things are **not** closed: compatibility with an operator's real IdP needs a host that has one, and the requested scope is still operator-configured rather than policy-derived, which is R4's work. |
+| **R2.C** | foundation only | `aws::sigv4` 16/16 against the AWS documentation's own vectors, with five falsifications run and two real bugs caught by the oracle. **No STS call, no broker operation, no CLI verb, and no product surface yet**, so item 2 is not closed under M11's rule. See *Status of item 2*. |
 
 **The R1 row is the one worth reading twice.** `uat_040`'s file-injection row was
 asserting that the staged secret reached the redacted channel in cleartext — a
@@ -1096,8 +1097,58 @@ as a blanket `cache.clear()` reds the row about a sibling credential staying
 served; and `forget` on the refusal path reds the row about a refused deletion
 — because the vault write is what decides, and a refusal must cost nothing.
 
-Items 1, 2, 3, 5, 6 and 7 are unstarted. Item 1 is the one semantic connector
-exercised against a real socket, as *Status of item 1* above records.
+Items 2, 3, 5, 6 and 7 are unstarted. Item 1 is the one semantic connector
+exercised against a real socket, as *Status of item 1* above records, and item 2
+has a foundation and nothing else, as *Status of item 2* below records.
+
+### Status of item 2 (AWS re-signing + STS): **foundation only**
+
+There was no AWS code in this repository when R2.C started — not a trait, not a
+stub, not a test. So item 2 is construction rather than repair, and the failure
+mode is different from item 1's: there was no existing path to inherit a
+property from, so a subtly wrong signing primitive would be the whole problem.
+
+**R2.C.1 is the signing core, and it is the only part done.** Canonicalisation,
+the four-step key derivation, the `Authorization` header, and the refusals.
+There is no STS call, no broker operation and no CLI verb, so no agent can ask
+for an AWS credential, and **per M11's rule a provider does not count as closed
+on a signing core alone.**
+
+What is left, in order:
+
+- **R2.C.2.** `sts:AssumeRole` over real HTTPS, a short-lived session, cached
+  and revocable — reusing the `forget` machinery from R2.B.1 rather than
+  inventing a second invalidation path.
+- **R2.C.3.** A broker operation and a CLI verb, so the agent names an
+  *operation* and never sees an AWS secret. That is what satisfies "the agent
+  must never need to know the secret key" in its strongest form; handing the
+  agent a session token would be a weaker property wearing the same label.
+- **A live call against AWS**, which is `host-dependent` for the same reason
+  item 1's is: it needs a real account and real credentials on a machine with
+  network, and no repository check asserts it.
+
+**The oracle, and why the vectors mattered more than the tests.** Every
+expected value comes from the AWS documentation and none was copied from this
+implementation's output: they were computed first by a separate implementation
+written from the specification, and the two compared. That caught two bugs no
+test written afterwards would have found. The first put the date stamp in the
+credential scope **twice**, and the signature was still correct — the extra text
+is not hashed — so nothing local noticed and every provider would have rejected
+the request with a scope no reader could reconcile against the signature beside
+it. The second was a parameter that could not do what its name promised: the
+path is split on `/` before encoding, so a segment can never contain a slash,
+and the real AWS rule is *double* encoding outside S3.
+
+Three of the four first-run failures were the test being wrong rather than the
+code, and a fifth falsification did not bite until its row was rebuilt with a
+pair that actually distinguishes the two implementations. Both are recorded in
+the module and in the test, because "the tests pass" is the least informative
+sentence anyone can write about a signing primitive.
+
+**No new supply-chain surface.** `sha2` was already a direct broker dependency
+and `hmac` was already resolved through the vault; `Cargo.lock` gains one line
+and no package. `aws-sigv4` was not used: a new name in a signed SBOM to avoid
+a four-step HMAC chain is the wrong trade.
 
 ---
 
