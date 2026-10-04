@@ -79,6 +79,11 @@ chacha20poly1305 = "0.10"
 aead = "0.5"
 rand = "0.8"
 sha2 = "0.10"
+# M11 / C3: `client_secret_basic` is base64 over a form-encoded pair, and the
+# authorization server that verifies it has to decode strictly. Already in the
+# lock through `asv-connector-pg`; hand-rolling a decoder inside the component
+# that holds a long-lived client secret is not a trade worth making.
+base64 = "0.22"
 hmac = "0.12"
 subtle = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }

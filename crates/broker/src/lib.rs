@@ -33,6 +33,14 @@ pub mod identity;
 pub mod inventory;
 pub mod isolated_exec;
 pub mod oauth2;
+/// The RFC 6749 authorization server the OAuth2 tests run against.
+///
+/// Feature-gated rather than `#[cfg(test)]` because the assertions that matter
+/// live in the integration tests, and a test binary cannot see a module the
+/// library only compiled for itself. Off by default: a production broker must
+/// not be able to link a server that hands out tokens.
+#[cfg(any(test, feature = "test-support"))]
+pub mod oauth2_test_support;
 pub mod pg_policy;
 pub mod pg_session;
 pub mod recovery;

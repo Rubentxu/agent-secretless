@@ -7,6 +7,13 @@ license.workspace = true
 repository.workspace = true
 description = "ASV broker. Secret-bearing process, isolated by OS identity (ADR-0002)."
 
+[features]
+# M11 / C3: the authorization server the OAuth2 tests run against. Additive and
+# off by default, so a production binary cannot pull in a server that hands out
+# tokens. The broker's own dev-dependency on itself is what turns it on for the
+# integration tests, which is the only place it should ever be reachable from.
+test-support = ["asv-connector-http/test-support"]
+
 [[bin]]
 name = "asv-brokerd"
 path = "src/main.rs"
@@ -71,8 +78,25 @@ serde = { workspace = true }
 # promotes them to real broker dependencies rather than adding anything new.
 rcgen = { workspace = true }
 time = { workspace = true }
+# M11 / C3: the issuer talks to a provider's token endpoint over real HTTPS.
+# `reqwest` because it is already the workspace's HTTP stack with the same
+# `rustls-tls` feature `asv-connector-http` uses, and a hand-rolled HTTP client
+# inside the process that holds the long-lived client secret is a bad trade on
+# every axis at once: it would be a second HTTP implementation to get right, in
+# the one component whose compromise leaks a credential that does not expire.
+reqwest.workspace = true
+url.workspace = true
+# M11 / C3: the authorization server has to decode `client_secret_basic`
+# strictly, because a lenient decode would agree with a client that encoded it
+# wrong and the whole check would be worth nothing.
+base64.workspace = true
 
 [dev-dependencies]
+# The integration tests need the broker's `test-support` feature, and a crate
+# cannot turn on its own feature from inside itself. Depending on itself here is
+# the supported way to say it: it applies to the lib *as a dependency of the
+# test*, and never to the binary.
+asv-broker = { path = ".", features = ["test-support"] }
 serde_json = "1"
 tempfile = "3"
 # The end-to-end tests drive the real connector against a local TLS origin.

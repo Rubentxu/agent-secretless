@@ -34,7 +34,9 @@
 pub mod fake_origin;
 
 #[cfg(any(test, feature = "test-support"))]
-pub use fake_origin::{Certificate, FakeOrigin, OriginHandler, OriginResponse, Reply, TlsOrigin};
+pub use fake_origin::{
+    Certificate, FakeOrigin, Observed, OriginHandler, OriginResponse, Reply, TlsOrigin,
+};
 pub mod github;
 pub mod transport;
 
