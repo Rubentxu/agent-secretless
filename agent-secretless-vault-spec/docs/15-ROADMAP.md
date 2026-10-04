@@ -501,6 +501,66 @@ repository can assert what `getent passwd` answers on a host that is not this
 one. The posture is now enforceable; it is not yet exercised on a real service
 account, and the gate row says that rather than rounding it up.
 
+### C1-R, second increment — the posture on the wire, and a fifth state
+
+The first increment made the identity **enforceable** and it stayed invisible,
+which is the whole reason the M7 residual was a footnote: a refusal an
+operator never learns about is not a control they can rely on. So the posture
+is now a field, `BrokerInfo::identity` (protocol v6 to v7), and both `asv
+doctor` and `agent discover` report it.
+
+**`dedicated` is derived, never an argument.** A constructor that took the flag
+would let a caller assemble a report saying *dedicated* about a broker that
+declared a different uid — which is precisely the claim this field exists to
+make falsifiable, so the derivation is the property and the signature enforces
+it.
+
+**The three states are three, and the third is why.** A shared, undeclared uid
+is the documented posture of an unpackaged deployment, so it is not `Ok` (a
+clean bill of health for the one protection the broker cannot give itself), not
+`Warn` (see below) and not `Unknown` (it *is* observable, and the number
+matters). A build that reports nothing is `Unknown`, because that is what it is
+— version skew, which `broker.protocol` already names.
+
+**A check needed a fifth state, and needing one is the finding.** The first
+version reported a shared identity as `Warn`, which made every `asv doctor` on a
+development machine read `Degraded`: a broker started from a shell shares that
+shell's uid, so the degradation was permanent. **A status that is always
+degraded is a status nobody reads**, which is the same shape of failure as a
+check that always passes — and it contradicted the claim the M7 row above
+spends a milestone narrowing, by degrading the diagnostic for the very state
+that row calls correct. Six existing tests failed on it, and none of them was
+wrong. `CheckState` therefore gained `Info`: observed, stated, and not a defect
+in this installation. It still carries the remedy with both flags, because an
+operator can act on that without being told their installation is broken.
+
+The human renderer counts `Info` in its summary, because a state that is
+neither a warning nor unknown would otherwise reach the operator only by
+scrolling. While there: the width assertion tested `Unknown` rather than the
+**longest** spelling, so `info` — four characters — would have passed a test
+pinned to `unknown` without breaking anything, which is the shape of a guard
+that has stopped guarding. It now walks `CheckState::ALL`, which was the
+original intent.
+
+**Falsified 4 of 4 — and W2 escaped on the first run, which is the row worth
+keeping.** Dropping the field where the CLI reads the broker's response left the
+entire workspace green. The reason is precise and it is the third time this
+repository has found it: the doctor tests build `BrokerFacts` by hand and never
+cross the wire, and `agent discover` did not render the identity at all, so the
+value **travelled from the broker and died inside the product**. A complete and
+correct mechanism with no production consumer, which no test of its own unit can
+catch — `ShutdownSignal::stop`, `ShutdownSignal::revoke` and the untested
+`RouteTransports` are the two earlier instances of it in this product, and
+`RouteTransports` is the one a falsification campaign found.
+
+Both halves of the fix were required, not one. `agent discover` now renders the
+identity with its three states named — it is the surface an autonomous caller
+reads rather than a human, so a state without a name would be worse than a
+state that is absent. And the cold-discovery test asserts it **over a real
+socket and on the envelope**, so it covers the serialisation as well as the
+mapping; asserting on the struct would have covered the mapping alone and left
+the same hole one layer down.
+
 ### The defect this found next to it
 
 Writing that proof turned up a real defect in the hardened path, in the code

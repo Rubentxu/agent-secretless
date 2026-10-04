@@ -16,7 +16,7 @@ agente ──(sustituto / socket)──▶ broker ──(credencial real)──�
 
 > **Estado: pre-1.0, en v0.29.0. Sin certificar, y los gates lo dicen.**
 >
-> El workspace compila y hay **1094 tests enumerados** (1094 pasan, 0 ignorado, 0
+> El workspace compila y hay **1102 tests enumerados** (1102 pasan, 0 ignorado, 0
 > fallan; el conteo lo vuelve a derivar el gate `R11 README test count` en cada
 > corrida de CI, así que esta línea ya no puede quedarse vieja). El vault, la
 > firma SSH, los brokers HTTP y PostgreSQL, la política Cedar, la consola de
@@ -61,7 +61,7 @@ imposición es del sistema de tipos:
   una passphrase de recuperación *separada*. **Rekey** de passphrase que
   re-envuelve la misma clave de datos, de modo que los backups previos a la
   rotación siguen funcionando (`crates/vault`).
-- **Daemon broker** (`asv-brokerd`) — IPC por socket Unix (protocolo v6),
+- **Daemon broker** (`asv-brokerd`) — IPC por socket Unix (protocolo v7),
   identidad `SO_PEERCRED`, política Cedar con **deny-by-default**, arranque
   fail-closed: abre `--vault`/`--passphrase-file` al arrancar o niega toda
   operación brokered. Los core dumps se desactivan con `RLIMIT_CORE=0` antes
@@ -165,7 +165,7 @@ es una suposición:
 cargo build --release -p asv-broker
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# esperado: passed=1094 failed=0 ignored=0
+# esperado: passed=1102 failed=0 ignored=0
 ```
 
 Ese número era `passed=692` en este fichero durante varios milestones, y nada
@@ -200,7 +200,7 @@ pisar una instancia en marcha. Si solo se pasa una de `--vault` /
 ```text
 crates/
   domain/         tipos core, SecretBytes, canonicalización de Authority
-  ipc-protocol/   request/response versionado y acotado por longitud (protocolo v6)
+  ipc-protocol/   request/response versionado y acotado por longitud (protocolo v7)
   identity/       identidad de carga de trabajo SO_PEERCRED + pidfd
   vault/          envelope cifrado, backup/restore, rekey, prototipo TPM
   policy/         integración Cedar, decisiones deny-by-default
