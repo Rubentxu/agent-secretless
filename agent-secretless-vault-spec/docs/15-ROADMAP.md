@@ -841,6 +841,71 @@ No fixed UAT set: each connector is gated by the acceptance tests it
 introduces, and the set grows with the catalog. Completion is DELEGATED to
 `16-SECURITY-RELEASE-GATES`, which requires the full matrix.
 
+### Status of item 4 (OAuth2 provider framework): **implemented**, self-hosted
+
+Item 4 is the only one of the seven that has been built, and the difference
+between what it was and what it is took five increments, each of which is worth
+naming because the first two changed nothing a reader could see.
+
+It began as a prototype: a trait, a struct, and an `issue()` that hashed the
+client id and the scope and called the result a bearer token. Ten unit tests
+agreed with it about everything, including the parts that were wrong. Then, in
+order:
+
+- **The transport.** `asv_connector_http`'s scripted fake origin could not host
+  a server, because a server's answer depends on what was asked. `TlsOrigin`
+  answers from a handler, and the TLS machinery — accept, handshake, read a
+  request, write a response — now exists once for both shapes instead of once
+  per fixture. `PinnedClient` gained a finite timeout, because a client with no
+  timeout is not fast, it is unbounded, and an origin that accepts and then says
+  nothing is indistinguishable from one withholding an answer on purpose.
+- **A party that can say no.** `AuthorizationServer` implements RFC 6749
+  §2.3.1/§4.4/§5.1/§5.2, RFC 7009, RFC 7662 and RFC 8707 over a real TLS
+  socket, with twenty tests establishing that it enforces them rather than
+  replaying answers. Its default client's identifier contains a colon, which is
+  load-bearing: form-encoded it survives the split on the first colon, sent raw
+  it does not, so a client that skips the encoding cannot tell itself apart
+  from a conforming one.
+- **The issuer stopped inventing tokens.** `ClientCredentialsIssuer` performs a
+  real HTTPS POST, and three of its rules exist because the alternative is a
+  broker that looks healthy while holding more authority than it was asked for:
+  the endpoint must be HTTPS, a granted scope that differs from the requested
+  one aborts, and a token with no positive `expires_in` is refused. The
+  placeholder was renamed `DeterministicTokenIssuer` and a source-scanning test
+  fails if production code names it — a guard that has been seen to fail.
+- **It gained a production consumer**, which is what `prototype` meant. The
+  second increment still had a real issuer and *no caller anywhere in the
+  runtime*, so the status did not move; this is the fourth time this product has
+  produced a complete and correct mechanism with no production consumer, and the
+  third time a campaign rather than a test is what found it.
+  `OAuth2SecretPort` is a `SecretPort`, so a credential registered through
+  `asv-brokerd --oauth2-clients PATH` is read from the real vault, spent on one
+  token request, and what the operation's sink receives is a short-lived access
+  token. The wiring is in `main.rs`. `RoutingSecretPort` falls through to the
+  vault on `NotFound` **only**: any other failure is a refusal, because a
+  provider outage answered from the vault hands the operation the stored
+  `client_secret` and the operation then succeeds.
+- **Five mutations, five reds.** `tests/oauth2_falsification.py` replaces the
+  exchange with a direct read of the stored secret (8 of the 10 vertical tests
+  go red), drops the token cache's deadline, makes the router fall back to the
+  vault on any error, accepts a widened scope, and sends the Basic credential
+  over the raw pair. No residue.
+
+**What this is not, stated before anyone has to ask.** The provider is
+self-hosted, not a third-party IdP, and the documents say `self-hosted` in the
+status field rather than `real` in the prose. Establishing compatibility with an
+operator's actual identity provider needs a host that has one, so **V1-C3 stays
+host-dependent in its strong form** and the difference is a fact about the
+work rather than an excuse. Two further limits are named as limits rather than
+as controls: the requested scope is operator-configured rather than
+policy-derived, and while `forget()` makes a revocation immediate when called,
+the credential-removal path does not call it yet, so a revocation's real effect
+is bounded by the token's `expires_in`.
+
+Items 1, 2, 3, 5, 6 and 7 are untouched. The GitHub surface is the one
+semantic connector that has been exercised against a real socket, and it is
+item 1; the other six are unstarted.
+
 ---
 
 ## M12 — TPM/hardware-backed vault
@@ -1003,6 +1068,17 @@ CURRENT: v0.29.0
   credential that reaches an operation and is then revoked, expired and audited.
   M15's strategy selection is only meaningful over provider-backed strategies,
   so this is a prerequisite and not a parallel.
+  **Half of it is delivered and the half that is not is the one that needs a
+  host.** The vertical exists and is measured: a client secret in a real vault
+  is traded for a short-lived token, the secret stops at the broker, expiry and
+  revocation are refusals, the audience is bound, a provider that stops
+  answering stops the operation, and the exchange is on the provider's record.
+  The provider is **self-hosted** — a real authorization server implementing
+  RFC 6749, RFC 7009, RFC 7662 and RFC 8707, not a third-party IdP — and
+  nothing about the broker's behaviour depends on that choice except its
+  compatibility with someone else's. So M11 is `implemented` and V1-C3 is
+  **still host-dependent**, now for one stated reason rather than for all of
+  them.
 - **V1-C4** does the same for M12 with a real TPM: a hardware adapter,
   enrollment, recovery before any destructive step, PCR and device-state change,
   a theft test, software ↔ device-bound migration, and `Unsupported` rather than

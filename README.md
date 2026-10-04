@@ -16,12 +16,16 @@ agent ──(surrogate / socket)──▶ broker ──(real credential)──�
 
 > **Status: pre-1.0, at v0.29.0. Not certified, and the gates say so.**
 >
-> The workspace compiles and **1102 tests are enumerated** (1102 pass, 0 ignored,
+> The workspace compiles and **1175 tests are enumerated** (1175 pass, 0 ignored,
 > 0 fail; the count is re-derived every CI run by the `R11 README test count`
 > gate, so this line cannot go stale again). Vault, SSH signing, the HTTP and
 > PostgreSQL brokers, Cedar policy, the operator console and the CONNECT TLS
-> bridge exist and are exercised. The OAuth2 framework and TPM sealing are
-> **prototypes**, and no production path calls them.
+> bridge exist and are exercised. The OAuth2 framework is **implemented and in
+> production use** against a **self-hosted** authorization server — a real one
+> speaking RFC 6749/7009/7662/8707, not a third-party IdP, and that difference
+> is the half of M11 that is still open. TPM sealing remains a **prototype**
+> with no production path, because that needs hardware this host does not
+> have.
 >
 > **Verifiable status lives in
 > [`16-SECURITY-RELEASE-GATES.md`](agent-secretless-vault-spec/docs/16-SECURITY-RELEASE-GATES.md),
@@ -85,8 +89,17 @@ type system:
   **Not** an eBPF socket redirect: that research gate returned NO-GO and the
   explicit-proxy path is what shipped.
 - **OAuth2 client-credentials framework** for short-lived surrogate issuance —
-  a **prototype**. The reference issuer synthesises a token instead of talking
-  to a token endpoint, and nothing in production calls it (M11).
+  **implemented, with a production consumer** (M11). `asv-brokerd
+  --oauth2-clients PATH` declares credentials this broker trades for short-lived
+  tokens: the client secret is read from the vault, spent on one HTTPS POST to
+  the token endpoint, and what the operation receives is a short-lived access
+  token the provider issued. The secret stops at the broker. A granted scope
+  that differs from the one requested aborts, a token with no positive
+  `expires_in` is refused, a non-HTTPS token endpoint is refused outright, and a
+  provider that stops answering stops the operation rather than falling back to
+  the vault. Five mutations, five reds
+  (`tests/oauth2_falsification.py`). The provider is self-hosted; V1-C3 stays
+  host-dependent for compatibility with an operator's real IdP.
 - **TPM sealing prototype** — PCR policy binding and an offline recovery blob
   (M12; `SoftwareTpm` is a placeholder, no real hardware path yet).
 - **Crash recovery** — append-only journal with length prefixes and CRC32;
@@ -155,7 +168,7 @@ Each item says where its detail lives, because none of it is a guess.
 cargo build --release -p asv-broker
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# expected: passed=1102 failed=0 ignored=0
+# expected: passed=1175 failed=0 ignored=0
 ```
 
 That number was `passed=692` in this file for several milestones, and nothing

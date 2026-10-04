@@ -16,12 +16,16 @@ agente ──(sustituto / socket)──▶ broker ──(credencial real)──�
 
 > **Estado: pre-1.0, en v0.29.0. Sin certificar, y los gates lo dicen.**
 >
-> El workspace compila y hay **1102 tests enumerados** (1102 pasan, 0 ignorado, 0
+> El workspace compila y hay **1175 tests enumerados** (1175 pasan, 0 ignorado, 0
 > fallan; el conteo lo vuelve a derivar el gate `R11 README test count` en cada
 > corrida de CI, así que esta línea ya no puede quedarse vieja). El vault, la
 > firma SSH, los brokers HTTP y PostgreSQL, la política Cedar, la consola de
 > operador y el puente TLS sobre CONNECT existen y se ejercitan. El framework
-> OAuth2 y el sellado TPM son **prototipos**, y nada en producción los llama.
+> OAuth2 está **implementado y en uso en producción** contra un authorization
+> server **autoalojado** — uno real que habla RFC 6749/7009/7662/8707, no un IdP
+> de terceros, y esa diferencia es la mitad de M11 que sigue abierta. El
+> sellado TPM sigue siendo un **prototipo** sin camino de producción, porque eso
+> necesita hardware que esta máquina no tiene.
 >
 > **El estado verificable vive en
 > [`16-SECURITY-RELEASE-GATES.md`](agent-secretless-vault-spec/docs/16-SECURITY-RELEASE-GATES.md),
@@ -90,8 +94,17 @@ imposición es del sistema de tipos:
   **No** es una redirección de socket eBPF: ese gate de investigación
   devolvió NO-GO y lo que se entregó fue el camino de proxy explícito.
 - **Framework OAuth2 client-credentials** para emisión de sustitutos de corta
-  vida — es un **prototipo**. El emisor de referencia sintetiza un token en
-  vez de hablar con un token endpoint, y nada en producción lo llama (M11).
+  vida — **implementado, y con un consumidor en producción** (M11).
+  `asv-brokerd --oauth2-clients PATH` declara las credenciales que este broker
+  canjea por tokens de corta vida: el client secret se lee del vault, se gasta
+  en un POST HTTPS al token endpoint, y lo que recibe la operación es un access
+  token de corta vida emitido por el provider. El secreto se queda en el broker.
+  Un scope concedido que difiere del pedido aborta, un token sin `expires_in`
+  positivo se rechaza, un token endpoint que no sea HTTPS se rechaza de
+  entrada, y un provider que deja de responder detiene la operación en vez de
+  caer al vault. Cinco mutaciones, cinco rojas
+  (`tests/oauth2_falsification.py`). El provider es autoalojado; V1-C3 sigue
+  siendo host-dependent por la compatibilidad con el IdP real de un operador.
 - **Prototipo de sellado TPM** — política de PCR y blob de recuperación offline
   (M12; `SoftwareTpm` es un placeholder, aún no hay camino de hardware real).
 - **Recuperación ante crashes** — journal append-only con prefijos de longitud
@@ -165,7 +178,7 @@ es una suposición:
 cargo build --release -p asv-broker
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# esperado: passed=1102 failed=0 ignored=0
+# esperado: passed=1175 failed=0 ignored=0
 ```
 
 Ese número era `passed=692` en este fichero durante varios milestones, y nada
