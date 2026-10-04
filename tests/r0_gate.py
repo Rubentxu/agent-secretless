@@ -255,46 +255,90 @@ def r0_4_atomic_history() -> None:
                f"thing that leaves it dirty.")
         return
 
-    code, out = run(["git", "log", "--format=%H%x1f%s", "-12"])
-    if code != 0:
-        record("R0.4 atomic history", FAIL, "git log could not be read")
-        return
+    # The R0 commits are found by what they *introduced*, not by where they
+    # are. The first version of this looked at the last twelve commits, which
+    # measures recency rather than the property: twelve commits after R0
+    # landed, the R0 commits had scrolled out of the window and the guard
+    # reported "R0 does not have a distinct commit for the roadmap" about a
+    # block that had been closed and verified for days. A guard that goes red
+    # for a reason other than the one it names teaches its reader to ignore
+    # it.
+    #
+    # Anchoring on the introducing commit is also what keeps this honest the
+    # other way. A full-history search for the *word* "roadmap" would find this
+    # repository's later `docs(roadmap):` commits and pass on those, so the
+    # search is `-S` over the distinctive string each sub-block added: the
+    # rebaselined section, the single checksum authority, and the skill
+    # contract. Each of those appears for the first time in its own commit, and
+    # in no later one.
+    # Each concern is anchored on a string that its own commit **introduced**
+    # and that no later commit removed, found with `git log -S --reverse`, so
+    # the answer is the introducing commit regardless of where it sits in the
+    # history.
+    #
+    # Two other anchors were tried and both were wrong in an instructive way.
+    # A window of the last twelve commits measures *recency*, not the property:
+    # twelve commits after R0 landed, this reported "R0 does not have a distinct
+    # commit for the roadmap" about a block closed and verified days earlier. A
+    # guard that goes red for a reason other than the one it names teaches its
+    # reader to ignore it. And `--diff-filter=A` on a file the commit added
+    # works for two of the three concerns and not the third, because the skill
+    # commit's job was to *remove* the in-repo proposal and leave a pointer —
+    # it added no file at all.
+    #
+    # The strings are also chosen so no later commit re-introduces them.
+    # Searching the full history for the *word* "roadmap" would find this
+    # repository's later `docs(roadmap):` commits and pass on those, which
+    # would be a guard that cannot fail.
+    concerns = {
+        # The rebaselined critical path.
+        "roadmap": "## Critical path — rebaselined",
+        # The single signed checksum authority, which R0.2 introduced when
+        # `checksums.txt` was retired.
+        "distribution": "CHECKSUM_AUTHORITY",
+        # The withdrawal notice the skill commit left where the in-repo
+        # proposal used to be.
+        "skill": "propuesta (retirada",
+    }
+    landed: dict[str, str] = {}
+    for concern, needle in concerns.items():
+        code, out = run(["git", "log", "-S" + needle, "--format=%H", "--reverse"])
+        if code != 0:
+            record("R0.4 atomic history", FAIL,
+                   f"could not search history for the {concern} commit")
+            return
+        shas = [s for s in out.splitlines() if s.strip()]
+        if not shas:
+            record("R0.4 atomic history", FAIL,
+                   f"no commit ever introduced {concern!r}; the block was "
+                   f"landed without it rather than as a reviewable unit")
+            return
+        landed[concern] = shas[0]
 
-    entries = [l.split("\x1f", 1) for l in out.splitlines() if "\x1f" in l]
-    if not entries:
-        record("R0.4 atomic history", FAIL, "no commits to inspect")
-        return
-
-    # Each sub-block of R0 is a separate commit, because they are separately
-    # reviewable and separately revertable — a reviewer who distrusts the
-    # rebaseline should not have to unpick the installer to get rid of it.
-    wanted = {"roadmap": 0, "distribution": 0, "skill": 0}
-    for _, subject in entries:
-        for concern in wanted:
-            if concern in subject.lower():
-                wanted[concern] += 1
-    absent = [k for k, v in wanted.items() if v == 0]
-    if absent:
+    # Distinct commits, because three concerns landing together is one step
+    # wearing three labels.
+    if len(set(landed.values())) != len(landed):
+        merged = sorted(concerns[c] for c, sha in landed.items()
+                        if list(landed.values()).count(sha) > 1)
         record("R0.4 atomic history", FAIL,
-               f"R0 does not have a distinct commit for {sorted(absent)}; the "
-               f"block was landed as one step rather than as reviewable units")
+               f"these concerns were landed in one commit, not as separate "
+               f"reviewable steps: {merged}")
         return
 
-    # An empty commit is the cheapest way to look like careful work.
     empty = []
-    for sha, subject in entries:
+    for concern, sha in landed.items():
         _, files = run(["git", "show", "--name-only", "--format=", sha])
         if not [p for p in files.splitlines() if p.strip()]:
-            empty.append(subject)
+            empty.append(f"{concern} ({sha[:12]})")
     if empty:
         record("R0.4 atomic history", FAIL,
                f"these commits change no files: {empty}")
         return
 
     record("R0.4 atomic history", PASS,
-           f"the working tree is clean, R0 spans distinct commits for the "
-           f"roadmap, the installer and the skill, and none of the {len(entries)} "
-           f"recent commits is empty")
+           f"the working tree is clean, and R0 landed as three distinct, "
+           f"non-empty commits: "
+           + ", ".join(f"{c}={s[:12]}" for c, s in sorted(landed.items())))
 
 
 # -------------------------------------------------------------------- main
