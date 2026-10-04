@@ -12,6 +12,11 @@ matrices of session fields could not produce:
 
     crates/vault/src/tpm2.rs   R6, R7, R8, R9, R10
 
+and, for the policy route — the session a PCR-bound object is sealed to, and
+the digest the client has to be able to state before it seals anything:
+
+    crates/vault/src/tpm2.rs   R11, R12, R13, R14, R15
+
 **The wire layout is pinned without a device** by
 `a_password_session_sits_between_the_handles_and_the_parameters`, which
 transcribes the 65 bytes `tpm2-tools` sends rather than generating them with
@@ -20,7 +25,13 @@ area — ahead of the handles, behind the parameters, or in the one place that
 works — and each is required to put the *device* test in red, which is the
 claim: a layout the device accepts is not a layout the client should ship.
 
-## Why these five rows and not others
+The policy route is pinned the same way and against the same reference client,
+with `a_policy_session_is_the_request_the_reference_client_sends` (59 bytes) and
+`a_policy_pcr_is_the_request_the_reference_client_sends` (58 bytes). Both
+transcriptions read as wrong against the rest of this module: one carries a byte
+this client cannot name, and the other carries **no authorization area at all**.
+
+## Why these rows and not others
 
 *   **R1** puts `pcrUpdateCounter` back into the `PCR_Read` request. It is the
     exact bug the encoding work found: `pcrUpdateCounter` is declared in-out, so
@@ -42,6 +53,27 @@ claim: a layout the device accepts is not a layout the client should ship.
     placeholder this module replaced did exactly that for the whole life of M12,
     and the milestone exists because a mechanism that looks healthy while
     protecting nothing is the failure being removed.
+*   **R11** puts the password session area back into `PolicyPCR`. This is the
+    row that keeps the two halves of the file from being one habit: a policy
+    command that authorizes nothing must send no area, and the area is the one
+    piece of this module that *looks* right everywhere else. It is refused
+    `0x184`, which is the same code six earlier attempts read as a session
+    problem.
+*   **R12** replaces the `pcrDigest` with thirty-two zero bytes. The digest is
+    the hash of the PCR values the selection names, and the device checks it —
+    so this row is the difference between "the command is well formed" and "the
+    command says something true". A client that sent zeros would be sealing to a
+    policy no PCR meets.
+*   **R13** stops sorting the values by PCR index, and **R14** stops folding the
+    `pcrDigest` into the policy chain. Both leave a chain that still advances
+    and still looks like a digest; neither names the PCRs the policy is about.
+    They run without a device because the chain this client computes is pinned
+    to values the device reported, so a wrong formula cannot agree with the
+    fixture unless the fixture is also wrong.
+*   **R15** flips the one byte in `TPM2_StartAuthSession` this client cannot
+    name. It is a field the device admits exactly one value for, so a client
+    that guessed wrong gets `0x2DA` or `0x2D5`; the row is what keeps the
+    admission honest.
 
 ## What this campaign cannot falsify, and says so
 
@@ -51,14 +83,23 @@ rows exercise; it is not hardware, and `is_hardware` is false throughout. A host
 with a real TPM would be a different run on a different machine.
 
 **That a sealed object can be created and unsealed.** `TPM2_CreatePrimary`,
-`TPM2_Create` and `TPM2_Load` are not implemented. R5 measures that the refusal
-is real, not that sealing works. A working password session (R6 to R8) is the
-transport that sealing would ride on, not the sealing itself: a session that
-authorises a PCR write has not been shown to authorise an object.
+`TPM2_Create` and `TPM2_Load` are still not implemented, and R5 measures that
+the refusal is real, not that sealing works. What the policy route adds is the
+state a seal would be *to*: R11 to R15 establish that a client can open a policy
+session, satisfy a PCR condition in it, and compute the digest that condition
+produces. A session that satisfies a policy and an object sealed to that policy
+are two different claims, and only the first has been measured.
+
+**That the policy digest this client computes is what another TPM would
+compute.** The chain is pinned against `swtpm` 0.10.2. The formula is the
+specified one and the seed was measured, but a different implementation is a
+different measurement, and this campaign does not claim otherwise.
 
 **That a PCR write is durable.** R6 to R8 and R10 run against `swtpm`, whose
 PCRs live in a process that the fixture kills. What they establish is that the
-write was accepted and folded in, not that it survives a reboot.
+write was accepted and folded in, not that it survives a reboot. R11 and R12
+are in the same position: the policy is satisfied by PCR values that die with
+the process.
 
 ## Running it
 
@@ -103,12 +144,18 @@ MUTATIONS = [
         path=TARGET,
         suite="device",
         edits=[
+            # The `PCR_Read` body is built by `pcr_selection_body` now, shared
+            # with `PolicyPCR` so the policy chain hashes the bytes that go on the
+            # wire. The mutation belongs where the body is assembled, not where
+            # the comment about it used to live.
             (
-                "        body.extend_from_slice(&bitmap);\n"
-                "        // **And nothing else.**",
-                "        body.extend_from_slice(&bitmap);\n"
-                "        body.extend_from_slice(&0u32.to_be_bytes());\n"
-                "        // **And nothing else.**",
+                "    body.push(PC_CLIENT_PCR_SELECTION_BYTES);\n"
+                "    body.extend_from_slice(&bitmap);\n"
+                "    Ok(body)",
+                "    body.push(PC_CLIENT_PCR_SELECTION_BYTES);\n"
+                "    body.extend_from_slice(&bitmap);\n"
+                "    body.extend_from_slice(&0u32.to_be_bytes());\n"
+                "    Ok(body)",
             )
         ],
     ),
@@ -165,17 +212,24 @@ MUTATIONS = [
         why="what the placeholder did for the whole life of M12",
         path=TARGET,
         suite="default",
+        # The refusal message has been rewritten twice since this row was
+        # written — each time the row's anchor went stale and the campaign
+        # refused to run at all, which is the guard working. It is anchored to
+        # the whole function so the next rewrite breaks it loudly.
         edits=[
             (
                 "    fn seal(&self, _kek: &[u8; 32], _pcr_policy: &PcrPolicy)"
                 " -> Result<TpmSealed, TpmError> {\n"
                 "        Err(TpmError::TpmRefused(\n"
-                "            \"this tpm2 device does not seal yet:"
-                " object creation is not implemented\".to_string(),\n"
+                "            \"this tpm2 device does not seal yet: CreateLoaded and Unseal work, but \\\n"
+                "             CreateLoaded has no creationPCR, and a policy-bound unseal needs a \\\n"
+                "             policy session and AES-CFB decryption of its response\"\n"
+                "                .to_string(),\n"
                 "        ))\n"
                 "    }",
                 "    fn seal(&self, kek: &[u8; 32], pcr_policy: &PcrPolicy)"
                 " -> Result<TpmSealed, TpmError> {\n"
+                "        let _ = kek;\n"
                 "        Ok(TpmSealed {\n"
                 "            blob: vec![0u8; 32],\n"
                 "            pcr_policy: pcr_policy.clone(),\n"
@@ -279,6 +333,85 @@ MUTATIONS = [
                 "            .map(|_| ())",
                 "        let _ = (handles, parameters, self.channel.is_none());\n"
                 "        Ok(())",
+            )
+        ],
+    ),
+    Mutation(
+        name="R11 PolicyPCR goes out carrying the password session area",
+        why="a policy command that authorises nothing must send no area, and the "
+            "area this module uses for PCR_Extend is the one thing that looks "
+            "right and is refused with 0x184",
+        path=TARGET,
+        suite="device",
+        must_fail="a_policy_pcr_is_accepted_for_the_pcrs_it_names",
+        edits=[
+            (
+                "        self.command(TPM2_POLICY_PCR, &body)?\n"
+                "            .into_body()\n"
+                "            .map(|_| pcr_digest)",
+                "        self.authorized_command(TPM2_POLICY_PCR, &body, &[])?\n"
+                "            .into_body()\n"
+                "            .map(|_| pcr_digest)",
+            )
+        ],
+    ),
+    Mutation(
+        name="R12 the pcrDigest stops being the hash of the PCR values",
+        why="a well-formed digest that says nothing true is refused by the device, "
+            "and a client that sent one would be sealing to a policy no PCR meets",
+        path=TARGET,
+        suite="device",
+        must_fail="a_policy_pcr_is_accepted_for_the_pcrs_it_names",
+        edits=[
+            (
+                "        let pcr_digest = pcr_value_digest(&self.pcr_read(slots)?);",
+                "        let pcr_digest = [0u8; 32];\n"
+                "        let _ = pcr_value_digest;",
+            )
+        ],
+    ),
+    Mutation(
+        name="R13 the pcr digest stops sorting by PCR index",
+        why="the device concatenates the values the selection covers in index "
+            "order, so a digest over the caller's ordering names a set nobody asked for",
+        path=TARGET,
+        suite="default",
+        must_fail="the_pcr_digest_hashes_the_values_in_index_order_not_in_the_order_asked",
+        edits=[
+            (
+                "    ordered.sort_by_key(|(index, _)| *index);",
+                "    // mutation: the order the caller listed them in is the order they hash in",
+            )
+        ],
+    ),
+    Mutation(
+        name="R14 the policy chain stops folding in the pcrDigest",
+        why="the chain is H(policy ‖ CC ‖ pcrs ‖ pcrDigest); drop the last term "
+            "and the chain still advances, still looks like a digest, and no longer "
+            "names the PCRs the policy is about",
+        path=TARGET,
+        suite="default",
+        must_fail="the_policy_chain_reproduces_the_digests_the_device_reported",
+        edits=[
+            (
+                "    hasher.update(pcr_digest);\n"
+                "    hasher.finalize().into()",
+                "    let _ = pcr_digest;\n"
+                "    hasher.finalize().into()",
+            )
+        ],
+    ),
+    Mutation(
+        name="R15 the policy session's unnamed byte stops being zero",
+        why="a field the device admits exactly one value for, and this client "
+            "cannot name; a client that guessed wrong is answered 0x2DA or 0x2D5",
+        path=TARGET,
+        suite="default",
+        must_fail="a_policy_session_is_the_request_the_reference_client_sends",
+        edits=[
+            (
+                "const POLICY_SESSION_UNNAMED_FIELD: u8 = 0x00;",
+                "const POLICY_SESSION_UNNAMED_FIELD: u8 = 0x01;",
             )
         ],
     ),

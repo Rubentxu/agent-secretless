@@ -76,6 +76,21 @@
 //! of one refused. It no longer does, and the answer is one line of structure
 //! that six matrices of session fields never varied.
 //!
+//! **What the policy route is, and what it is not.** `Tpm2Device::policy_pcr`
+//! and `advance_policy_digest` exist because a seal that binds to PCR values
+//! has to state the policy it binds to, and the only way to state one is to know
+//! it before there is an object to seal. So this module can open a policy
+//! session, satisfy a PCR condition in it, and compute the digest that condition
+//! produces — the `authPolicy` an object would carry.
+//!
+//! That is the *state a seal would be to*, and a state is not a seal. What is
+//! still missing is `TPM2_CreateLoaded` carrying that `authPolicy` and
+//! `TPM2_Unseal` answering under the session — and the unseal's answer is
+//! encrypted with the session key, so AES-CFB decryption is part of that half,
+//! not an optional extra. A `seal` implemented now would have to either refuse
+//! or hand back a `PcrPolicy` that nothing enforces, and the second of those is
+//! the mechanism that looks healthy while protecting nothing.
+//!
 //! **A command with one password session is built like this:**
 //!
 //! ```text
@@ -197,6 +212,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use sha2::{Digest as _, Sha256};
+
 use crate::tpm::{Digest, PcrPolicy, PcrSlot, TpmDevice, TpmError, TpmSealed};
 
 /// `TPM_ST_NO_SESSIONS`: the request carries no authorization area, which is
@@ -250,6 +267,65 @@ const TPM2_CLEAR: u32 = 0x0000_0126;
 /// handle, not a complaint about the session that follows. The two were read as
 /// one failure for six attempts; see the module docs.
 const TPM_RH_LOCKOUT: u32 = 0x4000_000A;
+
+// ---------------------------------------------------------------------------
+// The policy route: the state a PCR-bound object is sealed to, and the session
+// that satisfies that state at unseal time.
+//
+// Every constant and every byte order below was measured against `swtpm` with
+// `tpm2_policypcr` — the reference client — reading the same device, and the
+// measurement contradicts a plain reading of the specification in two places.
+// Both are recorded where they are used, because both were found the expensive
+// way.
+// ---------------------------------------------------------------------------
+
+/// `TPM2_StartAuthSession`.
+const TPM2_START_AUTH_SESSION: u32 = 0x0000_0176;
+
+/// `TPM2_PolicyPCR`.
+///
+/// Sent with `TPM_ST_NO_SESSIONS` and **no authorization area at all**, which is
+/// the second of the two contradictions. A policy command that authorizes
+/// nothing sends nothing: the session it names *is* the single handle, and the
+/// 58 bytes the reference client puts on the wire carry no session area between
+/// the handle and the parameters. Every attempt to build this command with the
+/// session area this module uses for `PCR_Extend` was answered `0x184` — a
+/// refusal naming the first handle, read for six attempts as a session problem
+/// when the area was the thing that had no business being there.
+const TPM2_POLICY_PCR: u32 = 0x0000_017F;
+
+/// `TPM2_PolicyGetDigest`: what the session has accumulated so far.
+const TPM2_POLICY_GET_DIGEST: u32 = 0x0000_0189;
+
+/// `TPM_ALG_NULL`: the session carries no symmetric encryption.
+const TPM_ALG_NULL: u16 = 0x0010;
+
+/// `TPM_SE_POLICY`. A trial session (`0x0002`) is refused by this device with
+/// `0x3C4`; a policy session is what a real seal needs.
+const TPM_SE_POLICY: u16 = 0x0001;
+
+/// `TPM_RH_NULL`: neither `tpmKey` nor `bind` is a key.
+const TPM_RH_NULL: u32 = 0x4000_0007;
+
+/// Bytes in the `nonceCaller` a policy session is started with.
+///
+/// The device accepts any length from 16 up to the digest size and truncates
+/// what it is given — measured: `SHA-256` sessions accepted 20 and 32 caller
+/// nonces and answered a 20-byte `nonceTPM` for the 20-byte request, while 48
+/// was refused with `0x1D5`. The digest size is sent because that is what the
+/// reference client sends, not because a smaller value was found to fail.
+const POLICY_SESSION_NONCE_BYTES: usize = 32;
+
+/// The byte the reference client sends between `nonceCaller` and `sessionType`.
+///
+/// **Its field is not established.** A reading of `TPM2_StartAuthSession` puts an
+/// `encryptedSalt` `TPM2B_AUTH` there, which is two bytes; the reference client
+/// sends one, and the device accepts one and refuses two (`0x4D6`). So this
+/// client sends what the device takes, and the value is not free: `0x00` is
+/// accepted, `0x01` is refused with `0x2DA` and anything else with `0x2D5` —
+/// a field with a permitted value, not padding. Naming it `encryptedSalt` would
+/// be a guess dressed as a fact, so it is named for what was measured.
+const POLICY_SESSION_UNNAMED_FIELD: u8 = 0x00;
 
 /// A TPM this module can reach, named by how it is reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -716,20 +792,99 @@ impl Tpm2Device {
             .map(|_| ())
     }
 
+    /// `TPM2_StartAuthSession`: a session that accumulates a policy digest.
+    ///
+    /// The policy route's first command, and the one whose parameter area this
+    /// client had wrong twice before. Measured against the reference client
+    /// reading the same device, the area after `nonceCaller` is **seven** bytes:
+    /// one byte the device requires to be `0x00`, then `sessionType`,
+    /// `symmetric` and `authHash`. A plausible reading of the command puts a
+    /// two-byte `encryptedSalt` there instead, and a request built that way is
+    /// answered `0x4D6` — a refusal about the request's length, from a command
+    /// whose length is the only thing that is wrong.
+    ///
+    /// `TPM_RH_NULL` for both handles: the session is bound to nothing and
+    /// encrypts to nothing, which is what makes the policy digest it
+    /// accumulates the only state it carries.
+    pub fn start_policy_session(&self) -> Result<PolicySession, Tpm2Error> {
+        let mut nonce = [0u8; POLICY_SESSION_NONCE_BYTES];
+        crate::envelope::fill_random_for_crate(&mut nonce);
+        let response = self.command(TPM2_START_AUTH_SESSION, &policy_session_body(&nonce))?;
+        let answer = response.into_body()?;
+        if answer.len() < 4 {
+            return Err(Tpm2Error::Malformed(
+                "no session handle on a StartAuthSession answer".into(),
+            ));
+        }
+        Ok(PolicySession {
+            handle: u32::from_be_bytes([answer[0], answer[1], answer[2], answer[3]]),
+        })
+    }
+
+    /// `TPM2_PolicyPCR`: require `slots` to hold the values the device reports
+    /// now, and advance the session's policy digest.
+    ///
+    /// Returns the `pcrDigest` that was sent, which is the input
+    /// [`advance_policy_digest`] needs to reproduce the policy this command
+    /// produces. Returning it is what lets a caller check the device's
+    /// arithmetic against its own rather than asking the device twice.
+    ///
+    /// The `pcrDigest` is **the hash of the PCR values themselves**, and the
+    /// device checks it: a digest of thirty-two zero bytes, of thirty-two `0xFF`
+    /// bytes, or of anything else that is not what the selected PCRs hash to,
+    /// is refused with `0x1C4` and the session's policy digest does not move.
+    /// That is why this call reads the PCRs first — which is also why the
+    /// reference client issues a `PCR_Read` immediately before its `PolicyPCR`.
+    pub fn policy_pcr(
+        &self,
+        session: PolicySession,
+        slots: &[PcrSlot],
+    ) -> Result<Digest, Tpm2Error> {
+        let pcr_digest = pcr_value_digest(&self.pcr_read(slots)?);
+        let body = policy_pcr_body(session.handle, &pcr_digest, &pcr_selection_body(slots)?);
+        self.command(TPM2_POLICY_PCR, &body)?
+            .into_body()
+            .map(|_| pcr_digest)
+    }
+
+    /// `TPM2_PolicyGetDigest`: the policy the session holds right now.
+    ///
+    /// A fresh policy session answers thirty-two zero bytes, measured. That is
+    /// the seed the policy chain starts from, and it is what
+    /// [`PolicySession::seed`] compares its own arithmetic against.
+    pub fn policy_digest(&self, session: PolicySession) -> Result<Digest, Tpm2Error> {
+        let response = self.command(TPM2_POLICY_GET_DIGEST, &session.handle.to_be_bytes())?;
+        let body = response.into_body()?;
+        // A TPM2B: a u16 length, then the bytes. The length is what the device
+        // says it sent, and a policy digest this client cannot compare is a
+        // refusal rather than a truncated answer.
+        if body.len() < 2 {
+            return Err(Tpm2Error::Malformed(
+                "no length on a PolicyGetDigest answer".into(),
+            ));
+        }
+        let length = u16::from_be_bytes([body[0], body[1]]) as usize;
+        if body.len() < 2 + length || length != 32 {
+            return Err(Tpm2Error::Malformed(
+                "a PolicyGetDigest answer is not a sha256 digest".into(),
+            ));
+        }
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&body[2..34]);
+        Ok(digest)
+    }
+
     /// One `PCR_Read` round trip, parsed and checked against what was asked.
     fn exchange_pcrs(&self, slots: &[PcrSlot]) -> Result<PcrRead, Tpm2Error> {
         if slots.is_empty() {
             return Err(Tpm2Error::Unsupported("no PCR was requested"));
         }
         let bitmap = selection_bitmap(slots, PC_CLIENT_PCR_SELECTION_BYTES)?;
-
-        let mut body = Vec::new();
-        // `TPML_PCR_SELECTION`: a count, then one `TPMS_PCR_SELECTION` of
-        // `hash` (u16), `sizeofSelect` (u8) and the bitmap itself.
-        body.extend_from_slice(&1u32.to_be_bytes());
-        body.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
-        body.push(PC_CLIENT_PCR_SELECTION_BYTES);
-        body.extend_from_slice(&bitmap);
+        // The same marshalling `TPM2_PolicyPCR` sends, byte for byte. Shared on
+        // purpose: the policy chain this module computes hashes exactly the
+        // bytes that go on the wire, and two copies of that encoding would be
+        // two places for them to drift apart.
+        let body = pcr_selection_body(slots)?;
         // **And nothing else.** `pcrUpdateCounter` is declared in-out, and
         // sending a four-byte zero for it makes a real TPM answer
         // `TPM_RC_SIZE` — a correct refusal of a request whose length does not
@@ -740,6 +895,138 @@ impl Tpm2Device {
         let response = self.command(TPM2_PCR_READ, &body)?;
         let answer = response.into_body()?;
         parse_pcr_read(&answer, &bitmap, slots.len())
+    }
+}
+
+/// A `TPML_PCR_SELECTION` for the SHA-256 bank, as one command carries it.
+///
+/// A count, then a `TPMS_PCR_SELECTION` of `hash` (u16), `sizeofSelect` (u8)
+/// and the bitmap. Written once because `PCR_Read` and `PolicyPCR` must agree
+/// on it to the byte: the policy chain is computed over this encoding.
+fn pcr_selection_body(slots: &[PcrSlot]) -> Result<Vec<u8>, Tpm2Error> {
+    let bitmap = selection_bitmap(slots, PC_CLIENT_PCR_SELECTION_BYTES)?;
+    let mut body = Vec::with_capacity(7 + bitmap.len());
+    body.extend_from_slice(&1u32.to_be_bytes());
+    body.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+    body.push(PC_CLIENT_PCR_SELECTION_BYTES);
+    body.extend_from_slice(&bitmap);
+    Ok(body)
+}
+
+/// The body of a `TPM2_StartAuthSession` for a policy session, `nonce` included.
+///
+/// Separate from the send so the layout can be compared with the reference
+/// client's bytes without a device on the other end.
+fn policy_session_body(nonce: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8 + 2 + nonce.len() + 7);
+    // `tpmKey` and `bind`, neither of which is a key.
+    body.extend_from_slice(&TPM_RH_NULL.to_be_bytes());
+    body.extend_from_slice(&TPM_RH_NULL.to_be_bytes());
+    // `nonceCaller`, then the seven bytes measured in the module docs.
+    body.extend_from_slice(&(nonce.len() as u16).to_be_bytes());
+    body.extend_from_slice(nonce);
+    body.push(POLICY_SESSION_UNNAMED_FIELD);
+    body.extend_from_slice(&TPM_SE_POLICY.to_be_bytes());
+    body.extend_from_slice(&TPM_ALG_NULL.to_be_bytes());
+    body.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+    body
+}
+
+/// The body of a `TPM2_PolicyPCR`: the session handle, then `pcrDigest`, then
+/// the selection.
+///
+/// The session handle is a **handle**, so it leads; and the request carries no
+/// authorization area, which is what `TPM2_POLICY_PCR`'s note says and what the
+/// reference client's 58 bytes show.
+fn policy_pcr_body(handle: u32, pcr_digest: &Digest, selection: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(4 + 2 + pcr_digest.len() + selection.len());
+    body.extend_from_slice(&handle.to_be_bytes());
+    body.extend_from_slice(&(pcr_digest.len() as u16).to_be_bytes());
+    body.extend_from_slice(pcr_digest);
+    body.extend_from_slice(selection);
+    body
+}
+
+/// The digest `TPM2_PolicyPCR` carries: the hash of the PCR values it names.
+///
+/// **In ascending PCR index order**, not in the order the caller listed them.
+/// The device concatenates the values the selection covers, sorted by index, and
+/// a digest computed over the caller's ordering is a digest of something the
+/// device did not name — which it answers `0x1C4`.
+pub fn pcr_value_digest(observed: &[(PcrSlot, Digest)]) -> Digest {
+    let mut ordered: Vec<(u8, Digest)> = observed
+        .iter()
+        .map(|(slot, digest)| (slot.index(), *digest))
+        .collect();
+    ordered.sort_by_key(|(index, _)| *index);
+    let mut hasher = Sha256::new();
+    for (_, digest) in ordered {
+        hasher.update(digest);
+    }
+    hasher.finalize().into()
+}
+
+/// The policy digest after one `TPM2_PolicyPCR`, computed rather than asked for.
+///
+/// `H(policyDigest ‖ TPM_CC_PolicyPCR ‖ pcrs ‖ pcrDigest)` — the chain a policy
+/// session walks, and the value a `sealed` object's `authPolicy` has to hold
+/// for the device to accept the session that satisfies it. Measured against
+/// `swtpm`: a fresh session's `0^256` and a selection of PCRs 0-3 produce
+/// `84b506c9…`, and asking the same session for its digest produces exactly
+/// that.
+///
+/// The point of computing it is that a client must be able to state the policy
+/// it is sealing to. A seal whose `authPolicy` was read back from the device
+/// after the fact would be a seal to whatever the device happened to hold.
+pub fn advance_policy_digest(
+    current: &Digest,
+    slots: &[PcrSlot],
+    pcr_digest: &Digest,
+) -> Result<Digest, Tpm2Error> {
+    Ok(advance_policy_digest_over(
+        current,
+        &pcr_selection_body(slots)?,
+        pcr_digest,
+    ))
+}
+
+/// [`advance_policy_digest`] over an already-marshalled selection.
+///
+/// Split so the chain can be checked against a value the device reported for a
+/// selection this crate does not model: `PcrSlot` names PCRs 0, 4 and 7, while
+/// the measurement that pinned the chain was taken over PCRs 0 to 3.
+fn advance_policy_digest_over(current: &Digest, selection: &[u8], pcr_digest: &Digest) -> Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(current);
+    hasher.update(TPM2_POLICY_PCR.to_be_bytes());
+    hasher.update(selection);
+    hasher.update(pcr_digest);
+    hasher.finalize().into()
+}
+
+/// A policy session: the TPM's own state for the policy being built.
+///
+/// Copyable and inert. It is a handle, so a session that outlives the device
+/// that issued it is a handle to nothing, and every command that takes one
+/// answers a refusal rather than a policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicySession {
+    handle: u32,
+}
+
+impl PolicySession {
+    /// The handle the device gave this session.
+    pub fn handle(&self) -> u32 {
+        self.handle
+    }
+
+    /// What this session's policy digest should be, computed locally.
+    ///
+    /// Starts at the seed a fresh session holds — thirty-two zero bytes,
+    /// measured — and is the value a caller compares
+    /// [`Tpm2Device::policy_digest`] against.
+    pub fn seed() -> Digest {
+        [0u8; 32]
     }
 }
 
@@ -1508,6 +1795,176 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // The policy route, pinned against the reference client's bytes.
+    //
+    // Both requests below are transcribed from what `tpm2_policypcr` and
+    // `tpm2_startauthsession` put on the wire, read out of the device's own log
+    // rather than out of a specification. Each one is a layout that reads as
+    // wrong: the `StartAuthSession` area has a byte this client cannot name, and
+    // `PolicyPCR` carries no authorization area at all, which is the opposite of
+    // the rule this module had learned from `PCR_Extend`.
+    // ---------------------------------------------------------------------
+
+    /// The 59 bytes a policy `StartAuthSession` is, spelled out.
+    ///
+    /// The nonce is the reference client's own, so the whole request is
+    /// comparable byte for byte. The `nonceCaller` is replaced in practice —
+    /// this client sends thirty-two fresh bytes — and the *shape* of that field
+    /// is what the rest of the request depends on.
+    #[test]
+    fn a_policy_session_is_the_request_the_reference_client_sends() {
+        let reference_nonce: Vec<u8> = vec![
+            0x84, 0xEF, 0xBF, 0x27, 0x05, 0x03, 0x72, 0x84, 0xB6, 0xE0, 0x97, 0x9B, 0x89, 0x9E,
+            0x15, 0xD3, 0xA9, 0x2F, 0xC4, 0x0D, 0x4A, 0x11, 0xC0, 0xCC, 0x78, 0x57, 0x71, 0x65,
+            0xBD, 0xF8, 0xB9, 0xF7,
+        ];
+        let body = policy_session_body(&reference_nonce);
+        let size = 10 + body.len();
+        let mut request = Vec::new();
+        request.extend_from_slice(&TPM_ST_NO_SESSIONS.to_be_bytes());
+        request.extend_from_slice(&(size as u32).to_be_bytes());
+        request.extend_from_slice(&TPM2_START_AUTH_SESSION.to_be_bytes());
+        request.extend_from_slice(&body);
+
+        let mut expected: Vec<u8> = vec![
+            0x80, 0x01, // TPM_ST_NO_SESSIONS
+            0x00, 0x00, 0x00, 0x3B, // commandSize = 59
+            0x00, 0x00, 0x01, 0x76, // TPM2_StartAuthSession
+            0x40, 0x00, 0x00, 0x07, // tpmKey = TPM_RH_NULL
+            0x40, 0x00, 0x00, 0x07, // bind = TPM_RH_NULL
+            0x00, 0x20, // nonceCaller, 32 bytes
+        ];
+        expected.extend_from_slice(&reference_nonce);
+        expected.extend_from_slice(&[
+            0x00, // the byte this client does not name; the device requires 0x00
+            0x00, 0x01, // sessionType = TPM_SE_POLICY
+            0x00, 0x10, // symmetric = TPM_ALG_NULL
+            0x00, 0x0B, // authHash = TPM_ALG_SHA256
+        ]);
+        assert_eq!(request, expected, "the wire layout changed");
+        assert_eq!(request.len(), 59, "the reference request is 59 bytes");
+    }
+
+    /// The 58 bytes a `PolicyPCR` is, spelled out.
+    ///
+    /// The selection is PCRs 0 to 3, which `PcrSlot` does not model, so this
+    /// pins the *encoding* rather than a slot list. What it pins hardest is the
+    /// absence: between the session handle and the `pcrDigest` there is no
+    /// authorization size, no `TPM_RS_PW` and no `TPMA_SESSION`, and a client
+    /// that added one would agree with every other command in this module and
+    /// be answered `0x184`.
+    #[test]
+    fn a_policy_pcr_is_the_request_the_reference_client_sends() {
+        let reference_digest: Digest = [
+            0x38, 0x72, 0x3A, 0x2E, 0x5E, 0x8A, 0x17, 0xAA, 0x79, 0x50, 0xDC, 0x00, 0x82, 0x09,
+            0x94, 0x4E, 0x89, 0x8F, 0x69, 0xA7, 0xBD, 0x10, 0xA2, 0x3C, 0x83, 0x9D, 0x34, 0x1E,
+            0x93, 0x5F, 0xD5, 0xCA,
+        ];
+        let reference_selection: Vec<u8> = vec![
+            0x00, 0x00, 0x00, 0x01, // one bank
+            0x00, 0x0B, // TPM_ALG_SHA256
+            0x03, // sizeofSelect
+            0x0F, 0x00, 0x00, // PCRs 0, 1, 2, 3
+        ];
+        let body = policy_pcr_body(0x0300_0000, &reference_digest, &reference_selection);
+        let size = 10 + body.len();
+        let mut request = Vec::new();
+        request.extend_from_slice(&TPM_ST_NO_SESSIONS.to_be_bytes());
+        request.extend_from_slice(&(size as u32).to_be_bytes());
+        request.extend_from_slice(&TPM2_POLICY_PCR.to_be_bytes());
+        request.extend_from_slice(&body);
+
+        let expected: Vec<u8> = vec![
+            0x80, 0x01, // TPM_ST_NO_SESSIONS
+            0x00, 0x00, 0x00, 0x3A, // commandSize = 58
+            0x00, 0x00, 0x01, 0x7F, // TPM2_PolicyPCR
+            0x03, 0x00, 0x00, 0x00, // pcrHandle = the policy session
+            0x00, 0x20, // pcrDigest, 32 bytes
+        ]
+        .into_iter()
+        .chain(reference_digest)
+        .chain(reference_selection)
+        .collect();
+        assert_eq!(request, expected, "the wire layout changed");
+        assert_eq!(request.len(), 58, "the reference request is 58 bytes");
+    }
+
+    /// The `pcrDigest` is the hash of the PCR values, in index order.
+    ///
+    /// The order matters because the device concatenates the values the
+    /// selection covers, sorted by PCR index, and a digest computed over the
+    /// caller's ordering names a set the device did not name. A client that
+    /// listed its slots in a different order would compute a digest that looks
+    /// right and is refused.
+    #[test]
+    fn the_pcr_digest_hashes_the_values_in_index_order_not_in_the_order_asked() {
+        let pcr0: Digest = [0x10; 32];
+        let pcr4: Digest = [0x44; 32];
+        let pcr7: Digest = [0x77; 32];
+
+        let in_order = pcr_value_digest(&[
+            (PcrSlot::Pcr0, pcr0),
+            (PcrSlot::Pcr4, pcr4),
+            (PcrSlot::Pcr7, pcr7),
+        ]);
+        let shuffled = pcr_value_digest(&[
+            (PcrSlot::Pcr7, pcr7),
+            (PcrSlot::Pcr0, pcr0),
+            (PcrSlot::Pcr4, pcr4),
+        ]);
+        assert_eq!(
+            in_order, shuffled,
+            "the digest must not depend on the order the caller listed the PCRs"
+        );
+
+        let mut hasher = Sha256::new();
+        hasher.update(pcr0);
+        hasher.update(pcr4);
+        hasher.update(pcr7);
+        let expected: Digest = hasher.finalize().into();
+        assert_eq!(in_order, expected, "it is the hash of the values");
+    }
+
+    /// The policy chain this client computes is the one the device reported.
+    ///
+    /// Pinned to a measured pair: over a selection of PCRs 0 to 3 on a device
+    /// whose PCRs were all zero, the device answered `84b506c9…` for a session
+    /// that started at `0^256`, and the same session asked a second time
+    /// answered `6dcc673f…`. Both fall out of the chain below, computed here
+    /// with no device in the loop — so a change to the formula is caught by a
+    /// test that cannot be explained by the fixture agreeing with the client.
+    #[test]
+    fn the_policy_chain_reproduces_the_digests_the_device_reported() {
+        let selection: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01, 0x00, 0x0B, 0x03, 0x0F, 0x00, 0x00];
+        // The digest of four zero-valued PCRs, which is what the reference
+        // client sent and what the device accepted.
+        let pcr_digest: Digest = [
+            0x38, 0x72, 0x3A, 0x2E, 0x5E, 0x8A, 0x17, 0xAA, 0x79, 0x50, 0xDC, 0x00, 0x82, 0x09,
+            0x94, 0x4E, 0x89, 0x8F, 0x69, 0xA7, 0xBD, 0x10, 0xA2, 0x3C, 0x83, 0x9D, 0x34, 0x1E,
+            0x93, 0x5F, 0xD5, 0xCA,
+        ];
+        let first = advance_policy_digest_over(&PolicySession::seed(), &selection, &pcr_digest);
+        let expected_first: Digest = [
+            0x84, 0xB5, 0x06, 0xC9, 0x1F, 0x20, 0x5E, 0x06, 0xAB, 0xD6, 0xF8, 0x3F, 0x26, 0x9D,
+            0x8D, 0x80, 0x11, 0xD4, 0x95, 0xE0, 0x92, 0x14, 0xA4, 0x0F, 0xE3, 0x2B, 0x46, 0x60,
+            0x30, 0x1D, 0xDA, 0x09,
+        ];
+        assert_eq!(first, expected_first, "the first step of the chain moved");
+
+        let second = advance_policy_digest_over(&first, &selection, &pcr_digest);
+        let expected_second: Digest = [
+            0x6D, 0xCC, 0x67, 0x3F, 0xD4, 0x6F, 0x7D, 0x26, 0xF5, 0x10, 0x35, 0x18, 0x3B, 0x7C,
+            0x34, 0xBE, 0x0E, 0x7E, 0x1C, 0x9F, 0x9D, 0x7E, 0x8C, 0xF6, 0x9F, 0xE5, 0x14, 0xBB,
+            0xB5, 0xED, 0x6E, 0xCE,
+        ];
+        assert_eq!(
+            second, expected_second,
+            "the chain must advance on the same input, as the device's own second \
+             answer showed"
+        );
+    }
+
+    // ---------------------------------------------------------------------
     // The session encoding, against a device.
     // ---------------------------------------------------------------------
 
@@ -1589,5 +2046,137 @@ mod tests {
             "the refusal should still name the missing handle, not the session; \
              it was {without_handle:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // The policy route, against a device.
+    // ---------------------------------------------------------------------
+
+    /// A policy session starts, and it starts at the seed the chain assumes.
+    ///
+    /// Two facts in one test because they are one fact: the session is
+    /// accepted, and the digest it holds before any policy command is
+    /// thirty-two zero bytes. The second is what makes the local chain
+    /// comparable at all — a seed this client guessed would make every later
+    /// comparison agree with a wrong number.
+    #[cfg(feature = "tpm-device")]
+    #[test]
+    fn a_policy_session_is_accepted_and_starts_at_the_seed() {
+        let swtpm = Swtpm::start();
+        let device = swtpm.device();
+        let session = device
+            .start_policy_session()
+            .expect("a policy session is accepted with the measured layout");
+        assert_ne!(
+            session.handle(),
+            0,
+            "the device named the session it opened"
+        );
+        assert_eq!(
+            device.policy_digest(session).expect("PolicyGetDigest"),
+            PolicySession::seed(),
+            "a fresh policy session holds thirty-two zero bytes; a different seed \
+             would make the locally computed chain meaningless"
+        );
+    }
+
+    /// `PolicyPCR` is accepted for the PCRs it names.
+    ///
+    /// The `pcrDigest` this sends is the hash of what the device just reported,
+    /// which is the value the device demands; a command built with the session
+    /// area this module uses for `PCR_Extend` is answered `0x184` instead.
+    #[cfg(feature = "tpm-device")]
+    #[test]
+    fn a_policy_pcr_is_accepted_for_the_pcrs_it_names() {
+        let swtpm = Swtpm::start();
+        let device = swtpm.device();
+        let session = device.start_policy_session().expect("policy session");
+        let digest = device
+            .policy_pcr(session, &[PcrSlot::Pcr0, PcrSlot::Pcr4])
+            .expect("PolicyPCR over the PCRs the device just reported");
+        assert_eq!(digest.len(), 32);
+        assert_ne!(
+            device.policy_digest(session).expect("PolicyGetDigest"),
+            PolicySession::seed(),
+            "an accepted PolicyPCR that left the policy where it started would \
+             satisfy a test that only checked for a lack of errors"
+        );
+    }
+
+    /// A `pcrDigest` the PCRs do not produce is refused, and moves nothing.
+    ///
+    /// This is the row that separates "the command is well formed" from "the
+    /// command says something true". Thirty-two zero bytes are a well-formed
+    /// `TPM2B_DIGEST` and the device answers `0x1C4` to them — and, measured
+    /// separately, so does a random digest. What the test asserts is the
+    /// refusal and the absence of movement, because the code is a property of
+    /// this build and the absence of movement is not.
+    #[cfg(feature = "tpm-device")]
+    #[test]
+    fn a_pcr_digest_the_pcrs_do_not_produce_is_refused_and_moves_nothing() {
+        let swtpm = Swtpm::start();
+        let device = swtpm.device();
+        let session = device.start_policy_session().expect("policy session");
+        let before = device.policy_digest(session).expect("PolicyGetDigest");
+
+        let body = policy_pcr_body(
+            session.handle(),
+            &[0u8; 32],
+            &pcr_selection_body(&[PcrSlot::Pcr0]).expect("selection"),
+        );
+        let refused = device
+            .command(TPM2_POLICY_PCR, &body)
+            .expect("a refused command is still an answer")
+            .into_body()
+            .expect_err("a pcrDigest of thirty-two zero bytes is not what PCR 0 hashes to");
+        assert!(
+            matches!(refused, Tpm2Error::Refused { .. }),
+            "the device should refuse it; it was {refused:?}"
+        );
+        assert_eq!(
+            device.policy_digest(session).expect("PolicyGetDigest"),
+            before,
+            "a refused PolicyPCR that advanced the policy would be the worst of \
+             both: an answer that failed and a state that moved"
+        );
+    }
+
+    /// The chain this client computes is the chain the device walks.
+    ///
+    /// The load-bearing test of the whole policy route. It reads the device's
+    /// digest after each step and compares it with the value computed here from
+    /// the previous one — so a wrong formula, a wrong selection encoding or a
+    /// wrong command code all show up as a disagreement between two
+    /// computations, neither of which is the other's source.
+    #[cfg(feature = "tpm-device")]
+    #[test]
+    fn the_policy_digest_this_client_computes_is_the_one_the_device_reports() {
+        let swtpm = Swtpm::start();
+        let device = swtpm.device();
+        let session = device.start_policy_session().expect("policy session");
+
+        let mut local = PolicySession::seed();
+        let mut steps: Vec<Vec<PcrSlot>> = vec![
+            vec![PcrSlot::Pcr0],
+            vec![PcrSlot::Pcr4],
+            vec![PcrSlot::Pcr0, PcrSlot::Pcr4, PcrSlot::Pcr7],
+        ];
+        // The order a caller happens to pass must not change the result, so one
+        // step is deliberately shuffled.
+        steps.push(vec![PcrSlot::Pcr7, PcrSlot::Pcr0, PcrSlot::Pcr4]);
+
+        for slots in steps {
+            let pcr_digest = device
+                .policy_pcr(session, &slots)
+                .expect("PolicyPCR over the PCRs the device just reported");
+            local = advance_policy_digest(&local, &slots, &pcr_digest)
+                .expect("the selection this client sends is one it can marshal");
+            assert_eq!(
+                device.policy_digest(session).expect("PolicyGetDigest"),
+                local,
+                "the device's policy digest and the one computed here disagree \
+                 after a PolicyPCR over {slots:?}"
+            );
+        }
     }
 }
