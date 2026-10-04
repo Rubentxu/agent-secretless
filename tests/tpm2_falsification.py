@@ -213,20 +213,16 @@ MUTATIONS = [
         path=TARGET,
         suite="default",
         # The refusal message has been rewritten twice since this row was
-        # written — each time the row's anchor went stale and the campaign
-        # refused to run at all, which is the guard working. It is anchored to
-        # the whole function so the next rewrite breaks it loudly.
+        # written, and each rewrite silently made the campaign unrunnable: R5
+        # quoted the whole function, the anchor check returned non-zero, and
+        # nothing consumed that exit code. It is anchored to the signature and
+        # the refusal call rather than to the message text, so the next rewrite
+        # of the prose cannot break it again.
         edits=[
             (
                 "    fn seal(&self, _kek: &[u8; 32], _pcr_policy: &PcrPolicy)"
                 " -> Result<TpmSealed, TpmError> {\n"
-                "        Err(TpmError::TpmRefused(\n"
-                "            \"this tpm2 device does not seal yet: CreateLoaded and Unseal work, but \\\n"
-                "             CreateLoaded has no creationPCR, and a policy-bound unseal needs a \\\n"
-                "             policy session and AES-CFB decryption of its response\"\n"
-                "                .to_string(),\n"
-                "        ))\n"
-                "    }",
+                "        Err(TpmError::TpmRefused(",
                 "    fn seal(&self, kek: &[u8; 32], pcr_policy: &PcrPolicy)"
                 " -> Result<TpmSealed, TpmError> {\n"
                 "        let _ = kek;\n"
@@ -235,8 +231,18 @@ MUTATIONS = [
                 "            pcr_policy: pcr_policy.clone(),\n"
                 "            policy_version: 1,\n"
                 "        })\n"
-                "    }",
-            )
+                "        /* Err(TpmError::TpmRefused(",
+            ),
+            (
+                "        ))\n"
+                "    }\n"
+                "\n"
+                "    /// Refuses rather than pretending. See [`TpmDevice::seal`].",
+                "        )) */\n"
+                "    }\n"
+                "\n"
+                "    /// Refuses rather than pretending. See [`TpmDevice::seal`].",
+            ),
         ],
     ),
     Mutation(

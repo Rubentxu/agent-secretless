@@ -84,12 +84,31 @@
 //! produces — the `authPolicy` an object would carry.
 //!
 //! That is the *state a seal would be to*, and a state is not a seal. What is
-//! still missing is `TPM2_CreateLoaded` carrying that `authPolicy` and
-//! `TPM2_Unseal` answering under the session — and the unseal's answer is
-//! encrypted with the session key, so AES-CFB decryption is part of that half,
-//! not an optional extra. A `seal` implemented now would have to either refuse
-//! or hand back a `PcrPolicy` that nothing enforces, and the second of those is
-//! the mechanism that looks healthy while protecting nothing.
+//! still missing here is the code, not a command the device refuses: a device
+//! accepts `TPM2_Create` under a primary with the `authPolicy` this chain
+//! computes, `TPM2_Load` of the resulting private/public pair, and `Unseal`
+//! under a session that satisfies the policy — all measured, returning the
+//! sealed bytes exactly.
+//!
+//! **A note on the encryption this module's sessions do *not* do.** An earlier
+//! draft of this file said the policy `Unseal` would answer in an encrypted
+//! parameter that has to be decrypted with AES-CFB first, and named that as
+//! the reason the seal was still open. A policy session started with
+//! `TPM_ALG_NULL` symmetric receives a **cleartext** response; `Unseal` answers
+//! `0` and its `outData` is the sealed bytes in the open. The decryption was
+//! an assumption, not a measurement, and it is named here because a file that
+//! says it has been removed is a weaker record than one that says what was
+//! believed and what replaced it.
+//!
+//! Two further measurements belong to whoever implements the seal, because
+//! both cost a wrong answer that read as a different problem. `TPM2_Create`
+//! has **four** parameters (`inSensitive`, `inPublic`, `outsideInfo`,
+//! `creationPCR`) and sending two of them is refused as if the attributes were
+//! wrong. And in a response carrying an authorization area the **response
+//! handles come before `parameterSize`** — reading that the other way round
+//! yields a transient handle of `0x80000000` that looks like a two-gigabyte
+//! size.
+//!
 //!
 //! **A command with one password session is built like this:**
 //!
@@ -1040,9 +1059,11 @@ impl TpmDevice for Tpm2Device {
     /// here the honest answer is that it is not implemented on this device.
     fn seal(&self, _kek: &[u8; 32], _pcr_policy: &PcrPolicy) -> Result<TpmSealed, TpmError> {
         Err(TpmError::TpmRefused(
-            "this tpm2 device does not seal yet: CreateLoaded and Unseal work, but \
-             CreateLoaded has no creationPCR, and a policy-bound unseal needs a \
-             policy session and AES-CFB decryption of its response"
+            "this tpm2 device does not seal yet: the device side is measured \
+             end to end - CreatePrimary, Create with the computed authPolicy, \
+             Load, and Unseal under a policy session returning the sealed bytes \
+             - and what is missing is this module writing it. ContextSave is \
+             refused 0x145 here, so Create/Load is the only durable route"
                 .to_string(),
         ))
     }
