@@ -29,10 +29,14 @@ Checked:
   document that describes the product to users was not updated with it.
 - **Suite size.** Every `N tests` token in every shipped README, and the
   `passed=N … ignored=N` arithmetic of the quick-start block, must agree with
-  what `cargo test -- --list` enumerates. The arithmetic is checked as a sum
-  rather than as two independent numbers on purpose: deriving the passed and
-  ignored split would mean running the whole suite, and a sum is enough to
-  catch a stale count, which is the failure this exists for.
+  what `cargo test -- --list` enumerates. The arithmetic is checked against the
+  tests the documented command can *reach*: the block's own `--skip` filters are
+  parsed and every enumerated name matching one is subtracted, so a block that
+  skips a test and then claims the full count is caught. This replaced a weaker
+  sum-only check whose stated justification — that deriving the split would mean
+  running the whole suite — measurement refuted; see "Why the split is derivable
+  after all" below for the argument and for the part that genuinely is not
+  derivable.
 - **Spec-pack inventory.** "20 documents, 19 ADRs" must match the filesystem.
   The count was 15 when there were 19.
 - **Status does not live in a README.** A `M<N> ✅` in a README fails. This is
@@ -51,6 +55,30 @@ It deliberately does not hardcode expected values — not 866, not 4, not 19. A
 guard that pins "866 tests" fails the moment a test is added, which is the
 normal case, and teaches maintainers to edit the guard instead of reading the
 document. The job is to catch contradiction.
+
+## Why the split is derivable after all
+
+The first version of the suite-size check compared `passed + ignored` against the
+enumerated total, and its docstring defended the sum on the grounds that
+"deriving the passed and ignored split would mean running the whole suite".
+Measurement found the argument wrong on its own terms. The quick-start block
+documents the command that produced the number, and that command carries its own
+`--skip` filters; `cargo test -- --list` — already invoked, already cached — emits
+the full name of every test, so the tests the command cannot reach are countable
+without executing anything. A block that skipped one test and claimed the full
+total was green under the sum, because the claim it was making was
+arithmetically impossible.
+
+The limit that does remain: the guard can bound how many tests the command can
+run, but it cannot say *which* of the reachable ones are `ignored` rather than
+`passed`, because that depends on the profile the command is built with. That is
+not a small gap. `uat_030_perf` carries
+`#[cfg_attr(debug_assertions, ignore = "…")]` on its p95 budget, so the same
+enumerated test is `ignored` under `cargo test` and `passed` under
+`cargo test --release` — measured, 1490us against a 6000us budget on this host.
+A prose sentence about "0 ignored" that names no profile is therefore outside
+what this guard can refute, and the fix for that class is to make the sentence
+name the profile rather than to teach the guard to guess it.
 
 It re-derives the suite size itself rather than reading it out of the gates
 table, even though `scripts/check-gate-status.py` enumerates the same thing in
@@ -80,6 +108,21 @@ PROTOCOL_CLAIM = re.compile(r"(?:protocol|protocolo)\s+v(\d+)\b", re.IGNORECASE)
 # The quick-start arithmetic: `passed=865 failed=0 ignored=1`.
 PASSED_CLAIM = re.compile(r"(?:passed|pasaron|aprobados)[=:]\s*(\d+)", re.IGNORECASE)
 IGNORED_CLAIM = re.compile(r"ignored[=:]\s*(\d+)", re.IGNORECASE)
+# A libtest skip filter, as it appears in a documented command. `--skip` takes a
+# substring, not a glob, so the same substring rule is applied when counting the
+# tests it keeps out.
+SKIP_FLAG = re.compile(r"--skip\s+(\S+)")
+# `cargo test`, and the two ways a documented command can narrow the run to a
+# subset of the workspace. A block that names a package is describing a subset
+# run, whose count is not the workspace enumeration and is not this check's
+# business: refusing it would mean punishing a README for documenting how to
+# test one crate.
+CARGO_TEST = re.compile(r"\bcargo\s+test\b")
+PACKAGE_SELECT = re.compile(r"(?:^|\s)(?:-p|--package)\s+\S+")
+# A fenced code block, captured whole so a claim and the command it documents can
+# be read from the same block. The pattern is deliberately loose about the info
+# string: a reader is not required to label the fence `bash` for this to apply.
+FENCED_BLOCK = re.compile(r"^```[^\n]*\n(.*?)^```", re.DOTALL | re.MULTILINE)
 # A milestone marked with a tick anywhere in a README.
 MILESTONE_TICK = re.compile(r"\bM(\d{1,2})\s*[✅✔]")
 
@@ -132,7 +175,14 @@ def protocol_version() -> int | None:
     return int(match.group(1)) if match else None
 
 
-def enumerated_tests() -> int | None:
+def enumerated_test_names() -> list[str] | None:
+    """Every test the workspace enumerates, by name.
+
+    The names are the point. A count cannot tell you which tests a documented
+    `--skip` keeps out of a run, and a count is what made the quick-start's
+    `passed=1194` — with a skip in the very command that produced it — pass a
+    guard that was checking the claim.
+    """
     proc = subprocess.run(
         ["cargo", "test", "--workspace", "--locked", "--", "--list"],
         cwd=REPO,
@@ -142,7 +192,12 @@ def enumerated_tests() -> int | None:
     )
     if proc.returncode != 0:
         return None
-    return sum(1 for line in proc.stdout.splitlines() if line.strip() and ": test" in line)
+    names = []
+    for line in proc.stdout.splitlines():
+        if not line.strip() or ": test" not in line:
+            continue
+        names.append(line.split(": test", 1)[0].strip())
+    return names
 
 
 def check_protocol_claims(failures: list[str]) -> None:
@@ -162,14 +217,27 @@ def check_protocol_claims(failures: list[str]) -> None:
                 )
 
 
+def reachable_tests(names: list[str], patterns: list[str]) -> list[str]:
+    """The tests a command carrying these `--skip` filters can still run.
+
+    libtest's `--skip` is a substring match, so a pattern is counted the same way
+    it filters. A pattern that matches nothing removes nothing: a typo in a
+    filter must not lower the ceiling and manufacture a failure against a
+    correct document, because a guard that punishes correct documents is one
+    maintainers disable on its first good day.
+    """
+    return [n for n in names if not any(p in n for p in patterns)]
+
+
 def check_suite_claims(failures: list[str]) -> None:
-    observed = enumerated_tests()
-    if observed is None:
+    names = enumerated_test_names()
+    if names is None:
         failures.append(
             "could not enumerate the suite (cargo test --list failed); refusing to "
             "pass a count claim that cannot be checked"
         )
         return
+    observed = len(names)
 
     for readme in readmes():
         text = readme.read_text(encoding="utf-8")
@@ -179,17 +247,36 @@ def check_suite_claims(failures: list[str]) -> None:
                     f"{readme.name} states {claimed} tests, {observed} are enumerated"
                 )
 
-        # The quick-start block's own arithmetic. A stale count fails the sum
-        # without needing the suite to be run, which is the whole point: the
-        # number that drifted by 174 was never re-derived by anything.
-        passed = PASSED_CLAIM.search(text)
-        ignored = IGNORED_CLAIM.search(text)
-        if passed and ignored:
+        # The quick-start block's own arithmetic, against what the command in
+        # that block can reach. A stale count fails the sum without needing the
+        # suite to be run, which is the whole point: the number that drifted by
+        # 174 was never re-derived by anything.
+        for block in FENCED_BLOCK.findall(text):
+            passed = PASSED_CLAIM.search(block)
+            ignored = IGNORED_CLAIM.search(block)
+            if not (passed and ignored):
+                continue
+            # Only a whole-workspace run carries a count this check can decide.
+            # A block documenting `cargo test -p somecrate` is describing a
+            # subset, and a guard that refused it would be punishing a README
+            # for being helpful.
+            if not CARGO_TEST.search(block) or PACKAGE_SELECT.search(block):
+                continue
+            patterns = SKIP_FLAG.findall(block)
+            reachable = reachable_tests(names, patterns)
+            skipped = observed - len(reachable)
             total = int(passed.group(1)) + int(ignored.group(1))
-            if total != observed:
+            if total != len(reachable):
+                detail = (
+                    f", and its own `--skip` filters exclude {skipped} of them"
+                    if skipped
+                    else ""
+                )
                 failures.append(
                     f"{readme.name} quick start states passed={passed.group(1)} "
-                    f"+ ignored={ignored.group(1)} = {total}, {observed} are enumerated"
+                    f"+ ignored={ignored.group(1)} = {total}, but the command it "
+                    f"documents can run {len(reachable)} of the {observed} "
+                    f"enumerated tests{detail}"
                 )
 
 

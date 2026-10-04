@@ -16,9 +16,19 @@ agente ──(sustituto / socket)──▶ broker ──(credencial real)──�
 
 > **Estado: pre-1.0, en v0.29.0. Sin certificar, y los gates lo dicen.**
 >
-> El workspace compila y hay **1194 tests enumerados** (1194 pasan, 0 ignorado, 0
-> fallan; el conteo lo vuelve a derivar el gate `R11 README test count` en cada
-> corrida de CI, así que esta línea ya no puede quedarse vieja). El vault, la
+> El workspace compila y hay **1194 tests enumerados**. Con `cargo test`, 1193
+> se ejecutan y pasan y 1 queda fuera de las compilaciones de depuración por
+> construcción: el presupuesto de latencia p95 lleva
+> `#[cfg_attr(debug_assertions, ignore)]`, porque un presupuesto de latencia
+> medido contra ed25519 en depuración es una afirmación sobre
+> `debug_assertions`, no sobre el producto. Ese test sí se ejecuta y pasa con
+> `--release` — medido aquí en 1490us contra un presupuesto de 6000us — así que
+> la corrida en release de abajo ejecuta los 1194. El conteo y la aritmética
+> del inicio rápido los vuelve a derivar en cada corrida de CI el gate
+> `R11 README test count`, que resta los filtros `--skip` que documenta el propio
+> inicio rápido en vez de comprobar una suma, de modo que un bloque que se salta
+> un test y luego afirma el conteo completo falla en vez de pasar sobre una
+> aritmética que no pudo ocurrir. El vault, la
 > firma SSH, los brokers HTTP y PostgreSQL, la política Cedar, la consola de
 > operador y el puente TLS sobre CONNECT existen y se ejercitan. El framework
 > OAuth2 está **implementado y en uso en producción** contra un authorization
@@ -178,13 +188,23 @@ es una suposición:
 cargo build --release -p asv-broker
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# esperado: passed=1194 failed=0 ignored=0
+# esperado: passed=1192 failed=0 ignored=0
 ```
+
+1192 y no 1194 porque el comando de arriba se salta dos: `uat_028` levanta un
+`sshd` real y necesita un host donde correr, y el presupuesto p95 se afirma por
+separado en `--release` para que el inicio rápido siga siendo rápido. Los dos
+saltos se cuentan como filtrados, no como ignorados, así que 1192 + 2
+filtrados son los 1194 enumerados.
 
 Ese número era `passed=692` en este fichero durante varios milestones, y nada
 lo comprobaba: un conteo viejo en un README es una afirmación como cualquier
 otra, y este guard (`scripts/check-doc-claims.py`) ahora lo vuelve a derivar en
-lugar de dejarlo a la memoria.
+lugar de dejarlo a la memoria. Al principio comprobaba `passed + ignored` como
+una suma, y así es como un `passed=1194` estuvo un tiempo en este bloque: la
+suma era correcta, la afirmación era imposible, y un guard que sólo suma no
+puede ver que el comando del mismo bloque se salta los dos tests que el número
+está contando.
 
 Prueba el broker con un vault:
 

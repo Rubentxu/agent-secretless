@@ -14,9 +14,12 @@ thirteenth.
 
 Each case builds a synthetic repository, mutates exactly one claim, and
 requires the guard to notice. The suite-size check derives its expected value
-from a stubbed `enumerated_tests`, because running the real suite once per case
-would make a unit test into an integration test and buy nothing: what is under
-test is the comparison, not `cargo`.
+from a stubbed `enumerated_test_names`, because running the real suite once per
+case would make a unit test into an integration test and buy nothing: what is
+under test is the comparison, not `cargo`. The stub returns *names* rather than
+a count for the reason the check now needs one: a `--skip` filter can only be
+applied to a name, and a stub of a count cannot express "this filter removes
+this test".
 
 Run: python3 tests/doc_claims_drift.py
 """
@@ -40,6 +43,21 @@ PASSED = 865
 IGNORED = 1
 DOC_COUNT = 20
 ADR_COUNT = 19
+
+# Two of the synthetic names are spelled the way the real ones are, because the
+# skip-filter cases are only meaningful if the pattern the README documents
+# actually matches something in the enumeration. They are the two the shipped
+# quick-start skips: a live OpenSSH round trip and a p95 latency budget.
+SKIPPED_IN_FIXTURE = (
+    "ssh_agent::uat_028_openssh_authenticates_through_the_broker_socket",
+    "broker::one_hundred_brokered_reads_stay_under_the_p95_budget",
+)
+
+
+def synthetic_test_names(count: int = ENUMERATED) -> list[str]:
+    names = list(SKIPPED_IN_FIXTURE)
+    names += [f"crate{i}::unit::test_{i:04d}" for i in range(count - len(names))]
+    return names
 
 
 def load_guard():
@@ -107,15 +125,17 @@ def build_tree(root: Path) -> dict[str, Path]:
     }
 
 
-def run_checks(tree: dict[str, Path], stub_enumerated: int = ENUMERATED):
+def run_checks(tree: dict[str, Path], stub_names: list[str] | None = None):
     """Run every check against a synthetic tree, with cargo stubbed out.
 
     Returns the accumulated failures.
     """
     guard = load_guard()
-    original_repo, original_enum = guard.REPO, guard.enumerated_tests
+    original_repo, original_names = guard.REPO, guard.enumerated_test_names
     guard.REPO = tree["root"]
-    guard.enumerated_tests = lambda: stub_enumerated
+    guard.enumerated_test_names = lambda: (
+        synthetic_test_names() if stub_names is None else stub_names
+    )
     failures: list[str] = []
     try:
         guard.check_protocol_claims(failures)
@@ -124,7 +144,7 @@ def run_checks(tree: dict[str, Path], stub_enumerated: int = ENUMERATED):
         guard.check_no_status_in_readme(failures)
         guard.check_vocabulary(failures)
     finally:
-        guard.REPO, guard.enumerated_tests = original_repo, original_enum
+        guard.REPO, guard.enumerated_test_names = original_repo, original_names
     return failures
 
 
@@ -336,7 +356,87 @@ def main() -> int:
         )
     )
 
-    # 12. The real repository, through the real entry point. Everything above
+    # 12. The false claim this increment was written for, in miniature. The
+    #     block skips a test and then claims the full count: the sum
+    #     `passed + ignored` is arithmetically consistent with the enumeration
+    #     and the claim is still impossible, because the command cannot run the
+    #     test it skipped. The sum-only version of this check passed it.
+    results.append(
+        case(
+            "a quick start that skips a test and claims the full count is caught",
+            expect_pass=False,
+            mutate=lambda t: t["readme"].write_text(
+                t["readme"].read_text(encoding="utf-8").replace(
+                    "cargo test --workspace --release\n",
+                    "cargo test --workspace --release -- --skip uat_028\n",
+                ),
+                encoding="utf-8",
+            ),
+            must_contain="exclude 1 of them",
+        )
+    )
+
+    # 13. The control for case 12. The same command, with the count corrected to
+    #     what it can actually pass, must pass — otherwise the check would be
+    #     punishing the honest document instead of the false one, which is how
+    #     a guard gets disabled.
+    results.append(
+        case(
+            "a quick start that skips a test and claims only what it can run passes",
+            expect_pass=True,
+            mutate=lambda t: t["readme"].write_text(
+                t["readme"].read_text(encoding="utf-8")
+                .replace(
+                    "cargo test --workspace --release\n",
+                    "cargo test --workspace --release -- --skip uat_028\n",
+                )
+                .replace(
+                    f"passed={PASSED} failed=0 ignored={IGNORED}",
+                    f"passed={PASSED - 1} failed=0 ignored={IGNORED}",
+                ),
+                encoding="utf-8",
+            ),
+        )
+    )
+
+    # 14. A filter that matches nothing removes nothing. A typo in `--skip` must
+    #     not lower the ceiling and turn a correct document into a failure; the
+    #     guard cannot know whether the author meant to skip that test, and
+    #     guessing is how a guard starts refusing work it should do.
+    results.append(
+        case(
+            "a --skip filter that matches no test does not lower the ceiling",
+            expect_pass=True,
+            mutate=lambda t: t["readme"].write_text(
+                t["readme"].read_text(encoding="utf-8").replace(
+                    "cargo test --workspace --release\n",
+                    "cargo test --workspace --release -- --skip uat_999_no_such_test\n",
+                ),
+                encoding="utf-8",
+            ),
+        )
+    )
+
+    # 15. Two filters, both real: the shipped shape, where the count that is
+    #     impossible is off by exactly the number the filters exclude. A check
+    #     that only ever sees one filter would still pass this claim.
+    results.append(
+        case(
+            "two skip filters are both counted",
+            expect_pass=False,
+            mutate=lambda t: t["readme"].write_text(
+                t["readme"].read_text(encoding="utf-8").replace(
+                    "cargo test --workspace --release\n",
+                    "cargo test --workspace --release -- "
+                    "--skip uat_028 --skip one_hundred_brokered_reads\n",
+                ),
+                encoding="utf-8",
+            ),
+            must_contain="exclude 2 of them",
+        )
+    )
+
+    # 16. The real repository, through the real entry point. Everything above
     #     drives the check functions against synthetic trees; this runs the
     #     guard as CI runs it. It is the control that says the synthetic cases
     #     are testing the shipped behaviour and not a parallel implementation.
