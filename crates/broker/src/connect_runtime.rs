@@ -273,6 +273,35 @@ impl std::fmt::Debug for SubstitutingHandler {
     }
 }
 
+/// The route table, answering the question the bridge asks before it dials.
+///
+/// A newtype rather than an impl on `ConnectRouteSet` so the route module stays
+/// ignorant of the bridge: the question "how do I reach this destination" is the
+/// bridge's, and the answer happens to be a field of a route.
+#[derive(Debug, Clone)]
+pub struct RouteTransports(pub Arc<crate::connect_routes::ConnectRouteSet>);
+
+impl crate::tls_bridge::UpstreamTransportPolicy for RouteTransports {
+    fn transport_for(
+        &self,
+        target: &crate::tls_bridge::AuthorityEndpoint,
+    ) -> Result<crate::connect_routes::UpstreamTransport, crate::tls_bridge::BridgeError> {
+        // A destination with no route is refused here rather than defaulting.
+        // It has already been refused once, by the policy, and reaching this
+        // point without a route means the two disagree — which the handler
+        // reports in its own words a moment later. Returning a transport here
+        // would dial something on the strength of a disagreement.
+        self.0
+            .route_for(target)
+            .map(|route| route.upstream())
+            .ok_or_else(|| {
+                crate::tls_bridge::BridgeError::Upstream(format!(
+                    "no route declares how to reach {target}, so the broker will not dial it"
+                ))
+            })
+    }
+}
+
 impl ConnectionHandler for SubstitutingHandler {
     fn run(&self, mut tunnel: EstablishedTunnel) -> Result<(), BridgeError> {
         // Which family and credential this tunnel may spend is the *route's*

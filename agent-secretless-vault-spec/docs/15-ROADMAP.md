@@ -1890,7 +1890,7 @@ fails for any other reason counts as an escape rather than as a pass.
 
 ## C2.8 — CONNECT in production, and the first thing that is not
 
-### Status: open. Seven measurements in; the fifth built the multi-request loop and found four defects in it, the sixth falsified the loop and found two more, and the seventh carried a real `npm install` through it and found the boundary of the design. Every defect so far sat under a green test
+### Status: open. Eight measurements in; the fifth built the multi-request loop and found four defects in it, the sixth falsified the loop and found two more, the seventh carried a real `npm install` through it and found the boundary of the design, and the eighth built the TLS leg from the broker to the destination and found a hole in the tests where a defect was assumed. Every defect so far sat under a green test
 
 V1-C2's scope, written when the block was opened and not narrowed since: *a
 production listener wiring `relay_substituted` into a running `asv-brokerd`,
@@ -2436,26 +2436,70 @@ turned a correct behaviour into a phantom discrepancy. It is reported as an uppe
 bound now, and the origin remains the witness: it counts what it was handed, and
 nothing the broker says about itself can move that number.
 
-**Still owed in this block.** **TLS on the leg from the broker to the
-destination**, without which a real HTTPS registry is unreachable and every claim
-above is scoped to a local origin. Its shape is small at the code and not small
-at the decision, and the decision is the part worth writing down now: the broker
-has no destination trust anchors at all, so the anchors have to become
-**configurable** rather than a constant. A hardcoded public root set would verify
-`registry.npmjs.org` and refuse every destination an operator runs on a private
-CA — and would leave no seam for a test to inject a root into, which is the same
-"the only way to check this assertion is the one this product cannot reach"
-problem the anti-replay window's comment says it resolved. So the increment is:
-an anchors argument beside `--connect-routes` and `--policy`, a client handshake
-at the one connect site in `serve_connect`, `EstablishedTunnel.upstream` widened
-from `TcpStream` to something that is `Read + Write` and still exposes its socket
-for `set_read_timeout`, a TLS origin in the broker's tests, and a campaign row
-for the property that matters most — **a destination whose certificate does not
-verify is refused before a single byte carrying the credential is written to it.**
-`webpki-roots` is already in `Cargo.lock` as a transitive dependency, so the
-default needs no crate this workspace does not already build; what is undecided
-is whether the bundled public roots are the right *default* for a credential
-broker, and that is a threat-model question rather than an implementation one. Stress and cancellation under load beyond the
+**The eighth measurement closed the leg, and the way it was closed is the part
+worth reading.** The increment this section owed is built: the transport is a
+required field of `ConnectRoute`, the bridge dials TLS and verifies against
+operator anchors, and a bridge with no transport declared reaches nothing. What
+the campaign then found is not a defect in the product but a **hole where one
+was assumed to be.**
+
+`tests/upstream_tls_falsification.py` has 8 rows. On its first run, seven went
+red and one came back **ESCAPE**: *a route that declares `tls` is dialled in the
+clear* — the declaration silently ignored and the real credential put on the wire
+in the open, which is the entire leak this block exists to close. The mutation
+was sound. The problem was that **nothing in the workspace had ever constructed
+the policy production uses.** All five original properties were measured through
+a test-local `Always` that answers whatever it is handed, while the real
+implementation is `RouteTransports`. So the leak itself was untested, and every
+other row in the campaign had a witness.
+
+```text
+R2 a route that declares tls is dialled in the clear   ESCAPE   -> hole, not defect
+```
+
+**A campaign row that escapes is a statement about the tests, not about the
+mutation.** Reading it the other way round is how a suite ends up green and
+wrong, and the cost here was the highest in this block. The hole is closed by two
+tests, and the second is the subtle one: `a_destination_no_route_declares_is_not
+_dialled` builds the two gates **disagreeing on purpose** — the table names one
+host, the bridge's policy authorizes another — because with them in agreement the
+policy refuses first and the test would have measured *that* refusal, which is a
+real property and not this one. **8/8 red by their named assertion, no residue.**
+
+Three more defects, all of them in the measurement rather than the product, and
+all the same failure as the L3/L4 pair the relay campaign found: a row that
+cannot run is not a pass. R1's mutation did not compile — twice, as a doubled
+`.map` and then as a `Result` unwrapped as an `Option` — so that row had never
+measured anything. The runner selected rows by reading `sys.argv[1:]` while
+`argparse` had no positionals declared, so **no single row could be re-run at
+all**. And reproducing R1 by hand had left the mutation applied to the tree, so
+`RouteTransports` was answering `Cleartext` for any destination with no route —
+the fail-open default the change exists to prevent — with the suite green around
+it.
+
+**What the property is, stated so it can be checked.** The refusal has to happen
+at the handshake, before the credential is written, and that is asserted on
+**whether `serve_connect` returned a tunnel** rather than on the origin's buffer:
+a destination whose handshake failed cannot report bytes it never got to read, so
+the buffer cannot distinguish "refused first" from "refused after handing over
+the secret". Row T2 deletes the eager handshake and the suite stays green on the
+buffer alone — which is why the test was split, and why the split is the
+assertion rather than a convenience.
+
+**Still owed in this block.** **The default for `--connect-roots` is asserted by
+a log line.** A broker started without the flag has an empty anchor store and
+verifies nothing; that is the right reading, and no test starts the real binary
+without the flag to watch it happen. It is a cheap test and it is not written.
+**No public HTTPS destination has been reached through this**, because that needs
+the bundled-roots decision, and that decision is still open: a fixed public root
+set would verify `registry.npmjs.org` with this product's credentials and refuse
+every destination an operator runs on a private CA. `webpki-roots` is in
+`Cargo.lock` only transitively, so choosing it is a new dependency and the
+campaign could not falsify that choice. And **every fixture in this repository
+still dials a loopback origin in `cleartext`**, so the end-to-end verticals
+exercise the `cleartext` declaration and not the `tls` one — the TLS leg is
+measured against a locally minted CA, which is honest and is not the same as a
+registry. Also still owed: **stress and cancellation under load** beyond the
 anti-replay property already measured. And **the broker has no ordered shutdown at
 all**: `main.rs` installs no signal handling, so tunnels dying when the process
 stops is carried entirely by the process dying. That is a real guarantee from the

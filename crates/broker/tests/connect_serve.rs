@@ -17,8 +17,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use asv_broker::tls_bridge::{
-    issue_leaf, AuthorityEndpoint, Bridge, BridgeError, ConnectPolicy, LeafError, LeafSource,
-    SessionCa, SessionProofs, UpstreamResolver, VerifiedLeaf, SESSION_PROOF_HEADER,
+    issue_leaf, AuthorityEndpoint, Bridge, BridgeError, CleartextUpstream, ConnectPolicy,
+    LeafError, LeafSource, SessionCa, SessionProofs, UpstreamResolver, VerifiedLeaf,
+    SESSION_PROOF_HEADER,
 };
 use asv_domain::{AgentSessionId, Authority};
 use asv_tls_acceptor::LeafMaterial;
@@ -168,10 +169,19 @@ fn endpoint(host: &str, port: u16) -> AuthorityEndpoint {
     AuthorityEndpoint::new(Authority::canonicalize(host).expect("host"), port).expect("endpoint")
 }
 
+/// A bridge that reaches its destination in the clear.
+///
+/// Said rather than defaulted: these origins are loopback plain HTTP, and a
+/// `Bridge` that could only be configured one way would have nothing to say
+/// about a destination it refuses to reach at all.
 fn bridge_allowing(host: &str, port: u16) -> Bridge {
     Bridge::new(ConnectPolicy {
         allowed: vec![endpoint(host, port)],
     })
+    .with_upstream(
+        std::sync::Arc::new(CleartextUpstream),
+        std::sync::Arc::new(rustls::RootCertStore::empty()),
+    )
 }
 
 /// Connects to `listener`, sends the CONNECT head, and returns both halves:

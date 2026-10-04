@@ -470,6 +470,10 @@ def main() -> int:
         "operation_family": "git_hub",
         "credential": credential_id,
         "minimum_posture": "STRONG_SECRETLESS",
+        # C2.8: how the broker reaches this destination. Required, and named
+        # rather than defaulted, because the credential crosses this leg and
+        # "the default happens to be cleartext" is not a decision anyone made.
+        "upstream": "cleartext",
     }]))
     policy = work / "policy.cedar"
     policy.write_text(

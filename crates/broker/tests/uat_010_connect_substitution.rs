@@ -47,8 +47,8 @@ use std::time::{Duration, Instant};
 use asv_broker::audit::{AuditLog, SubstitutionRecorder};
 use asv_broker::connect_runtime::SharedSessions;
 use asv_broker::tls_bridge::{
-    issue_leaf, proof_nonce, AuthorityEndpoint, Bridge, BridgeError, ConnectPolicy,
-    EstablishedTunnel, LeafError, LeafSource, RelayLimits, SessionCa, SessionProofs,
+    issue_leaf, proof_nonce, AuthorityEndpoint, Bridge, BridgeError, CleartextUpstream,
+    ConnectPolicy, EstablishedTunnel, LeafError, LeafSource, RelayLimits, SessionCa, SessionProofs,
     SubstitutionError, SubstitutionOutcome, SubstitutionRecord, UpstreamResolver, VerifiedLeaf,
     SESSION_PROOF_HEADER,
 };
@@ -273,9 +273,23 @@ enum Who {
 /// cannot be cloned into a thread: keeping it on the `Rig` produced a field
 /// nothing read and three copies of the same policy.
 fn policy() -> Bridge {
-    Bridge::new(ConnectPolicy {
+    cleartext_bridge(ConnectPolicy {
         allowed: vec![endpoint(HOST, 443), endpoint(HOST, OTHER_PORT)],
     })
+}
+
+/// A bridge that reaches every destination in the clear.
+///
+/// **Stated, not defaulted.** A `Bridge` with no transport policy reaches
+/// nothing at all, so every fixture here has to say how it dials — and what it
+/// says is a real property, not a formality: these origins are loopback plain
+/// HTTP, so the credential crosses this leg in the clear, and the test that
+/// says so is the one that should have to say so.
+fn cleartext_bridge(policy: ConnectPolicy) -> Bridge {
+    Bridge::new(policy).with_upstream(
+        Arc::new(CleartextUpstream),
+        Arc::new(rustls::RootCertStore::empty()),
+    )
 }
 
 /// An origin that answers a **script** of raw responses, one per request, and
@@ -1179,7 +1193,7 @@ fn an_unauthorised_destination_is_refused_before_the_proof_is_looked_at() {
     client.flush().expect("flush");
 
     // A policy that allows only HOST:443.
-    let bridge = Bridge::new(ConnectPolicy {
+    let bridge = cleartext_bridge(ConnectPolicy {
         allowed: vec![endpoint(HOST, 443)],
     });
     let leaves = SessionLeaves { ca: Arc::new(ca) };

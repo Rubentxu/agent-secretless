@@ -42,7 +42,7 @@ use asv_domain::AgentSessionId;
 
 use crate::tls_bridge::{
     AuthorityEndpoint, Bridge, BridgeError, Cancel, CancelReason, ConnectPolicy, EstablishedTunnel,
-    LeafSource, RelayLimits, SessionProofs, UpstreamResolver,
+    LeafSource, RelayLimits, SessionProofs, UpstreamResolver, UpstreamTransportPolicy,
 };
 
 /// The shutdown and revocation state a listener polls on every socket read.
@@ -357,6 +357,22 @@ impl ConnectListener {
             shutdown,
             config,
         }
+    }
+
+    /// Say how each destination is reached, and against which anchors.
+    ///
+    /// Separate from [`ConnectListener::new`] because a listener that could
+    /// only be built one way would have nowhere to put this, and "nowhere to
+    /// put it" is how a credential ends up crossing a socket nobody chose. Left
+    /// unset, the bridge reaches no destination at all rather than reaching one
+    /// the clear.
+    pub fn with_upstream_transport(
+        mut self,
+        policy: Arc<dyn UpstreamTransportPolicy + Send + Sync>,
+        roots: Arc<rustls::RootCertStore>,
+    ) -> Self {
+        self.bridge = self.bridge.with_upstream(policy, roots);
+        self
     }
 
     pub fn config(&self) -> &ListenerConfig {

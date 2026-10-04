@@ -776,16 +776,53 @@ pub struct Bridge {
     cancel: Option<std::sync::Arc<dyn Cancel>>,
     /// How long a client may take to send its CONNECT head.
     head_deadline: Option<std::time::Duration>,
+    /// How each destination is reached. `None` means **no transport has been
+    /// declared for anything**, and every destination is refused.
+    ///
+    /// Fail-closed rather than defaulting to cleartext, because the previous
+    /// revision of this file had no such field and dialled a bare `TcpStream`:
+    /// the credential this product exists to withhold crossed the last hop in
+    /// the clear, on every tunnel, with nothing in the configuration saying so.
+    /// A bridge that cannot dial anything until something says how is the only
+    /// version of this that cannot be wrong by omission.
+    upstream: Option<std::sync::Arc<dyn UpstreamTransportPolicy>>,
+    /// The anchors a destination's certificate is verified against.
+    ///
+    /// **Not the public root set.** It is exactly what the operator supplied,
+    /// and an empty store verifies nothing, so a broker with no `--connect-roots`
+    /// refuses every TLS destination rather than trusting the world's CAs to
+    /// decide who gets this product's credentials. A hardcoded public bundle
+    /// would have been one line and would have been wrong in two directions: it
+    /// verifies any host on the internet, and it refuses every destination an
+    /// operator runs on a private CA.
+    destination_roots: std::sync::Arc<rustls::RootCertStore>,
 }
 
 impl Bridge {
     /// Build a bridge from a CONNECT policy.
+    ///
+    /// The bridge that comes out of this reaches no destination at all, because
+    /// nothing has said how to reach one. That is a deliberate starting point
+    /// rather than an oversight to be tidied away with a default.
     pub fn new(policy: ConnectPolicy) -> Self {
         Self {
             policy,
             cancel: None,
             head_deadline: None,
+            upstream: None,
+            destination_roots: std::sync::Arc::new(rustls::RootCertStore::empty()),
         }
+    }
+
+    /// Say how each destination is reached, and against which anchors.
+    pub fn with_upstream(
+        mut self,
+        policy: std::sync::Arc<dyn UpstreamTransportPolicy>,
+        roots: std::sync::Arc<rustls::RootCertStore>,
+    ) -> Self {
+        self.upstream = Some(policy);
+        self.destination_roots = roots;
+        self
     }
 
     /// Make this bridge interruptible.
@@ -809,6 +846,57 @@ impl Bridge {
     pub fn with_head_deadline(mut self, d: std::time::Duration) -> Self {
         self.head_deadline = Some(d);
         self
+    }
+
+    /// Turn a connected socket into the leg the operator declared for it.
+    ///
+    /// Three outcomes, and the one that is easiest to write is the one this
+    /// refuses to write: there is no default. A bridge with no transport policy
+    /// dials nothing, so "I forgot to configure it" and "the destination is
+    /// down" are not the same failure.
+    fn dial_upstream(
+        &self,
+        socket: TcpStream,
+        target: &AuthorityEndpoint,
+    ) -> Result<Upstream, BridgeError> {
+        let Some(policy) = self.upstream.as_deref() else {
+            return Err(BridgeError::Upstream(format!(
+                "no upstream transport is declared for {}, so this broker reaches no \
+                 destination at all",
+                target.host()
+            )));
+        };
+        match policy.transport_for(target)? {
+            crate::connect_routes::UpstreamTransport::Cleartext => Ok(Upstream::Plain(socket)),
+            crate::connect_routes::UpstreamTransport::Tls => {
+                // The name checked is the route's host, never the resolved
+                // address: a certificate is issued for a name, and verifying
+                // against an IP literal would accept a certificate minted for
+                // any other host on that address.
+                let name = rustls::pki_types::ServerName::try_from(target.host().to_owned())
+                    .map_err(|_| {
+                        BridgeError::Handshake(format!(
+                            "{} is not a name a certificate can be issued for",
+                            target.host()
+                        ))
+                    })?;
+                let config = rustls::ClientConfig::builder()
+                    .with_root_certificates(self.destination_roots.as_ref().clone())
+                    .with_no_client_auth();
+                let connection = rustls::ClientConnection::new(std::sync::Arc::new(config), name)
+                    .map_err(|e| BridgeError::Handshake(e.to_string()))?;
+                let mut tls = rustls::StreamOwned::new(connection, socket);
+                // Complete the handshake here rather than lazily on the first
+                // read. Lazily, a destination that presents a bad certificate
+                // fails *mid-body*, after the credential has already been
+                // written to it — which is the whole failure this function
+                // exists to prevent.
+                tls.conn
+                    .complete_io(&mut tls.sock)
+                    .map_err(|e| BridgeError::Handshake(format!("{target}: {e}")))?;
+                Ok(Upstream::Tls(Box::new(tls)))
+            }
+        }
     }
 
     /// The cancellation source, or a never-cancelled stand-in.
@@ -919,6 +1007,111 @@ pub trait UpstreamResolver {
     fn resolve(&self, target: &AuthorityEndpoint) -> Result<SocketAddr, BridgeError>;
 }
 
+/// How the broker reaches a destination.
+///
+/// An enum rather than a `Box<dyn Read + Write>` because the relay needs the
+/// socket underneath it — `set_read_timeout` is what turns a blocking read into
+/// a pollable one, and a trait object would have hidden the one method that
+/// makes revocation reach a live tunnel. Both variants are the same product
+/// decision made explicit, which is why the wrong one is spelled rather than
+/// guessed.
+#[derive(Debug)]
+pub enum Upstream {
+    /// A plain socket. The credential crosses this leg in the clear.
+    Plain(TcpStream),
+    /// TLS to the destination, verified against the bridge's anchors and the
+    /// route's host name.
+    ///
+    /// **Boxed, and that is not tidiness.** `StreamOwned<ClientConnection,
+    /// TcpStream>` is over a kilobyte — it carries a whole TLS session — while
+    /// `TcpStream` is four bytes. Unboxed, every `EstablishedTunnel` and every
+    /// `Upstream` handed across a thread boundary was a kilobyte wider than the
+    /// cleartext case, for a destination that may be neither. `clippy`'s
+    /// `large_enum_variant` caught it, and the one-byte allocation is the right
+    /// price for it.
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Upstream {
+    /// The socket underneath, for `SO_RCVTIMEO`.
+    ///
+    /// Reach the socket rather than trying to set a deadline on the TLS layer:
+    /// `set_read_timeout` is a property of the file description, and the relay
+    /// arms it once for the whole tunnel and disarms it once after.
+    pub fn sock(&self) -> &TcpStream {
+        match self {
+            Upstream::Plain(tcp) => tcp,
+            Upstream::Tls(tls) => &tls.sock,
+        }
+    }
+
+    /// Whether this leg is encrypted, for the log line an operator reads.
+    pub fn is_tls(&self) -> bool {
+        matches!(self, Upstream::Tls(_))
+    }
+}
+
+impl std::io::Read for Upstream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Upstream::Plain(tcp) => tcp.read(buf),
+            Upstream::Tls(tls) => tls.read(buf),
+        }
+    }
+}
+
+impl std::io::Write for Upstream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Upstream::Plain(tcp) => tcp.write(buf),
+            Upstream::Tls(tls) => tls.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Upstream::Plain(tcp) => tcp.flush(),
+            Upstream::Tls(tls) => tls.flush(),
+        }
+    }
+}
+
+/// How the broker reaches each destination it has been authorized for.
+///
+/// A trait so the bridge stays ignorant of the route file's format while still
+/// being able to ask the question, and so a test can answer it without writing
+/// a route file. The runtime implements it over the loaded route table.
+pub trait UpstreamTransportPolicy: std::fmt::Debug + Send + Sync {
+    /// The transport for `target`, or a refusal naming why there isn't one.
+    fn transport_for(
+        &self,
+        target: &AuthorityEndpoint,
+    ) -> Result<crate::connect_routes::UpstreamTransport, BridgeError>;
+}
+
+/// Answers `Cleartext` for every destination.
+///
+/// Exists for the same reason [`NEVER_CANCELLED`] does: a bridge that can only
+/// be configured one way is a bridge whose tests have to reach for a file format
+/// to vary anything, and the tests here point at loopback origins that speak
+/// plain HTTP by construction.
+///
+/// It is a *value*, not a default. Nothing applies it implicitly, the product's
+/// own wiring answers from the route table instead, and a caller that reaches
+/// for this has written down "the credential crosses this leg in the clear" as
+/// code rather than as configuration.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CleartextUpstream;
+
+impl UpstreamTransportPolicy for CleartextUpstream {
+    fn transport_for(
+        &self,
+        _target: &AuthorityEndpoint,
+    ) -> Result<crate::connect_routes::UpstreamTransport, BridgeError> {
+        Ok(crate::connect_routes::UpstreamTransport::Cleartext)
+    }
+}
+
 /// A CONNECT that has been authorised, TLS-terminated and dialled.
 ///
 /// Both halves are returned rather than relayed, because a duplex relay over
@@ -928,8 +1121,9 @@ pub trait UpstreamResolver {
 pub struct EstablishedTunnel {
     /// To the client, presenting the session leaf for `target`'s host.
     pub client: rustls::StreamOwned<rustls::ServerConnection, TcpStream>,
-    /// To the upstream, already connected.
-    pub upstream: TcpStream,
+    /// To the upstream, already connected and already speaking whatever the
+    /// operator declared this route uses.
+    pub upstream: Upstream,
     /// The authorised target this tunnel is for.
     pub target: AuthorityEndpoint,
     /// The session this tunnel belongs to (ADR-0019).
@@ -1757,8 +1951,13 @@ impl Bridge {
             handshake_once(client, &config).map_err(|e| BridgeError::Handshake(e.to_string()))?;
 
         let addr = upstream.resolve(&target)?;
-        let upstream =
-            TcpStream::connect(addr).map_err(|e| BridgeError::Upstream(e.to_string()))?;
+        let socket = TcpStream::connect(addr).map_err(|e| BridgeError::Upstream(e.to_string()))?;
+        // **Before a single byte of the tunnel is forwarded, and therefore
+        // before any credential is rewritten into it.** The order here is the
+        // security property: a destination whose certificate does not verify is
+        // refused at the handshake, so the rewritten request never reaches a
+        // socket that has not proved who it is.
+        let upstream = self.dial_upstream(socket, &target)?;
 
         Ok(EstablishedTunnel {
             client,
@@ -2211,6 +2410,7 @@ impl EstablishedTunnel {
                 .set_read_timeout(Some(CANCEL_POLL))
                 .map_err(|e| BridgeError::Io(e.to_string()))?;
             self.upstream
+                .sock()
                 .set_read_timeout(Some(CANCEL_POLL))
                 .map_err(|e| BridgeError::Io(e.to_string()))?;
         }
@@ -2220,7 +2420,7 @@ impl EstablishedTunnel {
             // that dies with a timeout armed surfaces as a dropped connection
             // rather than as silence, which is the safer of the two failures.
             let _ = self.client.sock.set_read_timeout(None);
-            let _ = self.upstream.set_read_timeout(None);
+            let _ = self.upstream.sock().set_read_timeout(None);
         }
         outcome
     }

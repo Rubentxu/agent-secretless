@@ -598,7 +598,8 @@ impl Fixture {
   "port": {},
   "operation_family": "git_hub",
   "credential": "{credential_id}",
-  "minimum_posture": "STRONG_SECRETLESS"
+  "minimum_posture": "STRONG_SECRETLESS",
+  "upstream": "cleartext"
 }}]"#,
                 origin.port
             ),
@@ -1546,7 +1547,8 @@ fn a_route_the_policy_does_not_permit_is_refused_at_load() {
   "port": 443,
   "operation_family": "git_hub",
   "credential": "{id}",
-  "minimum_posture": "STRONG_SECRETLESS"
+  "minimum_posture": "STRONG_SECRETLESS",
+  "upstream": "cleartext"
 }}]"#
         ),
     )

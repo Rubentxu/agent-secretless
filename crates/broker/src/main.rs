@@ -15,6 +15,11 @@ use secrecy::SecretString;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use zeroize::Zeroize;
+// For `--connect-roots`: the trait is what turns a PEM file into certificates,
+// and the file is read with the library's own reader rather than a hand-rolled
+// one. Only the trait is imported; the type it is implemented for is named at
+// the call site.
+use rustls::pki_types::pem::PemObject as _;
 
 fn main() -> std::io::Result<()> {
     // R2 (16-SECURITY-RELEASE-GATES): "broker core dumps disabled". A core
@@ -90,6 +95,9 @@ fn main() -> std::io::Result<()> {
     // purpose — a route with no policy rule is refused, and that refusal is the
     // default, so widening CONNECT is two deliberate edits rather than one.
     let mut policy_file: Option<PathBuf> = None;
+    // C2.8: the anchors a *destination's* certificate is verified against. Not
+    // the public root set and not defaulted — see `Bridge::with_upstream`.
+    let mut connect_roots: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         let arg = match arg.into_string() {
             Ok(s) => s,
@@ -178,6 +186,13 @@ fn main() -> std::io::Result<()> {
                     std::process::exit(1);
                 }
             }
+            "--connect-roots" => {
+                connect_roots = args.next().map(PathBuf::from);
+                if connect_roots.is_none() {
+                    eprintln!("asv: --connect-roots requires a path argument");
+                    std::process::exit(1);
+                }
+            }
             "-h" | "--help" => {
                 eprintln!(
                     "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH] [--audit-max-records N] [--audit-file PATH] [--enrol-principal PATH] [--harden] [--connect-listen ADDR]"
@@ -186,6 +201,14 @@ fn main() -> std::io::Result<()> {
                 eprintln!("  --connect-listen ADDR  serve the CONNECT proxy on ADDR. Needs a");
                 eprintln!("                         --vault: a tunnel with no credential behind");
                 eprintln!("                         it is refused, so there is nothing to serve.");
+                eprintln!("  --connect-roots PATH   PEM anchors a TLS destination's certificate");
+                eprintln!(
+                    "                         is verified against. Absent means the store is"
+                );
+                eprintln!("                         empty, so every route declaring \"upstream\":");
+                eprintln!("                         \"tls\" is refused. Not the public root set:");
+                eprintln!("                         that would decide who gets this product's");
+                eprintln!("                         credentials on the internet's say-so.");
                 eprintln!("  --connect-routes PATH  the CONNECT route table. Every route is");
                 eprintln!("                         authorized against the policy at load, so a");
                 eprintln!("                         route the policy does not permit fails the");
@@ -602,6 +625,60 @@ fn main() -> std::io::Result<()> {
         // different hats, and both are invisible until someone runs a real
         // CONNECT.
         let sessions = Arc::clone(&state.sessions);
+        // C2.8: the anchors a TLS destination is verified against. Read from the
+        // operator's file and *only* from it — an empty store verifies nothing,
+        // so a broker started without this refuses every route that says
+        // `"upstream": "tls"` instead of trusting whatever the internet's CAs
+        // happen to say. A file that cannot be read is fatal for the same
+        // reason a bad route file is: a broker that looks healthy while
+        // verifying nothing is a reading an operator cannot act on.
+        let mut destination_roots = rustls::RootCertStore::empty();
+        if let Some(path) = connect_roots.as_deref() {
+            let pem = std::fs::read(path).unwrap_or_else(|e| {
+                eprintln!("asv: cannot read --connect-roots {}: {e}", path.display());
+                std::process::exit(1);
+            });
+            // Parsed by rustls' own PEM reader rather than a hand-rolled one:
+            // an anchor file is a place where a bespoke parser is a place where
+            // "it loaded" and "it loaded the right certificates" come apart.
+            //
+            // Every section is counted. A file with one good certificate and
+            // nine unparseable ones loads, verifies almost nothing, and reads as
+            // working — so the unusable sections are named in the log rather
+            // than dropped in a `filter_map` that cannot report itself.
+            let mut usable = Vec::new();
+            let mut unparseable = 0usize;
+            for section in rustls::pki_types::CertificateDer::pem_slice_iter(&pem) {
+                match section {
+                    Ok(der) => usable.push(der),
+                    Err(_) => unparseable += 1,
+                }
+            }
+            let (_, rejected) = destination_roots.add_parsable_certificates(usable);
+            tracing::info!(
+                path = %path.display(),
+                anchors = destination_roots.len(),
+                unparseable_sections = unparseable,
+                rejected,
+                "destination trust anchors loaded"
+            );
+            if destination_roots.is_empty() {
+                eprintln!(
+                    "asv: --connect-roots {} contained no usable certificate; every TLS \
+                     destination would be refused",
+                    path.display()
+                );
+                std::process::exit(1);
+            }
+        } else {
+            tracing::warn!(
+                "no --connect-roots given; the anchor store is empty, so every route \
+                 declaring \"upstream\": \"tls\" is refused. The public root set is \
+                 deliberately not the default: it would decide on the internet's say-so \
+                 who receives this product's credentials."
+            );
+        }
+
         let connect_listener = asv_broker::connect_listener::ConnectListener::new(
             leaves,
             Arc::new(asv_broker::connect_runtime::SystemUpstream),
@@ -609,6 +686,12 @@ fn main() -> std::io::Result<()> {
             Arc::clone(&shutdown),
             routes.to_connect_policy().allowed,
             asv_broker::connect_listener::ListenerConfig::default(),
+        )
+        .with_upstream_transport(
+            Arc::new(asv_broker::connect_runtime::RouteTransports(Arc::clone(
+                &routes,
+            ))),
+            Arc::new(destination_roots),
         );
 
         let tcp = std::net::TcpListener::bind(bind).unwrap_or_else(|e| {

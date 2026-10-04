@@ -16,7 +16,7 @@ agent ──(surrogate / socket)──▶ broker ──(real credential)──�
 
 > **Status: pre-1.0, at v0.29.0. Not certified, and the gates say so.**
 >
-> The workspace compiles and **1059 tests are enumerated** (1059 pass, 0 ignored,
+> The workspace compiles and **1067 tests are enumerated** (1067 pass, 0 ignored,
 > 0 fail; the count is re-derived every CI run by the `R11 README test count`
 > gate, so this line cannot go stale again). Vault, SSH signing, the HTTP and
 > PostgreSQL brokers, Cedar policy, the operator console and the CONNECT TLS
@@ -146,7 +146,7 @@ Each item says where its detail lives, because none of it is a guess.
 cargo build --release -p asv-broker
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# expected: passed=1059 failed=0 ignored=0
+# expected: passed=1067 failed=0 ignored=0
 ```
 
 That number was `passed=692` in this file for several milestones, and nothing

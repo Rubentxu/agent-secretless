@@ -91,6 +91,39 @@ pub struct ConnectRoute {
     /// `StrongSecretless` invents a guarantee nobody made. Making the operator
     /// state it is the only option that cannot be silently wrong.
     pub minimum_posture: IntegrationPosture,
+    /// How the broker reaches this route's destination.
+    ///
+    /// **Required, not defaulted, for the same reason `minimum_posture` is.**
+    /// There is no safe default here and there is no safe fallback: `tls` is the
+    /// only variant that keeps the credential off the wire in the clear, and
+    /// `cleartext` is the one that puts the real credential in front of anyone
+    /// sharing the network. Defaulting to `tls` would break every destination
+    /// whose certificate this broker cannot verify, and — worse — would do it
+    /// silently, so an operator would find out from a failing tunnel rather
+    /// than from the file. Defaulting to `cleartext` is worse still: it is the
+    /// leak this whole product exists to prevent, chosen by omission.
+    ///
+    /// So the operator states it, and `cleartext` is a word someone had to type
+    /// in a file about credentials. The broker also logs every tunnel that uses
+    /// it, because a route table is not read often enough for spelling a
+    /// variant to feel like a decision.
+    pub upstream: UpstreamTransport,
+}
+
+/// How the broker reaches a route's destination.
+///
+/// Named for the leg, not for the security property, because the two variants
+/// differ in exactly one thing and a name that promises encryption would be a
+/// claim the type cannot keep: `Cleartext` is a real, supported, operator-chosen
+/// mode, and calling it `Insecure` would invite a caller to treat it as an
+/// error rather than a decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamTransport {
+    /// TLS, verified against the destination's anchors and the route's host.
+    Tls,
+    /// A plain socket. The credential crosses this leg in the clear.
+    Cleartext,
 }
 
 /// A route that has passed canonicalization and the policy cross-check.
@@ -104,6 +137,7 @@ pub struct ResolvedRoute {
     operation_family: OperationFamily,
     credential: CredentialId,
     minimum_posture: IntegrationPosture,
+    upstream: UpstreamTransport,
 }
 
 impl ResolvedRoute {
@@ -125,6 +159,11 @@ impl ResolvedRoute {
     /// The weakest posture permitted for this route.
     pub fn minimum_posture(&self) -> IntegrationPosture {
         self.minimum_posture
+    }
+
+    /// How this route's destination is reached.
+    pub fn upstream(&self) -> UpstreamTransport {
+        self.upstream
     }
 }
 
@@ -210,6 +249,7 @@ impl ConnectRouteSet {
                 operation_family: route.operation_family,
                 credential,
                 minimum_posture: route.minimum_posture,
+                upstream: route.upstream,
             });
         }
 
@@ -395,12 +435,23 @@ mod tests {
     }
 
     fn route(authority: &str, port: u16) -> ConnectRoute {
+        route_with(authority, port, UpstreamTransport::Cleartext)
+    }
+
+    /// The same route, reaching its destination some other way.
+    ///
+    /// The default is `Cleartext` because every fixture here dials a loopback
+    /// origin that speaks plain HTTP, and a test that had to say "tls" to
+    /// reach its own fixture would be testing the string rather than the
+    /// behaviour. The `Tls` arm is what the transport tests name explicitly.
+    fn route_with(authority: &str, port: u16, upstream: UpstreamTransport) -> ConnectRoute {
         ConnectRoute {
             authority: authority.to_owned(),
             port,
             operation_family: OperationFamily::GitHub,
             credential: credential_id(1).to_wire(),
             minimum_posture: IntegrationPosture::StrongSecretless,
+            upstream,
         }
     }
 
@@ -652,21 +703,92 @@ mod tests {
         let json = r#"[
             {"authority":"api.github.com","port":443,
              "operation_family":"git_hub","credential":"00000000-0000-4000-8000-000000000001",
-             "minimum_posture":"STRONG_SECRETLESS",
+             "minimum_posture":"STRONG_SECRETLESS","upstream":"cleartext",
              "allowed_any_host":true}
         ]"#;
 
         // The control: the same document without the unknown field loads.
+        //
+        // **Every required field is here**, `upstream` included, and that is not
+        // tidiness — it is the third time this control has been the weak point.
+        // It once omitted `minimum_posture`, then it omitted `upstream`, and a
+        // control that cannot load fails the test for a reason the test does not
+        // name, which is a test that has stopped measuring what it says it does.
         let control = r#"[
             {"authority":"api.github.com","port":443,
              "operation_family":"git_hub","credential":"00000000-0000-4000-8000-000000000001",
-             "minimum_posture":"STRONG_SECRETLESS"}
+             "minimum_posture":"STRONG_SECRETLESS","upstream":"cleartext"}
         ]"#;
         ConnectRouteSet::load(control, &permitting())
             .expect("the control must load, or this test proves nothing");
 
         let err = ConnectRouteSet::load(json, &permitting())
             .expect_err("an unknown field must not be ignored");
+        assert!(matches!(err, ConnectRouteError::Malformed(_)), "{err:?}");
+    }
+
+    /// **`upstream` is required, and the two spellings are the only two.**
+    ///
+    /// The whole fail-closed design of the destination leg rests on this field
+    /// being something the operator had to write down, and nothing checked it
+    /// until a falsification campaign pointed at the gap: the field is
+    /// required, and `tls` and `cleartext` are the only values that parse.
+    ///
+    /// Both halves matter. A default would make the credential's crossing the
+    /// last hop a thing that happened because a key was absent. A typo would do
+    /// the same, silently, by deserializing to a default.
+    #[test]
+    fn a_route_must_say_how_its_destination_is_reached() {
+        let complete = r#"[
+            {"authority":"api.github.com","port":443,
+             "operation_family":"git_hub","credential":"00000000-0000-4000-8000-000000000001",
+             "minimum_posture":"STRONG_SECRETLESS","upstream":"tls"}
+        ]"#;
+        let loaded = ConnectRouteSet::load(complete, &permitting())
+            .expect("a route that says tls must load");
+        assert_eq!(
+            loaded
+                .route_for(&endpoint("api.github.com", 443))
+                .expect("the route is there")
+                .upstream(),
+            UpstreamTransport::Tls,
+            "the route loaded and lost the transport it declared"
+        );
+
+        // The control, because the three failures below are only meaningful
+        // against a document this loader otherwise accepts.
+        let cleartext = complete.replace("\"tls\"", "\"cleartext\"");
+        let loaded = ConnectRouteSet::load(&cleartext, &permitting())
+            .expect("a route that says cleartext must load too");
+        assert_eq!(
+            loaded
+                .route_for(&endpoint("api.github.com", 443))
+                .expect("the route is there")
+                .upstream(),
+            UpstreamTransport::Cleartext
+        );
+
+        // Three refusals, and they fail for three different reasons a reader
+        // would otherwise have to guess at.
+        let absent = complete.replace(",\"upstream\":\"tls\"", "");
+        let err = ConnectRouteSet::load(&absent, &permitting()).expect_err(
+            "a route that does not say how its destination is reached must be refused, \
+             because defaulting it would put the credential on the wire by omission",
+        );
+        assert!(matches!(err, ConnectRouteError::Malformed(_)), "{err:?}");
+
+        let misspelled = complete.replace("\"tls\"", "\"encrypted\"");
+        let err = ConnectRouteSet::load(&misspelled, &permitting()).expect_err(
+            "a transport this build does not know must be refused rather than defaulted, \
+             or a typo would read as a decision",
+        );
+        assert!(matches!(err, ConnectRouteError::Malformed(_)), "{err:?}");
+
+        let insecure = complete.replace("\"tls\"", "\"insecure\"");
+        let err = ConnectRouteSet::load(&insecure, &permitting()).expect_err(
+            "a spelling that means \"do not check this\" must not be a way to spell \
+             cleartext",
+        );
         assert!(matches!(err, ConnectRouteError::Malformed(_)), "{err:?}");
     }
 
