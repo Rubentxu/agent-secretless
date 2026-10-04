@@ -281,7 +281,20 @@ fn uat_040_file_injection_is_0600_and_cleaned_up() {
         "/bin/sh",
         &[
             "-c",
-            "stat -c '%a' \"$ASV_SECRET_FILE\"; cat \"$ASV_SECRET_FILE\"",
+            // The length, never the value. This row used to `cat` the staged
+            // file and assert on the plaintext, which meant it was asserting
+            // that the file-injection path **leaks into the redacted channel** —
+            // and it passed for exactly as long as that was true. R1 seeded the
+            // redactor from the secret the runtime resolved, so the value is now
+            // correctly replaced by `[REDACTED]` and the row went red.
+            //
+            // The fix is not to weaken the row but to ask a question the
+            // redacted channel can still answer: did the child receive the real
+            // bytes? `wc -c` is unforgeable here — `[REDACTED]` is a different
+            // length — and it keeps the secret off the wire and out of this
+            // file's failure messages, which is the same reason R1's own
+            // delivery row asserts a length rather than a value.
+            "stat -c '%a' \"$ASV_SECRET_FILE\"; wc -c < \"$ASV_SECRET_FILE\"",
         ],
     );
     t.secret_injection = SecretInjectionPlan::File {
@@ -307,7 +320,13 @@ fn uat_040_file_injection_is_0600_and_cleaned_up() {
     let out = String::from_utf8_lossy(&run.stdout_redacted);
     assert_eq!(run.exit_code, Some(0), "{out}");
     assert_eq!(out.lines().next().map(str::trim), Some("600"), "{out}");
-    assert_eq!(out.lines().nth(1), Some("file-secret"));
+    assert_eq!(
+        out.lines().nth(1).map(str::trim),
+        Some("11"),
+        "the child must have read all {} bytes of the staged secret; the redacted \
+         channel is expected to hide the value, not the length: {out}",
+        "file-secret".len()
+    );
     // Automatic destruction (§7): the file is gone after the run.
     assert!(!path.exists(), "the staged secret file must be removed");
     let _ = std::fs::remove_dir(dir);
