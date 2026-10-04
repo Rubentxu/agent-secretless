@@ -200,6 +200,12 @@ fn main() -> std::io::Result<()> {
     let mut vault_path: Option<PathBuf> = None;
     let mut passphrase_path: Option<PathBuf> = None;
     let mut harden = false;
+    // C1-R: the identity this installation declared, and whether the operator
+    // made the guarantee a condition of starting. See `identity.rs` for why
+    // this is a declaration measured against a syscall rather than an inference
+    // from the uid's shape.
+    let mut declared_uid: Option<u32> = None;
+    let mut require_dedicated_identity = false;
     // R9 audit retention. A flag, not an environment variable: the broker's
     // env-quarantine invariant (uat_017) scans for env reads in production
     // sources, and operator configuration belongs in the launch contract.
@@ -328,11 +334,46 @@ fn main() -> std::io::Result<()> {
                     std::process::exit(1);
                 }
             }
+            "--identity-uid" => {
+                // The launch contract, flag-not-env like every other operator
+                // setting in this binary: the broker's env quarantine scans for
+                // env reads in production sources, and an identity is exactly
+                // the kind of thing that must be visible in `ps` rather than
+                // inherited from whatever launched the process.
+                let raw = args.next().unwrap_or_default();
+                // `args` yields `OsString`. A non-UTF-8 argument is a usage
+                // error, and `to_string_lossy` makes it one: the parse below
+                // fails on the replacement characters and exits 2, which is the
+                // same answer a typo gets.
+                let raw = raw.to_string_lossy();
+                match raw.parse::<u32>() {
+                    Ok(uid) => declared_uid = Some(uid),
+                    Err(_) => {
+                        eprintln!("asv: --identity-uid requires a numeric uid, got {raw:?}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--require-dedicated-identity" => require_dedicated_identity = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH] [--audit-max-records N] [--audit-file PATH] [--enrol-principal PATH] [--harden] [--connect-listen ADDR]"
+                    "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH] [--audit-max-records N] [--audit-file PATH] [--enrol-principal PATH] [--harden] [--connect-listen ADDR] [--identity-uid N] [--require-dedicated-identity]"
                 );
                 eprintln!();
+                eprintln!("  --identity-uid N       the uid this installation expects the");
+                eprintln!("                         broker to be. A broker running as any");
+                eprintln!("                         other uid refuses to start, because an");
+                eprintln!("                         operator who declared 998 and got their");
+                eprintln!("                         own account believes they installed a");
+                eprintln!("                         service. Absent means no identity was");
+                eprintln!("                         declared, and the broker says so rather");
+                eprintln!("                         than inferring one.");
+                eprintln!("  --require-dedicated-identity  refuse to start unless a");
+                eprintln!("                         --identity-uid was declared and this");
+                eprintln!("                         process is not setuid. This is what");
+                eprintln!("                         stops a packaged install from");
+                eprintln!("                         degrading into the development shape");
+                eprintln!("                         and reporting success.");
                 eprintln!("  --connect-listen ADDR  serve the CONNECT proxy on ADDR. Needs a");
                 eprintln!("                         --vault: a tunnel with no credential behind");
                 eprintln!("                         it is refused, so there is nothing to serve.");
@@ -366,6 +407,21 @@ fn main() -> std::io::Result<()> {
                 socket_path = PathBuf::from(arg);
             }
         }
+    }
+    // The identity check runs before the vault, the passphrase and the harden
+    // profile, and before the enrolment branch: every one of those acts on a
+    // credential or writes a record, and a broker that is going to refuse over
+    // its own identity should refuse before it has touched any of them. A
+    // refusal that arrives after the passphrase has been read is a refusal
+    // that has already had the secret.
+    if let Err(error) = asv_broker::identity::check(
+        unsafe { libc::getuid() },
+        unsafe { libc::geteuid() },
+        declared_uid,
+        require_dedicated_identity,
+    ) {
+        eprintln!("asv: {error}");
+        std::process::exit(1);
     }
     // Enrolment runs before the vault checks, because it is not a vault
     // operation: it locates the record by the vault's path, writes it, and

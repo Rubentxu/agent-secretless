@@ -1,0 +1,132 @@
+# agent-secretless broker — systemd **system** unit, for a dedicated identity.
+#
+# This is the counterpart to `asv-brokerd.service`, which is a *user* unit and
+# deliberately runs as you. That unit says so in its own first paragraph: "a
+# dedicated broker uid is M7 and does not exist yet, which the README states."
+# This file is the one that makes it exist.
+#
+# ## The gap this closes, in the product's own terms
+#
+# Everything the broker does to protect a credential is real and all of it is
+# *inside the invoking user's own boundary*. The socket is `0600` in a `0700`
+# directory, the process is undumpable, and Landlock and seccomp are installed —
+# and any other program that user runs is in the same uid, outside the reach of
+# `PR_SET_DUMPABLE` as far as this broker's `/proc/<pid>/mem` is concerned, and
+# free to open the socket, the vault and the audit log. UAT-003 proves the
+# broker is unreadable by a process *lacking* `CAP_SYS_PTRACE`; a dedicated uid
+# is what turns that into "unreadable by anything that is not root".
+#
+# The distance between those two sentences is `User=` below.
+#
+# ## Why the uid is declared rather than inferred
+#
+# `ExecStart` passes `--identity-uid` and `--require-dedicated-identity`. The
+# broker refuses to start if it is running as any other uid, and it refuses
+# before it opens the vault. That is the part worth reviewing in this file: the
+# declaration is a **contract**, checked by the binary against a syscall, so a
+# deployment that gets this wrong stops rather than starting and looking
+# healthy. There is no way to write "run as the broker user" in this file and
+# have the broker take it on trust.
+#
+# The installer writes the number from `getent passwd`, and this file is a
+# template: the shipped unit has a placeholder and refuses until it is
+# replaced. A template that shipped a plausible number would be a number
+# somebody trusted.
+#
+# ## `DynamicUser` is deliberately NOT used, and the reason is the declaration
+#
+# `DynamicUser=true` would remove the account management this file's
+# `User=` line asks an installer to do, and it is the tidier answer in every
+# respect except one: a dynamically allocated uid is chosen at activation time,
+# so there is nothing an operator can write into `--identity-uid` beforehand.
+# The enforcement would then be unreachable in the only configuration where it
+# would be most convenient, and the honest thing is to refuse that combination
+# rather than to pass the flag and let it be decorative.
+#
+# A deployment that wants no account can still get the property by dropping
+# `--identity-uid` and keeping `--require-dedicated-identity`: the broker then
+# refuses on the *absence* of a declaration, which is the same protection one
+# level weaker — it proves nobody claimed a wrong identity, not that a right one
+# was claimed.
+#
+# ## Directives, and the one that was left out on purpose
+#
+# `StateDirectory=asv` and `RuntimeDirectory=asv` are the ownership answer:
+# systemd creates both, chowns them to the service user, and sets the mode, so
+# the vault and the socket belong to the broker's uid without the installer
+# having to `chown` anything and without a world-readable parent directory in
+# between. They are also what makes the uid real: a service user with no
+# directory has nothing to protect.
+#
+# `ProtectSystem=strict`, `ProtectHome=` and `PrivateTmp` are **absent**, and
+# that is the same decision `asv-brokerd.service` records at length rather
+# than the same mistake. A wrong sandbox is worse than none: the broker refuses
+# to start when it cannot open its vault, so a directive that blocks a path the
+# deployment genuinely needs produces a service that fails at boot with an error
+# about a path, and the operator concludes the broker is broken. What *is*
+# enabled here is `NoNewPrivileges`, which cannot break a write because it is a
+# one-way ratchet, and `PrivateUsers` is left out for the same reason as the
+# others: it is a claim about a mapping that has to be right on every host this
+# lands on, and nothing in this repository can test that.
+#
+# Enabling `--harden` is likewise a decision about *this* deployment's write set
+# and belongs to whoever owns it, which is why the user unit declines it too.
+
+[Unit]
+Description=agent-secretless broker (dedicated identity, machine-wide)
+Documentation=https://github.com/Rubentxu/agent-secretless
+Documentation=man:systemd.exec(5)
+# There is no ordering to express against a plain vault file, so this is
+# documentation rather than a real dependency — the same reasoning as the user
+# unit's.
+After=local-fs.target
+
+[Service]
+Type=simple
+
+# A fixed account, not `DynamicUser`: the uid has to be knowable before
+# activation for `--identity-uid` to mean anything. See the section above.
+#
+# REPLACE_ME: the installer writes the service account here, and refuses to
+# leave this token in place.
+User=REPLACE_ME
+Group=REPLACE_ME
+
+# The uid the installation expects, and the demand that it be the one in
+# force. Both are refused by the binary if unmet, and the refusal happens
+# before the vault is opened, so a misconfigured unit stops without ever
+# having read the passphrase.
+#
+# REPLACE_ME: written from `getent passwd` by the installer.
+ExecStart=/usr/local/libexec/asv/asv-brokerd /run/asv/broker.sock --vault /var/lib/asv/vault.asv --passphrase-file /etc/asv/passphrase --identity-uid REPLACE_ME --require-dedicated-identity
+
+# The ownership answer. systemd creates both, chowns them to `User=` above and
+# sets their mode, so the socket is the broker's and the vault directory is too
+# — no `chown` in the installer, and no world-readable parent in between.
+#
+# `StateDirectoryMode` is 0700 rather than systemd's 0755 default: this
+# directory holds an unlocked vault.
+StateDirectory=asv
+StateDirectoryMode=0700
+RuntimeDirectory=asv
+RuntimeDirectoryMode=0700
+
+# Configuration travels by argv and the passphrase by file, never by
+# environment. The broker is forbidden from reading the environment
+# (uat_017_env_scan, rule D9) precisely so a credential cannot re-enter through
+# an inherited variable, and a unit that passed the passphrase as
+# `$ASV_PASSPHRASE` would undo that from outside the process.
+Restart=on-failure
+RestartSec=2
+
+# The one sandbox directive enabled. A one-way ratchet set before exec, it
+# cannot break a write, and the broker's own `harden` path already sets
+# `PR_SET_NO_NEW_PRIVS` for the same reason.
+NoNewPrivileges=true
+
+# The socket is 0600 inside a 0700 directory and the broker refuses to start if
+# it already exists, so it cannot clobber a running instance.
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
