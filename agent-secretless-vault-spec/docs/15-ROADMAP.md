@@ -2438,7 +2438,24 @@ nothing the broker says about itself can move that number.
 
 **Still owed in this block.** **TLS on the leg from the broker to the
 destination**, without which a real HTTPS registry is unreachable and every claim
-above is scoped to a local origin. Stress and cancellation under load beyond the
+above is scoped to a local origin. Its shape is small at the code and not small
+at the decision, and the decision is the part worth writing down now: the broker
+has no destination trust anchors at all, so the anchors have to become
+**configurable** rather than a constant. A hardcoded public root set would verify
+`registry.npmjs.org` and refuse every destination an operator runs on a private
+CA — and would leave no seam for a test to inject a root into, which is the same
+"the only way to check this assertion is the one this product cannot reach"
+problem the anti-replay window's comment says it resolved. So the increment is:
+an anchors argument beside `--connect-routes` and `--policy`, a client handshake
+at the one connect site in `serve_connect`, `EstablishedTunnel.upstream` widened
+from `TcpStream` to something that is `Read + Write` and still exposes its socket
+for `set_read_timeout`, a TLS origin in the broker's tests, and a campaign row
+for the property that matters most — **a destination whose certificate does not
+verify is refused before a single byte carrying the credential is written to it.**
+`webpki-roots` is already in `Cargo.lock` as a transitive dependency, so the
+default needs no crate this workspace does not already build; what is undecided
+is whether the bundled public roots are the right *default* for a credential
+broker, and that is a threat-model question rather than an implementation one. Stress and cancellation under load beyond the
 anti-replay property already measured. And **the broker has no ordered shutdown at
 all**: `main.rs` installs no signal handling, so tunnels dying when the process
 stops is carried entirely by the process dying. That is a real guarantee from the
