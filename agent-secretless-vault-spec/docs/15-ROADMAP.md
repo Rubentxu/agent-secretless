@@ -62,6 +62,27 @@ R9  M17 attestation / trusted execution  depends on real M12 evidence
 | **R9** | Attestation as a verdict the domain consumes, never a vendor API. | Attested secret release working end to end on real TPM evidence. |
 | **R10** | Stabilize adapters + plan-bound authority + durable automation + optional hardware trust together. | The compatibility, migration, failure and partial-cutover matrix green, with a TPM-less install remaining a supported configuration. |
 
+### Where the blocks stand
+
+Recorded from measured results, not from intent. A block is listed here only
+when its exit condition has been observed to hold; a block that was *attempted*
+is not listed, and a block with a residual says so in its own row.
+
+| Block | State | Measured by |
+|---|---|---|
+| **R0** | closed | `tests/r0_gate.py` — 4 passed, 0 failed, 0 unavailable. Signature verification reachable from a clean install, 46 negative provenance checks, the official skill published outside this repository and cross-repo verified at 105 checks. |
+| **R1** | closed | `r1_isolated_reachability` 11/11 and `r1_isolated_e2e` 6/6, both from the product surface. One caveat, recorded because it changes how the evidence should be read: 21 tests across three files return early when unprivileged user namespaces are unavailable, and Cargo reports that as **passed**, not as skipped. The R1 full-suite result was therefore re-opened and is being corrected (`bl-bl-01M44FDFNF0003888YSWEGPXM0`). |
+| **R2.A** | closed, with one half `host-dependent` | `r2a_github_vertical` 11/11 in-process against a real TLS origin, and `r2a_cli_reachability` 4/4 against the real binaries. The live call against the real `api.github.com` is **not** measured and is not claimed; see *Status of item 1* below. |
+
+**The R1 row is the one worth reading twice.** `uat_040`'s file-injection row was
+asserting that the staged secret reached the redacted channel in cleartext — a
+test encoding a defect as its expectation — and it was green for exactly as long
+as that was true. R1 fixed the leak, so the row went red, and the full-workspace
+run that R2.A's exit gate required is what surfaced it. A block can be declared
+closed with a red test inside it, and the way that happened here was a row that
+never ran being indistinguishable from a row that passed. Fixed in `9d3d556`;
+the structural half is backlog.
+
 ### What moved, and what stayed
 
 - **TPM2 is not a v1.0 gate.** M12 is `prototype` with hardware validation
@@ -922,11 +943,74 @@ No fixed UAT set: each connector is gated by the acceptance tests it
 introduces, and the set grows with the catalog. Completion is DELEGATED to
 `16-SECURITY-RELEASE-GATES`, which requires the full matrix.
 
+### Status of item 1 (GitHub): **implemented**, and reachable from a product surface
+
+Item 1 was the last of the seven to have a production consumer, and like item 4
+it was complete long before anything could reach it. The gap was not in the
+connector or the broker: `Request::ReadIssue`, `CreateIssue` and `CreateRelease`
+existed, were policy-gated, and had about thirty tests — and **every call-site
+of all three in the tree was a test**. The relationship between "a GitHub
+capability exists" and "an operator can ask for one" had never been stated, so
+the three `AgentRel` GitHub links sat `withheld` while pointing at
+`asv run -- gh issue view --`: an argv for a command this CLI does not have, on
+a path that would not have let `gh` authenticate anyway, because `asv run`
+substitutes at a CONNECT tunnel and never hands the child a token.
+
+`asv github` is the surface. It opens a session, mints a **one-use** surrogate
+from a vault *id*, spends it on a typed operation, and ends the session before
+printing. There is no path in the CLI that can produce a GitHub token, and that
+is not a gap to be filled in later — it is the reason the command exists. Three
+decisions are decisions rather than conveniences: `--credential` is a vault id
+and never a token; `--body` is a path or `-`, never a literal, because `argv` is
+readable by any same-uid peer through `/proc/<pid>/cmdline`; and the surrogate is
+minted per invocation with `max_uses: 1`, because a long-lived surrogate is a
+bearer capability that outlives the reason it was minted.
+
+`requires_human` stays `true` on all three relations **including the read**. The
+read looks like the cheap case and is not — it lends a credential to a third
+party over the network — and relaxing it to `false` would have been a one-word
+change made by the same commit that published the link, with no policy decision
+behind it. It is pinned, and relaxing it is a separate proposal.
+
+**The evidence is deliberately split in two, and neither half claims the
+other's.**
+
+- `crates/broker/tests/r2a_github_vertical.rs` (11 rows) drives the real
+  `BrokerState`, a real `VaultStore` and `VaultSecretPort`, the real policy and
+  the real `GithubClient` against a local origin with real certificate
+  verification. It establishes that the operation succeeds, that the origin
+  really received the credential, that only the three promised fields come back,
+  that the grant is spent by its one use, that a spent grant costs nothing on
+  the wire, that a cross-origin redirect never reaches the second origin, that a
+  hostile repository never dials at all, and that no token appears in any
+  response, refusal or audit record.
+- `crates/broker/tests/r2a_cli_reachability.rs` (4 rows) drives the real
+  binaries and establishes that the verb parses, dials a real broker process and
+  is answered by it.
+
+**What is not measured, stated before anyone has to ask.** The second file is
+hermetic by arrangement — every row is refused by the broker before any connector
+runs, so it never resolves `api.github.com` — and it therefore **cannot**
+establish that a read succeeds. The reason is a design property, not a gap in the
+fixture: the GitHub audience is the compile-time constant `GITHUB_AUTHORITY`, and
+the broker's dev-dependency on itself applies "to the lib as a dependency of the
+test, and never to the binary". Putting a test-only audience override in a
+production binary is the switch this design refuses to have. So **a live call
+against the real `api.github.com` remains `host-dependent`**: it needs a real
+token in a real vault on a machine with network, and no repository check asserts
+it. M11's rule asks for a real provider; the provider half of that is honestly
+outstanding, not quietly claimed.
+
+Falsifications run rather than assumed: `token` → `bearer` in the authorization
+header turns two rows red; removing `validate_repo`'s character check turns the
+repository row red with `owner/repo ` reaching the provider; making `run_github`
+able to skip the socket turns three of the four CLI rows red.
+
 ### Status of item 4 (OAuth2 provider framework): **implemented**, self-hosted
 
-Item 4 is the only one of the seven that has been built, and the difference
-between what it was and what it is took five increments, each of which is worth
-naming because the first two changed nothing a reader could see.
+Item 4 was the only one of the seven that had been built when R2.A started, and
+the difference between what it was and what it is took five increments, each of
+which is worth naming because the first two changed nothing a reader could see.
 
 It began as a prototype: a trait, a struct, and an `issue()` that hashed the
 client id and the scope and called the result a bearer token. Ten unit tests
