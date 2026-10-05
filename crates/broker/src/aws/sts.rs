@@ -22,12 +22,6 @@
 //! with that by configuration. This reader cannot violate it, because it
 //! implements no entity mechanism at all:
 //!
-//! - `&amp;` `&lt;` `&gt;` `&quot;` `&apos;` and numeric character references
-//!   are decoded, because AWS itself emits them and a session token can
-//!   contain `+` and `/` and `=`;
-//! - there is no depth, no DTD handling and no external reference of any kind;
-//! - the whole response is bounded before a byte of it is looked at.
-//!
 //! - the five predefined entities and numeric character references are decoded,
 //!   because AWS itself emits them and a session token contains `+`, `/` and
 //!   `=` that have to survive a round trip;

@@ -22,9 +22,15 @@
 //! - **R2.C.3.** A broker operation and a CLI verb, so the agent names an
 //!   operation and never sees an AWS secret.
 //!
-//! Nothing here is reachable from a product surface yet, and this module says
-//! so rather than letting a test imply otherwise. Per M11's rule a provider
-//! does not count as closed on a signing core alone.
+//! **This module is reachable from a product surface, and that reachability is
+//! narrow enough to name.** The `asv aws` verb opens its own session, hands it
+//! to [`AwsBinding`](crate::aws_binding::AwsBinding), and the binding's `StsClient` signs
+//! through [`SigV4Signer`] here — so the path is verb → broker → binding →
+//! client → this module, with `aws.*` advertised to agents as the way in. What
+//! is *not* claimed is closure. Per M11's rule a provider does not count as
+//! closed on a signing core alone, and R2.C is recorded as open: one operation
+//! is not a catalogue, and `s3:GetObject`, the regional STS endpoints and the
+//! live call remain named gaps rather than a summary line.
 //!
 //! # The security property this has to have
 //!
