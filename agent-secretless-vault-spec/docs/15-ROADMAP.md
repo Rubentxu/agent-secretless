@@ -73,7 +73,7 @@ is not listed, and a block with a residual says so in its own row.
 | **R0** | closed | `tests/r0_gate.py` — 4 passed, 0 failed, 0 unavailable. Signature verification reachable from a clean install, 46 negative provenance checks, the official skill published outside this repository and cross-repo verified at 105 checks. |
 | **R1** | closed, and the caveat that qualified it is gone | `r1_isolated_reachability` 11/11 and `r1_isolated_e2e` 6/6, both from the product surface, and `uat_040_isolated_worker_runtime` 15/15. This row previously carried a caveat that 21 tests returned early when their substrate was missing and Cargo reported that as **passed**. The figure was right and the file count was wrong — it is three files, not five, and the split is 18 plus 3. All 18 now **refuse** with `UNAVAILABLE_SUBSTRATE` and are falsified by `tests/falsification/r1_substrate_falsify.py`: 18 red, 14 green, 0 unmeasured. The remaining 3 are the PostgreSQL rows, which already had the better shape (`ASV_UAT033_REQUIRE=1`) and are left alone. See *The rows that reported passing without running*. |
 | **R2.A** | closed, with one half `host-dependent` | `r2a_github_vertical` 11/11 in-process against a real TLS origin, and `r2a_cli_reachability` 4/4 against the real binaries. The live call against the real `api.github.com` is **not** measured and is not claimed; see *Status of item 1* below. |
-| **R2.B** | partial, with the strong form `host-dependent` | `r2b_oauth2_revocation` 5/5 with four falsifications run. The revocation gap is closed and the property is structural — `forget` is required on `SecretPort` with no default. Two things are **not** closed: compatibility with an operator's real IdP needs a host that has one, and the requested scope is still operator-configured rather than policy-derived, which is R4's work. |
+| **R2.B** | partial, and less reachable than the row used to say | `oauth2_vertical` 11/11 over a real vault, a real issuer and a real resource call, and `r2b_oauth2_revocation` 5/5 with four falsifications. The revocation gap is closed and the property is structural — `forget` is required on `SecretPort` with no default. **What no request reaches is the larger gap and it was not recorded here before:** the daemon constructs `OAuth2SecretPort` from an operator-written `--oauth2-clients` file and installs it in `state.secrets`, and there is no `Request` variant, no dispatch arm and no CLI verb that asks it for anything. The port is live in the process and inert. That is *why* the requested scope is operator-configured rather than policy-derived: no policy is evaluated on this path, because there is no path. Two further things stay open — compatibility with an operator's real IdP needs a host that has one, and making the scope policy-bound is R4's work. See *Status of item 4*. |
 | **R2.C** | one operation reachable from the product surface; item 2 still not closed | `aws::sigv4` 16/16 against the AWS documentation's own vectors, `aws::sts` 34/34 and `aws::calendar` 9/9 against an oracle written from the specifications, `aws::port` 12/12 with no socket in it, `aws::identity` 12/12 against two documented AWS samples, `r2c2b_sts_vertical` 18/18 against a real TLS origin, and `r2c3_aws_vertical` 13/13 from the product surface — CLI verb, typed IPC, real vault, real policy, real origin, and the advertisement an agent reads to find the verb at all. **113 mutations** across seven harnesses, and the number is the sum of the harness files rather than an inherited figure: 25 `sigv4`, 25 `sts`, 13 `client`, 14 `calendar`, 13 `port`, 14 `identity`, 9 `r2c3`. Of those, **110 red, 1 refused by the compiler, 2 recorded survivors** (the post-read size bound, unexercised because the fake origin always declares a `content-length`; and the binding's `Debug`, which cannot leak because `AwsSecretPort`'s own `Debug` does not). All seven are in the repository at `tests/falsification/` and every one was re-run from there, so the figure is re-derivable rather than merely asserted. **One operation is not a catalogue** — `s3:GetObject`, the regional STS endpoints and the live call are open, so item 2 is not closed under M11's rule. See *Status of item 2*. |
 
 **The R1 row is the one worth reading twice.** `uat_040`'s file-injection row was
@@ -1055,6 +1055,63 @@ repository row red with `owner/repo ` reaching the provider; making `run_github`
 able to skip the socket turns three of the four CLI rows red.
 
 ### Status of item 4 (OAuth2 provider framework): **implemented**, self-hosted
+
+#### The port is live in the process and inert
+
+This section is here because the row above used to describe OAuth2 as *partial*
+and name one of the two gaps — the operator-configured scope — as if the other
+were reachability. Reachability is the larger gap, and it is easy to miss
+because the code looks connected.
+
+It is not. Measured, not inferred:
+
+- `crates/broker/src/main.rs` constructs `OAuth2SecretPort` from the operator's
+  `--oauth2-clients` JSON file and installs it in `state.secrets` behind a
+  `RoutingSecretPort`. That wiring exists and works.
+- `crates/ipc-protocol` has **no** `Request` variant that asks for a token, and
+  the dispatch in `crates/broker/src/lib.rs` has no arm that serves one.
+- The CLI has no `oauth2` verb; the only occurrence of the string in
+  `crates/cli/src/main.rs` is `CredentialKind::OAuth2` in a kind parser.
+
+So an operator can start the daemon with a perfectly good OAuth2 client, the
+broker will mint short-lived access tokens for it on demand from inside its own
+`lend` call, and **nothing an agent says can cause that to happen.** The
+`oauth2_vertical` is thorough — 11 rows over a real vault, a real issuer and a
+real resource call — and it is a *library* vertical: it drives `lend` directly.
+It proves the exchange and the property; it does not prove the path an agent
+takes, because there isn't one.
+
+**This is also the real answer to why the scope is operator-configured.** The
+recorded reasoning is that a scope a request chose would be a scope the agent
+picked, so the scope lives in configuration and policy should eventually own it.
+That is right as far as it goes and it is not the whole cause: **no policy is
+evaluated on this path at all, because there is no path.** A scope cannot be
+policy-bound by a policy that is never consulted. Making the scope
+policy-derived without first giving the port a product surface would be deriving
+a scope for a request nobody can make.
+
+#### What the next increment has to be, in order
+
+1. **A surface, before a scope rule.** `Action::OAuth2Token`, a typed request
+   and response, a dispatch arm, and a verb — so that something reaches the port
+   at all. And the response carries no token: the token is spent inside a
+   `SecretSink`, exactly as `lend` already requires, so the operation the agent
+   names is an *operation*, not a credential.
+2. **Then the scope, as a policy resource.** The audience alone is not enough to
+   write `read`-but-not-`write` against, so the resource has to carry the scope
+   as well as the audience — a new resource variant rather than a field added to
+   `Resource::Api`, because GitHub and AWS are already evaluated against that
+   one and widening it would change their meaning for every existing policy.
+3. **The intersection, and which side wins.** The operator's file proposes a
+   scope and the policy bounds it; the broker refuses when the proposal exceeds
+   the grant. A weaker answer does not widen a stronger one, and the agent names
+   neither. The refusal has to name which side was too wide, because
+   "`Forbidden`" against a mismatch between a config file and a policy sends the
+   operator looking in the wrong file.
+
+Until step 1 exists, the honest description of item 4 is a complete provider
+framework with no consumer — which is the failure mode the goal forbids under
+the name *code without a consumer*, and which this row now says outright.
 
 Item 4 was the only one of the seven that had been built when R2.A started, and
 the difference between what it was and what it is took five increments, each of
