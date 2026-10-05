@@ -281,6 +281,24 @@ fn una_autoridad_sin_intermedio_no_firma_nada() {
     );
 }
 
+/// **Mutation: hand a buffer with padding to the parser** — the certificate
+/// would carry bytes past its own end, which is a parser difference rather
+/// than a certificate.
+///
+/// Filed as compound and counted as such: it measures whether `x509-parser`
+/// leaves trailing bytes, which is a property of a third-party parser, not of
+/// this module. It is here because the parser is already in scope and a
+/// certificate with a tail is a real artifact defect worth catching once,
+/// where the bytes enter the process. The campaign cannot turn this red, and
+/// the harness docstring says so rather than counting it.
+#[test]
+fn el_certificado_consume_exactamente_sus_bytes() {
+    let fixture = Fixture::hostile();
+    let cert = issue(&ca(HOUR), &grant("svc-a.internal", HOUR), &fixture.csr);
+
+    assert_eq!(trailing(cert.der()), 0);
+}
+
 /// **Mutation: copy the request's distinguished name** — the certificate
 /// carries `CN=admin,O=attacker` and a peer that authorizes on the DN grants
 /// the attacker the identity that was granted to someone else.

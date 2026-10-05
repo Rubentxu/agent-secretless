@@ -797,6 +797,13 @@ pub struct Bridge {
     /// A bridge that cannot dial anything until something says how is the only
     /// version of this that cannot be wrong by omission.
     upstream: Option<std::sync::Arc<dyn UpstreamTransportPolicy>>,
+    /// R2.E.2: the client identity this bridge presents to a destination that
+    /// asks for one, and only to the single destination it was issued for.
+    ///
+    /// `None` — which is every caller that existed before R2.E — leaves the
+    /// bridge reaching a destination exactly as it did before, so this is
+    /// additive rather than a change of default.
+    client_identity: Option<std::sync::Arc<mtls::ClientIdentity>>,
     /// The anchors a destination's certificate is verified against.
     ///
     /// **Not the public root set.** It is exactly what the operator supplied,
@@ -821,8 +828,25 @@ impl Bridge {
             cancel: None,
             head_deadline: None,
             upstream: None,
+            client_identity: None,
             destination_roots: std::sync::Arc::new(rustls::RootCertStore::empty()),
         }
+    }
+
+    /// Present `identity` to the one destination it was issued for.
+    ///
+    /// The pairing with [`Bridge::with_upstream`] is the point rather than a
+    /// convenience. Roots say what a destination is *trusted* to be; this says
+    /// what this broker is willing to *prove* to it. A bridge holding the
+    /// second without the first would present a client identity to a
+    /// destination whose certificate it never checked, which is how a client
+    /// certificate becomes a credential for an impostor.
+    pub fn with_client_identity(
+        mut self,
+        identity: std::sync::Arc<mtls::ClientIdentity>,
+    ) -> Self {
+        self.client_identity = Some(identity);
+        self
     }
 
     /// Say how each destination is reached, and against which anchors.
@@ -891,9 +915,53 @@ impl Bridge {
                             target.host()
                         ))
                     })?;
-                let config = rustls::ClientConfig::builder()
-                    .with_root_certificates(self.destination_roots.as_ref().clone())
-                    .with_no_client_auth();
+                let roots = self.destination_roots.as_ref().clone();
+                // R2.E.2: the client certificate is offered only to the
+                // destination it was issued for, and a bridge holding an
+                // identity for some *other* host refuses this hop rather than
+                // completing it as an anonymous client.
+                //
+                // The refusal is the point, and it is the difference between
+                // "no identity configured" and "the wrong identity
+                // configured". The first is a bridge reaching an ordinary
+                // service. The second is a misconfiguration, and answering it
+                // by quietly dropping to no client auth would turn a grant
+                // that can no longer be honoured into one that reaches the
+                // destination with nothing to show — which is how a broken
+                // identity becomes a silent downgrade instead of an outage.
+                let config = match self.client_identity.as_deref() {
+                    Some(identity) if identity.presents_to(target.host()) => {
+                        // Checked here rather than left to the destination. A
+                        // client certificate past its granted lifetime is one
+                        // the peer will reject, so offering it spends a
+                        // handshake to learn something this process already
+                        // knew — and reports it as a transport failure rather
+                        // than as "this session's identity has aged out and
+                        // needs reissuing", which is the diagnosis an operator
+                        // can act on.
+                        if identity.is_expired(std::time::Instant::now()) {
+                            return Err(BridgeError::Handshake(format!(
+                                "{target}: the client identity for {} is past the lifetime \
+                                 it was granted and has to be reissued",
+                                identity.bound_host()
+                            )));
+                        }
+                        identity
+                            .client_config(&roots)
+                            .map_err(|e| BridgeError::Handshake(format!("{target}: {e}")))?
+                    }
+                    Some(identity) => {
+                        return Err(BridgeError::Handshake(format!(
+                            "{target}: this bridge holds a client identity for {}, and \
+                             presenting it here would hand that identity to a host it was \
+                             not granted to",
+                            identity.bound_host()
+                        )));
+                    }
+                    None => rustls::ClientConfig::builder()
+                        .with_root_certificates(roots)
+                        .with_no_client_auth(),
+                };
                 let connection = rustls::ClientConnection::new(std::sync::Arc::new(config), name)
                     .map_err(|e| BridgeError::Handshake(e.to_string()))?;
                 let mut tls = rustls::StreamOwned::new(connection, socket);
@@ -3662,3 +3730,7 @@ mod substitution_tests {
         assert_eq!(unknown, wrong_session);
     }
 }
+
+#[cfg(test)]
+#[path = "tls_bridge/client_auth.rs"]
+mod client_auth;

@@ -86,9 +86,11 @@
 
 pub mod grant;
 pub mod issue;
+pub mod present;
 
 pub use grant::{ClientGrant, MIN_CLIENT_CERT_TTL};
 pub use issue::{ClientCertError, ClientCsr, IssuedClientCert, issue_client_certificate};
+pub use present::ClientIdentity;
 
 #[cfg(test)]
 mod tests;

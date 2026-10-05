@@ -186,6 +186,17 @@ pub enum ClientCertError {
     /// The issuer could not produce a certificate from material that parsed.
     #[error("the certificate could not be signed: {0}")]
     SigningFailed(String),
+
+    /// Material this module signed itself could not be assembled into
+    /// something a destination can be offered.
+    ///
+    /// Separate from [`ClientCertError::SigningFailed`] because the cause is
+    /// on this side of the boundary rather than in a request: a chain whose
+    /// key and certificate do not match is a broker that built something
+    /// unusable, and reporting that as a bad request sends an operator looking
+    /// at the wrong process.
+    #[error("{0}")]
+    Unusable(String),
 }
 
 /// Sign `csr`'s public key into a client certificate for the identity in

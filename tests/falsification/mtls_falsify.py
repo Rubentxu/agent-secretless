@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Falsification for R2.E.1, mTLS client certificate issuance.
+"""Falsification for R2.E, mTLS: issuance (R2.E.1) and presentation (R2.E.2).
+
+Four phases across four files, because R2.E has two halves that live in two
+places. The phases are named in the output and tallied separately so that a
+reader can see which half a mutation belongs to; the totals are one line each
+rather than one number that hides all four.
 
 Same four-bucket accounting as the other harnesses, and the same `no-run`
 outcome, because a row that never executed is indistinguishable from a row that
 passed unless the harness is built so it cannot say otherwise.
 
-**The module has twenty-five rows. This campaign files twenty mutations, and
-four of the twenty-five rows are not falsifiable and are counted as such
-rather than quietly folded into the total.**
+**R2.E.1 has twenty-six rows and this campaign files twenty mutations against
+them, and four of the twenty-six are not falsifiable and are counted as such
+rather than quietly folded into the total. R2.E.2 has ten rows and ten more
+mutations, of which one row is positive and one is half compile-time.**
 
 **One of the four is structural, and it is the module's whole posture.**
 `ni_la_peticion_ni_el_certificado_tienen_clave_privada` is a compiler-refused
@@ -79,11 +85,20 @@ only thing that caught it was running the rows in the real repository, where
 seven of them went red. The harness restored the working copy correctly; the
 copy-out did not know that.
 
-**Why this harness has a second loop.** The base harness edits exactly one
-file, and the canonicalization bypass is a mutation of `grant.rs`. Rather than
-fork the bucket accounting — which is the one number in the file nobody checks
-— the second phase reuses `run_test` and prints its own four buckets. The
-totals are two lines, and the phase that produced each is named.
+**Why this harness has four loops.** The base harness edits exactly one file.
+`grant.rs` carries the canonicalization bypass, `present.rs` the R2.E.2
+identity, and `tls_bridge.rs` the branch that offers it. Rather than fork the
+bucket accounting — which is the one number in the file nobody checks — each
+phase reuses `run_test` and prints its own four buckets.
+
+**The two R2.E.2 mutations worth reading first are the binding ones.** A
+client certificate presented to "whoever asked for one" hands the identity to
+a host impersonating a server, so `presents_to` is an exact comparison against
+the host fixed at issue time. `la_identidad_no_se_presenta_a_un_destino_distinto`
+and `un_destino_distinto_no_llega_de_ninguna_forma` are a pair on purpose: the
+first pins the refusal, the second pins that the refusal is not a silent
+downgrade to a handshake with no certificate. Either alone is satisfiable by
+the wrong behaviour.
 
 Run:  python3 mtls_falsify.py
 """
@@ -97,6 +112,8 @@ import sts_falsify as f  # noqa: E402
 
 ISSUE = f.REPO / "crates/broker/src/mtls/issue.rs"
 GRANT = f.REPO / "crates/broker/src/mtls/grant.rs"
+PRESENT = f.REPO / "crates/broker/src/mtls/present.rs"
+BRIDGE = f.REPO / "crates/broker/src/tls_bridge.rs"
 
 # (label, old, new, test that must go red) -- all in ISSUE.
 MUTATIONS = [
@@ -293,6 +310,121 @@ GRANT_MUTATIONS = [
 ]
 
 
+# R2.E.2 -- the identity the broker holds. Same rule: the binding to one
+# destination is the property, and every mutation here attacks the binding or
+# the material.
+PRESENT_MUTATIONS = [
+    (
+        # Without canonicalization, a grant can be bound to a spelling no
+        # route would ever produce, so `presents_to` compares against a string
+        # the destination never answers to and the identity is unusable in
+        # both directions rather than refusing the wrong one.
+        "bind the identity to a host without canonicalizing it",
+        "        let bound_host = asv_domain::Authority::canonicalize(host)\n            .map_err(|e| ClientCertError::Unusable(format!(\"{host} is not a destination: {e}\")))?\n            .as_str()\n            .to_string();",
+        "        let bound_host = host.to_string();",
+        "una_identidad_no_se_emite_para_un_host_que_no_es_un_host",
+    ),
+    (
+        # The classic off-by-one-suffix. A grant for `svc.example` would then
+        # authenticate `other.svc.example`, and a server that asks for a
+        # client certificate is exactly what an attacker impersonates in
+        # order to receive one.
+        "compare the binding by suffix",
+        "        self.bound_host == host",
+        "        self.bound_host.ends_with(host) || self.bound_host == host",
+        "la_identidad_solo_llega_al_host_exacto",
+    ),
+    (
+        # The same defect with the comparison removed entirely: present it to
+        # whoever asks. Two rows go red, and the handshake row is the one that
+        # says a peer really did receive it.
+        "present the identity to whoever asks for one",
+        "        self.bound_host == host",
+        "        let _ = host;\n        true",
+        "la_identidad_solo_llega_al_host_exacto",
+    ),
+    (
+        # A leaf alone chains to nothing for a peer that trusts only the root,
+        # which is every peer in this product's model: the root is the anchor
+        # and the intermediate is the broker's.
+        "send the leaf without the intermediate",
+        "            chain: vec![\n                CertificateDer::from(issued.der().to_vec()),\n                CertificateDer::from(ca.intermediate_der.clone()),\n            ],",
+        "            chain: vec![CertificateDer::from(issued.der().to_vec())],",
+        "la_cadena_lleva_el_intermedio_para_que_el_destino_pueda_encadenar",
+    ),
+    (
+        # An expired client certificate is one the destination will reject, so
+        # `is_expired` reporting false here spends a handshake to learn
+        # something the broker already knew and reports it as a transport
+        # failure.
+        "report an identity past its lifetime as usable",
+        "        now.saturating_duration_since(self.issued_at) >= self.ttl",
+        "        let _ = (now, self.issued_at, self.ttl);\n        false",
+        "una_identidad_caducada_no_se_presenta",
+    ),
+    (
+        # A derived `Debug` on a struct holding a `PrivateKeyDer` prints the
+        # key. `PrivateKeyDer` and `CertificateDer` both implement `Debug`, so
+        # this compiles and is exactly the edit someone makes when the
+        # hand-written impl looks like boilerplate.
+        "derive Debug on the identity and print the key",
+        '        f.debug_struct("ClientIdentity")\n            .field("identity", &self.identity)\n            .field("bound_host", &self.bound_host)\n            .field("chain_len", &self.chain.len())\n            .field("ttl", &self.ttl)\n            .finish_non_exhaustive()',
+        '        f.debug_struct("ClientIdentity")\n            .field("identity", &self.identity)\n            .field("bound_host", &self.bound_host)\n            .field("key", &self.key)\n            .finish()',
+        "el_debug_de_una_identidad_no_imprime_su_clave",
+    ),
+]
+
+# R2.E.2 -- the branch in `dial_upstream` that offers it.
+BRIDGE_MUTATIONS = [
+    (
+        # The guard removed: the identity is offered to every destination the
+        # bridge reaches. Both binding rows go red, and the destination that
+        # demands a certificate accepts one it was never granted.
+        "offer the identity to every destination",
+        "                    Some(identity) if identity.presents_to(target.host()) => {",
+        "                    Some(identity) => {",
+        "la_identidad_no_se_presenta_a_un_destino_distinto",
+    ),
+    (
+        # The silent downgrade. A grant that stopped matching the route becomes
+        # a handshake with no certificate instead of an error, and the
+        # destination -- which demands one -- refuses for a reason that names
+        # nothing about the identity.
+        "answer a mismatched identity with no client auth",
+        """                    Some(identity) => {
+                        return Err(BridgeError::Handshake(format!(
+                            "{target}: this bridge holds a client identity for {}, and \\
+                             presenting it here would hand that identity to a host it was \\
+                             not granted to",
+                            identity.bound_host()
+                        )));
+                    }""",
+        """                    Some(_) => rustls::ClientConfig::builder()
+                        .with_root_certificates(roots)
+                        .with_no_client_auth(),""",
+        "un_destino_distinto_no_llega_de_ninguna_forma",
+    ),
+    (
+        # Left to the destination, which rejects it: the operator sees a
+        # transport failure rather than "this session's identity has aged out
+        # and needs reissuing".
+        "present an identity that is past its lifetime",
+        "                        if identity.is_expired(std::time::Instant::now()) {",
+        "                        if false {",
+        "una_identidad_caducada_no_se_presenta",
+    ),
+    (
+        # The builder that silently does nothing, which is the shape a
+        # half-finished feature takes: the type exists, the call site reads
+        # correctly, and no certificate is ever presented.
+        "accept a client identity and keep it nowhere",
+        "        self.client_identity = Some(identity);",
+        "        let _ = identity;",
+        "un_destino_que_exige_certificado_acepta_la_identidad_concedida",
+    ),
+]
+
+
 def run_phase(path: Path, mutations: list, title: str) -> tuple[int, dict, list]:
     """Apply `mutations` to one file and return the four-bucket tally.
 
@@ -345,33 +477,48 @@ def run_phase(path: Path, mutations: list, title: str) -> tuple[int, dict, list]
     return len(mutations), buckets, problems
 
 
+# (file, prefix, mutations, phase title)
+PHASES = [
+    (ISSUE, "tls_bridge::mtls::tests::", MUTATIONS, "R2.E.1 issuance"),
+    (GRANT, "tls_bridge::mtls::tests::", GRANT_MUTATIONS, "R2.E.1 grant"),
+    (PRESENT, "tls_bridge::client_auth::", PRESENT_MUTATIONS, "R2.E.2 identity"),
+    (BRIDGE, "tls_bridge::client_auth::", BRIDGE_MUTATIONS, "R2.E.2 presentation"),
+]
+
+
 def main() -> int:
-    f.TEST_PREFIX = "tls_bridge::mtls::tests::"
     f.CARGO_TARGET = "--lib"
-    f.STS = ISSUE
     f.MUTATIONS[:] = MUTATIONS
+    f.STS = ISSUE
 
-    total = len(MUTATIONS) + len(GRANT_MUTATIONS)
-    print(
-        f"# falsifying {ISSUE.relative_to(f.REPO)} and {GRANT.relative_to(f.REPO)} "
-        f"with {total} mutations\n"
-    )
+    total = sum(len(m) for _, _, m, _ in PHASES)
+    print(f"# falsifying R2.E with {total} mutations across {len(PHASES)} phases\n")
 
-    print(f"## phase 1 -- {ISSUE.name}")
-    _, buckets_a, problems_a = run_phase(ISSUE, MUTATIONS, ISSUE.name)
-    print()
-    print(f"## phase 2 -- {GRANT.name}")
-    _, buckets_b, problems_b = run_phase(GRANT, GRANT_MUTATIONS, GRANT.name)
+    tally = {}
+    problems = []
+    for index, (path, prefix, mutations, title) in enumerate(PHASES, start=1):
+        f.TEST_PREFIX = prefix
+        f.STS = path
+        print(f"## phase {index} -- {title} ({path.relative_to(f.REPO)})")
+        _, buckets, found = run_phase(path, mutations, f"{path.name}")
+        tally[title] = buckets
+        problems += found
+        print()
 
-    merged = {k: buckets_a[k] + buckets_b[k] for k in buckets_a}
-    print()
+    merged = {}
+    for buckets in tally.values():
+        for key, value in buckets.items():
+            merged[key] = merged.get(key, 0) + value
+    assert sum(merged.values()) == total, (merged, total)
+
     print(f"mutations: {total}  (the four buckets partition the run)")
     for name, count in merged.items():
         print(f"  {name:<22}: {count}")
-    print(f"\n  phase 1 {ISSUE.name}: " + ", ".join(f"{k}={v}" for k, v in buckets_a.items() if v))
-    print(f"  phase 2 {GRANT.name}: " + ", ".join(f"{k}={v}" for k, v in buckets_b.items() if v))
+    print()
+    for title, buckets in tally.items():
+        line = ", ".join(f"{k}={v}" for k, v in buckets.items() if v)
+        print(f"  {title}: {line or 'none'}")
 
-    problems = problems_a + problems_b
     for label, test, why in problems:
         print(f"\nFINDING: {label}\n  test: {test}\n  {why}")
     return 1 if problems else 0
