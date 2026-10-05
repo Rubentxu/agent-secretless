@@ -1175,6 +1175,28 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
+/// How long one connection may take before the broker stops waiting on it.
+///
+/// **This is the bound that keeps one peer from taking the whole broker down.**
+/// `serve` is called from a single-threaded accept loop, and a blocking `read`
+/// on a socket the peer has opened but not written to never returns on its own.
+/// Without a deadline, connecting and saying nothing is enough to stop every
+/// agent from reaching every credential for as long as the attacker cares to
+/// hold the connection open.
+///
+/// The number is deliberately far larger than the work it bounds. A real client
+/// sends its whole request in one `write` immediately after `connect`; five
+/// seconds is four or five orders of magnitude more than that takes. A generous
+/// bound is the right kind of wrong: it never cuts off a legitimate client, and
+/// it converts an unbounded stall into a finite one.
+///
+/// **This is a mitigation, not the fix.** The structural problem is that one
+/// thread serves every peer in turn; the fix is a thread or a task per
+/// connection, which needs `BrokerState` to stop being exclusively borrowed. What
+/// this buys is that the worst case is bounded and observable rather than
+/// permanent.
+const CONNECTION_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn serve(state: &mut BrokerState, stream: UnixStream) -> std::io::Result<()> {
     // Identity first, before reading a single request byte. This ordering is
     // the whole point of ADR-0003: the peer's claims are never consulted.
@@ -1188,6 +1210,18 @@ fn serve(state: &mut BrokerState, stream: UnixStream) -> std::io::Result<()> {
         tracing::debug!(error = %e, "pidfd association unavailable, continuing with peer credentials");
     }
 
+    // Both directions, and before the socket is split: the timeout is a property
+    // of the file description, so setting it once covers the reader and the
+    // writer. A write that blocks is the same denial of service as a read that
+    // does — a peer that connects, asks a question and then never drains the
+    // answer would otherwise pin the single thread just as effectively.
+    stream
+        .set_read_timeout(Some(CONNECTION_IO_TIMEOUT))
+        .and_then(|()| stream.set_write_timeout(Some(CONNECTION_IO_TIMEOUT)))
+        .map_err(|e| {
+            std::io::Error::other(format!("asv brokerd could not bound the connection: {e}"))
+        })?;
+
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
 
@@ -1196,8 +1230,25 @@ fn serve(state: &mut BrokerState, stream: UnixStream) -> std::io::Result<()> {
     // any same-uid peer for the process lifetime, which is exactly the leak the
     // adversarial harness looks for. Zeroize as soon as decoding is done.
     let mut buf = vec![0u8; asv_ipc_protocol::MAX_MESSAGE_BYTES + 1];
-    let n = reader.read(&mut buf)?;
+    let n = match reader.read(&mut buf) {
+        Ok(n) => n,
+        // A peer that opened the socket and then went quiet, or that stopped
+        // reading the answer. Neither is a broker failure, so neither is logged
+        // as one: this is the connection ending, and the next one is served
+        // immediately.
+        Err(e) if is_timeout(&e) => {
+            tracing::debug!(
+                "a connection was open for {}s without a complete exchange and \
+                 was closed",
+                CONNECTION_IO_TIMEOUT.as_secs()
+            );
+            buf.zeroize();
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     if n == 0 {
+        buf.zeroize();
         return Ok(());
     }
 
@@ -1222,6 +1273,21 @@ fn serve(state: &mut BrokerState, stream: UnixStream) -> std::io::Result<()> {
     writer.write_all(&bytes)?;
     writer.flush()?;
     Ok(())
+}
+
+/// Whether `error` is the kernel reporting that one of the deadlines above
+/// expired.
+///
+/// `WouldBlock` and `TimedOut` are both what a socket with `SO_RCVTIMEO` /
+/// `SO_SNDTIMEO` set returns once the time is up, and which one you get is
+/// platform-dependent — Linux reports `WouldBlock` for a plain `read`, macOS
+/// reports `TimedOut` — so accepting only one of them would leave the broker
+/// unbounded on the other.
+fn is_timeout(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 #[cfg(unix)]
