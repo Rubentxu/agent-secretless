@@ -70,11 +70,12 @@ is not listed, and a block with a residual says so in its own row.
 
 | Block | State | Measured by |
 |---|---|---|
-| **R0** | closed | `tests/r0_gate.py` — 4 passed, 0 failed, 0 unavailable. Signature verification reachable from a clean install, 46 negative provenance checks, the official skill published outside this repository and cross-repo verified at 105 checks. |
+| **R0** | **not closed**, and both red gates name their own cause | `tests/r0_gate.py` — **2 passed, 2 failed, 0 unavailable**. R0.1 (roadmap authority) and R0.2 (installer provenance: signature verification reachable from a clean install, 46 negative provenance checks, each one shown refusable) both hold. **R0.3 is red** because the official skill, published outside this repository, has not caught up to the four registry relations R2.F published: the cross-repo contract now stands at **109 checks, 4 failed**, and the four failures are exactly those four relations the skill cannot find documented. **R0.4 is red** because the working tree carries another campaign's uncommitted work. This row previously read *closed, 4 passed, 0 failed, 105 checks*; all three numbers were written before the measurement they describe. |
 | **R1** | closed, and the caveat that qualified it is gone | `r1_isolated_reachability` 11/11 and `r1_isolated_e2e` 6/6, both from the product surface, and `uat_040_isolated_worker_runtime` 15/15. This row previously carried a caveat that 21 tests returned early when their substrate was missing and Cargo reported that as **passed**. The figure was right and the file count was wrong — it is three files, not five, and the split is 18 plus 3. All 18 now **refuse** with `UNAVAILABLE_SUBSTRATE` and are falsified by `tests/falsification/r1_substrate_falsify.py`: 18 red, 14 green, 0 unmeasured. The remaining 3 are the PostgreSQL rows, which already had the better shape (`ASV_UAT033_REQUIRE=1`) and are left alone. See *The rows that reported passing without running*. |
 | **R2.A** | closed, with one half `host-dependent` | `r2a_github_vertical` 11/11 in-process against a real TLS origin, and `r2a_cli_reachability` 4/4 against the real binaries. The live call against the real `api.github.com` is **not** measured and is not claimed; see *Status of item 1* below. |
-| **R2.B** | surface delivered; scope-as-policy-resource still open | `oauth2_vertical` 11/11 over a real vault, a real issuer and a real resource call, `r2b_oauth2_revocation` 5/5 with four falsifications, and now `r2b2_oauth2_vertical` 22/22 through the broker's own `handle` — `asv oauth2 whoami` reaches the port. `ALLOWED_AUDIENCES` was **not** widened: `Resource::OAuth2Client` is a separate type, so admitting a generic IdP cannot reopen D6 for GitHub and AWS, and the schema refuses the dangerous rule at load rather than at evaluation. The answer is verified against the deployment, not relayed, and the issuer's own escalation check turns out to speak before the broker's. Falsified 15 mutations in five passes: 14 red, 1 documented survivor, 0 unmeasured. Still open: a live third-party IdP, scope as a policy resource, and the config-file-vs-policy intersection. See *Status of item 4*. |
+| **R2.B** | surface delivered; scope-as-policy-resource still open | `oauth2_vertical` 10/10 over a real vault, a real issuer and a real resource call, `r2b_oauth2_revocation` 5/5 with four falsifications, and now `r2b2_oauth2_vertical` 25/25 through the broker's own `handle` — `asv oauth2 whoami` reaches the port. `ALLOWED_AUDIENCES` was **not** widened: `Resource::OAuth2Client` is a separate type, so admitting a generic IdP cannot reopen D6 for GitHub and AWS, and the schema refuses the dangerous rule at load rather than at evaluation. The answer is verified against the deployment, not relayed, and the issuer's own escalation check turns out to speak before the broker's. Falsified 15 mutations in five passes: 14 red, 1 documented survivor, 0 unmeasured. Still open: a live third-party IdP, scope as a policy resource, and the config-file-vs-policy intersection. See *Status of item 4*. |
 | **R2.C** | one operation reachable from the product surface; item 2 still not closed | `aws::sigv4` 16/16 against the AWS documentation's own vectors, `aws::sts` 34/34 and `aws::calendar` 9/9 against an oracle written from the specifications, `aws::port` 12/12 with no socket in it, `aws::identity` 12/12 against two documented AWS samples, `r2c2b_sts_vertical` 18/18 against a real TLS origin, and `r2c3_aws_vertical` 13/13 from the product surface — CLI verb, typed IPC, real vault, real policy, real origin, and the advertisement an agent reads to find the verb at all. **113 mutations** across seven harnesses, and the number is the sum of the harness files rather than an inherited figure: 25 `sigv4`, 25 `sts`, 13 `client`, 14 `calendar`, 13 `port`, 14 `identity`, 9 `r2c3`. Of those, **110 red, 1 refused by the compiler, 2 recorded survivors** (the post-read size bound, unexercised because the fake origin always declares a `content-length`; and the binding's `Debug`, which cannot leak because `AwsSecretPort`'s own `Debug` does not). All seven are in the repository at `tests/falsification/` and every one was re-run from there, so the figure is re-derivable rather than merely asserted. **One operation is not a catalogue** — `s3:GetObject`, the regional STS endpoints and the live call are open, so item 2 is not closed under M11's rule. See *Status of item 2*. |
+| **R2.F** | surface delivered end-to-end; the registry side is **not** closed | `r2f_registry_vertical` **21/21** against a real socket — declaration, reachability, pull and push across both manifests and blobs — plus four `asv registry` verbs and four published relations (`asv://rels/registry/{manifest,blob}/{read,push}`), so an agent can *find* the capability rather than be told it exists. Pull and push share one `RegistryGrant`; each arm still writes its own `Action` at the call site, because a policy that permits pushing a blob has not by itself permitted publishing an index that names it. Falsified by named mutations across `tests/falsification/registry_*.py` — a blob upload pointed at the manifest path, and a `ContentDigest` computed after the socket was opened. **Still open:** push is monolithic rather than a `POST`→`PUT` session, so a registry answering with a `Location` the client has not vetted is a follow-up; and `put_blob` verifies the digest *before* opening the socket but cannot verify that the registry kept the bytes, because the registry does not return them. See *Status of item 7*. |
 
 **The R1 row is the one worth reading twice.** `uat_040`'s file-injection row was
 asserting that the staged secret reached the redacted channel in cleartext — a
@@ -734,7 +735,7 @@ Fixed by extracting the declaration into
 `harden::broker_install_paths`, which is testable, and adding the passphrase's
 parent as **read-only** — the broker has no business writing beside a
 passphrase. Five assertions in
-`crates/broker/tests/uat_048_landlock_install_paths.rs` cover the mapping from
+`crates/broker/tests/uat_048_landlock_install_paths.rs` — nine assertions, not five — cover the mapping from
 the operator's arguments to the set, including one that fails if a future
 change widens the static hierarchies over the test's premise.
 
@@ -1624,7 +1625,7 @@ as a blanket `cache.clear()` reds the row about a sibling credential staying
 served; and `forget` on the refusal path reds the row about a refused deletion
 — because the vault write is what decides, and a refusal must cost nothing.
 
-Items 2, 3, 5, 6 and 7 are unstarted. Item 1 is the one semantic connector
+Only items 2 and 6 are unstarted. Items 3, 5 and 7 have landed: `crates/broker/src/k8s/` is eleven files, `crates/broker/src/mtls/` is seven, and item 7 carries both the OCI registry work and `crates/broker/src/aws/s3/`. Item 2 is the case this paragraph used to file as unstarted and is half-built rather than absent — R2.C's row above records the signing, STS and calendar work, and that same row records why it does not close item 2. Item 6, Terraform, is genuinely unstarted: there is no Terraform identifier anywhere in `crates/`. Item 1 is the one semantic connector
 exercised against a real socket, as *Status of item 1* above records, and item 2
 has a foundation and nothing else, as *Status of item 2* below records.
 
@@ -1995,6 +1996,33 @@ computes the right HMAC and drops the host requirement passes all six vectors an
 replays across destinations, which is why the mutations that matter most there
 are the ones that delete a refusal.
 
+### Status of item 7 (Docker/registry): **implemented for OCI read and push**, and the catalogue is not closed
+
+Item 7 was the last of the seven to be unreachable from any product surface. It has a
+surface now: four `asv registry` verbs, four published relations, and
+`r2f_registry_vertical` at 21 rows against a real socket rather than an in-process
+call. The registry's answer is the registry's — the client never sees the credential —
+and a response is bounded at 1 MiB, because a registry must not be able to choose how
+much memory the broker uses.
+
+Two corrections in this block were security findings rather than features, and they
+are worth reading as a pair. `AddressPolicy` refused the IPv4 spellings of a
+destination it refused and accepted several IPv6 ones: multicast, `ff00::/8`,
+`fec0::/10`, 6to4 and both NAT64 prefixes all spelled a host the policy was already
+refusing (`4586028`). And the four registry arms each carried their own copy of the
+same six-step preamble, which is how a check like *the credential must be the one the
+declaration named* comes to be maintained in four places; it is one `RegistryGrant` now
+(`63869bc`), with each arm keeping its `Action` at the call site so a reviewer reads
+the action rather than infers it from a parameter.
+
+The registry side is not closed. Push is monolithic rather than a `POST`→`PUT` session,
+so a registry that answers with a `Location` is a `realm`-shaped input that would need
+the same vetting a realm gets, and it does not get it yet. And `put_blob` proves the
+digest before opening the socket but cannot prove the registry stored the bytes, because
+the registry does not return them: a registry that accepts an upload and discards it is
+indistinguishable, from here, from one that kept it. Docker itself is unstarted; what
+exists is the OCI distribution surface underneath it.
+
 ---
 
 ## M12 — TPM/hardware-backed vault
@@ -2145,7 +2173,7 @@ starting point for the remaining work.
 The pipeline the rebaseline puts at R3, ahead of the M11 residual:
 `discover → safe parse → plan → adopt → binding → project → execute → verify →
 scrub → receipt`. **R3.A.1 builds the first two steps and the surface they
-report through.** `plan` onward is R3.A.2 and later, and is not started.
+report through.** `plan` is R3.A.2 and `adopt` is R3.A.3, and both are started: R3.A.2 is sectioned below and landed in `7e5fa34`, R3.A.3 in `56b3182`. What is genuinely not started is everything after `adopt` — `binding`, `project`, `execute`, `verify`, `scrub`, `receipt`.
 
 The exit criterion for R3 is *"a new adapter addable without touching broker or
 domain"*, which is a statement about the shape of the tree rather than about how
