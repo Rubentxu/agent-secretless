@@ -63,6 +63,7 @@ pub mod oauth2_test_support;
 pub mod pg_policy;
 pub mod pg_session;
 pub mod recovery;
+pub mod registry_declaration;
 pub mod selfreport;
 pub mod surrogate;
 pub mod tls_bridge;

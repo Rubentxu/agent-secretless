@@ -487,7 +487,7 @@ impl CredentialClass {
         match (self, family) {
             (Self::Generic, _) => true,
             (Self::Database, OperationFamily::Database) => true,
-            (Self::Database, OperationFamily::GitHub) => false,
+            (Self::Database, _) => false,
         }
     }
 }
@@ -505,6 +505,16 @@ pub enum OperationFamily {
     GitHub,
     /// `PostgresConnect`, `PostgresQuery`.
     Database,
+    /// `PullManifest`, `PullBlob`, `PushManifest` (M11-R2.F.3).
+    ///
+    /// A family of its own because a registry credential is neither a GitHub
+    /// token nor a database password, and the question this enum answers is
+    /// "is this surrogate even the right *shape* for this operation". Folding
+    /// it into `GitHub` would have been the cheaper change and would have made
+    /// a GitHub-scoped surrogate usable for a registry pull without anyone
+    /// deciding that — which is the same confused deputy the M4 policy
+    /// bypass rows are about, one layer down.
+    Registry,
 }
 
 impl OperationFamily {
@@ -517,6 +527,7 @@ impl OperationFamily {
         match self {
             Self::GitHub => "github",
             Self::Database => "postgres",
+            Self::Registry => "registry",
         }
     }
 }
