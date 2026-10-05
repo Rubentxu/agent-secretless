@@ -105,7 +105,9 @@ pub enum DeploymentError {
     ///
     /// Harmless on its own, and refused because a configuration carrying an
     /// exception that does nothing is a configuration nobody has read.
-    #[error("audience {audience} is public; declaring the in-cluster exception for it means nothing")]
+    #[error(
+        "audience {audience} is public; declaring the in-cluster exception for it means nothing"
+    )]
     ExceptionOnAPublicAudience {
         /// The audience carrying an exception it does not need.
         audience: Authority,
@@ -239,9 +241,11 @@ impl K8sDeployment {
             None => Err(DeploymentError::PrivateAudienceUndeclared {
                 audience: self.audience.clone(),
             }),
-            Some(_) if !InCluster::matches(&self.audience) => Err(DeploymentError::NotAClusterName {
-                audience: self.audience.clone(),
-            }),
+            Some(_) if !InCluster::matches(&self.audience) => {
+                Err(DeploymentError::NotAClusterName {
+                    audience: self.audience.clone(),
+                })
+            }
             Some(_) => Ok(()),
         }
     }

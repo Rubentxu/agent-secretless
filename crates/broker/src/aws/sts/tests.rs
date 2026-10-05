@@ -247,7 +247,12 @@ fn a_session_name_carrying_whitespace_is_refused() {
     // "asv session" is the single most likely typo there is. It is worth
     // refusing here because the versioned character classes are left to AWS on
     // purpose, and "no whitespace" is both documented and stable.
-    for bad in ["asv session", "asv\tsession", "asv\nsession", "asv\rsession"] {
+    for bad in [
+        "asv session",
+        "asv\tsession",
+        "asv\nsession",
+        "asv\rsession",
+    ] {
         assert!(
             AssumeRole::new(ROLE_ARN, bad, 3600, None).is_err(),
             "{bad:?} carries whitespace and was accepted"
@@ -303,11 +308,7 @@ fn a_session_that_expired_before_it_was_used_is_refused_rather_than_served() {
     // The document is complete and the credential is gone. Serving it anyway
     // would be the worst outcome available: a confident answer that fails at
     // the provider, attributed to something else.
-    let outcome = parse_assume_role(
-        sample().as_bytes(),
-        &request(),
-        at(SAMPLE_EXPIRATION + 1),
-    );
+    let outcome = parse_assume_role(sample().as_bytes(), &request(), at(SAMPLE_EXPIRATION + 1));
     assert_eq!(
         outcome.err(),
         Some(StsError::AlreadyExpired("2019-11-09T13:34:41Z".into()))
@@ -341,11 +342,7 @@ fn an_expiration_outside_the_one_documented_shape_is_refused() {
             SAMPLE_SESSION_TOKEN,
             stamp,
         );
-        let outcome = parse_assume_role(
-            body.as_bytes(),
-            &request(),
-            at(SAMPLE_EXPIRATION - 3600),
-        );
+        let outcome = parse_assume_role(body.as_bytes(), &request(), at(SAMPLE_EXPIRATION - 3600));
         assert!(
             matches!(outcome, Err(StsError::MalformedExpiration(_))),
             "{stamp:?} was accepted as an instant"
@@ -396,7 +393,10 @@ fn a_provider_refusal_is_named_rather_than_flattened() {
     match parse(body) {
         Err(StsError::Provider { code, message }) => {
             assert_eq!(code, "AccessDenied");
-            assert!(message.contains("sts:AssumeRole"), "the message was lost: {message}");
+            assert!(
+                message.contains("sts:AssumeRole"),
+                "the message was lost: {message}"
+            );
         }
         other => panic!("a provider refusal was not named: {other:?}"),
     }
@@ -421,10 +421,7 @@ fn an_error_response_is_never_mistaken_for_credentials() {
   <Error><Type>Sender</Type><Code>Throttling</Code><Message>slow down</Message></Error>
   <RequestId>abc</RequestId>
 </ErrorResponse>"#;
-    assert!(matches!(
-        parse(body),
-        Err(StsError::Provider { .. })
-    ));
+    assert!(matches!(parse(body), Err(StsError::Provider { .. })));
 }
 
 #[test]
@@ -436,10 +433,7 @@ fn a_document_this_reader_does_not_know_is_refused() {
         "<AssumeRoleResponse><AssumeRoleResult/></AssumeRoleResponse>",
         r#"{"Credentials":{"AccessKeyId":"ASIA"}}"#,
     ] {
-        assert!(
-            parse(body).is_err(),
-            "{body:?} was read as an STS document"
-        );
+        assert!(parse(body).is_err(), "{body:?} was read as an STS document");
     }
 }
 
@@ -448,7 +442,10 @@ fn a_response_larger_than_the_bound_is_refused_unread() {
     // The bound is not about AWS, whose response is well under a kilobyte. It
     // is about the reader refusing to look at something it did not expect.
     let padding = "x".repeat(MAX_RESPONSE_BYTES);
-    let body = sample().replace("</AssumeRoleResponse>", &format!("<P>{padding}</P></AssumeRoleResponse>"));
+    let body = sample().replace(
+        "</AssumeRoleResponse>",
+        &format!("<P>{padding}</P></AssumeRoleResponse>"),
+    );
     assert!(
         body.len() > MAX_RESPONSE_BYTES,
         "the fixture has to actually exceed the bound to mean anything"
@@ -480,7 +477,12 @@ fn a_credential_field_left_empty_is_missing_rather_than_empty() {
     // puzzle.
     for (access_key, secret, token, field) in [
         ("", SAMPLE_SECRET, SAMPLE_SESSION_TOKEN, "AccessKeyId"),
-        (SAMPLE_ACCESS_KEY, "", SAMPLE_SESSION_TOKEN, "SecretAccessKey"),
+        (
+            SAMPLE_ACCESS_KEY,
+            "",
+            SAMPLE_SESSION_TOKEN,
+            "SecretAccessKey",
+        ),
         (SAMPLE_ACCESS_KEY, SAMPLE_SECRET, "", "SessionToken"),
     ] {
         let body = response_with(access_key, secret, token, "2019-11-09T13:34:41Z");
@@ -709,7 +711,8 @@ fn a_multibyte_character_beside_a_tag_is_read_whole_and_does_not_bring_the_reade
          <Expiration>2019-11-09T13:34:41Z</Expiration>\
          </Credentials></AssumeRoleResult></AssumeRoleResponse>"
     );
-    let session = parse(&body).expect("a multibyte character beside a tag is text, and text is readable");
+    let session =
+        parse(&body).expect("a multibyte character beside a tag is text, and text is readable");
     assert_eq!(
         session.access_key_id,
         format!("é{SAMPLE_ACCESS_KEY}"),
@@ -774,7 +777,9 @@ fn a_body_that_is_not_utf8_is_refused_before_it_is_parsed() {
     body[field_at] = 0xff;
     assert_eq!(
         parse_assume_role(&body, &request(), at(SAMPLE_EXPIRATION - 3600)).err(),
-        Some(StsError::UnrecognisedDocument("the body is not UTF-8".into())),
+        Some(StsError::UnrecognisedDocument(
+            "the body is not UTF-8".into()
+        )),
     );
 }
 
@@ -810,7 +815,9 @@ fn the_three_signing_values_have_no_public_getter() {
     // are secret are not, and the only route out is a sink.
     let session = parse(&sample()).expect("the documented sample parses");
     let mut sink = Recorder::default();
-    session.with_signing_values(&mut sink).expect("hand it over");
+    session
+        .with_signing_values(&mut sink)
+        .expect("hand it over");
 
     // Field access is what a getter would exist to serve, and the compiler is
     // what says no. These are the public fields, in the order they are declared.
@@ -822,7 +829,10 @@ fn the_three_signing_values_have_no_public_getter() {
     );
     // The secret pair is `Zeroizing` and private: the only way to observe them
     // is the sink, and the sink is the only thing that gets them.
-    assert_eq!(sink.calls, 1, "the sink was handed the values more than once");
+    assert_eq!(
+        sink.calls, 1,
+        "the sink was handed the values more than once"
+    );
 }
 
 #[derive(Default)]

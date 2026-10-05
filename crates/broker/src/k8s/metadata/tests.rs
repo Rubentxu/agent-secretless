@@ -5,7 +5,7 @@
 //! to assert, and most of these rows are about the *shape* of what comes back
 //! rather than its contents.
 
-use super::{MetadataError, SecretMetadata, secret_metadata};
+use super::{secret_metadata, MetadataError, SecretMetadata};
 use crate::k8s::K8sReply;
 
 /// A reply whose `data` holds a value that must not survive the read.
@@ -109,7 +109,10 @@ fn the_base64_of_the_value_is_not_copied_out_of_the_reply() {
         "cGF5bWVudHMvc3Zjogc2VjcmV0LXZhbHVl",
         "c3VwZXItc2VjcmV0LXZhbHVl",
     ] {
-        assert!(!answer.contains(value), "the answer repeated a value: {answer}");
+        assert!(
+            !answer.contains(value),
+            "the answer repeated a value: {answer}"
+        );
     }
 }
 
@@ -184,7 +187,8 @@ fn a_secret_with_no_data_still_answers() {
     // they are not.
     let metadata = secret_metadata(&K8sReply {
         status: 200,
-        body: br#"{"kind":"Secret","metadata":{"name":"empty","namespace":"payments"},"data":{}}"#.to_vec(),
+        body: br#"{"kind":"Secret","metadata":{"name":"empty","namespace":"payments"},"data":{}}"#
+            .to_vec(),
     })
     .expect("an empty Secret is a Secret");
 
@@ -201,7 +205,10 @@ fn a_secret_with_no_data_member_at_all_answers_with_a_zero_count() {
     .expect("a Secret with no data member is still a Secret");
 
     assert_eq!(metadata.key_count(), 0);
-    assert_eq!(metadata.secret_type, "", "an absent type is empty, not guessed");
+    assert_eq!(
+        metadata.secret_type, "",
+        "an absent type is empty, not guessed"
+    );
 }
 
 /// # The positive rows

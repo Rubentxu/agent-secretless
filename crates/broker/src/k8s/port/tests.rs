@@ -34,10 +34,7 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// relative fixture would make every row here test the refusal instead.
 fn token_file(contents: &[u8]) -> PathBuf {
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "asv-k8s-port-{}-{n}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("asv-k8s-port-{}-{n}", std::process::id()));
     fs::create_dir_all(&dir).expect("create the fixture dir");
     let path = dir.join("token");
     fs::write(&path, contents).expect("write the fixture token");
@@ -96,10 +93,12 @@ fn nothing_is_trimmed_normalised_or_appended() {
     let padded: &[u8] = b"   eyJhbGciOiJSUzI1NiJ9.e30.sig   ";
     let port = K8sSecretPort::new(token_file(padded)).expect("absolute");
     let mut sink = Recorder::default();
-    port.lend("k8s/default", &mut sink).expect("a space-padded token still lends");
+    port.lend("k8s/default", &mut sink)
+        .expect("a space-padded token still lends");
     let seen = sink.seen.expect("the sink was called");
     assert_eq!(
-        seen, padded,
+        seen,
+        padded,
         "the token was altered on its way to the sink: {:?}",
         String::from_utf8_lossy(&seen)
     );
@@ -172,7 +171,8 @@ fn forget_costs_nothing_because_nothing_is_held() {
     port.lend("k8s/default", &mut first).expect("lends");
     port.forget("k8s/default");
     let mut second = Recorder::default();
-    port.lend("k8s/default", &mut second).expect("still lends after forget");
+    port.lend("k8s/default", &mut second)
+        .expect("still lends after forget");
     assert_eq!(second.seen.as_deref(), Some(TOKEN));
     // A second call, not a second read of a cache: the count is on the sink,
     // and it is two because two lends happened.
@@ -259,7 +259,9 @@ fn a_missing_token_file_is_unavailable_rather_than_empty() {
     let mut sink = Recorder::default();
     // Not an empty-token refusal: a rotated-away file and an empty file are
     // different diagnoses and the message has to tell them apart.
-    let err = port.lend("k8s/default", &mut sink).expect_err("a missing file");
+    let err = port
+        .lend("k8s/default", &mut sink)
+        .expect_err("a missing file");
     assert!(matches!(err, SecretError::Unavailable(_)));
     assert!(format!("{err}").contains("could not be read"), "{err}");
     assert_eq!(sink.calls, 0);

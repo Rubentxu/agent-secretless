@@ -36,8 +36,8 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
-use asv_broker::aws_binding::{AwsBinding, AwsDeployment};
 use asv_broker::aws::client::{AwsCredentialConfig, StsClient};
+use asv_broker::aws_binding::{AwsBinding, AwsDeployment};
 use asv_broker::handle;
 use asv_broker::{BrokerState, VaultSecretPort};
 use asv_connector_http::fake_origin::{Observed, OriginResponse, TlsOrigin};
@@ -57,13 +57,16 @@ const ROLE: &str = "arn:aws:iam::123456789012:role/demo";
 
 /// The origin answers the two calls differently, the way a real STS does.
 fn origin() -> TlsOrigin {
-    TlsOrigin::start("sts.amazonaws.com", Arc::new(|observed: &Observed| {
-        if observed.body.contains("Action=GetCallerIdentity") {
-            OriginResponse::new(200, identity_response())
-        } else {
-            OriginResponse::new(200, assume_role_response())
-        }
-    }))
+    TlsOrigin::start(
+        "sts.amazonaws.com",
+        Arc::new(|observed: &Observed| {
+            if observed.body.contains("Action=GetCallerIdentity") {
+                OriginResponse::new(200, identity_response())
+            } else {
+                OriginResponse::new(200, assume_role_response())
+            }
+        }),
+    )
 }
 
 fn identity_response() -> String {
@@ -106,9 +109,12 @@ impl Vertical {
         let dir = tempfile::tempdir().expect("tempdir");
         let passphrase = secrecy::SecretString::from("r2c3-passphrase".to_string());
 
-        let mut store =
-            VaultStore::create(dir.path().join("v.asv"), &passphrase, KdfParams::fast_for_tests())
-                .expect("create vault");
+        let mut store = VaultStore::create(
+            dir.path().join("v.asv"),
+            &passphrase,
+            KdfParams::fast_for_tests(),
+        )
+        .expect("create vault");
         let key: VaultKey = store
             .header()
             .unlock(&passphrase)
@@ -155,7 +161,9 @@ impl Vertical {
         // addresses it was handed either way.
         let transport = PinnedClient::build_with_roots(
             &resolved,
-            AddressPolicy { allow_loopback: true },
+            AddressPolicy {
+                allow_loopback: true,
+            },
             &[origin.certificate()],
         )
         .expect("the fixture origin is usable over the pinned audience");
@@ -174,7 +182,7 @@ impl Vertical {
         state.aws.push(AwsBinding::new(
             AwsDeployment {
                 credential: CredentialId::from_wire(CRED).expect("canonical wire form"),
-                    audience,
+                audience,
                 region: "us-east-1".to_string(),
                 role_arn: ROLE.to_string(),
                 role_session_name: "asv-session".to_string(),
@@ -247,8 +255,15 @@ fn refusal(response: &Response) -> (ErrorCode, &str) {
 fn an_agent_names_the_operation_and_gets_the_providers_own_answer() {
     let mut vertical = Vertical::permitting();
     match vertical.whoami(CRED) {
-        Response::AwsCallerIdentity { arn, user_id, account } => {
-            assert_eq!(arn, "arn:aws:sts::123456789012:assumed-role/demo/asv-session");
+        Response::AwsCallerIdentity {
+            arn,
+            user_id,
+            account,
+        } => {
+            assert_eq!(
+                arn,
+                "arn:aws:sts::123456789012:assumed-role/demo/asv-session"
+            );
             assert_eq!(user_id, "ARO123EXAMPLE123:asv-session");
             assert_eq!(account, "123456789012");
         }
@@ -272,10 +287,16 @@ fn the_encoded_response_carries_no_credential() {
     let response = vertical.whoami(CRED);
     let encoded = serde_json::to_string(&response).expect("the response encodes");
     for secret in [LONG_LIVED_KEY, SESSION_SECRET_KEY, SESSION_TOKEN] {
-        assert!(!encoded.contains(secret), "a credential reached the caller: {encoded}");
+        assert!(
+            !encoded.contains(secret),
+            "a credential reached the caller: {encoded}"
+        );
     }
     // And the row is not passing on an empty string.
-    assert!(encoded.contains("assumed-role/demo/asv-session"), "{encoded}");
+    assert!(
+        encoded.contains("assumed-role/demo/asv-session"),
+        "{encoded}"
+    );
 }
 
 /// The audit has to answer "who spent this credential" without being a second
@@ -294,7 +315,10 @@ fn the_audit_record_of_the_call_carries_no_credential() {
         "the call left no audit trace: {records}"
     );
     for secret in [LONG_LIVED_KEY, SESSION_SECRET_KEY, SESSION_TOKEN] {
-        assert!(!records.contains(secret), "a credential reached the audit: {records}");
+        assert!(
+            !records.contains(secret),
+            "a credential reached the audit: {records}"
+        );
     }
 }
 
@@ -321,7 +345,10 @@ fn a_credential_no_deployment_names_is_refused_before_any_socket() {
         message.contains(CRED),
         "the refusal does not list the configured deployments: {message}"
     );
-    assert!(vertical.origin.observed().is_empty(), "a refused request reached AWS");
+    assert!(
+        vertical.origin.observed().is_empty(),
+        "a refused request reached AWS"
+    );
 }
 
 /// A stock policy permits nothing here, and the omission is the point.
@@ -340,7 +367,10 @@ fn a_stock_policy_refuses_the_operation_before_any_socket() {
     // verb, and this row is about the *decision*, so it pins the form that
     // actually reaches an operator.
     assert!(message.contains("aws.sts.caller_identity"), "{message}");
-    assert!(vertical.origin.observed().is_empty(), "a denied request reached AWS");
+    assert!(
+        vertical.origin.observed().is_empty(),
+        "a denied request reached AWS"
+    );
 }
 
 /// A session this peer does not own is refused, before any socket.
@@ -372,7 +402,10 @@ fn a_session_this_peer_does_not_own_is_refused_before_any_socket() {
     let (code, message) = refusal(&response);
     assert_eq!(code, ErrorCode::Denied);
     assert!(message.contains("not owned"), "{message}");
-    assert!(vertical.origin.observed().is_empty(), "an unowned session reached AWS");
+    assert!(
+        vertical.origin.observed().is_empty(),
+        "an unowned session reached AWS"
+    );
 }
 
 /// A broker with no deployment configured refuses everything, and says so.
@@ -388,7 +421,10 @@ fn a_broker_with_no_deployment_configured_refuses_every_aws_request() {
     let (code, message) = refusal(&asked);
     assert_eq!(code, ErrorCode::Denied);
     assert!(message.contains("configured"), "{message}");
-    assert!(vertical.origin.observed().is_empty(), "an unconfigured broker reached AWS");
+    assert!(
+        vertical.origin.observed().is_empty(),
+        "an unconfigured broker reached AWS"
+    );
 }
 
 /// Ending the session stops the next call, so an AWS operation cannot outlive
@@ -410,7 +446,10 @@ fn ending_the_session_stops_further_aws_calls() {
     let after = vertical.whoami(CRED);
     let (code, message) = refusal(&after);
     assert_eq!(code, ErrorCode::Denied);
-    assert!(message.contains("not owned") || message.contains("revoked"), "{message}");
+    assert!(
+        message.contains("not owned") || message.contains("revoked"),
+        "{message}"
+    );
 }
 
 /// The operator's audience, not the request's.
@@ -436,8 +475,7 @@ fn the_request_goes_to_the_deployments_audience() {
         // the deployment named, not that the header is a bare string equal to it.
         let authority = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
         assert_eq!(
-            authority,
-            vertical.origin.certified_for,
+            authority, vertical.origin.certified_for,
             "the request went somewhere the deployment did not name: {host}"
         );
     }
@@ -456,7 +494,10 @@ fn a_broker_with_no_vault_open_refuses_before_any_socket() {
     let (code, message) = refusal(&asked);
     assert_eq!(code, ErrorCode::Denied);
     assert!(message.contains("credential store"), "{message}");
-    assert!(vertical.origin.observed().is_empty(), "an unvaulted broker reached AWS");
+    assert!(
+        vertical.origin.observed().is_empty(),
+        "an unvaulted broker reached AWS"
+    );
 }
 
 /// A binding printed whole names the deployment and none of the sessions.
@@ -471,10 +512,19 @@ fn a_binding_printed_never_prints_a_session() {
     vertical.whoami(CRED);
     let printed = format!("{:?}", vertical.state.aws[0]);
     for secret in [LONG_LIVED_KEY, SESSION_SECRET_KEY, SESSION_TOKEN] {
-        assert!(!printed.contains(secret), "a credential reached the binding's Debug");
+        assert!(
+            !printed.contains(secret),
+            "a credential reached the binding's Debug"
+        );
     }
-    assert!(printed.contains(ROLE), "the printed binding lost the role: {printed}");
-    assert!(printed.contains(CRED), "the printed binding lost the credential: {printed}");
+    assert!(
+        printed.contains(ROLE),
+        "the printed binding lost the role: {printed}"
+    );
+    assert!(
+        printed.contains(CRED),
+        "the printed binding lost the credential: {printed}"
+    );
 }
 
 /// An agent that asks the broker what it can do is told about this one.

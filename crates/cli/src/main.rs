@@ -1232,10 +1232,17 @@ fn run_aws(socket: &std::path::Path, command: &AwsCommand) -> std::io::Result<()
     let _ = call(socket, &Request::EndSession { session });
 
     match &response {
-        Response::AwsCallerIdentity { arn, user_id, account } => {
+        Response::AwsCallerIdentity {
+            arn,
+            user_id,
+            account,
+        } => {
             if *json {
                 let result = ipc::from_response(&response);
-                println!("{}", render::json::envelope(&render::json::for_result(&result)));
+                println!(
+                    "{}",
+                    render::json::envelope(&render::json::for_result(&result))
+                );
             } else {
                 println!("arn:     {arn}");
                 println!("user_id: {user_id}");
@@ -1246,7 +1253,10 @@ fn run_aws(socket: &std::path::Path, command: &AwsCommand) -> std::io::Result<()
         Response::Error { code, message } => {
             if *json {
                 let result = ipc::from_response(&response);
-                println!("{}", render::json::envelope(&render::json::for_result(&result)));
+                println!(
+                    "{}",
+                    render::json::envelope(&render::json::for_result(&result))
+                );
             } else {
                 eprintln!("asv aws refused ({code:?}): {message}");
             }
@@ -1318,7 +1328,10 @@ fn run_oauth2(socket: &std::path::Path, command: &Oauth2Command) -> std::io::Res
         } => {
             if *json {
                 let result = ipc::from_response(&response);
-                println!("{}", render::json::envelope(&render::json::for_result(&result)));
+                println!(
+                    "{}",
+                    render::json::envelope(&render::json::for_result(&result))
+                );
             } else {
                 println!("resource: {resource}");
                 println!("scope:    {scope}");
@@ -1329,7 +1342,10 @@ fn run_oauth2(socket: &std::path::Path, command: &Oauth2Command) -> std::io::Res
         Response::Error { code, message } => {
             if *json {
                 let result = ipc::from_response(&response);
-                println!("{}", render::json::envelope(&render::json::for_result(&result)));
+                println!(
+                    "{}",
+                    render::json::envelope(&render::json::for_result(&result))
+                );
             } else {
                 eprintln!("asv oauth2 refused ({code:?}): {message}");
             }
@@ -1702,7 +1718,11 @@ fn print_response(response: &Response) {
         // it can label them. Present because the match is exhaustive on purpose:
         // an unhandled response must be a compile error, not a silent blank line
         // to an operator who has just asked AWS a question.
-        Response::AwsCallerIdentity { arn, user_id, account } => {
+        Response::AwsCallerIdentity {
+            arn,
+            user_id,
+            account,
+        } => {
             println!("arn:     {arn}");
             println!("user_id: {user_id}");
             println!("account: {account}");

@@ -123,11 +123,7 @@ struct SecretView {
     kind: Option<String>,
     #[serde(default)]
     metadata: ObjectMetaView,
-    #[serde(
-        rename = "data",
-        default,
-        deserialize_with = "count_entries"
-    )]
+    #[serde(rename = "data", default, deserialize_with = "count_entries")]
     key_count: usize,
 }
 
@@ -186,8 +182,8 @@ pub fn secret_metadata(reply: &K8sReply) -> Result<SecretMetadata, MetadataError
     // Straight from the bytes. There is no intermediate `Value`, so there is
     // no moment at which the whole document — value included — exists as a
     // tree of heap strings.
-    let view: SecretView =
-        serde_json::from_slice(&reply.body).map_err(|error| MetadataError::Unreadable(error.to_string()))?;
+    let view: SecretView = serde_json::from_slice(&reply.body)
+        .map_err(|error| MetadataError::Unreadable(error.to_string()))?;
 
     // The kind is checked before any metadata is handed back, so a reply that
     // is a Pod or a Status is refused on its own terms rather than yielding a

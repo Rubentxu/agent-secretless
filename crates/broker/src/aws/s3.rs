@@ -93,7 +93,9 @@ pub enum S3Error {
     /// the point: normalising produces a path the operator did not name, and
     /// the signature would be computed over the *normalised* one while a
     /// reader of the request line sees the original.
-    #[error("object key {key:?} contains a {segment:?} segment; a key is refused rather than rewritten")]
+    #[error(
+        "object key {key:?} contains a {segment:?} segment; a key is refused rather than rewritten"
+    )]
     Traversal {
         /// The key as it was given.
         key: String,
@@ -146,7 +148,10 @@ impl S3Target {
             ),
             Addressing::PathStyle => (
                 format!("s3.{region}.amazonaws.com"),
-                format!("/{}/{encoded_key}", encode_component(bucket.as_bytes(), false)),
+                format!(
+                    "/{}/{encoded_key}",
+                    encode_component(bucket.as_bytes(), false)
+                ),
             ),
         };
 
@@ -187,27 +192,38 @@ fn check_bucket(bucket: &str) -> Result<(), S3Error> {
     // its message still says "lowercase". The arm was a second way to say
     // something the first one already said.
     if bucket.contains('_') {
-        return Err(invalid("a bucket name has no underscore, which is what DNS labels allow and S3 does not"));
+        return Err(invalid(
+            "a bucket name has no underscore, which is what DNS labels allow and S3 does not",
+        ));
     }
     if bucket.contains("..") {
         return Err(invalid("a bucket name has no adjacent dots"));
     }
-    if bucket.starts_with('.') || bucket.ends_with('.') || bucket.starts_with('-') || bucket.ends_with('-')
+    if bucket.starts_with('.')
+        || bucket.ends_with('.')
+        || bucket.starts_with('-')
+        || bucket.ends_with('-')
     {
-        return Err(invalid("a bucket name starts and ends with a letter or a digit"));
+        return Err(invalid(
+            "a bucket name starts and ends with a letter or a digit",
+        ));
     }
     if !bucket
         .bytes()
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
     {
-        return Err(invalid("a bucket name is lowercase letters, digits, dots and hyphens"));
+        return Err(invalid(
+            "a bucket name is lowercase letters, digits, dots and hyphens",
+        ));
     }
     // An IP-shaped name is refused because TLS cannot present a wildcard
     // certificate for one, which is why virtual-hosted addressing breaks on it
     // — and a signature computed for a host nobody can prove is not a host
     // anybody should send a credential to.
     if looks_like_ipv4(bucket) {
-        return Err(invalid("a bucket name may not be an IPv4 address; a certificate cannot cover it"));
+        return Err(invalid(
+            "a bucket name may not be an IPv4 address; a certificate cannot cover it",
+        ));
     }
     Ok(())
 }
@@ -235,7 +251,9 @@ fn check_key(key: &str) -> Result<(), S3Error> {
         reason,
     };
     if key.is_empty() {
-        return Err(invalid("a key is not empty; an empty one names the bucket itself"));
+        return Err(invalid(
+            "a key is not empty; an empty one names the bucket itself",
+        ));
     }
     if let Some(byte) = key.bytes().find(|b| b.is_ascii_control()) {
         return Err(S3Error::InvalidKey {
@@ -247,7 +265,10 @@ fn check_key(key: &str) -> Result<(), S3Error> {
             },
         });
     }
-    if key.split('/').any(|segment| segment == ".." || segment == ".") {
+    if key
+        .split('/')
+        .any(|segment| segment == ".." || segment == ".")
+    {
         return Err(S3Error::Traversal {
             key: key.to_string(),
             segment: key

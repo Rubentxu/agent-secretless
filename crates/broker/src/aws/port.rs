@@ -201,10 +201,7 @@ impl AwsSecretPort {
     }
 
     /// Moves a session's three values into `sink` and takes them back.
-    fn hand_over(
-        session: &AwsSession,
-        sink: &mut dyn AwsSecretSink,
-    ) -> Result<(), StsClientError> {
+    fn hand_over(session: &AwsSession, sink: &mut dyn AwsSecretSink) -> Result<(), StsClientError> {
         session
             .with_signing_values(sink)
             .map_err(StsClientError::Request)

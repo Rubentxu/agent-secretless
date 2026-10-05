@@ -225,5 +225,8 @@ fn the_epoch_is_where_both_directions_agree_it_is() {
             day: 1
         }
     );
-    assert_eq!(amz_date(SystemTime::UNIX_EPOCH), Some("19700101T000000Z".into()));
+    assert_eq!(
+        amz_date(SystemTime::UNIX_EPOCH),
+        Some("19700101T000000Z".into())
+    );
 }

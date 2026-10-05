@@ -186,7 +186,7 @@ fn caller_identity_response() -> String {
     <RequestId>01234567-89ab-cdef-0123-456789abcdef</RequestId>
   </ResponseMetadata>
 </GetCallerIdentityResponse>"#
-    .to_string()
+        .to_string()
 }
 
 /// An origin that answers the two calls differently, the way a real STS does.
@@ -195,16 +195,19 @@ fn caller_identity_response() -> String {
 /// thing: the session-signed rows need a session minted *and* an identity read,
 /// and the whole subject is the second request.
 fn origin_for_session(identity_reply: Option<(u16, String)>) -> TlsOrigin {
-    TlsOrigin::start("sts.amazonaws.com", Arc::new(move |observed: &Observed| {
-        if observed.body.contains("Action=GetCallerIdentity") {
-            match &identity_reply {
-                Some((status, body)) => OriginResponse::new(*status, body.clone()),
-                None => OriginResponse::new(200, caller_identity_response()),
+    TlsOrigin::start(
+        "sts.amazonaws.com",
+        Arc::new(move |observed: &Observed| {
+            if observed.body.contains("Action=GetCallerIdentity") {
+                match &identity_reply {
+                    Some((status, body)) => OriginResponse::new(*status, body.clone()),
+                    None => OriginResponse::new(200, caller_identity_response()),
+                }
+            } else {
+                OriginResponse::new(200, assume_role_response())
             }
-        } else {
-            OriginResponse::new(200, assume_role_response())
-        }
-    }))
+        }),
+    )
 }
 
 /// The port a session-signed call goes through, wired the way the broker wires
@@ -213,10 +216,7 @@ fn origin_for_session(identity_reply: Option<(u16, String)>) -> TlsOrigin {
 fn session_port(origin: &TlsOrigin) -> (AwsSecretPort, Arc<std::sync::atomic::AtomicUsize>) {
     let (long_lived, grants) = CountingPort::new(LONG_LIVED_KEY.as_bytes());
     let client = Arc::new(client_for(origin));
-    let port = AwsSecretPort::new(Arc::new(ClientExchange::new(
-        client,
-        Arc::new(long_lived),
-    )));
+    let port = AwsSecretPort::new(Arc::new(ClientExchange::new(client, Arc::new(long_lived))));
     (port, grants)
 }
 
@@ -227,19 +227,24 @@ fn session_port(origin: &TlsOrigin) -> (AwsSecretPort, Arc<std::sync::atomic::At
 /// one that is not exported. Only the three shapes below are reachable, and
 /// every other test in the tree goes through the scripted `FakeOrigin`.
 fn origin(reply: Reply) -> TlsOrigin {
-    TlsOrigin::start("sts.amazonaws.com", Arc::new(move |_: &Observed| match &reply {
-        Reply::StatusWithLocation { status, body, location } => OriginResponse::new(
-            *status,
-            body.clone(),
-        )
-        .with_header("location", location),
-        Reply::Body(body) => OriginResponse::new(200, body.clone()),
-        Reply::Redirect(location) => {
-            OriginResponse::new(302, String::new()).with_header("location", location)
-        }
-        Reply::Status { status, body } => OriginResponse::new(*status, body.clone()),
-        other => panic!("the STS fixture only scripts a body, a redirect or a status; got {other:?}"),
-    }))
+    TlsOrigin::start(
+        "sts.amazonaws.com",
+        Arc::new(move |_: &Observed| match &reply {
+            Reply::StatusWithLocation {
+                status,
+                body,
+                location,
+            } => OriginResponse::new(*status, body.clone()).with_header("location", location),
+            Reply::Body(body) => OriginResponse::new(200, body.clone()),
+            Reply::Redirect(location) => {
+                OriginResponse::new(302, String::new()).with_header("location", location)
+            }
+            Reply::Status { status, body } => OriginResponse::new(*status, body.clone()),
+            other => {
+                panic!("the STS fixture only scripts a body, a redirect or a status; got {other:?}")
+            }
+        }),
+    )
 }
 
 /// A client pinned to `origin`, the way production is built against a vetted
@@ -257,7 +262,9 @@ fn client_for(origin: &TlsOrigin) -> StsClient {
     // is refused is the transport's own, not this file's.
     let transport = PinnedClient::build_with_roots(
         &resolved,
-        asv_connector_http::transport::AddressPolicy { allow_loopback: true },
+        asv_connector_http::transport::AddressPolicy {
+            allow_loopback: true,
+        },
         &[origin.certificate()],
     )
     .expect("the fixture origin is usable over the pinned audience");
@@ -299,9 +306,15 @@ fn a_session_arrives_over_a_real_socket_without_the_long_lived_key_leaving() {
     let authorization = request
         .header("authorization")
         .expect("the request is signed");
-    assert!(authorization.starts_with("AWS4-HMAC-SHA256 "), "{authorization}");
+    assert!(
+        authorization.starts_with("AWS4-HMAC-SHA256 "),
+        "{authorization}"
+    );
     assert!(authorization.contains("Credential=AKIDEXAMPLE/20191109/"));
-    assert!(authorization.contains("/sts/aws4_request"), "{authorization}");
+    assert!(
+        authorization.contains("/sts/aws4_request"),
+        "{authorization}"
+    );
     // The access key id is not a secret: it is the `AKIA…` identifier, and the
     // scope is *supposed* to carry it. What must not appear is the key.
     assert!(authorization.contains(ACCESS_KEY_ID));
@@ -329,7 +342,9 @@ fn the_signature_commits_to_the_body_that_was_actually_sent() {
     );
     // And the payload hash in the header is the hash of those bytes, which is
     // what makes the signature bind the body rather than merely accompany it.
-    let claimed = request.header("x-amz-content-sha256").expect("the hash is sent");
+    let claimed = request
+        .header("x-amz-content-sha256")
+        .expect("the hash is sent");
     assert_eq!(
         claimed,
         asv_broker::aws::sigv4::sha256_hex_of(body.as_bytes()),
@@ -383,8 +398,9 @@ fn every_header_the_provider_requires_signed_is_signed() {
         .expect("the fixture answers");
 
     let request = &origin.observed()[0];
-    let requires_signing =
-        |name: &str| name.eq_ignore_ascii_case("host") || name.to_ascii_lowercase().starts_with("x-amz-");
+    let requires_signing = |name: &str| {
+        name.eq_ignore_ascii_case("host") || name.to_ascii_lowercase().starts_with("x-amz-")
+    };
 
     let unsigned: Vec<&str> = request
         .headers
@@ -500,10 +516,12 @@ fn the_origin_check_is_the_transports_and_the_client_does_not_reimplement_it() {
         &here,
         &url("https://sts.amazonaws.com/other")
     ));
-    assert!(!asv_connector_http::transport::PinnedClient::is_same_origin(
-        &here,
-        &url("https://evil.example/path")
-    ));
+    assert!(
+        !asv_connector_http::transport::PinnedClient::is_same_origin(
+            &here,
+            &url("https://evil.example/path")
+        )
+    );
     // A different spelling of the same host is still the same origin.
     assert!(asv_connector_http::transport::PinnedClient::is_same_origin(
         &here,
@@ -633,7 +651,9 @@ fn a_same_origin_redirect_is_followed_and_the_signature_is_recomputed_for_the_ho
     let observed = origin.observed();
     assert!(observed.len() > 1, "the hop was never followed");
     for request in &observed {
-        let authorization = request.header("authorization").expect("every hop is signed");
+        let authorization = request
+            .header("authorization")
+            .expect("every hop is signed");
         assert!(
             authorization.contains("Credential=AKIDEXAMPLE/"),
             "a hop went out unsigned"
@@ -688,7 +708,12 @@ fn a_session_signed_request_signs_the_session_token_and_sends_it() {
         call.header("authorization").unwrap_or("<unsigned>")
     );
     // And the generic rule holds for this request too, token included.
-    for header in ["host", "x-amz-date", "x-amz-content-sha256", "x-amz-security-token"] {
+    for header in [
+        "host",
+        "x-amz-date",
+        "x-amz-content-sha256",
+        "x-amz-security-token",
+    ] {
         assert!(
             call.header(header).is_some() && authorization_commits_to(call, header),
             "{header} is not both sent and signed"
@@ -746,10 +771,10 @@ fn the_identity_that_comes_back_is_the_providers_own_words() {
     let (port, _grants) = session_port(&origin);
     let client = client_for(&origin);
 
-    let identity = get_caller_identity(&client, &port, CREDENTIAL, at(NOW)).expect("the fixture answers");
+    let identity =
+        get_caller_identity(&client, &port, CREDENTIAL, at(NOW)).expect("the fixture answers");
     assert_eq!(
-        identity.arn,
-        "arn:aws:sts::123456789012:assumed-role/demo/asv-session",
+        identity.arn, "arn:aws:sts::123456789012:assumed-role/demo/asv-session",
         "the ARN is not the one the provider sent"
     );
     assert_eq!(identity.user_id, "ARO123EXAMPLE123:asv-session");
@@ -758,7 +783,10 @@ fn the_identity_that_comes_back_is_the_providers_own_words() {
     // reason the struct can derive `Debug` at all.
     let printed = format!("{identity:?}");
     for secret in [SESSION_SECRET_KEY, SESSION_TOKEN, LONG_LIVED_KEY] {
-        assert!(!printed.contains(secret), "a credential is in the identity's Debug");
+        assert!(
+            !printed.contains(secret),
+            "a credential is in the identity's Debug"
+        );
     }
 }
 

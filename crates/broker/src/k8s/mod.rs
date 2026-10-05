@@ -70,6 +70,6 @@ pub mod request;
 
 pub use binding::{DeploymentError, InCluster, K8sBinding, K8sDeployment};
 pub use client::{K8sClient, K8sClientError, K8sReply};
-pub use metadata::{MetadataError, SecretMetadata, secret_metadata};
+pub use metadata::{secret_metadata, MetadataError, SecretMetadata};
 pub use port::{K8sSecretPort, MAX_TOKEN_BYTES};
 pub use request::{ApiError, ApiRequest, Scope, Verb};

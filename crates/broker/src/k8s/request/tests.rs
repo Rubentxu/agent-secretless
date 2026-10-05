@@ -37,7 +37,9 @@ use super::*;
 fn namespaced<'a>(verb: Verb, resource: &'a str, name: Option<&'a str>) -> ApiRequest<'a> {
     ApiRequest {
         verb,
-        scope: Scope::Namespaced { namespace: "team-a" },
+        scope: Scope::Namespaced {
+            namespace: "team-a",
+        },
         resource,
         name,
     }
@@ -137,7 +139,9 @@ fn a_builder_that_refuses_everything_would_fail_these() {
     assert!(namespaced(Verb::Get, "pods", Some("web-0")).path().is_ok());
     assert!(namespaced(Verb::List, "pods", None).path().is_ok());
     assert!(namespaced(Verb::Create, "secrets", None).path().is_ok());
-    assert!(namespaced(Verb::Delete, "pods", Some("web-0")).path().is_ok());
+    assert!(namespaced(Verb::Delete, "pods", Some("web-0"))
+        .path()
+        .is_ok());
     assert_eq!(
         ApiRequest {
             verb: Verb::Get,
@@ -360,7 +364,9 @@ fn a_namespace_longer_than_a_label_is_refused() {
     let long = "a".repeat(64);
     let r = ApiRequest {
         verb: Verb::List,
-        scope: Scope::Namespaced { namespace: Box::leak(long.into_boxed_str()) },
+        scope: Scope::Namespaced {
+            namespace: Box::leak(long.into_boxed_str()),
+        },
         resource: "pods",
         name: None,
     };

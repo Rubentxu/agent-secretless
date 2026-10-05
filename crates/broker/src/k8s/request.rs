@@ -224,7 +224,6 @@ pub enum ApiError {
         /// Which field was refused.
         what: &'static str,
     },
-
     // Two arms this enum does not have, and the absence is the point.
     //
     // There is no "namespace mismatch" and no "unsupported group". A namespace

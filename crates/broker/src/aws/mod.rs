@@ -27,11 +27,11 @@
 //! provider, and nothing above should be read as saying it does.
 
 pub mod audience;
-pub mod s3;
 pub mod calendar;
 pub mod client;
 pub mod identity;
 pub mod port;
+pub mod s3;
 pub mod sigv4;
 pub mod sts;
 

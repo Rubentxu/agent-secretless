@@ -19,7 +19,7 @@ use asv_domain::Authority;
 
 use super::super::request::{ApiRequest, Scope, Verb};
 use super::super::{K8sSecretPort, MAX_TOKEN_BYTES};
-use super::{BearerSink, K8sClient, K8sClientError, MAX_REPLY_BYTES, method_for};
+use super::{method_for, BearerSink, K8sClient, K8sClientError, MAX_REPLY_BYTES};
 use asv_connector_http::SecretSink;
 
 const API_HOST: &str = "kubernetes.default.svc";
@@ -98,7 +98,9 @@ fn header_of(observed: &Observed, name: &str) -> Option<String> {
 
 #[test]
 fn a_get_reaches_the_origin_with_the_bearer_header_assembled_from_the_port() {
-    let origin = origin(API_HOST, |_| OriginResponse::json(200, r#"{"kind":"Secret"}"#));
+    let origin = origin(API_HOST, |_| {
+        OriginResponse::json(200, r#"{"kind":"Secret"}"#)
+    });
     let client = client_for(&origin);
 
     let reply = client
@@ -107,11 +109,13 @@ fn a_get_reaches_the_origin_with_the_bearer_header_assembled_from_the_port() {
 
     assert!(reply.is_success(), "status {}", reply.status);
     let seen = origin.last().expect("the origin saw a request");
-    assert_eq!(header_of(&seen, "authorization").as_deref(), Some(
-        "Bearer eyJhbGciOiJSUzI1NiJ9.fixture-service-account-token"
-    ));
+    assert_eq!(
+        header_of(&seen, "authorization").as_deref(),
+        Some("Bearer eyJhbGciOiJSUzI1NiJ9.fixture-service-account-token")
+    );
     assert!(
-        seen.request_line.starts_with("GET /api/v1/namespaces/default/secrets/db-credentials"),
+        seen.request_line
+            .starts_with("GET /api/v1/namespaces/default/secrets/db-credentials"),
         "{}",
         seen.request_line
     );
@@ -177,8 +181,12 @@ fn a_same_origin_redirect_is_followed_and_the_token_is_lent_again_for_it() {
     // the first attempt's sink is already dropped and zeroized by the time the
     // second one runs.
     let origin = origin(API_HOST, |observed| {
-        if observed.request_line.contains("/api/v1/namespaces/default/secrets/db-credentials") {
-            OriginResponse::new(302, "").with_header("location", "/api/v1/namespaces/default/secrets/renamed")
+        if observed
+            .request_line
+            .contains("/api/v1/namespaces/default/secrets/db-credentials")
+        {
+            OriginResponse::new(302, "")
+                .with_header("location", "/api/v1/namespaces/default/secrets/renamed")
         } else {
             OriginResponse::json(200, r#"{"kind":"Secret","metadata":{"name":"renamed"}}"#)
         }
@@ -311,9 +319,15 @@ fn a_client_is_refused_when_the_port_is_zero() {
     let mut audience = audience_for(&origin);
     audience.port = 0;
 
-    let err = K8sClient::new(audience, AddressPolicy { allow_loopback: true }, None)
-        .err()
-        .expect("port 0 never connects");
+    let err = K8sClient::new(
+        audience,
+        AddressPolicy {
+            allow_loopback: true,
+        },
+        None,
+    )
+    .err()
+    .expect("port 0 never connects");
 
     assert!(matches!(err, K8sClientError::Transport(_)), "{err:?}");
 }
@@ -324,7 +338,9 @@ fn a_body_past_the_cap_is_refused_rather_than_truncated() {
     // and the error would be about the document rather than about an origin
     // that is too large to be the API server.
     let oversized = "x".repeat(MAX_REPLY_BYTES + 1);
-    let origin = origin(API_HOST, move |_| OriginResponse::json(200, oversized.clone()));
+    let origin = origin(API_HOST, move |_| {
+        OriginResponse::json(200, oversized.clone())
+    });
     let client = client_for(&origin);
 
     let err = client
@@ -449,7 +465,10 @@ fn no_refusal_this_client_produces_contains_the_token() {
         rendered.push(format!("{err:?}"));
     }
 
-    assert!(!rendered.is_empty(), "the rows above must have produced output");
+    assert!(
+        !rendered.is_empty(),
+        "the rows above must have produced output"
+    );
     let token = String::from_utf8_lossy(TOKEN);
     for text in &rendered {
         assert!(

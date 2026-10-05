@@ -99,7 +99,11 @@ impl AwsBinding {
     /// `long_lived` is the vault port for the *operator's* key. It is borrowed
     /// once per mint, inside the cache, and never reaches anything downstream of
     /// a minted session.
-    pub fn new(deployment: AwsDeployment, client: Arc<StsClient>, long_lived: Arc<dyn SecretPort>) -> Self {
+    pub fn new(
+        deployment: AwsDeployment,
+        client: Arc<StsClient>,
+        long_lived: Arc<dyn SecretPort>,
+    ) -> Self {
         let port = AwsSecretPort::new(Arc::new(ClientExchange::new(client.clone(), long_lived)));
         Self {
             deployment,

@@ -794,7 +794,8 @@ fn main() -> std::io::Result<()> {
                 // for this provider means handing the client secret to the
                 // resource as if it were a token. That is the one failure in
                 // this file worth writing two loops to make impossible.
-                let port_clients: Vec<_> = clients.iter().map(|loaded| loaded.client.clone()).collect();
+                let port_clients: Vec<_> =
+                    clients.iter().map(|loaded| loaded.client.clone()).collect();
                 let oauth2: Arc<dyn asv_connector_http::SecretPort> =
                     Arc::new(asv_broker::oauth2_port::OAuth2SecretPort::new(
                         Arc::clone(&vault_port),

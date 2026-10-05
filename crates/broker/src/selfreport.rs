@@ -226,7 +226,9 @@ mod tests {
         let credential = CredentialId::new();
         let surrogate = "surrogate".to_string();
         vec![
-            Request::Ping { protocol: PROTOCOL_VERSION },
+            Request::Ping {
+                protocol: PROTOCOL_VERSION,
+            },
             Request::AgentInfo {
                 protocol: PROTOCOL_VERSION,
             },

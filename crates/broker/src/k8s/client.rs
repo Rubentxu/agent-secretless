@@ -56,8 +56,8 @@ use asv_connector_http::transport::{
 use asv_connector_http::{SecretError, SecretPort, SecretSink};
 use zeroize::Zeroizing;
 
-use super::request::{ApiError, ApiRequest};
 use super::port::MAX_TOKEN_BYTES;
+use super::request::{ApiError, ApiRequest};
 
 /// The largest reply body this client will read into memory.
 ///
@@ -248,46 +248,47 @@ impl K8sClient {
             url,
             &origin,
             |target| -> Result<Redirect<K8sReply>, K8sClientError> {
-            let mut sink = BearerSink::new();
-            port.lend(credential, &mut sink)?;
-            let header = sink.take()?;
+                let mut sink = BearerSink::new();
+                port.lend(credential, &mut sink)?;
+                let header = sink.take()?;
 
-            // A token the port accepted that the HTTP stack will not take is a
-            // credential problem, not a transport one, and saying so keeps the
-            // operator looking at the mount rather than at the network.
-            let value = reqwest::header::HeaderValue::from_bytes(&header).map_err(|_| {
-                SecretError::Unavailable(
-                    "a token this port accepted is not a header value the HTTP stack will send".into(),
-                )
-            })?;
-            // `builder` is dropped with this scope too, so the copy the HTTP
-            // stack made of the header does not outlive the attempt either.
-            let response = self
-                .transport
-                .client()
-                .request(method.clone(), target.clone())
-                .header(reqwest::header::AUTHORIZATION, value)
-                .send()
-                .map_err(|error| TransportError::RequestFailed {
-                    audience: self.audience.authority.to_string(),
-                    reason: error.to_string(),
+                // A token the port accepted that the HTTP stack will not take is a
+                // credential problem, not a transport one, and saying so keeps the
+                // operator looking at the mount rather than at the network.
+                let value = reqwest::header::HeaderValue::from_bytes(&header).map_err(|_| {
+                    SecretError::Unavailable(
+                        "a token this port accepted is not a header value the HTTP stack will send"
+                            .into(),
+                    )
                 })?;
+                // `builder` is dropped with this scope too, so the copy the HTTP
+                // stack made of the header does not outlive the attempt either.
+                let response = self
+                    .transport
+                    .client()
+                    .request(method.clone(), target.clone())
+                    .header(reqwest::header::AUTHORIZATION, value)
+                    .send()
+                    .map_err(|error| TransportError::RequestFailed {
+                        audience: self.audience.authority.to_string(),
+                        reason: error.to_string(),
+                    })?;
 
-            let status = response.status().as_u16();
-            let next = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| target.join(value).ok());
+                let status = response.status().as_u16();
+                let next = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| target.join(value).ok());
 
-            if let Some(next) = next {
-                if status >= 300 && status < 400 {
-                    return Ok(Redirect::Hop(next));
+                if let Some(next) = next {
+                    if status >= 300 && status < 400 {
+                        return Ok(Redirect::Hop(next));
+                    }
                 }
-            }
 
-            let mut body = Vec::new();
-            read_capped(response, self.audience.authority.to_string(), &mut body)?;
+                let mut body = Vec::new();
+                read_capped(response, self.audience.authority.to_string(), &mut body)?;
                 Ok(Redirect::Done(K8sReply { status, body }))
             },
         )?;
@@ -324,12 +325,12 @@ fn read_capped(
     use std::io::Read;
     let mut chunk = [0u8; 16 * 1024];
     loop {
-        let read = response.read(&mut chunk).map_err(|error| {
-            TransportError::RequestFailed {
+        let read = response
+            .read(&mut chunk)
+            .map_err(|error| TransportError::RequestFailed {
                 audience: audience.clone(),
                 reason: error.to_string(),
-            }
-        })?;
+            })?;
         if read == 0 {
             return Ok(());
         }

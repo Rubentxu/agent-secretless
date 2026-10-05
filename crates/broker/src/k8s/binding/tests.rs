@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use asv_domain::{Authority, CredentialId};
 
 use super::{
-    DEFAULT_KUBELET_PORT, DeploymentError, InCluster, K8sBinding, K8sDeployment, PROJECTED_TOKEN_PATH,
+    DeploymentError, InCluster, K8sBinding, K8sDeployment, DEFAULT_KUBELET_PORT,
+    PROJECTED_TOKEN_PATH,
 };
 
 fn credential() -> CredentialId {
@@ -56,7 +57,10 @@ fn the_refusal_says_what_to_do_rather_than_only_what_failed() {
         .expect_err("undeclared");
     let rendered = format!("{err}");
 
-    assert!(rendered.contains("declare"), "the refusal must say how: {rendered}");
+    assert!(
+        rendered.contains("declare"),
+        "the refusal must say how: {rendered}"
+    );
     assert!(rendered.contains("private"), "and must say why: {rendered}");
 }
 
@@ -88,7 +92,10 @@ fn an_ip_literal_may_not_declare_itself_in_cluster() {
         .check(true)
         .expect_err("an IP literal is not a cluster DNS name");
 
-    assert!(matches!(err, DeploymentError::NotAClusterName { .. }), "{err:?}");
+    assert!(
+        matches!(err, DeploymentError::NotAClusterName { .. }),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -101,7 +108,10 @@ fn a_name_that_only_looks_like_a_cluster_name_is_refused() {
         .check(true)
         .expect_err("the suffix has to be the end of the name");
 
-    assert!(matches!(err, DeploymentError::NotAClusterName { .. }), "{err:?}");
+    assert!(
+        matches!(err, DeploymentError::NotAClusterName { .. }),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -129,10 +139,10 @@ fn a_public_audience_may_not_carry_the_exception() {
         .check(false)
         .expect_err("the exception means nothing for a public audience");
 
-    assert!(matches!(
-        err,
-        DeploymentError::ExceptionOnAPublicAudience { .. }
-    ), "{err:?}");
+    assert!(
+        matches!(err, DeploymentError::ExceptionOnAPublicAudience { .. }),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -152,7 +162,9 @@ fn a_public_audience_without_the_exception_is_accepted() {
 fn a_relative_token_path_is_refused_at_load() {
     let mut d = deployment("kubernetes.default.svc").in_cluster();
     d.token_path = PathBuf::from("var/run/secrets/token");
-    let err = d.check(true).expect_err("a relative path depends on the cwd");
+    let err = d
+        .check(true)
+        .expect_err("a relative path depends on the cwd");
 
     assert!(
         matches!(err, DeploymentError::RelativeTokenPath { .. }),
@@ -189,7 +201,8 @@ fn a_deployment_whose_token_file_does_not_exist_still_loads() {
     let mut d = deployment("kubernetes.default.svc").in_cluster();
     d.token_path = PathBuf::from("/nonexistent/asv/k8s/token");
 
-    d.check(true).expect("a missing file is a lend-time problem, not a load-time one");
+    d.check(true)
+        .expect("a missing file is a lend-time problem, not a load-time one");
 }
 
 /// # The exception has to be visible where it is in force
@@ -229,8 +242,7 @@ fn the_projected_token_path_is_the_one_kubernetes_actually_uses() {
     // against the documented string, which is the only version of this that can
     // fail.
     assert_eq!(
-        PROJECTED_TOKEN_PATH,
-        "/var/run/secrets/kubernetes.io/serviceaccount/token",
+        PROJECTED_TOKEN_PATH, "/var/run/secrets/kubernetes.io/serviceaccount/token",
         "the projected-token path moved; every real deployment would fail"
     );
 }
@@ -269,7 +281,9 @@ fn binding(deployment: K8sDeployment) -> K8sBinding {
     };
     let client = K8sClient::new_with_roots(
         resolved,
-        AddressPolicy { allow_loopback: true },
+        AddressPolicy {
+            allow_loopback: true,
+        },
         Some(std::time::Duration::from_secs(5)),
         &[],
     )
@@ -295,7 +309,10 @@ fn a_binding_serves_nothing_else() {
     let other = CredentialId::from_wire("11111111-2222-3333-4444-555555555555")
         .expect("a wire credential id");
 
-    assert!(!binding.serves(&other), "an unconfigured credential reached a binding");
+    assert!(
+        !binding.serves(&other),
+        "an unconfigured credential reached a binding"
+    );
 }
 
 #[test]

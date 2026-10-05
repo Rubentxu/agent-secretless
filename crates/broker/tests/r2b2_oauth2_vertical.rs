@@ -1199,7 +1199,11 @@ fn a_grant_the_provider_spells_differently_is_the_same_grant_to_both_layers() {
     let rule = r#"permit (principal, action == Action::"oauth2_identity",
                        resource is OAuth2Client)
                    when { resource.scope == ["read:pods"] };"#;
-    for spelling in ["read:pods  read:pods", " read:pods ", "read:pods\tread:pods"] {
+    for spelling in [
+        "read:pods  read:pods",
+        " read:pods ",
+        "read:pods\tread:pods",
+    ] {
         let mut vertical = Vertical::new(rule, spelling);
         let response = vertical.whoami(CRED);
         assert!(

@@ -155,8 +155,9 @@ impl AwsSecretSink for SessionCall<'_> {
         let signer = SigV4Signer::new(
             std::str::from_utf8(access_key_id)
                 .map_err(|_| StsError::IncompleteRequest("an access key id that is not UTF-8"))?,
-            std::str::from_utf8(secret_access_key)
-                .map_err(|_| StsError::IncompleteRequest("a secret access key that is not UTF-8"))?,
+            std::str::from_utf8(secret_access_key).map_err(|_| {
+                StsError::IncompleteRequest("a secret access key that is not UTF-8")
+            })?,
             self.client.config().region.clone(),
             STS_SERVICE,
         )
@@ -164,9 +165,9 @@ impl AwsSecretSink for SessionCall<'_> {
         // and `IncompleteRequest` says so rather than blaming the document.
         .map_err(|_| StsError::IncompleteRequest("a session that cannot be signed"))?;
 
-        let amz_date = super::calendar::amz_date(self.now).ok_or(
-            StsError::IncompleteRequest("an instant a stamp cannot express"),
-        )?;
+        let amz_date = super::calendar::amz_date(self.now).ok_or(StsError::IncompleteRequest(
+            "an instant a stamp cannot express",
+        ))?;
         let payload_hash = sha256_hex_of(BODY.as_bytes());
         let host = self.client.host_header();
 
@@ -178,20 +179,22 @@ impl AwsSecretSink for SessionCall<'_> {
             &host,
             &payload_hash,
             &amz_date,
-            &[(SESSION_TOKEN_HEADER, std::str::from_utf8(session_token).map_err(
-                |_| StsError::IncompleteRequest("a session token that is not UTF-8"),
-            )?)],
+            &[(
+                SESSION_TOKEN_HEADER,
+                std::str::from_utf8(session_token).map_err(|_| {
+                    StsError::IncompleteRequest("a session token that is not UTF-8")
+                })?,
+            )],
         );
         let signed = sign_with(&signer, &headers, BODY.as_bytes(), &amz_date)
             .map_err(|error| StsError::IncompleteRequest(&leak_free(error)))?;
 
-        self.answered = Some(self.client.send(
-            &signed,
-            &headers,
-            BODY,
-            self.now,
-            |bytes, _now| parse_caller_identity(bytes),
-        ));
+        self.answered = Some(
+            self.client
+                .send(&signed, &headers, BODY, self.now, |bytes, _now| {
+                    parse_caller_identity(bytes)
+                }),
+        );
         // The signer, and with it the secret access key, is gone here. What
         // survives is `headers`, and that is the token on the wire.
         Ok(())

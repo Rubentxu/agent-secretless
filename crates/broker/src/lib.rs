@@ -29,8 +29,6 @@ pub mod admission;
 pub mod audit;
 /// R2.C: the AWS provider plane. The signing core first, in `aws::sigv4`.
 pub mod aws;
-/// R2.D: the Kubernetes provider plane. The request core first, in `k8s::request`.
-pub mod k8s;
 /// Where an integration test finds a binary, and why it may refuse one.
 ///
 /// Feature-gated for the same reason as `oauth2_test_support` and for a
@@ -47,11 +45,13 @@ pub mod http_frame;
 pub mod identity;
 pub mod inventory;
 pub mod isolated_exec;
+/// R2.D: the Kubernetes provider plane. The request core first, in `k8s::request`.
+pub mod k8s;
 pub mod oauth2;
+pub mod oauth2_binding;
 /// The production consumer of M11: a `SecretPort` that lends a short-lived
 /// access token rather than the stored client secret.
 pub mod oauth2_port;
-pub mod oauth2_binding;
 /// The RFC 6749 authorization server the OAuth2 tests run against.
 ///
 /// Feature-gated rather than `#[cfg(test)]` because the assertions that matter

@@ -108,7 +108,9 @@ pub enum ObjectError {
     },
 
     /// A header the answer is built from is missing.
-    #[error("the response has no {header:?} header, so there is nothing to answer {question:?} with")]
+    #[error(
+        "the response has no {header:?} header, so there is nothing to answer {question:?} with"
+    )]
     MissingHeader {
         /// The header that should have been there.
         header: &'static str,
@@ -229,12 +231,10 @@ pub fn object_metadata(
     }
 
     let length = require(response, "content-length", "how big is it")?;
-    let content_length: u64 = length
-        .parse()
-        .map_err(|_| ObjectError::NotANumber {
-            header: "content-length",
-            value: length.to_string(),
-        })?;
+    let content_length: u64 = length.parse().map_err(|_| ObjectError::NotANumber {
+        header: "content-length",
+        value: length.to_string(),
+    })?;
 
     let etag = require(response, "etag", "which version is it")?;
     let etag = etag
@@ -267,7 +267,6 @@ fn require<'a>(
         .header(header)?
         .ok_or(ObjectError::MissingHeader { header, question })
 }
-
 
 /// A header that may be absent, checked for control characters if it is not.
 ///

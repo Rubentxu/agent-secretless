@@ -5,7 +5,7 @@
 //! line being the same string — the property the module is shaped around and
 //! the one an implementation that encoded twice would get wrong quietly.
 
-use super::{Addressing, S3Error, S3Target, check_bucket, check_key, looks_like_ipv4};
+use super::{check_bucket, check_key, looks_like_ipv4, Addressing, S3Error, S3Target};
 
 /// The resolution, unwrapped. For rows that expect it to work.
 fn target(bucket: &str, key: &str) -> S3Target {
@@ -69,8 +69,13 @@ fn an_unreserved_character_is_left_alone() {
 
 #[test]
 fn path_style_puts_the_bucket_in_the_path_and_not_the_host() {
-    let resolved = S3Target::resolve("acme-artifacts", "a/b.txt", "eu-west-1", Addressing::PathStyle)
-        .expect("path style is a supported shape");
+    let resolved = S3Target::resolve(
+        "acme-artifacts",
+        "a/b.txt",
+        "eu-west-1",
+        Addressing::PathStyle,
+    )
+    .expect("path style is a supported shape");
 
     assert_eq!(resolved.authority.as_str(), "s3.eu-west-1.amazonaws.com");
     assert_eq!(resolved.path, "/acme-artifacts/a/b.txt");
@@ -112,9 +117,15 @@ fn an_ip_shaped_bucket_name_is_refused() {
 
 #[test]
 fn a_bucket_name_that_is_too_short_or_too_long_is_refused() {
-    assert!(attempt("ab", "k").is_err(), "two characters is not a bucket");
+    assert!(
+        attempt("ab", "k").is_err(),
+        "two characters is not a bucket"
+    );
     let long = "a".repeat(64);
-    assert!(attempt(&long, "k").is_err(), "64 characters is not a bucket");
+    assert!(
+        attempt(&long, "k").is_err(),
+        "64 characters is not a bucket"
+    );
 }
 
 #[test]
@@ -185,7 +196,10 @@ fn a_key_containing_a_dot_dot_segment_is_refused_rather_than_rewritten() {
     // signature would be computed over the normalised one.
     let err = attempt("acme-artifacts", "a/../../etc/passwd").expect_err("traversal");
     assert!(matches!(err, S3Error::Traversal { .. }), "{err:?}");
-    assert!(format!("{err}").contains("refused rather than rewritten"), "{err}");
+    assert!(
+        format!("{err}").contains("refused rather than rewritten"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -262,7 +276,10 @@ fn the_signed_path_is_encoded_exactly_once() {
 #[test]
 fn a_resolver_that_refused_everything_would_fail_these() {
     let resolved = target("acme-artifacts", "2026/10/report.json");
-    assert_eq!(resolved.authority.as_str(), "acme-artifacts.s3.eu-west-1.amazonaws.com");
+    assert_eq!(
+        resolved.authority.as_str(),
+        "acme-artifacts.s3.eu-west-1.amazonaws.com"
+    );
     assert_eq!(resolved.path, "/2026/10/report.json");
     assert!(check_bucket("acme-artifacts").is_ok());
     assert!(check_key("2026/10/report.json").is_ok());

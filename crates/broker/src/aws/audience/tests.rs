@@ -6,8 +6,8 @@
 use asv_domain::{Authority, CredentialId};
 
 use super::{
-    AudienceError, AwsDeployment, GLOBAL_STS_ENDPOINT, is_global_sts, is_region_shaped,
-    regional_sts_label,
+    is_global_sts, is_region_shaped, regional_sts_label, AudienceError, AwsDeployment,
+    GLOBAL_STS_ENDPOINT,
 };
 
 fn authority(name: &str) -> Authority {
@@ -80,7 +80,10 @@ fn the_refusal_names_both_regions() {
     let rendered = format!("{err}");
 
     assert!(rendered.contains("us-east-1"), "the pinned one: {rendered}");
-    assert!(rendered.contains("eu-west-1"), "the configured one: {rendered}");
+    assert!(
+        rendered.contains("eu-west-1"),
+        "the configured one: {rendered}"
+    );
 }
 
 /// # The hosts that contain the right characters
@@ -98,7 +101,10 @@ fn an_attacker_bucket_whose_name_contains_sts_is_refused() {
         .check_audience()
         .expect_err("an S3 bucket is not an STS endpoint");
 
-    assert!(matches!(err, AudienceError::NotAnStsEndpoint { .. }), "{err:?}");
+    assert!(
+        matches!(err, AudienceError::NotAnStsEndpoint { .. }),
+        "{err:?}"
+    );
     assert_eq!(regional_sts_label(&authority(hostile)), None);
 }
 
@@ -109,9 +115,7 @@ fn a_host_that_merely_ends_with_sts_is_refused() {
     // name or the leading junk goes unnoticed.
     let hostile = "evil-sts.eu-west-1.amazonaws.com";
     assert_eq!(regional_sts_label(&authority(hostile)), None);
-    assert!(deployment(hostile, "eu-west-1")
-        .check_audience()
-        .is_err());
+    assert!(deployment(hostile, "eu-west-1").check_audience().is_err());
 }
 
 #[test]
@@ -119,9 +123,7 @@ fn a_host_with_the_shape_before_a_foreign_suffix_is_refused() {
     // The suffix has to be the end of the name, not a fragment of it.
     let hostile = "sts.eu-west-1.amazonaws.com.attacker.example";
     assert_eq!(regional_sts_label(&authority(hostile)), None);
-    assert!(deployment(hostile, "eu-west-1")
-        .check_audience()
-        .is_err());
+    assert!(deployment(hostile, "eu-west-1").check_audience().is_err());
 }
 
 #[test]
@@ -161,8 +163,14 @@ fn a_first_party_api_that_is_not_sts_is_refused() {
         .check_audience()
         .expect_err("GitHub is not STS");
 
-    assert!(matches!(err, AudienceError::NotAnStsEndpoint { .. }), "{err:?}");
-    assert!(format!("{err}").contains("sts."), "the refusal names the shapes: {err}");
+    assert!(
+        matches!(err, AudienceError::NotAnStsEndpoint { .. }),
+        "{err:?}"
+    );
+    assert!(
+        format!("{err}").contains("sts."),
+        "the refusal names the shapes: {err}"
+    );
 }
 
 /// # The region is validated first
@@ -174,7 +182,14 @@ fn a_first_party_api_that_is_not_sts_is_refused() {
 fn a_region_that_is_not_shaped_like_one_is_refused_before_the_audience_is_read() {
     // `evil.example` as a region would make `sts.evil.example.amazonaws.com` a
     // match if the audience were compared first.
-    for region in ["", "eu west 1", "eu.west.1", "EU-WEST-1", "eu-west-1/x", "a"] {
+    for region in [
+        "",
+        "eu west 1",
+        "eu.west.1",
+        "EU-WEST-1",
+        "eu-west-1/x",
+        "a",
+    ] {
         let err = deployment(GLOBAL_STS_ENDPOINT, region)
             .check_audience()
             .expect_err("not a region");

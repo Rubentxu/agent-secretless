@@ -4,7 +4,7 @@
 //! claim: the answer is built entirely from headers, and there is nowhere in it
 //! for object bytes to go.
 
-use super::{ObjectError, ObjectMetadata, ObjectResponse, object_metadata};
+use super::{object_metadata, ObjectError, ObjectMetadata, ObjectResponse};
 
 const BUCKET: &str = "acme-artifacts";
 const KEY: &str = "2026/10/report.json";
@@ -20,7 +20,10 @@ fn get_ok() -> ObjectResponse {
         headers: vec![
             ("content-length".into(), "20481".into()),
             ("etag".into(), "\"d41d8cd98f00b204e9800998ecf8427e\"".into()),
-            ("last-modified".into(), "Tue, 05 Oct 2026 09:12:44 GMT".into()),
+            (
+                "last-modified".into(),
+                "Tue, 05 Oct 2026 09:12:44 GMT".into(),
+            ),
             ("content-type".into(), "application/json".into()),
             ("x-amz-version-id".into(), "3HL4kqtJvjVBH40Nrjfkd".into()),
         ],
@@ -43,7 +46,10 @@ fn the_answer_is_built_from_the_headers() {
     assert_eq!(metadata.etag, "d41d8cd98f00b204e9800998ecf8427e");
     assert_eq!(metadata.last_modified, "Tue, 05 Oct 2026 09:12:44 GMT");
     assert_eq!(metadata.content_type.as_deref(), Some("application/json"));
-    assert_eq!(metadata.version_id.as_deref(), Some("3HL4kqtJvjVBH40Nrjfkd"));
+    assert_eq!(
+        metadata.version_id.as_deref(),
+        Some("3HL4kqtJvjVBH40Nrjfkd")
+    );
     assert!(metadata.is_populated());
 }
 
@@ -66,14 +72,20 @@ fn an_optional_header_may_be_absent() {
         headers: vec![
             ("content-length".into(), "0".into()),
             ("etag".into(), "\"abc\"".into()),
-            ("last-modified".into(), "Tue, 05 Oct 2026 09:12:44 GMT".into()),
+            (
+                "last-modified".into(),
+                "Tue, 05 Oct 2026 09:12:44 GMT".into(),
+            ),
         ],
     };
     let metadata = read(&bare).expect("three headers is a complete answer");
 
     assert_eq!(metadata.content_type, None);
     assert_eq!(metadata.version_id, None);
-    assert!(!metadata.is_populated(), "a zero-length object is not populated");
+    assert!(
+        !metadata.is_populated(),
+        "a zero-length object is not populated"
+    );
 }
 
 #[test]
@@ -85,7 +97,10 @@ fn an_empty_object_is_an_answer_and_not_a_refusal() {
         headers: vec![
             ("content-length".into(), "0".into()),
             ("etag".into(), "\"d41d8cd98f00b204e9800998ecf8427e\"".into()),
-            ("last-modified".into(), "Tue, 05 Oct 2026 09:12:44 GMT".into()),
+            (
+                "last-modified".into(),
+                "Tue, 05 Oct 2026 09:12:44 GMT".into(),
+            ),
         ],
     };
 
@@ -183,9 +198,7 @@ fn an_unquoted_etag_is_refused() {
     // Accepting an unquoted one and normalising it here would make the
     // correctness of a conditional write depend on this module's idea of shape.
     let mut response = get_ok();
-    response
-        .headers
-        .retain(|(name, _)| name != "etag");
+    response.headers.retain(|(name, _)| name != "etag");
     response
         .headers
         .push(("etag".into(), "d41d8cd98f00b204e9800998ecf8427e".into()));
@@ -201,9 +214,7 @@ fn a_header_carrying_a_newline_is_refused() {
     // in one is a forged log line, and the refusal belongs here rather than in
     // whatever formats the value downstream.
     let mut response = get_ok();
-    response
-        .headers
-        .retain(|(name, _)| name != "last-modified");
+    response.headers.retain(|(name, _)| name != "last-modified");
     response.headers.push((
         "last-modified".into(),
         "Tue, 05 Oct 2026 09:12:44 GMT\nGET /admin HTTP/1.1".into(),

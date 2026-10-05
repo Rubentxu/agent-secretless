@@ -213,7 +213,11 @@ fn a_session_inside_the_margin_is_not_served_and_is_replaced() {
     let mut sink = Recorded::default();
     port.lend_session("aws-prod", at(EXPIRES_AT - margin.as_secs() - 1), &mut sink)
         .expect("served");
-    assert_eq!(mints.load(Ordering::SeqCst), 1, "a session past the margin was not served");
+    assert_eq!(
+        mints.load(Ordering::SeqCst),
+        1,
+        "a session past the margin was not served"
+    );
 
     // Exactly the margin left: not usable, so re-minted.
     let mut sink = Recorded::default();
@@ -286,7 +290,8 @@ fn forget_drops_the_cache_and_the_next_lend_re_mints() {
     let now = at(EXPIRES_AT - 3600);
 
     let mut sink = Recorded::default();
-    port.lend_session("aws-prod", now, &mut sink).expect("minted");
+    port.lend_session("aws-prod", now, &mut sink)
+        .expect("minted");
     assert_eq!(mints.load(Ordering::SeqCst), 1);
     assert_eq!(port.cached(), vec!["aws-prod".to_string()]);
 
@@ -298,7 +303,8 @@ fn forget_drops_the_cache_and_the_next_lend_re_mints() {
     );
 
     let mut sink = Recorded::default();
-    port.lend_session("aws-prod", now, &mut sink).expect("re-minted");
+    port.lend_session("aws-prod", now, &mut sink)
+        .expect("re-minted");
     assert_eq!(
         mints.load(Ordering::SeqCst),
         2,
@@ -312,7 +318,8 @@ fn forgetting_one_credential_leaves_the_others_cached() {
     let now = at(EXPIRES_AT - 3600);
     for credential in ["aws-prod", "aws-staging"] {
         let mut sink = Recorded::default();
-        port.lend_session(credential, now, &mut sink).expect("minted");
+        port.lend_session(credential, now, &mut sink)
+            .expect("minted");
     }
     assert_eq!(mints.load(Ordering::SeqCst), 2);
     assert_eq!(port.cached(), vec!["aws-prod", "aws-staging"]);
@@ -320,7 +327,8 @@ fn forgetting_one_credential_leaves_the_others_cached() {
     port.forget("aws-prod");
     assert_eq!(port.cached(), vec!["aws-staging"]);
     let mut sink = Recorded::default();
-    port.lend_session("aws-staging", now, &mut sink).expect("served");
+    port.lend_session("aws-staging", now, &mut sink)
+        .expect("served");
     assert_eq!(
         mints.load(Ordering::SeqCst),
         2,
@@ -337,18 +345,34 @@ fn the_single_value_sink_refuses_an_aws_session_and_says_why() {
     // there is no conversion to add by accident.
     let (port, mints) = port_expiring_at(EXPIRES_AT);
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut watcher = Watcher { calls: calls.clone() };
+    let mut watcher = Watcher {
+        calls: calls.clone(),
+    };
 
     let outcome = port.lend("aws-prod", &mut watcher);
     match outcome {
         Err(SecretError::Unavailable(why)) => {
-            assert!(why.contains("three values"), "the refusal does not explain: {why}");
-            assert!(why.contains("bearer"), "the refusal does not explain: {why}");
+            assert!(
+                why.contains("three values"),
+                "the refusal does not explain: {why}"
+            );
+            assert!(
+                why.contains("bearer"),
+                "the refusal does not explain: {why}"
+            );
         }
         other => panic!("an AWS session was served through the one-value sink: {other:?}"),
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 0, "the sink was reached at all");
-    assert_eq!(mints.load(Ordering::SeqCst), 0, "it even minted a session first");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the sink was reached at all"
+    );
+    assert_eq!(
+        mints.load(Ordering::SeqCst),
+        0,
+        "it even minted a session first"
+    );
 }
 
 #[test]
@@ -372,13 +396,20 @@ fn printing_the_port_never_prints_a_session() {
     // defended somewhere else entirely -- `AwsSession` redacts its own `Debug`,
     // and that is R2.C.2.a's row, not this one -- so the row would read as if
     // this file were what kept the values out.
-    for detail in [ACCESS_KEY, "arn:aws:iam::123456789012:role/demo", "asv-session"] {
+    for detail in [
+        ACCESS_KEY,
+        "arn:aws:iam::123456789012:role/demo",
+        "asv-session",
+    ] {
         assert!(
             !printed.contains(detail),
             "the cache listing leaked a session's own detail: {printed}"
         );
     }
-    assert!(printed.contains("aws-prod"), "the receipt lost the credential id: {printed}");
+    assert!(
+        printed.contains("aws-prod"),
+        "the receipt lost the credential id: {printed}"
+    );
 }
 
 #[test]
@@ -391,7 +422,8 @@ fn a_failing_exchange_leaves_the_cache_alone() {
     let now = at(EXPIRES_AT - 3600);
 
     let mut sink = Recorded::default();
-    port.lend_session("aws-prod", now, &mut sink).expect("minted");
+    port.lend_session("aws-prod", now, &mut sink)
+        .expect("minted");
     assert_eq!(mints.load(Ordering::SeqCst), 1);
 
     failing.store(true, Ordering::SeqCst);
@@ -405,7 +437,10 @@ fn a_failing_exchange_leaves_the_cache_alone() {
         vec!["aws-prod".to_string()],
         "a failure changed the cache"
     );
-    assert_eq!(sink.seen, 0, "a failed lend still handed values to the sink");
+    assert_eq!(
+        sink.seen, 0,
+        "a failed lend still handed values to the sink"
+    );
 }
 
 #[test]
@@ -430,11 +465,19 @@ fn an_exchange_failure_does_not_buy_a_stale_session() {
     failing.store(true, Ordering::SeqCst);
     let mut sink = Recorded::default();
     assert!(
-        port.lend_session("aws-prod", at(EXPIRES_AT - margin.as_secs()), &mut sink).is_err(),
+        port.lend_session("aws-prod", at(EXPIRES_AT - margin.as_secs()), &mut sink)
+            .is_err(),
         "an exchange failure served a session that was inside the margin"
     );
-    assert_eq!(sink.seen, 0, "the stale session's values reached the sink anyway");
-    assert_eq!(mints.load(Ordering::SeqCst), 2, "a failing exchange was not attempted");
+    assert_eq!(
+        sink.seen, 0,
+        "the stale session's values reached the sink anyway"
+    );
+    assert_eq!(
+        mints.load(Ordering::SeqCst),
+        2,
+        "a failing exchange was not attempted"
+    );
 }
 
 /// The mutex is held only to read and write the map, so one slow exchange does
@@ -502,7 +545,10 @@ fn the_cache_lock_is_not_held_across_an_exchange() {
 
     let deadline = Duration::from_secs(10);
     let mints = Arc::new(AtomicUsize::new(0));
-    let gate = Arc::new(Gate { open: Mutex::new(false), opened: Condvar::new() });
+    let gate = Arc::new(Gate {
+        open: Mutex::new(false),
+        opened: Condvar::new(),
+    });
     let port = Arc::new(AwsSecretPort::new(Arc::new(Held {
         mints: mints.clone(),
         gate: gate.clone(),
@@ -522,7 +568,10 @@ fn the_cache_lock_is_not_held_across_an_exchange() {
     // held exchange rather than an idle port.
     let entered = Instant::now();
     while mints.load(Ordering::SeqCst) == 0 {
-        assert!(entered.elapsed() < deadline, "the first exchange never started");
+        assert!(
+            entered.elapsed() < deadline,
+            "the first exchange never started"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
 
@@ -549,7 +598,11 @@ fn the_cache_lock_is_not_held_across_an_exchange() {
         "the second credential waited for the first exchange to return, so the \
          cache lock is held across the exchange"
     );
-    assert_eq!(mints.load(Ordering::SeqCst), 2, "a lend was served from an empty cache");
+    assert_eq!(
+        mints.load(Ordering::SeqCst),
+        2,
+        "a lend was served from an empty cache"
+    );
 }
 
 /// A session the reader would have refused is not what the cache serves either:

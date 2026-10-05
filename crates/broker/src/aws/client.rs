@@ -54,12 +54,10 @@
 
 use std::time::SystemTime;
 
-use asv_connector_http::transport::{
-    PinnedClient, Redirect, ResolvedAudience, TransportError,
-};
+use asv_connector_http::transport::{PinnedClient, Redirect, ResolvedAudience, TransportError};
 use asv_connector_http::{SecretError, SecretPort, SecretSink};
 
-use super::sigv4::{Header, SignRequest, SigV4Signer, SignError};
+use super::sigv4::{Header, SigV4Signer, SignError, SignRequest};
 use super::sts::{parse_assume_role, AssumeRole, AwsSession, StsError, STS_SERVICE};
 
 /// The endpoint AWS serves STS on.
@@ -171,7 +169,9 @@ impl SecretSink for SignerSink {
         // the port offers: the sink shape is what keeps the port dyn-safe
         // without giving up that the key has no owner outside the call.
         let key = std::str::from_utf8(secret).map_err(|_| {
-            SecretError::Unavailable("a secret access key that is not UTF-8 cannot be signed".into())
+            SecretError::Unavailable(
+                "a secret access key that is not UTF-8 cannot be signed".into(),
+            )
         })?;
         self.signer = Some(
             SigV4Signer::new(
@@ -181,9 +181,7 @@ impl SecretSink for SignerSink {
                 STS_SERVICE,
             )
             .map_err(|error| {
-                SecretError::Unavailable(format!(
-                    "the credential scope cannot be built: {error}"
-                ))
+                SecretError::Unavailable(format!("the credential scope cannot be built: {error}"))
             })?,
         );
         Ok(())
@@ -444,18 +442,25 @@ impl StsClient {
         )?;
 
         let status = response.status().as_u16();
-        if response.content_length().is_some_and(|len| len > MAX_RESPONSE_BYTES as u64) {
-            return Err(StsClientError::Transport(TransportError::ResponseTooLarge {
-                audience: authority.to_string(),
-            }));
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(StsClientError::Transport(
+                TransportError::ResponseTooLarge {
+                    audience: authority.to_string(),
+                },
+            ));
         }
         let bytes = response
             .bytes()
             .map_err(|error| TransportError::from((authority.clone(), error)))?;
         if bytes.len() > MAX_RESPONSE_BYTES {
-            return Err(StsClientError::Transport(TransportError::ResponseTooLarge {
-                audience: authority.to_string(),
-            }));
+            return Err(StsClientError::Transport(
+                TransportError::ResponseTooLarge {
+                    audience: authority.to_string(),
+                },
+            ));
         }
 
         match parse(&bytes, now) {

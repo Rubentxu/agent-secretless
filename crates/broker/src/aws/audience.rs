@@ -153,13 +153,17 @@ pub fn is_region_shaped(region: &str) -> bool {
     // is a second way to say something, and the bucket validator in
     // `aws::s3` lost an arm to the same finding.
     let parts: Vec<&str> = region.split('-').collect();
-    if parts
-        .iter()
-        .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
-    {
+    if parts.iter().any(|part| {
+        part.is_empty()
+            || !part
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    }) {
         return false;
     }
-    parts.iter().any(|part| part.ends_with(|b: char| b.is_ascii_digit()))
+    parts
+        .iter()
+        .any(|part| part.ends_with(|b: char| b.is_ascii_digit()))
 }
 
 impl AwsDeployment {
