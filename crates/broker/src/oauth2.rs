@@ -448,16 +448,11 @@ fn push_form_encoded(out: &mut Zeroizing<String>, raw: &[u8]) {
 
 /// A scope string as a set.
 ///
-/// RFC 6749's `scope` is a space-delimited *list*, so `read write` and
-/// `write read` are the same grant. Comparing the strings would call a
-/// reordering an escalation, and a client that normalised differently from its
-/// provider would refuse every token.
-fn scope_set(scope: &str) -> Vec<String> {
-    let mut parts: Vec<String> = scope.split_whitespace().map(str::to_string).collect();
-    parts.sort();
-    parts.dedup();
-    parts
-}
+/// Now [`asv_domain::scope_set`], which is where it lives: the policy engine
+/// builds the same set to hand Cedar a `Set` attribute, and two definitions of
+/// "what a scope list is" is a divergence waiting for the day one of them is
+/// edited.
+use asv_domain::scope_set;
 
 /// Refuses a granted scope that is not the requested one.
 ///

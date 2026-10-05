@@ -812,7 +812,55 @@ pub enum Resource {
         /// explain`; it is **not** consulted by `audience_is_approved`, because
         /// this variant is deliberately outside that list.
         audience: String,
+        /// The scope the operator registered, as the RFC 6749 §3.3 list it is
+        /// written in: space-delimited, order-insensitive, a set.
+        ///
+        /// **This is the scope the identity call is being made under**, so it
+        /// is what a policy can reason about: the engine splits it and hands
+        /// Cedar a `Set`, which is what makes `resource.scope.contains("pods:read")
+        /// && !resource.scope.contains("pods:delete")` a sentence the schema
+        /// accepts. A `String` attribute could not express the second half — see
+        /// [`scope_set`] for why substring matching is the wrong answer rather
+        /// than a weaker one.
+        ///
+        /// Never request-supplied, and that is structural rather than
+        /// disciplinary: the broker builds this from the registration it holds,
+        /// and `authorize_oauth2` passes the *deployment's* string. An agent
+        /// cannot ask for a scope, so it cannot ask for a wider one.
+        scope: String,
     },
+}
+
+/// A scope string as the canonical set RFC 6749 §3.3 defines it.
+///
+/// `scope` on the wire is a space-delimited **list**, so `read write` and
+/// `write read` are the same grant, and `read read` is the same grant as
+/// `read`. Three separate questions in this tree need that one answer, and they
+/// need it *identically*:
+///
+/// 1. the issuer, refusing a grant that is not the one it asked for;
+/// 2. the broker, comparing what a resource server reports;
+/// 3. the policy engine, building the `Set` a Cedar rule tests with `contains`.
+///
+/// Two spellings of this function is the defect, not a duplication to be tidied:
+/// if the issuer sorted and the policy engine did not, a reordering would be an
+/// escalation at one end and a clean set at the other, and both would be right
+/// about their own input. So there is one definition, here, and the two callers
+/// that used to have their own import it.
+///
+/// Sorted and deduplicated rather than merely split, so the value Cedar
+/// receives is canonical: a `Set` whose order depends on how the operator typed
+/// the file is a value two operators would spell differently and compare
+/// differently, and `contains` is the only operation on it that must agree.
+///
+/// Whitespace, not `split(' ')`: an operator's YAML or JSON carries the
+/// indentation, and a scope parsed into an empty token is a scope token that
+/// matches nothing while still being present.
+pub fn scope_set(scope: &str) -> Vec<String> {
+    let mut parts: Vec<String> = scope.split_whitespace().map(str::to_string).collect();
+    parts.sort();
+    parts.dedup();
+    parts
 }
 
 /// Authorization outcome. Deny is the default; there is no implicit allow

@@ -118,12 +118,21 @@ pub struct OAuth2Deployment {
     /// against what the resource reports, and a comparison does not need a type
     /// that forbids construction.
     pub audience: String,
-    /// The scope the operator expects the provider to grant.
+    /// The scope the operator registered for this client, as the RFC 6749 §3.3
+    /// list: space-delimited, order-insensitive, a set.
     ///
     /// This is the field that makes step 5 above possible. Without it the broker
     /// could only relay, and "the provider granted more than we configured"
     /// would be undetectable.
-    pub expected_scope: String,
+    ///
+    /// It was `expected_scope` until R2.B.2d, and the rename is the honest one
+    /// rather than the tidy one: from the moment the scope became a Cedar
+    /// attribute, this field had three jobs under one name — the ceiling the
+    /// operator registered, the value a policy rule tests with `contains`, and
+    /// the string the provider's answer is compared against. `expected` named
+    /// only the third, and a field called `expected` that a policy is *shown*
+    /// invites the reading that it is a hope rather than a registration.
+    pub registered_scope: String,
 }
 
 impl OAuth2Deployment {
@@ -192,11 +201,7 @@ impl OAuth2Binding {
         port: Arc<dyn SecretPort>,
     ) -> Result<Self, TransportError> {
         let policy = AddressPolicy::default();
-        let resolved = resolve_and_pin(
-            &deployment.resource,
-            deployment.resource_port,
-            policy,
-        )?;
+        let resolved = resolve_and_pin(&deployment.resource, deployment.resource_port, policy)?;
         let client = Arc::new(PinnedClient::build_timed(
             &resolved,
             policy,
@@ -238,11 +243,7 @@ impl OAuth2Binding {
         policy: AddressPolicy,
         roots: &[reqwest::Certificate],
     ) -> Result<Self, TransportError> {
-        let client = Arc::new(PinnedClient::build_with_roots(
-            &resolved,
-            policy,
-            roots,
-        )?);
+        let client = Arc::new(PinnedClient::build_with_roots(&resolved, policy, roots)?);
         Ok(Self {
             deployment,
             client_id,
@@ -292,9 +293,11 @@ impl OAuth2Binding {
         // would "handle" it by substituting U+FFFD and sending a header the
         // resource did not mint, which turns a refusal into a confusing 401.
         let token = std::str::from_utf8(token.expose())
-            .map_err(|_| IdentityError::Port(
-                "the OAuth2 port returned a token that is not valid UTF-8".into(),
-            ))?
+            .map_err(|_| {
+                IdentityError::Port(
+                    "the OAuth2 port returned a token that is not valid UTF-8".into(),
+                )
+            })?
             .to_string();
 
         let response = self
@@ -324,13 +327,40 @@ impl OAuth2Binding {
         let reported: ReportedIdentity = serde_json::from_str(&body)
             .map_err(|error| IdentityError::Malformed(error.to_string()))?;
 
-        // The comparison. `expected_scope` and `audience` come from the
+        // The comparison. `registered_scope` and `audience` come from the
         // deployment, never from the request and never from the response, so
         // there is no path by which either side of this test can be chosen by
         // the caller.
-        if reported.scope != self.deployment.expected_scope {
+        //
+        // **Compared as sets, not as strings, and the reason is that a second
+        // definition of "what a scope list is" is a defect with a long fuse.**
+        // This line was `reported.scope != self.deployment.registered_scope` and
+        // it was wrong the moment the scope became a policy resource: the policy
+        // compared *sets* and this compared *text*, so a deployment declaring
+        // `"read:pods  read:pods"` satisfied a rule of `scope == ["read:pods"]`
+        // and was then refused here for reporting `"read:pods read:pods"`. A
+        // policy that says yes and a broker that says no, on the same grant, for
+        // the difference between one space and two.
+        //
+        // It was not hypothetical and it was not new — an IdP that reorders the
+        // scope it grants, which RFC 6749 §3.3 explicitly allows, would have
+        // been refused as a widening. What the policy change did was make it
+        // *visible*: the rule and this line now answer the same question, so
+        // they had better answer it the same way. Both call
+        // [`asv_domain::scope_set`], the same function, so they cannot drift
+        // apart again without a test going red.
+        //
+        // Both directions still refuse — a provider that granted a *different*
+        // set is refused whether it is wider or narrower — because a grant the
+        // operator did not declare is a grant the operator did not configure,
+        // and the row that says so is
+        // `a_provider_granting_less_than_the_deployment_declares_is_refused`.
+        // What no longer matters is how the two lists were typed.
+        if asv_domain::scope_set(&reported.scope)
+            != asv_domain::scope_set(&self.deployment.registered_scope)
+        {
             return Err(IdentityError::ScopeWider {
-                expected: self.deployment.expected_scope.clone(),
+                expected: self.deployment.registered_scope.clone(),
                 granted: reported.scope,
             });
         }

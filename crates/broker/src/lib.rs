@@ -2683,8 +2683,15 @@ impl BrokerState {
         // `Api` type is gated by `ALLOWED_AUDIENCES`, a two-host list of
         // first-party APIs, and putting a generic IdP through it would either
         // break the product or, worse, widen that list for GitHub and AWS too.
-        // The audience travels in the resource for the audit trail and is
-        // deliberately not an approval input here.
+        //
+        // `scope` is the third field, and it is the one that makes the policy
+        // about something. The engine splits it into a `Set`, so a rule can ask
+        // what authority the registration *carries* — `contains("pods:read") &&
+        // !contains("pods:delete")` — instead of only which registration it is.
+        // It comes off the deployment for the same reason the audience does:
+        // an agent that could name its own scope would be naming its own
+        // authority, and the whole point of the comparison further down is that
+        // neither side of it is caller-chosen.
         self.authorize_verb(
             session,
             peer,
@@ -2692,6 +2699,7 @@ impl BrokerState {
             Resource::OAuth2Client {
                 credential: credential.to_wire(),
                 audience: binding.deployment.audience.clone(),
+                scope: binding.deployment.registered_scope.clone(),
             },
         )?;
         Ok(binding)

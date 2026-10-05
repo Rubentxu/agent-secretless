@@ -400,14 +400,15 @@ pub fn load_clients(path: &std::path::Path) -> Result<Vec<LoadedClient>, ClientC
                 ),
             });
         }
-        let credential_id = asv_domain::CredentialId::from_wire(&entry.credential).map_err(|error| {
-            ClientConfigError::Unusable {
-                credential: entry.credential.clone(),
-                reason: format!(
+        let credential_id =
+            asv_domain::CredentialId::from_wire(&entry.credential).map_err(|error| {
+                ClientConfigError::Unusable {
+                    credential: entry.credential.clone(),
+                    reason: format!(
                     "the credential is not a vault id, so no request could ever name it: {error}"
                 ),
-            }
-        })?;
+                }
+            })?;
         // Split once, into the two halves the broker needs: a canonical host to
         // vet and a port to dial. Both come from the operator's string, and
         // neither is ever taken from a request.
@@ -429,7 +430,7 @@ pub fn load_clients(path: &std::path::Path) -> Result<Vec<LoadedClient>, ClientC
                 resource,
                 resource_port,
                 audience: entry.audience,
-                expected_scope: entry.scope,
+                registered_scope: entry.scope,
             },
         });
     }
@@ -456,16 +457,17 @@ fn split_https(
             reason: format!("{url} is not https"),
         });
     }
-    let host = parsed.host_str().ok_or_else(|| ClientConfigError::Unusable {
-        credential: credential.to_string(),
-        reason: format!("{url} has no host"),
-    })?;
-    let authority = asv_domain::Authority::canonicalize(host).map_err(|error| {
-        ClientConfigError::Unusable {
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| ClientConfigError::Unusable {
+            credential: credential.to_string(),
+            reason: format!("{url} has no host"),
+        })?;
+    let authority =
+        asv_domain::Authority::canonicalize(host).map_err(|error| ClientConfigError::Unusable {
             credential: credential.to_string(),
             reason: format!("{host} is not a canonical host: {error}"),
-        }
-    })?;
+        })?;
     // `Url::port` is `None` for the default, which is 443 for https. The
     // explicit `.port_or_known_default()` would give 443, and the issuer path
     // wants the "unset" answer — so the branch is deliberate rather than a
@@ -829,7 +831,7 @@ mod tests {
             loaded.client.credential,
             "a request names the wire id and the port keys the record name"
         );
-        assert_eq!(loaded.deployment.expected_scope, loaded.client.scope);
+        assert_eq!(loaded.deployment.registered_scope, loaded.client.scope);
         assert_eq!(loaded.deployment.audience, loaded.client.audience);
         // The resource URL is split into a vetted host and an explicit port.
         // The *path* is dropped on purpose: the broker dials `/resource` itself,
@@ -837,7 +839,10 @@ mod tests {
         // endpoint by writing a longer URL here.
         assert_eq!(loaded.deployment.resource.to_string(), "api.example.com");
         assert_eq!(loaded.deployment.resource_port, 8443);
-        assert_eq!(loaded.deployment.token_endpoint.to_string(), "idp.example.com");
+        assert_eq!(
+            loaded.deployment.token_endpoint.to_string(),
+            "idp.example.com"
+        );
     }
 
     /// A port is defaulted rather than refused when the URL names no port,
@@ -897,10 +902,7 @@ mod tests {
             ),
             (
                 "a missing resource endpoint",
-                one(&GOOD.replace(
-                    r#","resource_url":"https://r.example/x""#,
-                    "",
-                )),
+                one(&GOOD.replace(r#","resource_url":"https://r.example/x""#, "")),
             ),
             (
                 "a credential that is not a uuid",
@@ -916,10 +918,7 @@ mod tests {
             ),
             (
                 "an empty credential",
-                one(&GOOD.replace(
-                    &format!(r#""credential":"{ID}""#),
-                    r#""credential":"""#,
-                )),
+                one(&GOOD.replace(&format!(r#""credential":"{ID}""#), r#""credential":"""#)),
             ),
             (
                 "a misspelled field name",

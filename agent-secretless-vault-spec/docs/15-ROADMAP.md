@@ -1334,6 +1334,148 @@ no row measures a hung resource, because a ten-second test is not a better test;
 and the registration file's `resource_url` path component is dropped at load
 (the broker dials `/resource` itself) without a row saying so out loud.
 
+#### R2.B.2d — the scope is a policy resource, and what that is worth
+
+The scope a registration carries is now an attribute a policy can be written
+about. `SCHEMA_JSON` declares `OAuth2Client` with one attribute, `scope`, of type
+`Set` of `String`; `resource_attributes` supplies it from the **deployment's**
+`registered_scope`; and an operator can write:
+
+```
+permit (principal, action == Action::"oauth2_identity",
+        resource is OAuth2Client)
+when { resource.scope == ["read:pods"] };
+```
+
+**It is a `Set` and not the raw string, and that is the whole design rather than
+a type preference.** A `String` has no `contains` in Cedar, so the only way to
+test a text scope is substring matching — and substring matching on scopes fails
+in the direction that matters: `pods:read` is a substring of `pods:readonly`, and
+a policy refusing `pods:delete` would also refuse a scope that merely *mentions*
+it. A set has neither failure, because membership is equality on whole tokens.
+The one function that answers "what is this scope list" is
+`asv_domain::scope_set`, which sorts and deduplicates, and it is called by the
+issuer that refuses an escalation, by the policy that reads the set, and by the
+broker that compares the answer. It used to be private to the issuer, which is
+the second definition of the same concept and the reason it moved.
+
+Measured: `asv-policy` **25/25** (three new rows), `r2b2_oauth2_vertical`
+**25/25** (three new rows, and one that had to be rewritten — below).
+Falsified by `tests/falsification/oauth2_scope_falsify.py`: **17 mutations in
+five passes — 15 red, 1 refused by the compiler, 1 survivor, 0 measured
+nothing.**
+
+Three findings came out of building it, and each one corrected something I had
+written earlier in this same document.
+
+**One: the documented rule was wrong a third time, in the same way.** The block
+above records that Cedar 4.7.1 rejects `resource is Api && x` and wants a `when`
+block. The rule for the scope was then written in the rejected form, in the
+documentation, by the same author, one commit later. It is worth writing down the
+second time; it was not worth writing down the second time and making the same
+mistake a third, and the row that loads the exact text the docs print is what
+turned a would-not-load into a test failure in seconds.
+
+**Two: a `contains` rule is a filter, not a guard, and the first version of the
+row claimed the stronger thing.** A rule asking
+`resource.scope.contains("pods:read")` is satisfied by `pods:read pods:delete` as
+readily as by `pods:read`. The row that asserted it refused the wider
+registration failed, and it was right to: **Cedar permits or refuses a
+registration, it does not narrow one.** No policy language can hand a token, so
+"read but not write" as a *narrowing* is not something this change could
+deliver, and the honest form of the rule is set equality — one positive
+statement of the exact grant, with no denylist for the operator to keep complete.
+`POLICY_TEXT` now recommends the equality form and says why the denylist is the
+trap most people reach for. A third row was removed rather than kept: it
+duplicated `a_provider_granting_less_than_the_deployment_declares_is_refused`
+and asserted the wrong error code for it.
+
+**Three: the broker compared the scope as text while the policy compared it as a
+set, and the two disagreed about the same grant.** A row that passed
+`"read:pods  read:pods"` — two spaces — to measure whether a repeated token is one
+grant was permitted by the policy and then refused by the broker as a widening,
+because the fixture's IdP reports the scope it granted normalised to single
+spaces and the broker's comparison was `reported.scope != registered_scope`.
+That is not cosmetic: **RFC 6749 §3.3 defines `scope` as an unordered list, so an
+IdP that reorders or re-spaces what it grants is behaving correctly**, and an
+operator whose registration file had a double space would have had every OAuth2
+identity call refused with a message telling them their configuration no longer
+described the credential. The comparison now goes through the same
+`scope_set`. Both directions still refuse — a grant the operator did not declare
+is refused whether wider or narrower — so what changed is that *how the two lists
+were typed* stopped mattering. The defect was older than this change; what this
+change did was make the two layers answer the same question, which is what made
+the disagreement visible.
+
+The remaining two paragraphs are about the campaign rather than the build, and
+they are the ones worth carrying to the next falsification harness in this repo.
+
+**A guard defect found while running the gates, and deliberately not fixed here.**
+`scripts/check-gate-status.py` reports `R11 full suite: states 1220 tests, 1596
+are enumerated` and the matching `R11 README test count` row. Both numbers are in
+`16-SECURITY-RELEASE-GATES.md`, and reading the row rather than obeying it is the
+whole finding: it records a **dated measurement** — "both re-measured on this
+cycle rather than carried forward, at 1220 enumerated" — and the guard
+re-derives it against the *current* enumeration. So the row is not stale, the
+guard is asking the wrong question, and the two available "fixes" are both wrong:
+writing 1596 into the row would falsify a historical record by claiming a cycle
+measured something it did not, and suppressing the check would leave a real
+regression class unwatched. **The guard needs to distinguish a claim about the
+present from a record of a past measurement**, and that is its own change, in a
+document a second session is writing. Not touched here on purpose; the same file
+also carries the `R11 dependency audit` and `R11 formatting` rows, both of which
+are pre-existing drift over 38 unformatted files mostly belonging to that
+session.
+
+**The one survivor is a result, and deleting it would have hidden something.**
+The mutation drops the deduplication from the scope normalisation, and the row
+stays green: **Cedar's `Set` collapses duplicate members**, so `"read:pods
+read:pods"` reaches the evaluator as `{read:pods}` and `== ["read:pods"]` holds
+without the dedup ever running. So the dedup is *unobservable through the
+policy* — no rule and no row can tell those two implementations apart, and a row
+claiming to would be claiming a property Cedar's own type supplies. The dedup is
+not decoration; it is load-bearing one layer down, where the **issuer** compares
+the requested scope against the granted one before a token exists and a
+duplicate really would read as a narrowing. The two layers are protected by
+different mechanisms, and the survivor is the measurement of that. Kept, with the
+explanation, because removing it would leave a mutation list that reads as
+complete coverage of something it does not cover.
+
+**A mutation outlived its row twice, and the pattern is the finding.** The
+unsplit-set mutation survived a row whose cases all had the same outcome whether
+the set was split or not — a row that cannot tell two implementations apart is a
+row that measures nothing about either, however many cases it has. And a second
+mutation was filed against a row that a rewrite of the block had silently
+dropped, which the harness reported as `no-run` rather than as a falsification.
+**A campaign's mutation list is coupled to its row list**, and a row block
+rewritten for clarity quietly un-measures whatever pointed at it. Both were
+re-filed against rows that do own the property, and the `no-run` bucket in the
+harness is the reason the second was visible at all.
+
+#### R2.B.2e, rescoped: narrowing a token is a port capability, not a policy one
+
+The original step 2 was going to be the intersection — the operator's file
+proposes a ceiling, a request proposes less, the policy bounds it, and the
+provider mints the smaller grant. Having built the first half, the honest
+conclusion is that **the second half is not a policy change and cannot be made
+one**, for two reasons that are properties of the tree rather than of the design:
+
+- `SecretPort` is a vault-and-provider boundary with **seventeen
+  implementations** across the tree, and a scope is not a concept any of the
+  other sixteen has. Putting a scope parameter on `lend` would mean every vault,
+  AWS, Kubernetes and mTLS port carrying an OAuth2 field they cannot honour.
+- The OAuth2 port's cache is **keyed by credential alone**, so a narrow request
+  served after a wide one would be answered with the wide cached token. The key
+  has to become `(credential, scope)`, and that is a change to the caching
+  invariant rather than a line in a policy document.
+
+So the scope-aware lend needs its own handle, and the day someone builds it must
+change the cache key in the same commit. Until then the posture is exact and
+worth stating: **the token's ceiling is the IdP's own grant, and what the policy
+can do is refuse a registration whose registered scope is not the one it wants.**
+That is a real control and it is the one an operator can use today; it is not
+least privilege per request, and the difference is what R2.B.2e is now for.
+
 #### A process incident, because it changed what a commit message can be trusted to mean
 
 While R2.B.2 was being written, a second agent session working in the same

@@ -9,9 +9,8 @@
 
 use asv_domain::{Action, AgentSessionId, ApprovalId, Authority, CapabilityId, Decision, Resource};
 use cedar_policy::{
-    Entity,
-    Authorizer, Context, Entities, EntityUid, PolicySet, Request, RestrictedExpression, Schema,
-    ValidationMode, Validator,
+    Authorizer, Context, Entities, Entity, EntityUid, PolicySet, Request, RestrictedExpression,
+    Schema, ValidationMode, Validator,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -101,30 +100,91 @@ permit (principal, action == Action::"postgres_read", resource is Database);
 // *deployment's* audience, so the rule is about one declared destination rather
 // than about AWS in general.
 //
-// -- A correction to the rule above, and it is the reason this paragraph exists
+// -- A defect that was here, and is fixed. Kept because the fix is the evidence
 //
-// The AWS example says `resource.audience == "..."`, and that condition **cannot
-// ever be true**. `cedar_decision` builds the request with
-// `Request::new(principal, action, resource, context, None)` -- the last argument
-// is where a resource's attributes go, and nothing in this crate ever builds an
-// `Entity`, so `Api::audience` is declared in `SCHEMA_JSON` and never supplied.
-// An operator who followed the documentation above would get a permanent,
-// unexplained denial. The reachable-host guarantee is *not* affected, because
-// `audience_is_approved` runs in Rust before Cedar; only the attribute is
-// missing. Fixing it is its own change with its own evidence, and until then
-// **match the entity name**, which is real: `Api::"api:<audience>"`.
+// The AWS example above says `resource.audience == "..."`, and for a while that
+// condition **could never be true**. `cedar_decision` built the entity store with
+// `&Entities::empty()`, and nothing in this crate built an `Entity`, so
+// `Api::audience` was declared in `SCHEMA_JSON`, validated against, and never
+// supplied. An operator who followed the documentation got a permanent,
+// unexplained denial. The reachable-host guarantee was never affected, because
+// `audience_is_approved` runs in Rust before Cedar; only the attribute was
+// missing.
 //
-// `oauth2_identity` has no permit rule for the same reason as the other two, and
-// its entity type is `OAuth2Client` rather than `Api` -- see `ALLOWED_AUDIENCES`
-// for why widening that list to admit arbitrary IdPs would be a regression for
-// GitHub and AWS rather than a compromise. So the working rule is:
+// The fix built the store with the schema, so an attribute is supplied and
+// checked against its declaration on the way in. `resource_attributes` is the
+// whole mechanism now, and it is one function every variant goes through -- so
+// a variant that forgets its arm is refused at load by a missing required
+// attribute rather than quietly making every condition on it unanswerable.
+//
+// A reader who remembers "match the entity name instead" is remembering advice
+// that was true for one commit and is now actively wrong: `Api::"api:<audience>"`
+// still works, and it constrains nothing the attribute does not.
+//
+// `oauth2_identity` has no permit rule, and that is unchanged and still the
+// right default: a surface added after this text was written should not start
+// answering on behalf of every session because someone upgraded. What changed is
+// that the rule an operator *writes* can now say something about the authority,
+// because the registration's scope is a declared attribute (`Set<String>`) rather
+// than nothing:
 //
 //   permit (principal, action == Action::"oauth2_identity",
-//           resource == OAuth2Client::"oauth2:<vault-credential-id>");
+//           resource is OAuth2Client)
+//   when { resource.scope.contains("pods:read")
+//          && !resource.scope.contains("pods:delete") };
 //
-// which addresses one *registered client* rather than one host. That is the
-// right granularity anyway: the authority being delegated is the registration,
-// and two registrations may share an audience while differing in scope.
+// **The `when` block is not decoration here either, and this paragraph has now
+// been wrong twice.** The rule above is the third one in this file to be written
+// as `resource is Api && condition`, and Cedar 4.7.1 rejects all three the same
+// way: the head is a `permit (principal, action, resource)` clause and the
+// condition belongs in a separate `when { .. }` block. It was worth writing
+// down the second time; it was not worth writing down the second time and then
+// making the same mistake a third. `contains` does not change the grammar, and a
+// rule with a condition in the head fails to *load* -- which is at least loud.
+//
+// The entity type is `OAuth2Client` rather than `Api` -- see `ALLOWED_AUDIENCES`
+// for why widening that list to admit arbitrary IdPs would be a regression for
+// GitHub and AWS rather than a compromise. Addressing one *registered client* is
+// the right granularity anyway: the authority being delegated is the
+// registration, and two registrations may share an audience while differing in
+// scope -- which is exactly the pair a `Set` can tell apart and an audience
+// comparison could not.
+//
+// **Which of those two shapes an operator should write, and why the first one is
+// a trap.** Both rules are valid Cedar and both refuse a registration carrying
+// `pods:delete`. They are not the same control:
+//
+//   when { resource.scope.contains("pods:read")
+//          && !resource.scope.contains("pods:delete") }     // a denylist
+//   when { resource.scope == ["pods:read"] }                // an allowlist
+//
+// The first is what most people write, and it is wrong in a way that only shows
+// up later. It refuses the scope you thought of; it permits
+// `pods:read pods:create pods:escalate`, because `create` was never on the list.
+// **A denylist is only as complete as the operator's memory of every mutating
+// scope their IdP offers**, and the failure arrives after the policy is written,
+// in production, on a registration somebody else added.
+//
+// The second says what is allowed rather than what is forbidden, so there is
+// nothing to keep complete, and it is the shape the rows in `r2b2_oauth2_vertical`
+// measure. Prefer it. Use the denylist form only when the registration's grant is
+// genuinely open-ended and the operator really does mean "anything but these".
+//
+// **What neither shape does: narrow.** Cedar *permits or refuses a registration*;
+// it cannot rewrite one, and no policy language can hand a token. The rule above
+// says "this session may act through a client whose registered scope is exactly
+// `pods:read`, and through no other" — an all-or-nothing judgement about one
+// registration. The token's ceiling is the IdP's own grant, and the broker's
+// comparison against the provider's answer is what catches the day it drifts.
+//
+// Narrowing a token *below* its registration — an agent asking for less than the
+// client holds, and the provider minting the smaller grant — is a *port*
+// capability rather than a policy one, and it is a separate change. It cannot be
+// bolted on by widening `SecretPort`, which is a vault-and-provider boundary
+// shared by seventeen implementations that have no concept of an OAuth2 scope;
+// the scope-aware lend needs its own handle, and the token cache's key has to
+// become `(credential, scope)` or a narrow request would be served a wide cached
+// token.
 //"#;
 
 /// Audiences a semantic HTTP action may ever target (D6; the design v2 open
@@ -186,7 +246,17 @@ const SCHEMA_JSON: &str = r#"{
           }
         }
       },
-      "OAuth2Client": {}
+      "OAuth2Client": {
+        "shape": {
+          "type": "Record",
+          "attributes": {
+            "scope": {
+              "type": "Set",
+              "element": { "type": "String" }
+            }
+          }
+        }
+      }
     },
     "actions": {
       "git_fetch": {
@@ -964,7 +1034,19 @@ impl PolicyEngine {
             // authorization into a quiet deny and three rows said "assertion
             // failed" with nothing behind them. The two fixes belong together —
             // a string literal, and an error an operator can read.
-            resource_attrs.insert(name.to_string(), RestrictedExpression::new_string(value));
+            //
+            // The `Set` arm is the same care applied to a value that is not a
+            // string at all: `new_set` over `new_string` members, never
+            // `from_str` on the joined `"read write"` — which would be a Cedar
+            // *expression* naming two entities, and would fail closed on every
+            // scope that contains a space.
+            let value = match value {
+                ResourceAttribute::Text(text) => RestrictedExpression::new_string(text),
+                ResourceAttribute::Set(members) => RestrictedExpression::new_set(
+                    members.into_iter().map(RestrictedExpression::new_string),
+                ),
+            };
+            resource_attrs.insert(name.to_string(), value);
         }
         // **This is where the attributes go, and the fact that they did not go
         // here is the whole defect.** Cedar resolves a resource's attributes from
@@ -1077,7 +1159,7 @@ fn resource_name(resource: &Resource) -> String {
     }
 }
 
-/// The attributes a resource entity carries, as `(name, value)` string pairs.
+/// The attributes a resource entity carries, as `(name, value)` pairs.
 ///
 /// **Every variant here must match a shape declared in `SCHEMA_JSON`, and an
 /// attribute that does not is a load-time error rather than a silently absent
@@ -1086,20 +1168,54 @@ fn resource_name(resource: &Resource) -> String {
 /// declare fails `Entity::new`, so a typo here stops the broker rather than
 /// producing another rule that can never match.
 ///
-/// Only `Api` has a shape, and so only `Api` produces an attribute.
-/// `OAuth2Client` is deliberately empty today: R2.B.2 gave the type no attribute
-/// precisely because the mechanism did not work, and shipping a declared field
-/// nothing supplied would have been the same defect one level down. It carries
-/// the scope when the scope becomes a policy resource, and the machinery to
-/// carry it is now here.
-fn resource_attributes(resource: &Resource) -> Vec<(&'static str, String)> {
+/// The value is typed because Cedar's is. A `String` attribute and a `Set`
+/// attribute are different types to the schema, and the wrong constructor does
+/// not error usefully — `new_string("read write")` is a perfectly valid string
+/// that no `contains` will ever find anything in, so a scope declared as text
+/// would load cleanly and deny silently. [`ResourceAttribute`] makes the
+/// distinction something a reviewer can see at the match arm.
+fn resource_attributes(resource: &Resource) -> Vec<(&'static str, ResourceAttribute)> {
     match resource {
-        Resource::Api { audience } => vec![("audience", audience.to_string())],
-        Resource::Repository { .. }
-        | Resource::Database { .. }
-        | Resource::Host { .. }
-        | Resource::OAuth2Client { .. } => Vec::new(),
+        Resource::Api { audience } => {
+            vec![("audience", ResourceAttribute::Text(audience.to_string()))]
+        }
+        // **A `Set`, and this is the arm that makes the scope a policy
+        // resource.** RFC 6749's `scope` is a space-delimited list, so the
+        // honest Cedar type is a set of strings and the honest policy question
+        // is `contains`.
+        //
+        // The alternative — hand over the raw string and let the rule test it
+        // with `contains` — is not a weaker control, it is **no control at all**,
+        // and it fails in the direction that matters. A `String` has no `contains`
+        // in Cedar, so a rule written that way is rejected; an author who wanted
+        // substring matching and got it would find that `pods:read` is a
+        // substring of `pods:readwrite`, that `read` is a substring of both, and
+        // that a policy refusing `pods:delete` also refuses a scope that merely
+        // *mentions* it. A set cannot have either failure: membership is equality
+        // on whole tokens, and a token that is not there is not there.
+        Resource::OAuth2Client { scope, .. } => {
+            vec![(
+                "scope",
+                ResourceAttribute::Set(asv_domain::scope_set(scope)),
+            )]
+        }
+        Resource::Repository { .. } | Resource::Database { .. } | Resource::Host { .. } => {
+            Vec::new()
+        }
     }
+}
+
+/// A resource attribute's value, in the shape the schema declares for it.
+///
+/// Exists because [`resource_attributes`] is where a type decision is made and
+/// the alternative is a `String` that means "a string, or the words of a set,
+/// depending on which variant you are looking at".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResourceAttribute {
+    /// A Cedar `String`, built with `RestrictedExpression::new_string`.
+    Text(String),
+    /// A Cedar `Set` of `String`, built with `RestrictedExpression::new_set`.
+    Set(Vec<String>),
 }
 
 #[cfg(test)]
@@ -1113,6 +1229,29 @@ mod tests {
             action,
             resource: Resource::Api {
                 audience: Authority::canonicalize(audience).expect("valid authority"),
+            },
+            context: PolicyContext {
+                workspace: "/repo".into(),
+                protected_ref: None,
+                request_digest: Some("digest".into()),
+                peer_uid: 1000,
+            },
+        }
+    }
+
+    /// An OAuth2 identity request against a registration carrying `scope`.
+    ///
+    /// The scope is the whole point of this helper existing: it is the field the
+    /// policy is supposed to be able to reason about, and a fixture that hardcoded
+    /// one would make every row below pass with a rule nobody wrote.
+    fn oauth2_request(action: Action, scope: &str) -> AuthorizationRequest {
+        AuthorizationRequest {
+            session: AgentSessionId::new(),
+            action,
+            resource: Resource::OAuth2Client {
+                credential: "cred-1".into(),
+                audience: "https://api.asv.test".into(),
+                scope: scope.into(),
             },
             context: PolicyContext {
                 workspace: "/repo".into(),
@@ -1306,33 +1445,71 @@ mod tests {
     /// `resource_attributes` trustworthy: it cannot quietly grow a field no
     /// policy can reference, and it cannot lose one every rule depends on,
     /// without a policy evaluation failing loudly rather than denying in silence.
+    ///
+    /// **Two shaped types, not one, and the row covers both** because a check
+    /// written when only `Api` had a shape would keep passing after `OAuth2Client`
+    /// grew one — the missing arm and the wrong-typed arm are different bugs with
+    /// the same symptom, and only the second is silent.
     #[test]
     fn a_resource_entity_carries_exactly_what_its_schema_declares() {
         let schema = Schema::from_json_str(SCHEMA_JSON).expect("the built-in schema parses");
         let audience = Authority::canonicalize("api.github.com").expect("valid");
-        let resource = Resource::Api {
+        let api = Resource::Api {
             audience: audience.clone(),
         };
-        // Declared: `Api` has a shape with one String attribute.
+        // Declared: `Api` has a shape with one **String** attribute.
         assert_eq!(
-            resource_attributes(&resource),
-            vec![("audience", audience.to_string())]
+            resource_attributes(&api),
+            vec![("audience", ResourceAttribute::Text(audience.to_string()))],
+            "the Api arm must emit a String, which is what the schema declares for it"
         );
-        // And the entity Cedar builds from it is accepted by that schema.
-        let uid = EntityUid::from_str(&format!(
-            "Api::\"{}\"",
-            resource_name(&resource)
-        ))
-        .expect("the resource name is a valid entity id");
-        let mut attrs = HashMap::new();
-        attrs.insert(
-            "audience".to_string(),
-            RestrictedExpression::new_string(audience.to_string()),
+        // Declared: `OAuth2Client` has one attribute and it is a **Set of
+        // String**. A `Text` here would satisfy the name and fail the type, and
+        // the failure a policy author would see is a rule that never matches.
+        assert_eq!(
+            resource_attributes(
+                &oauth2_request(Action::OAuth2Identity, "write  read read").resource
+            ),
+            vec![(
+                "scope",
+                ResourceAttribute::Set(vec!["read".into(), "write".into()])
+            )],
+            "the OAuth2Client arm must emit a Set of the individual scope tokens, \
+             deduplicated and order-independent"
         );
-        let entity = Entity::new(uid.clone(), attrs, HashSet::new())
-            .expect("an entity with a declared attribute builds");
-        Entities::from_entities(vec![entity], Some(&schema))
-            .expect("and the schema accepts it");
+        // And both are accepted by the schema that declares them, built the way
+        // `cedar_decision` builds them.
+        for resource in [
+            api.clone(),
+            oauth2_request(Action::OAuth2Identity, "read").resource,
+        ] {
+            let uid = EntityUid::from_str(&format!(
+                "{}::\"{}\"",
+                entity_type(&resource),
+                resource_name(&resource)
+            ))
+            .expect("the resource name is a valid entity id");
+            let attrs: HashMap<String, RestrictedExpression> = resource_attributes(&resource)
+                .into_iter()
+                .map(|(name, value)| {
+                    let value = match value {
+                        ResourceAttribute::Text(text) => RestrictedExpression::new_string(text),
+                        ResourceAttribute::Set(members) => RestrictedExpression::new_set(
+                            members.into_iter().map(RestrictedExpression::new_string),
+                        ),
+                    };
+                    (name.to_string(), value)
+                })
+                .collect();
+            let entity = Entity::new(uid, attrs, HashSet::new())
+                .expect("an entity with declared attributes builds");
+            Entities::from_entities(vec![entity], Some(&schema)).unwrap_or_else(|error| {
+                panic!(
+                    "{} does not conform to the schema: {error}",
+                    resource_name(&resource)
+                )
+            });
+        }
         // The types with no shape carry nothing, which is why they need no
         // entity at all: supplying an empty one would be a no-op with a cost.
         for resource_without_attributes in [
@@ -1347,16 +1524,188 @@ mod tests {
             Resource::Host {
                 hostname: "a".into(),
             },
-            Resource::OAuth2Client {
-                credential: "x".into(),
-                audience: "y".into(),
-            },
         ] {
             assert!(
                 resource_attributes(&resource_without_attributes).is_empty(),
                 "{resource_without_attributes:?} declares no shape, so it must carry no attribute"
             );
         }
+    }
+
+    /// **The row this whole change exists for: a policy can say what the
+    /// registration is allowed to carry, and the rule really is evaluated.**
+    ///
+    /// The exact text `POLICY_TEXT` prints for an operator to copy:
+    ///
+    /// ```text
+    /// permit (principal, action == Action::"oauth2_identity",
+    ///         resource is OAuth2Client)
+    /// when { resource.scope.contains("pods:read")
+    ///        && !resource.scope.contains("pods:delete") };
+    /// ```
+    ///
+    /// The two halves are the two things a substring comparison could not do.
+    /// `contains("pods:read")` is the ordinary case, and it is here to prove the
+    /// Set reaches Cedar at all. The negated half is the one that matters: with
+    /// the scope as a `String`, "read but not write" is not expressible, because
+    /// Cedar's `contains` is set membership and a `String` has no sets — and
+    /// with it as text, the only way to write the rule is substring matching,
+    /// which refuses a scope that merely *mentions* `pods:delete` and misses one
+    /// that *contains* `pods:delete` as a prefix.
+    ///
+    /// A rule that cannot be satisfied is the failure this must not have: the
+    /// first assertion below is the one that would catch a `Set` silently
+    /// degraded to a `String`, because a `contains` on a `String` is rejected at
+    /// *load* and the whole engine would refuse to build rather than permit
+    /// anything.
+    #[test]
+    fn a_scope_condition_separates_a_read_only_client_from_a_read_write_one() {
+        let engine = PolicyEngine::from_policy_text(
+            r#"permit (principal, action == Action::"oauth2_identity",
+                       resource is OAuth2Client)
+                   when { resource.scope.contains("pods:read")
+                          && !resource.scope.contains("pods:delete") };"#,
+        )
+        .expect("the documented OAuth2 scope rule is valid Cedar and validates");
+        let allowed = engine.authorize(
+            &oauth2_request(Action::OAuth2Identity, "pods:read"),
+            None,
+            None,
+        );
+        assert!(
+            allowed.decision.is_allowed(),
+            "a read-only registration must satisfy a rule that says read-only: {:?}",
+            allowed.reason
+        );
+        for refused_scope in ["pods:read pods:delete", "pods:delete", "pods:readonly"] {
+            let denied = engine.authorize(
+                &oauth2_request(Action::OAuth2Identity, refused_scope),
+                None,
+                None,
+            );
+            assert!(
+                !denied.decision.is_allowed(),
+                "{refused_scope:?} satisfied a rule that forbids pods:delete — membership is \
+                 equality on whole tokens, so pods:readonly is not pods:read"
+            );
+        }
+        // And the rule is not a blanket permit wearing a condition: a scope with
+        // no read at all is refused by the same rule that permits the first one.
+        assert!(
+            !engine
+                .authorize(
+                    &oauth2_request(Action::OAuth2Identity, "pods:list"),
+                    None,
+                    None
+                )
+                .decision
+                .is_allowed(),
+            "a registration with none of the required scope was permitted"
+        );
+    }
+
+    /// The scope order and repetition an operator actually types make no
+    /// difference to what the policy sees.
+    ///
+    /// RFC 6749's `scope` is a list and the IdP may echo it back in any order, so
+    /// `"pods:read pods:write"` and `"pods:write pods:read"` are one grant. If the
+    /// Set were built from the raw string, a policy that required an exact
+    /// ordering would pass on one registration and fail on the next — and the
+    /// failure would look like the policy being wrong rather than the
+    /// normalisation being incomplete.
+    ///
+    /// This shares its normalisation with the issuer's escalation check, which is
+    /// why [`asv_domain::scope_set`] is one function and not two: a rule that
+    /// agreed with the issuer about order would be a rule that could one day stop
+    /// agreeing, with nothing in the tree to notice.
+    #[test]
+    fn scope_order_and_repetition_are_one_grant_to_both_the_policy_and_the_issuer() {
+        let engine = PolicyEngine::from_policy_text(
+            r#"permit (principal, action == Action::"oauth2_identity",
+                       resource is OAuth2Client)
+                   when { resource.scope.contains("pods:read") };"#,
+        )
+        .expect("valid");
+        for spelling in [
+            "pods:read",
+            "pods:read  pods:read",
+            "  pods:read",
+            "pods:read\t",
+        ] {
+            let allowed = engine.authorize(
+                &oauth2_request(Action::OAuth2Identity, spelling),
+                None,
+                None,
+            );
+            assert!(
+                allowed.decision.is_allowed(),
+                "{spelling:?} is the same grant as `pods:read` and must be permitted: {:?}",
+                allowed.reason
+            );
+        }
+        // The one definition, checked against the definition this crate used to
+        // carry. The issuer calls the same function, so a change here moves both
+        // — and this assertion is what makes that a *checked* claim rather than
+        // a comment.
+        assert_eq!(
+            asv_domain::scope_set("write  read read"),
+            vec!["read".to_string(), "write".to_string()],
+            "scope_set is the shared normalisation: split on whitespace, sorted, deduplicated"
+        );
+    }
+
+    /// The scope the policy reads is the **registration's**, and the schema
+    /// refuses a rule that tries to read a different one.
+    ///
+    /// Two directions, because they are different guarantees. First: the field
+    /// `resource_attributes` reads is the `scope` of the resource, and the
+    /// broker fills that from the deployment — a row that could not distinguish
+    /// the two would pass if the broker started putting the *audience* there, and
+    /// the audience is a URL, so every membership test would fail closed and
+    /// every OAuth2 identity call would be denied for a reason no policy text
+    /// could explain.
+    ///
+    /// Second, and this is the property R2.B.2 relies on: a rule naming
+    /// `resource.audience` on an `OAuth2Client` is a **load-time** failure. The
+    /// operator gets told, once, at startup, instead of a permanent unexplained
+    /// denial per request. The control is stronger than it was designed to be —
+    /// it is the same accident that made the dangerous AWS rule unwritable.
+    #[test]
+    fn the_oauth2_scope_is_the_registration_s_and_a_rule_cannot_reach_anything_else() {
+        // The audience is not reachable as an attribute on this type, even
+        // though the domain variant carries it for the audit trail.
+        let refused = PolicyEngine::from_policy_text(
+            r#"permit (principal, action == Action::"oauth2_identity",
+                       resource is OAuth2Client)
+                   when { resource.audience == "https://api.asv.test" };"#,
+        );
+        assert!(
+            refused.is_err(),
+            "a rule reading an attribute the OAuth2Client shape does not declare must not load"
+        );
+
+        // And the scope is what the rule actually reads: an audience that
+        // *contains* the scope string cannot satisfy a membership test, which is
+        // the falsifiable form of "the policy reads the scope and not the
+        // audience".
+        let engine = PolicyEngine::from_policy_text(
+            r#"permit (principal, action == Action::"oauth2_identity",
+                       resource is OAuth2Client)
+                   when { resource.scope.contains("pods:read") };"#,
+        )
+        .expect("valid");
+        let mut mislabelled = oauth2_request(Action::OAuth2Identity, "pods:read");
+        if let Resource::OAuth2Client { scope, .. } = &mut mislabelled.resource {
+            *scope = "https://pods:read.asv.test".into();
+        }
+        assert!(
+            !engine
+                .authorize(&mislabelled, None, None)
+                .decision
+                .is_allowed(),
+            "a scope token that embeds the string was treated as the scope itself, so the rule \
+             is not testing whole tokens"
+        );
     }
 
     /// A resource attribute the schema does not declare is refused by the
@@ -1433,16 +1782,14 @@ mod tests {
              other construction failure: {refused}"
         );
         // And a correct build is unaffected by any of this.
-        assert!(
-            engine
-                .authorize(
-                    &api_request(Action::GitHubIssueRead, "api.github.com"),
-                    None,
-                    None
-                )
-                .decision
-                .is_allowed()
-        );
+        assert!(engine
+            .authorize(
+                &api_request(Action::GitHubIssueRead, "api.github.com"),
+                None,
+                None
+            )
+            .decision
+            .is_allowed());
     }
 
     /// **The row that makes `Some(&schema)` load-bearing.** It is the one thing

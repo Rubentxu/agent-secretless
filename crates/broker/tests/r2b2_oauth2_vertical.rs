@@ -121,7 +121,9 @@ impl OAuth2IssuerFactory for FixtureIssuer {
         let issuer = asv_broker::oauth2::ClientCredentialsIssuer::with_resolved(
             config,
             &resolved,
-            AddressPolicy { allow_loopback: true },
+            AddressPolicy {
+                allow_loopback: true,
+            },
             std::slice::from_ref(&self.certificate),
         )?;
         Ok(Box::new(issuer))
@@ -225,17 +227,21 @@ impl Vertical {
 }
 
 impl Vertical {
-    /// `expected_scope` is the one knob, and it exists so a row can declare a
+    /// The registered scope is the one knob, and it exists so a row can declare a
     /// scope the provider will *not* grant — the drift case. Everything else is
     /// fixed by the fixture.
-    fn new(policy: &str, expected_scope: &str) -> Self {
-        Self::with_widening(policy, expected_scope, None)
+    ///
+    /// Since R2.B.2d it is also the value Cedar sees, so a row can use it to
+    /// write a rule about the scope and get a different answer because of what
+    /// the registration carries rather than because of what the resource said.
+    fn new(policy: &str, registered_scope: &str) -> Self {
+        Self::with_widening(policy, registered_scope, None)
     }
 
     /// `widen_to` makes the *provider* hand back a scope other than the one
     /// asked for, which is the only way to reach the broker's own comparison:
     /// the production issuer refuses a widening before the broker sees it.
-    fn with_widening(policy: &str, expected_scope: &str, widen_to: Option<&str>) -> Self {
+    fn with_widening(policy: &str, registered_scope: &str, widen_to: Option<&str>) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let passphrase = secrecy::SecretString::from("r2b2-passphrase".to_string());
         let client = AsClient::awkward();
@@ -296,7 +302,7 @@ impl Vertical {
                 client_id: client.client_id.clone(),
                 token_url: server.url("/token"),
                 audience: RESOURCE_AUDIENCE.to_string(),
-                scope: expected_scope.to_string(),
+                scope: registered_scope.to_string(),
             }],
             match widen_to {
                 None => Arc::new(FixtureIssuer {
@@ -328,7 +334,7 @@ impl Vertical {
                     resource: host.clone(),
                     resource_port: server.port(),
                     audience: RESOURCE_AUDIENCE.to_string(),
-                    expected_scope: expected_scope.to_string(),
+                    registered_scope: registered_scope.to_string(),
                 },
                 client.client_id.clone(),
                 routing,
@@ -342,7 +348,9 @@ impl Vertical {
                     port: server.port(),
                     addresses: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
                 },
-                AddressPolicy { allow_loopback: true },
+                AddressPolicy {
+                    allow_loopback: true,
+                },
                 std::slice::from_ref(&server.certificate()),
             )
             .expect("the fixture resource is usable over a pinned loopback client"),
@@ -539,7 +547,11 @@ fn a_token_that_is_not_a_bearer_token_is_refused_rather_than_substituted() {
 
     struct NotUtf8;
     impl SecretPort for NotUtf8 {
-        fn lend(&self, _c: &str, s: &mut dyn SecretSink) -> Result<(), asv_connector_http::SecretError> {
+        fn lend(
+            &self,
+            _c: &str,
+            s: &mut dyn SecretSink,
+        ) -> Result<(), asv_connector_http::SecretError> {
             // A lone 0xFF can never be part of RFC 6750's `b64token`.
             s.accept(&[0xff, 0xfe, 0xfd])
         }
@@ -553,7 +565,7 @@ fn a_token_that_is_not_a_bearer_token_is_refused_rather_than_substituted() {
             resource: host.clone(),
             resource_port: server.port(),
             audience: RESOURCE_AUDIENCE.to_string(),
-            expected_scope: SCOPE.to_string(),
+            registered_scope: SCOPE.to_string(),
         },
         "asv:broker/ci".to_string(),
         Arc::new(NotUtf8),
@@ -562,12 +574,16 @@ fn a_token_that_is_not_a_bearer_token_is_refused_rather_than_substituted() {
             port: server.port(),
             addresses: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
         },
-        AddressPolicy { allow_loopback: true },
+        AddressPolicy {
+            allow_loopback: true,
+        },
         std::slice::from_ref(&server.certificate()),
     )
     .expect("the fixture resource is usable");
 
-    let refused = binding.identity(CRED).expect_err("invalid bytes are not presentable");
+    let refused = binding
+        .identity(CRED)
+        .expect_err("invalid bytes are not presentable");
     let message = refused.to_string();
     assert!(
         message.contains("UTF-8") || message.contains("utf-8"),
@@ -608,7 +624,11 @@ fn a_resource_answered_with_a_refusal_is_reported_as_one() {
     /// A port that yields a well-formed token the resource has never issued.
     struct UnknownToken;
     impl SecretPort for UnknownToken {
-        fn lend(&self, _c: &str, s: &mut dyn SecretSink) -> Result<(), asv_connector_http::SecretError> {
+        fn lend(
+            &self,
+            _c: &str,
+            s: &mut dyn SecretSink,
+        ) -> Result<(), asv_connector_http::SecretError> {
             // Valid UTF-8 and a plausible `b64token` shape, so the only reason
             // the resource can refuse is that it never minted this one.
             s.accept(b"asv-token-the-resource-never-issued")
@@ -623,7 +643,7 @@ fn a_resource_answered_with_a_refusal_is_reported_as_one() {
             resource: host.clone(),
             resource_port: server.port(),
             audience: RESOURCE_AUDIENCE.to_string(),
-            expected_scope: SCOPE.to_string(),
+            registered_scope: SCOPE.to_string(),
         },
         "asv:broker/ci".to_string(),
         Arc::new(UnknownToken),
@@ -632,12 +652,16 @@ fn a_resource_answered_with_a_refusal_is_reported_as_one() {
             port: server.port(),
             addresses: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
         },
-        AddressPolicy { allow_loopback: true },
+        AddressPolicy {
+            allow_loopback: true,
+        },
         std::slice::from_ref(&server.certificate()),
     )
     .expect("the fixture resource is usable");
 
-    let refused = binding.identity(CRED).expect_err("the resource refuses an unknown token");
+    let refused = binding
+        .identity(CRED)
+        .expect_err("the resource refuses an unknown token");
     let message = refused.to_string();
     assert!(
         message.contains("401"),
@@ -869,7 +893,7 @@ fn a_deployment_pointing_at_another_audience_is_refused() {
     // Re-point the deployment's declared audience at one the client is entitled
     // to but the resource does not serve, so the token is live and wrong.
     vertical.state.oauth2[0].deployment.audience = "https://admin.asv.test".to_string();
-    vertical.state.oauth2[0].deployment.expected_scope = SCOPE.to_string();
+    vertical.state.oauth2[0].deployment.registered_scope = SCOPE.to_string();
 
     let asked = vertical.whoami(CRED);
     let (code, message) = refusal(&asked);
@@ -1029,6 +1053,165 @@ fn a_rule_for_another_client_does_not_reach_this_one() {
         vertical.server.last_request().is_none(),
         "a denied request reached the identity provider"
     );
+}
+
+/// **The row the scope change exists for, measured through the broker rather
+/// than through the policy crate: the scope Cedar sees is the *registration's*.**
+///
+/// The policy crate can prove that a `Set` attribute and a `contains` rule work
+/// together. It cannot prove that the broker put the registration's scope in it —
+/// and a broker that supplied the *audience* instead would leave every policy-crate
+/// row green while denying every real call, because an audience is a URL and no
+/// membership test finds anything in one.
+///
+/// So the two halves run with **byte-identical requests**: same credential, same
+/// rule, same session, same everything. Only the operator's file differs, which is
+/// the only input this change is allowed to react to. If a request could influence
+/// the scope, the second half would still be permitted.
+///
+/// Note what this row does **not** claim, because the first version of it did and
+/// the test caught it. A rule that asks only `contains("read:pods")` is satisfied
+/// by `read:pods delete:pods` as readily as by `read:pods` — it is a *filter*, not
+/// a guard, and asserting that it refuses the wider registration was asserting a
+/// property the policy language does not have. Cedar permits or refuses a
+/// registration; it does not narrow one. The wider case is the next row's job.
+#[test]
+fn a_rule_about_the_registered_scope_follows_the_registration_and_nothing_else() {
+    let rule = r#"permit (principal, action == Action::"oauth2_identity",
+                       resource is OAuth2Client)
+                   when { resource.scope.contains("read:pods") };"#;
+
+    // A registration that carries the scope proceeds, and it reaches the
+    // provider — so the allowance is a real one, not a denial that happens to be
+    // the right answer.
+    let mut carrying = Vertical::new(rule, SCOPE);
+    let allowed = carrying.whoami(CRED);
+    assert!(
+        matches!(allowed, Response::OAuth2Identity { .. }),
+        "a registration carrying {SCOPE:?} was refused by a rule asking for it: {allowed:?}"
+    );
+    assert!(
+        carrying.server.last_request().is_some(),
+        "the permitted call never reached the identity provider, so the row proved nothing"
+    );
+
+    // The same request, the same rule, a registration that does not carry it.
+    let mut not_carrying = Vertical::new(rule, "delete:pods");
+    let denied = not_carrying.whoami(CRED);
+    let (code, message) = refusal(&denied);
+    assert_eq!(
+        code,
+        ErrorCode::Denied,
+        "a registration carrying only `delete:pods` satisfied a rule that requires \
+         `read:pods`: {message}"
+    );
+    assert!(
+        not_carrying.server.last_request().is_none(),
+        "a request the scope rule refused still reached the identity provider"
+    );
+}
+
+/// "This client may do exactly this and nothing else" — and it takes **set
+/// equality**, not a `contains` check.
+///
+/// The first attempt at this row used a denylist (`contains("read") &&
+/// !contains("delete") && !contains("write")`) and asserted it refused a
+/// registration carrying `read:pods create:pods`. It did not, and it should not
+/// have: the rule never mentioned `create`, so the registration satisfied it. The
+/// test failing was the point — a denylist is only as complete as the operator's
+/// memory of every mutating scope their IdP offers, and **the shape of the policy
+/// text is the thing that decides whether the operator has to remember.** One
+/// positive statement of the exact grant has nothing to keep complete.
+///
+/// So this row uses the form the docs recommend, and checks the three cases that
+/// separate a set from a string: the exact set passes, a superset does not, and a
+/// superset that *contains the whole string* the rule asks about still does not.
+/// That last one is the substring failure a `String` attribute would have had and
+/// a `Set` cannot.
+#[test]
+fn a_scope_rule_can_require_a_client_to_carry_exactly_one_grant() {
+    let rule = r#"permit (principal, action == Action::"oauth2_identity",
+                       resource is OAuth2Client)
+                   when { resource.scope == ["read:pods"] };"#;
+
+    for (scope, should_pass, why) in [
+        ("read:pods", true, "exactly the grant the rule names"),
+        (
+            "read:pods delete:pods",
+            false,
+            "a superset is not the grant, which is what a denylist would have had to catch \
+             one mutating scope at a time",
+        ),
+        (
+            "read:pods  read:pods",
+            true,
+            "a repeated token is one grant — this is the case that says so, and the first \
+             version of it passed a clean string while claiming repetition, which is a label \
+             that measures nothing",
+        ),
+        (
+            "prefix read:pods suffix",
+            false,
+            "a scope that merely mentions the grant must not satisfy it",
+        ),
+    ] {
+        let mut vertical = Vertical::new(rule, scope);
+        let response = vertical.whoami(CRED);
+        let permitted = matches!(response, Response::OAuth2Identity { .. });
+        assert_eq!(permitted, should_pass, "{scope:?}: {why} ({response:?})");
+        if should_pass {
+            assert!(
+                vertical.server.last_request().is_some(),
+                "{scope:?} was permitted but never reached the provider, so the row proved nothing"
+            );
+        } else {
+            assert!(
+                vertical.server.last_request().is_none(),
+                "{scope:?} was refused but still reached the provider"
+            );
+        }
+    }
+}
+
+/// A grant the provider **spells differently** is the same grant, and the policy
+/// and the broker have to agree about that.
+///
+/// Found by the row above. Its first version passed `"read:pods  read:pods"` —
+/// two spaces — to measure whether a repeated token is one grant, and the policy
+/// said yes and the broker said no: the fixture's IdP reports the scope it
+/// actually granted, normalised to single spaces, and the broker compared
+/// **strings**, so `"read:pods read:pods" != "read:pods  read:pods"` and a
+/// perfectly valid grant was refused as a widening.
+///
+/// That is not a cosmetic difference between two layers. A provider that
+/// reorders or re-spaces the scope it grants is behaving **correctly** — RFC 6749
+/// §3.3 defines `scope` as an unordered space-delimited list, which is why
+/// `asv_domain::scope_set` sorts and deduplicates — and an operator who wrote
+/// their registration with a line break or a double space would have had every
+/// OAuth2 identity call refused for a formatting reason, with a message telling
+/// them their configuration no longer describes the credential.
+///
+/// The row states the agreement rather than the fix: the same policy text and the
+/// same registration produce a permitted call that reaches the provider, so the
+/// two layers are answering one question the same way.
+#[test]
+fn a_grant_the_provider_spells_differently_is_the_same_grant_to_both_layers() {
+    let rule = r#"permit (principal, action == Action::"oauth2_identity",
+                       resource is OAuth2Client)
+                   when { resource.scope == ["read:pods"] };"#;
+    for spelling in ["read:pods  read:pods", " read:pods ", "read:pods\tread:pods"] {
+        let mut vertical = Vertical::new(rule, spelling);
+        let response = vertical.whoami(CRED);
+        assert!(
+            matches!(response, Response::OAuth2Identity { .. }),
+            "{spelling:?} is the same grant as `read:pods`; the policy accepts it and something \
+             downstream refused it: {response:?}"
+        );
+        assert!(
+            vertical.server.last_request().is_some(),
+            "{spelling:?} was permitted but never reached the provider, so the row proved nothing"
+        );
+    }
 }
 
 /// The audit has to answer "who spent this credential" without becoming a second
