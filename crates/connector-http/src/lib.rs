@@ -38,6 +38,9 @@ pub use fake_origin::{
     Certificate, FakeOrigin, Observed, OriginHandler, OriginResponse, Reply, TlsOrigin,
 };
 pub mod github;
+/// R2.F: the Docker Registry v2 bearer flow, up to the point where a
+/// credential would exist.
+pub mod registry;
 pub mod transport;
 
 pub use github::{
