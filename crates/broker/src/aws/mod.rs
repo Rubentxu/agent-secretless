@@ -26,6 +26,7 @@
 //! that names one operation establishes a path; it does not establish a
 //! provider, and nothing above should be read as saying it does.
 
+pub mod audience;
 pub mod s3;
 pub mod calendar;
 pub mod client;

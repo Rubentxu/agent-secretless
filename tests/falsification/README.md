@@ -71,6 +71,7 @@ has: no source edits while a campaign or a suite is in flight.
 | `k8s_binding_falsify.py` | `crates/broker/src/k8s/binding.rs` | 12, one-for-one against 20 rows |
 | `s3_falsify.py` | `crates/broker/src/aws/s3.rs` | 13, one-for-one against 23 rows |
 | `s3_object_falsify.py` | `crates/broker/src/aws/s3/object.rs` | 9, against 15 rows |
+| `aws_audience_falsify.py` | `crates/broker/src/aws/audience.rs` | 9 red + 1 compiler-refused, against 14 rows |
 | `r2b2_falsify.py` | `lib.rs`, `oauth2_binding.rs`, `policy/src/lib.rs`, `selfreport.rs` | 15, in five passes |
 
 `sts_falsify.py` is also the base harness the others import, which is why its
@@ -394,3 +395,53 @@ asserts an empty object is *not* populated, so making the method always return
 property like that is two-sided and each side needs its own mutation; the other
 side was already covered by the happy-path row, and the pair now pins the method
 from both ends.
+
+`aws_audience_falsify.py` closes half of an open item R2.C has been carrying
+since its own vertical ran, and the half it closes is the one with an attack in
+it.
+
+`AwsDeployment` carried a `region` and an `audience` as two independent fields.
+The credential scope is built from one and the request goes to the other, and
+AWS accepts that — the global endpoint routes by the region in the signature —
+which is exactly what makes it dangerous: the operator believes they pinned
+something, and what they pinned is not tied to what they sign for. The property
+is now that a deployment signs for a region and talks to **that region's**
+endpoint or the global one, as two shapes and nothing else.
+
+The comparison is anchored to a whole label, and the rows that hold it are hosts
+that contain the right characters. `mysts.s3.us-east-1.amazonaws.com` is a
+bucket name in the host, because S3's virtual-hosted addressing puts one there
+and a bucket is something anyone can create. `evil-sts.eu-west-1.amazonaws.com`
+ends with the region and the AWS suffix, so anything looking at the end of the
+name rather than the start approves it. A `contains("sts.")` check passes the
+first; an `ends_with` on the prefix passes the second.
+
+The one mutation to read twice is the **order**. Validating the region's shape
+*before* comparing it is what stops a region string carrying a dot from turning
+a whole-label match into a substring one. Flipping it leaves every other row in
+the campaign green, because every other row configures a well-shaped region.
+
+**The campaign found one defect in this module and one row it could not reach,
+and the first draft of its own docstring had both counts wrong.**
+
+Removing the "at least two parts" rule from the region validator left every
+answer unchanged — the character set and the digit rule were carrying it — so
+the arm is gone. That is the same finding as the bucket validator's
+`is_ascii_uppercase` arm in `s3_falsify.py`, and the shape repeats: a check that
+never changes an answer is a second way to say something.
+
+The S3-bucket row stayed green under the substring mutation, for a *second*
+reason. The substring split produces `s3.us-east-1` as the region, and the
+single-label rule refuses it before anything else looks. The same mutation
+against the `evil-sts` row does go red, because there it yields a clean
+`eu-west-1`. So the row is genuinely uncovered and the mutation is genuinely
+caught — one row per mutation is the harness's design, and filing the same
+mutation against both would be an attribution nothing checked.
+
+**What this does not do.** Whether a regional endpoint is *approved* is the
+policy crate's question, and `asv_policy::audience_is_approved` still lists only
+the global endpoint. That half needs the region passed alongside the audience and
+is a change to that function's contract, so it is not made here. A deployment
+pinned to a regional endpoint will load, sign correctly for its region, and then
+be refused by policy. That is the correct order: the refusal is loud, and it is
+the policy crate's decision rather than something a broker should widen quietly.
