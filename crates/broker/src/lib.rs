@@ -2176,52 +2176,22 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             reference,
         } => {
             // Everything that can refuse this happens first, and none of it
-            // touches a socket. The order is the argument: a denied request has
-            // not reached the registry and cannot have spent a credential.
-            let declaration = match state.authorize_registry(session, peer, &registry, &repository)
-            {
-                Ok(declaration) => declaration,
-                Err(denial) => return *denial,
-            };
-            let credential = match surrogates!(state).redeem_for(
-                &surrogate,
+            // touches a socket. `registry_grant` is that preamble; the two arms
+            // it does not do for us are named here on purpose.
+            let grant = match state.registry_grant(
                 session,
-                OperationFamily::Registry,
-                now_secs(),
+                peer,
+                &surrogate,
+                Action::RegistryPull,
+                &registry,
+                &repository,
             ) {
-                Ok(credential) => credential,
-                Err(error) => return surrogate_failure(error),
+                Ok(grant) => grant,
+                Err(refusal) => return refusal,
             };
-            // The surrogate says *which credential* this session was granted,
-            // and the declaration says *which credential serves this registry*.
-            // Both must name the same one, and neither substitutes for the
-            // other.
-            //
-            // The failure this refuses is the one that would otherwise be
-            // invisible: a session holding a valid surrogate for its own
-            // `Generic` credential, asking for a pull from a registry the
-            // operator declared against a *different* credential. Both halves
-            // pass on their own — the surrogate is genuine and the registry is
-            // declared — and the broker would then dial the registry with a
-            // secret the session was never granted. Checking only that the
-            // surrogate redeems (the shape check `redeem_for` already did) is
-            // not enough; it says the credential is the right *class*, not that
-            // it is the right credential.
-            if credential != declaration.credential {
-                return Response::Error {
-                    code: ErrorCode::Denied,
-                    message: format!(
-                        "this surrogate stands for {}, and the registry {} is served by {}",
-                        credential.to_wire(),
-                        declaration.authority,
-                        declaration.credential.to_wire()
-                    ),
-                };
-            }
-            // Parsed before the client is built so a malformed reference is
-            // reported as a malformed reference rather than as a failed fetch,
-            // and so no socket is opened for a string that was never going to
-            // be sent.
+            // Parsed here rather than in the grant because only a manifest is
+            // addressed by a reference; a blob is addressed by a digest and the
+            // two grammars are not interchangeable.
             let reference = match ImageReference::parse(&reference) {
                 Ok(reference) => reference,
                 Err(error) => {
@@ -2231,44 +2201,10 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                     }
                 }
             };
-            let repository = match RepositoryName::parse(&repository) {
-                Ok(repository) => repository,
-                Err(error) => {
-                    // Unreachable in practice: `authorize_registry` parsed the
-                    // same string a few lines above and returned on failure.
-                    // Refused rather than unwrapped because a handler that
-                    // panics on a field it validated is a handler whose panic
-                    // someone will one day be able to trigger.
-                    return Response::Error {
-                        code: ErrorCode::InvalidRequest,
-                        message: format!("the repository is not an OCI name: {error}"),
-                    };
-                }
-            };
-            let client = match state.registry_client(&declaration) {
-                Ok(client) => client,
-                Err(failure) => return *failure,
-            };
-            // Resolution is the only place a name becomes an address, and it
-            // happens here, after the declaration has said which name. Through
-            // the factory rather than inline, because real DNS against the
-            // system resolver is not something a test can point at a local
-            // origin, and an authorisation path no test can reach is one
-            // nobody has checked. The realm's own host goes through the same
-            // policy inside the client.
-            let audience = match state
-                .connectors
-                .resolve_registry(&declaration.authority)
+            match grant
+                .client
+                .get_manifest(&grant.audience, &grant.repository, &reference)
             {
-                Ok(audience) => audience,
-                Err(error) => {
-                    return Response::Error {
-                        code: registry_code(&error),
-                        message: format!("{} is not reachable: {error}", declaration.authority),
-                    }
-                }
-            };
-            match client.get_manifest(&audience, &repository, &reference) {
                 Ok(read) => {
                     // Content-addressed here rather than taken from a header,
                     // so the agent receives an address it can verify the body
@@ -2297,39 +2233,23 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             repository,
             digest,
         } => {
-            // Same ordering, same reasons, and deliberately not folded into the
-            // arm above: the policy resource for a blob is not the same
-            // resource, and a handler that treated them as one would let an
-            // operator who wrote a manifest-only rule see blob reads pass.
-            let declaration = match state.authorize_registry(session, peer, &registry, &repository)
-            {
-                Ok(declaration) => declaration,
-                Err(denial) => return *denial,
-            };
-            let credential = match surrogates!(state).redeem_for(
-                &surrogate,
+            // Same five controls as the arm above, in the same order, because
+            // `registry_grant` runs them once for both. What stays here is the
+            // direction, which is named rather than inferred, and the operand,
+            // which is a digest and not a reference: a blob is not addressable
+            // by a tag, and a reference here would be a claim about whatever
+            // the tag currently points at.
+            let grant = match state.registry_grant(
                 session,
-                OperationFamily::Registry,
-                now_secs(),
+                peer,
+                &surrogate,
+                Action::RegistryPull,
+                &registry,
+                &repository,
             ) {
-                Ok(credential) => credential,
-                Err(error) => return surrogate_failure(error),
+                Ok(grant) => grant,
+                Err(refusal) => return refusal,
             };
-            // The same equality as above, and for the same reason. A blob is a
-            // different resource and gets its own decision, but it does not get
-            // its own answer to "is this session allowed to spend this registry
-            // credential".
-            if credential != declaration.credential {
-                return Response::Error {
-                    code: ErrorCode::Denied,
-                    message: format!(
-                        "this surrogate stands for {}, and the registry {} is served by {}",
-                        credential.to_wire(),
-                        declaration.authority,
-                        declaration.credential.to_wire()
-                    ),
-                };
-            }
             let digest = match ContentDigest::parse(&digest) {
                 Ok(digest) => digest,
                 Err(error) => {
@@ -2339,35 +2259,13 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                     }
                 }
             };
-            let repository = match RepositoryName::parse(&repository) {
-                Ok(repository) => repository,
-                Err(error) => {
-                    return Response::Error {
-                        code: ErrorCode::InvalidRequest,
-                        message: format!("the repository is not an OCI name: {error}"),
-                    };
-                }
-            };
-            let client = match state.registry_client(&declaration) {
-                Ok(client) => client,
-                Err(failure) => return *failure,
-            };
-            let audience = match state
-                .connectors
-                .resolve_registry(&declaration.authority)
-            {
-                Ok(audience) => audience,
-                Err(error) => {
-                    return Response::Error {
-                        code: registry_code(&error),
-                        message: format!("{} is not reachable: {error}", declaration.authority),
-                    }
-                }
-            };
             // `get_blob` hashes what arrived and refuses a mismatch, so the
             // digest this answers with is the one the bytes were *verified* to
             // have rather than the one that was asked for.
-            match client.get_blob(&audience, &repository, &digest) {
+            match grant
+                .client
+                .get_blob(&grant.audience, &grant.repository, &digest)
+            {
                 Ok(read) => Response::BlobRead {
                     bytes: read.bytes,
                     digest: read.digest.to_string(),
@@ -2387,44 +2285,23 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             digest,
             bytes,
         } => {
-            // Same five checks as the pull, in the same order, and the write
-            // path is the one where a skipped check publishes rather than
-            // merely leaks: a push that went straight to the registry would put
-            // a layer in a repository the operator never declared.
-            let declaration = match state.authorize_registry_action(
+            // The same five controls as a pull, in the same order — and on a
+            // write a skipped control publishes rather than merely leaks. That
+            // is the reason the preamble is shared rather than repeated: the
+            // declaration lookup is what stops a push into a repository the
+            // operator never declared, and it is exactly the kind of step that
+            // is easy to leave out of the newest of four near-identical arms.
+            let grant = match state.registry_grant(
                 session,
                 peer,
+                &surrogate,
                 Action::RegistryPush,
                 &registry,
                 &repository,
             ) {
-                Ok(declaration) => declaration,
-                Err(denial) => return *denial,
+                Ok(grant) => grant,
+                Err(refusal) => return refusal,
             };
-            let credential = match surrogates!(state).redeem_for(
-                &surrogate,
-                session,
-                OperationFamily::Registry,
-                now_secs(),
-            ) {
-                Ok(credential) => credential,
-                Err(error) => return surrogate_failure(error),
-            };
-            // The equality the pull arms carry, for the same reason and with the
-            // same weight: on a write it is the difference between "this session
-            // may push to the registry the operator lent it a credential for" and
-            // "any session may push with whatever that registry is served by".
-            if credential != declaration.credential {
-                return Response::Error {
-                    code: ErrorCode::Denied,
-                    message: format!(
-                        "this surrogate stands for {}, and the registry {} is served by {}",
-                        credential.to_wire(),
-                        declaration.authority,
-                        declaration.credential.to_wire()
-                    ),
-                };
-            }
             let digest = match ContentDigest::parse(&digest) {
                 Ok(digest) => digest,
                 Err(error) => {
@@ -2434,32 +2311,13 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                     }
                 }
             };
-            let repository = match RepositoryName::parse(&repository) {
-                Ok(repository) => repository,
-                Err(error) => {
-                    return Response::Error {
-                        code: ErrorCode::InvalidRequest,
-                        message: format!("the repository is not an OCI name: {error}"),
-                    };
-                }
-            };
-            let client = match state.registry_client(&declaration) {
-                Ok(client) => client,
-                Err(failure) => return *failure,
-            };
-            let audience = match state.connectors.resolve_registry(&declaration.authority) {
-                Ok(audience) => audience,
-                Err(error) => {
-                    return Response::Error {
-                        code: registry_code(&error),
-                        message: format!("{} is not reachable: {error}", declaration.authority),
-                    }
-                }
-            };
             // `put_blob` re-hashes the bytes and refuses a mismatch *before*
             // opening a socket, so the digest this answers with is the content's
             // own rather than the caller's claim echoed back.
-            match client.put_blob(&audience, &repository, &digest, &bytes) {
+            match grant
+                .client
+                .put_blob(&grant.audience, &grant.repository, &digest, &bytes)
+            {
                 Ok(()) => Response::BlobPushed {
                     digest: digest.to_string(),
                     bytes: bytes.len(),
@@ -2479,40 +2337,23 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             reference,
             manifest,
         } => {
-            // The five checks again, deliberately not folded into the arm
-            // above: `Action::RegistryPush` is the same for both, and the
-            // *content* is not. A policy that permits pushing blobs has not
-            // thereby permitted publishing an index that names them.
-            let declaration = match state.authorize_registry_action(
+            // The same preamble as the blob push, for the same reason. What
+            // stays named here is `Action::RegistryPush` at the call site: a
+            // policy that permits pushing blobs has not thereby permitted
+            // publishing an index that names them, and a reader checking this
+            // arm against the policy should find the action written out rather
+            // than inferred from a shared helper's parameter.
+            let grant = match state.registry_grant(
                 session,
                 peer,
+                &surrogate,
                 Action::RegistryPush,
                 &registry,
                 &repository,
             ) {
-                Ok(declaration) => declaration,
-                Err(denial) => return *denial,
+                Ok(grant) => grant,
+                Err(refusal) => return refusal,
             };
-            let credential = match surrogates!(state).redeem_for(
-                &surrogate,
-                session,
-                OperationFamily::Registry,
-                now_secs(),
-            ) {
-                Ok(credential) => credential,
-                Err(error) => return surrogate_failure(error),
-            };
-            if credential != declaration.credential {
-                return Response::Error {
-                    code: ErrorCode::Denied,
-                    message: format!(
-                        "this surrogate stands for {}, and the registry {} is served by {}",
-                        credential.to_wire(),
-                        declaration.authority,
-                        declaration.credential.to_wire()
-                    ),
-                };
-            }
             let reference = match ImageReference::parse(&reference) {
                 Ok(reference) => reference,
                 Err(error) => {
@@ -2522,29 +2363,10 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                     }
                 }
             };
-            let repository = match RepositoryName::parse(&repository) {
-                Ok(repository) => repository,
-                Err(error) => {
-                    return Response::Error {
-                        code: ErrorCode::InvalidRequest,
-                        message: format!("the repository is not an OCI name: {error}"),
-                    };
-                }
-            };
-            let client = match state.registry_client(&declaration) {
-                Ok(client) => client,
-                Err(failure) => return *failure,
-            };
-            let audience = match state.connectors.resolve_registry(&declaration.authority) {
-                Ok(audience) => audience,
-                Err(error) => {
-                    return Response::Error {
-                        code: registry_code(&error),
-                        message: format!("{} is not reachable: {error}", declaration.authority),
-                    }
-                }
-            };
-            match client.put_manifest(&audience, &repository, &reference, &manifest) {
+            match grant
+                .client
+                .put_manifest(&grant.audience, &grant.repository, &reference, &manifest)
+            {
                 Ok(()) => {
                     // Content-addressed here for the same reason the pull arm
                     // does it: an agent that pushed by tag needs to learn what
@@ -3152,23 +2974,6 @@ impl BrokerState {
     /// become a filter over agent-chosen hosts, and an operator who wrote
     /// "allow only this one" would have written "allow everything except this
     /// one" instead. Same policy text; opposite meaning; and the error surfaces
-    /// as a confusing denial rather than as a hole.
-    fn authorize_registry(
-        &self,
-        session: AgentSessionId,
-        peer: &WorkloadIdentity,
-        registry: &str,
-        repository: &str,
-    ) -> Result<crate::registry_declaration::RegistryDeclaration, Box<Response>> {
-        self.authorize_registry_action(
-            session,
-            peer,
-            Action::RegistryPull,
-            registry,
-            repository,
-        )
-    }
-
     /// The registry path with the action decided by the caller (R2.F.4).
     ///
     /// **The action is a parameter rather than a second copy of this
@@ -3250,6 +3055,108 @@ impl BrokerState {
         Ok(crate::registry_declaration::RegistryDeclaration {
             authority: requested,
             credential: declaration.clone(),
+        })
+    }
+
+    /// Authorizes one registry request and prepares it, or refuses.
+    ///
+    /// Six steps, in this order, and the order is the argument: a denied request
+    /// has not reached the registry and cannot have spent a credential.
+    ///
+    /// 1. [`Self::authorize_registry_action`] — session ownership, an open
+    ///    vault, the repository grammar, the declaration matched **by
+    ///    equality** after canonicalisation, and the policy.
+    /// 2. `redeem_for` — the surrogate belongs to this session and has not
+    ///    expired.
+    /// 3. **The two must name the same credential.** This is the step a shape
+    ///    check cannot do. `redeem_for` verifies the credential is the right
+    ///    *class*, and both vault credentials for an installation are usually
+    ///    the same class; the declaration says which credential *serves this
+    ///    registry*. Checking only the first would let a session holding a valid
+    ///    surrogate for its own credential dial a registry the operator
+    ///    declared against a different one — passing both halves on their own.
+    /// 4. The client, built from the declaration rather than the request.
+    /// 5. The audience, resolved from the declaration's authority.
+    ///
+    /// **What is deliberately not folded in.** Each arm still names its own
+    /// `Action`, and each still parses the operand it alone needs — a reference
+    /// or a digest. The comment that used to sit on each arm said the
+    /// non-folding was on purpose; that judgement was about the *policy
+    /// resource* and about making the direction readable at the line, both of
+    /// which survive here. It was never a good argument for four copies of the
+    /// preamble above this call.
+    fn registry_grant(
+        &self,
+        session: AgentSessionId,
+        peer: &WorkloadIdentity,
+        surrogate: &str,
+        action: Action,
+        registry: &str,
+        repository: &str,
+    ) -> Result<RegistryGrant, Response> {
+        let declaration = self
+            .authorize_registry_action(session, peer, action, registry, repository)
+            .map_err(|denial| *denial)?;
+        // `surrogates!` is deliberately not used here. That macro expands to a
+        // bare `return`, so it only type-checks in a function returning
+        // `Response` directly -- which is the dispatcher and not this one. The
+        // poison case is spelled out instead of routing a lock failure through
+        // a macro that would refuse to compile here.
+        let credential = match self.surrogates() {
+            Ok(mut guard) => match guard.redeem_for(
+                surrogate,
+                session,
+                OperationFamily::Registry,
+                now_secs(),
+            ) {
+                Ok(credential) => credential,
+                Err(error) => return Err(surrogate_failure(error)),
+            },
+            Err(poisoned) => return Err(Response::from(poisoned)),
+        };
+        if credential != declaration.credential {
+            return Err(Response::Error {
+                code: ErrorCode::Denied,
+                message: format!(
+                    "this surrogate stands for {}, and the registry {} is served by {}",
+                    credential.to_wire(),
+                    declaration.authority,
+                    declaration.credential.to_wire()
+                ),
+            });
+        }
+        let client = match self.registry_client(&declaration) {
+            Ok(client) => client,
+            Err(failure) => return Err(*failure),
+        };
+        let audience = match self.connectors.resolve_registry(&declaration.authority) {
+            Ok(audience) => audience,
+            Err(error) => {
+                return Err(Response::Error {
+                    code: registry_code(&error),
+                    message: format!("{} is not reachable: {error}", declaration.authority),
+                })
+            }
+        };
+        // The repository was parsed inside `authorize_registry_action` to
+        // answer the policy. Parsed again here rather than threaded through,
+        // because the function that owns it returns only the declaration and
+        // changing that signature would make every caller carry a field two of
+        // them do not use. A refusal is still possible -- the two parses see the
+        // same string -- so this arm does not unwrap.
+        let repository = match RepositoryName::parse(repository) {
+            Ok(repository) => repository,
+            Err(error) => {
+                return Err(Response::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: format!("the repository is not an OCI name: {error}"),
+                })
+            }
+        };
+        Ok(RegistryGrant {
+            repository,
+            client,
+            audience,
         })
     }
 
@@ -3929,6 +3836,35 @@ fn pg_failure(error: PgSessionError) -> Response {
 /// `WrongSession` is: the request was well-formed and the token was real, so
 /// telling the agent to rephrase it would be advice no phrasing can satisfy
 /// (H2).
+/// Everything a registry request needs once it is authorized, and nothing
+/// that can refuse.
+///
+/// The four registry arms used to each run the same preamble and each
+/// decide for itself what a denial looks like, which meant a sixth control
+/// added to one arm would leave the other three without it **and compiling**.
+/// This type is the end of that: the checks run once, and the arms are left
+/// with only what differs between them — which verb, which body, which
+/// answer.
+///
+/// Holding the declaration as well as the client is deliberate. The
+/// operator's authority is what the socket is opened to, and an arm that
+/// wanted to dial something else would have to reach for it on purpose.
+pub(crate) struct RegistryGrant {
+    /// The repository, parsed once. `authorize_registry_action` already
+    /// parsed it to answer the policy; carrying the value stops each arm
+    /// from parsing the same string a second time and then reporting a
+    /// malformed one it had already been told was fine.
+    pub(crate) repository: RepositoryName,
+    /// A client that can already reach this declaration.
+    pub(crate) client: asv_connector_http::registry::client::RegistryClient,
+    /// The resolved authority. Resolution happened after the declaration
+    /// said which name, and inside the factory so a test can point it at a
+    /// local origin.
+    pub(crate) audience: asv_connector_http::transport::ResolvedAudience,
+}
+
+
+
 fn surrogate_failure(error: SurrogateError) -> Response {
     use SurrogateError::*;
     let code = match error {
