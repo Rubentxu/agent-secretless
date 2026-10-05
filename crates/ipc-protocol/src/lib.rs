@@ -187,7 +187,7 @@ impl BrokerIdentity {
 /// the unisolated one; a peer speaking protocol 7 does not know this verb
 /// exists, and a broker that answered its absence with something else would be
 /// inventing an operation it does not have.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 
 /// Hard ceiling on a single inbound message. Bounded allocation is required for
 /// any IPC that faces an untrusted peer (`docs/17-IMPLEMENTATION-BOOTSTRAP.md` §9).
@@ -380,6 +380,35 @@ pub enum Request {
         name: String,
         body: String,
     },
+    /// Asks AWS which identity the request would act as (M11-R2.C.3).
+    ///
+    /// **This request has no surrogate, and that is the whole difference from
+    /// the three above.** A surrogate is a bearer token the agent holds, which
+    /// is the right shape for GitHub and exactly the wrong one here: an AWS
+    /// session is three values, and handing the agent a session token would be
+    /// the weaker property wearing the same label. So the agent names a
+    /// *credential* and the broker resolves it, mints a session, signs, and
+    /// answers with what the provider said. Nothing the agent can hold here is
+    /// a credential, because the response type has no field one could go in.
+    ///
+    /// **There is no audience, no region and no role in it, and that is
+    /// deliberate.** All three are operator configuration, read from the
+    /// deployment that owns the credential. A request that named its own
+    /// destination would be a request that could move a signed call to wherever
+    /// it liked, and SigV4 signs the host — so a request-supplied audience would
+    /// make the signature mean nothing.
+    AwsCallerIdentity {
+        /// The session this call is charged to. Required for the same reason as
+        /// every other session-bearing request: an AWS call that could not be
+        /// revoked by ending a session would outlive the authority that
+        /// authorized it.
+        session: AgentSessionId,
+        /// A vault credential *reference*, resolved broker-side. Not a secret,
+        /// not an access key id, and not a session token — and a reference that
+        /// names nothing is refused rather than defaulted, because a default
+        /// would be a credential the operator never granted.
+        credential: String,
+    },
     /// Operator audit query (R9). Refused for agent sessions: audit readers
     /// must not be audit writers, and the human control plane that will own
     /// this channel ships separately. The variant exists on the wire so the
@@ -559,6 +588,24 @@ pub enum Response {
     ReleaseCreated {
         tag: String,
         url: String,
+    },
+    /// What AWS says the request is acting as, and nothing else (M11-R2.C.3).
+    ///
+    /// **There is no field here that could hold a credential, and that is the
+    /// property rather than a consequence of it.** All three are things AWS
+    /// itself prints in CloudTrail: the ARN names the role and the session, the
+    /// user id is AWS's own identifier for the assumed identity, and the account
+    /// is a twelve-digit number. There is no secret access key, no session
+    /// token, and no `OpaqueSecret` wrapper because there is nothing to wrap.
+    ///
+    /// A refusal does not come back as one of these with empty fields: it comes
+    /// back as [`ErrorCode::Denied`] or [`ErrorCode::Provider`], so an agent can
+    /// never mistake "I could not ask" for "I am nobody".
+    AwsCallerIdentity {
+        /// For example `arn:aws:sts::123456789012:assumed-role/demo/asv-session`.
+        arn: String,
+        user_id: String,
+        account: String,
     },
     /// Answer to an audit query. Records are metadata-only by construction;
     /// `dropped` counts retention evictions so loss is never silent.
@@ -849,6 +896,7 @@ impl Request {
             Request::PostgresRevoke { .. } => "postgres_revoke",
             Request::CreateCredential { .. } => "create_credential",
             Request::RunIsolated { .. } => "run_isolated",
+            Request::AwsCallerIdentity { .. } => "aws_caller_identity",
         }
     }
 }
@@ -1251,6 +1299,11 @@ mod tests {
             Response::ReleaseCreated {
                 tag: "v1".into(),
                 url: "u".into(),
+            },
+            Response::AwsCallerIdentity {
+                arn: "arn:aws:sts::123456789012:assumed-role/demo/asv-session".into(),
+                user_id: "ARO123EXAMPLE123:asv-session".into(),
+                account: "123456789012".into(),
             },
         ] {
             let json = serde_json::to_string(&response).expect("serializes");

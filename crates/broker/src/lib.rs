@@ -21,6 +21,9 @@ use pg_session::render_row;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
+
+pub mod aws_binding;
 
 pub mod admission;
 pub mod audit;
@@ -775,6 +778,20 @@ pub struct BrokerState {
     /// whose lifetime the request path does not control, and a socket outliving
     /// the broker that opened it is a credential outliving its owner.
     pub runtime: Option<PgRuntime>,
+    /// R2.C.3: the AWS deployments this broker will act as, with the session
+    /// cache in front of each.
+    ///
+    /// **Empty is the default and refuses every AWS request**, the same
+    /// fail-closed reading as `secrets` and `runtime`: a deployment that has
+    /// not said which role it may assume is not a deployment that gets to
+    /// assume whatever a request asks for.
+    ///
+    /// Held as bindings rather than configuration because the *cache* has to
+    /// outlive a request. A binding built per call would re-mint a session on
+    /// every call and borrow the long-lived key every time, which is the failure
+    /// `AwsSecretPort` exists to prevent. The audience and role live on the
+    /// deployment inside the binding, which is what keeps them out of a request.
+    pub aws: Vec<crate::aws_binding::AwsBinding>,
     /// R9: tamper-evident log of every handled request. One record per
     /// `handle` call, appended by the public wrapper (not by the inner
     /// dispatcher), so the audit cannot be bypassed by a new variant.
@@ -871,6 +888,10 @@ impl Default for BrokerState {
             connectors: Box::new(LiveConnectorFactory::default()),
             postgres: PgSessionMap::default(),
             runtime: None,
+            // No AWS deployment unless the operator declares one, for the
+            // same reason `secrets` is None: a fabricated default here would be
+            // a role nobody chose.
+            aws: Vec::new(),
             audit: Arc::new(Mutex::new(audit::AuditLog::default())),
             control_plane: admission::Enrolment::empty(),
             vault_writer: None,
@@ -2024,6 +2045,74 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                 Err(error) => surrogate_failure(error),
             }
         }
+        Request::AwsCallerIdentity {
+            session,
+            credential,
+        } => {
+            // The wire id is parsed before the authorization, not after: a
+            // string that is not a vault id cannot name a deployment, and
+            // refusing it as `InvalidRequest` says "you called me wrong" where
+            // the deployment lookup would have said "not granted". Those are
+            // different answers and a caller needs to be able to tell them.
+            let credential = match CredentialId::from_wire(&credential) {
+                Ok(id) => id,
+                Err(_) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: "the credential is not a vault id".into(),
+                    }
+                }
+            };
+            // Everything that can refuse this happens first, and none of it
+            // touches a socket. The order is the argument: a denied request has
+            // not reached AWS and cannot have spent a session.
+            let binding = match state.authorize_aws(session, peer, &credential) {
+                Ok(binding) => binding,
+                Err(denial) => return *denial,
+            };
+            // The long-lived key is borrowed from the vault by the cache, once
+            // per mint, and the three values a session hands over are consumed
+            // inside the call. Nothing in this arm holds a credential, and
+            // nothing in the response could: `Response::AwsCallerIdentity` has
+            // three string fields and no field one of them fits in.
+            match crate::aws::identity::get_caller_identity(
+                binding.client(),
+                binding.port(),
+                // The port is keyed by the *vault record name*, which is what
+                // the deployment declared, not the wire spelling. Re-serialising
+                // here rather than passing the parsed id is deliberate: the
+                // cache's key space and the deployment's key space are the same
+                // one, and there is no second spelling in play.
+                &credential.to_wire(),
+                SystemTime::now(),
+            ) {
+                Ok(identity) => Response::AwsCallerIdentity {
+                    arn: identity.arn,
+                    user_id: identity.user_id,
+                    account: identity.account,
+                },
+                // A named provider refusal is an IAM decision and is reported as
+                // one. Everything else is a transport or configuration failure,
+                // and none of them is attributed to the credential, because a
+                // wrong blame sends an operator to rotate something that is
+                // fine.
+                Err(crate::aws::client::StsClientError::Request(
+                    crate::aws::sts::StsError::Provider { code, message },
+                )) => Response::Error {
+                    code: ErrorCode::Upstream,
+                    message: format!("AWS refused the call: {code}: {message}"),
+                },
+                // `Upstream` and not a new code, because it is the code this
+                // enum already documents for exactly this: the broker did its
+                // job and the network or the provider did not. Inventing a
+                // variant for the same meaning would give an agent two codes to
+                // branch on where one is enough.
+                Err(error) => Response::Error {
+                    code: ErrorCode::Upstream,
+                    message: error.to_string(),
+                },
+            }
+        }
         Request::PostgresConnect {
             session,
             host,
@@ -2256,16 +2345,11 @@ impl BrokerState {
         peer: &WorkloadIdentity,
         repo: &str,
     ) -> Result<(), Box<Response>> {
-        // Read through an explicit guard rather than `self.sessions.belongs_to`:
-        // a poisoned store must not answer this question at all, and the
-        // tempting collapse — treat it as "not owned" — is only correct by
-        // accident. It would also be wrong for a *different* caller that
-        // wanted the inverse, which is exactly how a fail-closed check turns
-        // into an open one.
-        let Ok(store) = self.sessions_store() else {
-            return Err(Box::new(poison_response()));
-        };
-        if !store.belongs_to(session, peer) {
+        // Through `session_owned_by`, so the guard does not outlive this call.
+        // See that method: the guard and the policy evaluator want the same
+        // mutex, and this ordering is the only reason the GitHub path never
+        // deadlocked.
+        if !self.session_owned_by(session, peer)? {
             return Err(Box::new(Response::Error {
                 code: ErrorCode::Denied,
                 message: "session is not owned by the authenticated peer".into(),
@@ -2323,6 +2407,122 @@ impl BrokerState {
     ) -> Result<(), Box<Response>> {
         self.authorize_github(session, peer, repo)?;
         self.authorize_verb(session, peer, action, self.github_resource()?)
+    }
+
+    /// Whether `session` was opened by `peer`.
+    ///
+    /// **A method rather than a bare `sessions_store()`, and that is the whole
+    /// point of it.** `std::sync::Mutex` is not reentrant and the policy
+    /// evaluator locks the same store, so an authorization that held the guard
+    /// across its own `authorize_verb` call deadlocks on itself. The first
+    /// version of `authorize_aws` did exactly that: it took the guard to check
+    /// ownership, kept it, and then asked the policy — which re-locked the same
+    /// mutex on the same thread and parked forever.
+    ///
+    /// Nothing in this row's file hung to reveal it, because every other row
+    /// failed *before* this point. A hang is the finding here, and the reason it
+    /// was worth a userspace backtrace rather than a second guess: the symptom
+    /// is a suite that never finishes, and the cause is on the **success** path
+    /// that no failing row reaches.
+    ///
+    /// `authorize_github` reads the guard and returns before it asks the policy,
+    /// so it was safe by accident of ordering. It uses this helper now, because
+    /// "safe by accident of ordering" is how the next author reintroduces it.
+    fn session_owned_by(
+        &self,
+        session: AgentSessionId,
+        peer: &WorkloadIdentity,
+    ) -> Result<bool, Box<Response>> {
+        // Read through an explicit guard rather than `self.sessions.belongs_to`:
+        // a poisoned store must not answer this question at all, and the
+        // tempting collapse — treat it as "not owned" — is only correct by
+        // accident. It would also be wrong for a *different* caller that wanted
+        // the inverse, which is exactly how a fail-closed check turns into an
+        // open one.
+        let Ok(store) = self.sessions_store() else {
+            return Err(Box::new(poison_response()));
+        };
+        Ok(store.belongs_to(session, peer))
+    }
+
+    /// The AWS deployment a request's credential names, or a refusal.
+    ///
+    /// **Refusing an unknown credential is the point, not an edge case.** The
+    /// alternative — falling back to a default deployment, or minting for
+    /// whatever role the request implies — is a grant nobody made, and the
+    /// request is the untrusted side of this socket. The message lists what
+    /// *is* configured, because an agent that cannot find its credential needs
+    /// to know the difference between "not granted" and "misspelled".
+    fn aws_binding(
+        &self,
+        credential: &CredentialId,
+    ) -> Result<&crate::aws_binding::AwsBinding, Box<Response>> {
+        match self.aws.iter().find(|binding| binding.serves(credential)) {
+            Some(binding) => Ok(binding),
+            None => {
+                let configured: Vec<String> = self
+                    .aws
+                    .iter()
+                    .map(|binding| binding.deployment.credential.to_wire())
+                    .collect();
+                Err(Box::new(Response::Error {
+                    code: ErrorCode::Denied,
+                    message: format!(
+                        "no AWS deployment is configured for {}; configured: {configured:?}",
+                        credential.to_wire()
+                    ),
+                }))
+            }
+        }
+    }
+
+    /// Every check an AWS request must pass **before any socket is touched**.
+    ///
+    /// Ordered the way the failures are cheapest to refuse: session ownership,
+    /// then whether a vault is open at all, then whether the request named
+    /// something, and only then the policy decision. A request that fails any of
+    /// them has not reached AWS and cannot have spent anything.
+    ///
+    /// Note what is *not* here: no surrogate, and no credential material. The
+    /// GitHub path hands the agent a bearer token because a GitHub token is a
+    /// single value with a use count. An AWS session is three values, and handing
+    /// over any one of them would be the weaker property wearing the same label.
+    fn authorize_aws(
+        &self,
+        session: AgentSessionId,
+        peer: &WorkloadIdentity,
+        credential: &CredentialId,
+    ) -> Result<&crate::aws_binding::AwsBinding, Box<Response>> {
+        // The ownership check goes through `session_owned_by` so its guard is
+        // gone before the policy is consulted. Holding it here would deadlock:
+        // `evaluate` locks this same store. See that method for the backtrace
+        // that found it.
+        if !self.session_owned_by(session, peer)? {
+            return Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: "session is not owned by the authenticated peer".into(),
+            }));
+        }
+        if self.secrets.is_none() {
+            return Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: "no credential store is open, so no brokered operation can run".into(),
+            }));
+        }
+        let binding = self.aws_binding(credential)?;
+        // The audience comes from the *deployment*, never from the request, and
+        // the policy is evaluated against that. A policy permitting
+        // `aws_sts_caller_identity` on `sts.eu-west-1.amazonaws.com` therefore
+        // permits it there and not on a host a request asked for.
+        self.authorize_verb(
+            session,
+            peer,
+            Action::AwsStsCallerIdentity,
+            Resource::Api {
+                audience: binding.deployment.audience.clone(),
+            },
+        )?;
+        Ok(binding)
     }
 
     /// The policy resource every GitHub operation is evaluated against.

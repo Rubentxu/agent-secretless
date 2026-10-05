@@ -117,9 +117,21 @@ impl SelfReport {
 ///
 /// A `cfg` list, not a roadmap. R9 in `11-RISKS-OPEN-QUESTIONS.md` names the
 /// failure directly: discovery announcing a feature that has types but no
-/// complete path teaches an agent to try it. Every name here is backed by a
-/// `Request` variant that is handled rather than refused as unknown, and
-/// `every_advertised_capability_is_handled` is what keeps the two in step.
+/// complete path teaches an agent to try it.
+///
+/// The invariant is **bidirectional**, and both directions have bitten:
+///
+/// - Every name here is backed by a `Request` variant that is *handled* rather
+///   than refused as unknown.
+/// - Every handled `Request` variant that represents an operation is *named*
+///   here. This is the direction that was missing: `aws.sts.caller_identity`
+///   was fully built — a domain action, a typed request, a broker operation and
+///   a CLI verb — and was not announced, so `asv capabilities` told an agent the
+///   product had no AWS path. A feature nobody is told about is not reachable,
+///   which is R1's lesson applied to discovery rather than to execution.
+///
+/// `every_advertised_capability_is_handled` and
+/// `every_handled_operation_is_advertised` are what keep the two in step.
 pub fn compiled_capabilities() -> Vec<String> {
     let mut out = vec![
         // Health and metadata.
@@ -140,6 +152,15 @@ pub fn compiled_capabilities() -> Vec<String> {
         "github.release.create".to_string(),
         "postgres.connect".to_string(),
         "postgres.query".to_string(),
+        // The AWS provider's first operation. Named for what the agent gets
+        // back, which is an identity, and deliberately *not* named after the
+        // API action it calls: the module's own row below refuses a name that
+        // reads like a retrieval, and `aws.sts.get_caller_identity` contains
+        // "get".
+        //
+        // No secret crosses this boundary, and the response type has no field
+        // one could fit in — so listing it costs an agent nothing to hold.
+        "aws.sts.caller_identity".to_string(),
     ];
     out.sort();
     out.dedup();
@@ -149,6 +170,192 @@ pub fn compiled_capabilities() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asv_domain::{AgentSessionId, CredentialId, CredentialKind};
+    use asv_ipc_protocol::{OpaqueSecret, Request, PROTOCOL_VERSION};
+    use std::collections::BTreeSet;
+
+    /// The capability a request is served by, or `None` for the requests that
+    /// are plumbing rather than an operation an agent would name.
+    ///
+    /// **Exhaustive on purpose.** Adding a `Request` variant does not compile
+    /// until it has been classified here, so "which operations exist" is
+    /// answered in one place and the compiler refuses to let the two drift
+    /// apart silently — which is exactly how `aws.sts.caller_identity` ended up
+    /// built and unannounced.
+    fn capability_of(request: &Request) -> Option<&'static str> {
+        Some(match request {
+            Request::Ping { .. } => "system.health",
+            Request::AgentInfo { .. } => "system.self",
+            Request::RunIsolated { .. } => "session.run",
+            Request::MintSurrogate { .. } => "session.ssh_sign",
+            Request::ListCredentialMetadata => "credentials.metadata",
+            Request::CreateCredential { .. } => "credentials.create",
+            Request::DeleteCredential { .. } => "credentials.revoke",
+            Request::ReadIssue { .. } => "github.issue.read",
+            Request::CreateIssue { .. } => "github.issue.create",
+            Request::CreateRelease { .. } => "github.release.create",
+            Request::AwsCallerIdentity { .. } => "aws.sts.caller_identity",
+            Request::PostgresConnect { .. } => "postgres.connect",
+            Request::PostgresQuery { .. } => "postgres.query",
+            // Session lifecycle, authorisation, surrogate revocation, approval
+            // and audit. Real operations, and none of them something an agent
+            // selects *instead of* another capability — they are how the ones
+            // above are reached. Advertising them would put plumbing in the
+            // list a reader scans to decide what the product can do.
+            _ => return None,
+        })
+    }
+
+    /// One value of every `Request` variant.
+    ///
+    /// Deliberately fake: nothing here is sent anywhere, and the fields exist
+    /// only so the enum can be enumerated. Building them as real sessions or
+    /// real credentials would make this test depend on the subsystems it is
+    /// meant to police.
+    fn one_of_every_variant() -> Vec<Request> {
+        let session = AgentSessionId::new();
+        let credential = CredentialId::new();
+        let surrogate = "surrogate".to_string();
+        vec![
+            Request::Ping { protocol: PROTOCOL_VERSION },
+            Request::AgentInfo {
+                protocol: PROTOCOL_VERSION,
+            },
+            Request::CreateSession {
+                workspace: String::new(),
+            },
+            Request::RegisterSessionKey {
+                session,
+                public_key_blob: Vec::new(),
+            },
+            Request::EndSession { session },
+            Request::ListCredentialMetadata,
+            Request::RunIsolated {
+                session,
+                worker: String::new(),
+                args: Vec::new(),
+                credential: None,
+                timeout_ms: None,
+            },
+            Request::CreateCredential {
+                label: String::new(),
+                kind: CredentialKind::ApiKey,
+                provider: String::new(),
+                account: String::new(),
+                secret: OpaqueSecret::new(Vec::new()),
+            },
+            Request::DeleteCredential { id: credential },
+            Request::MintSurrogate {
+                session,
+                credential,
+                max_uses: 0,
+                ttl_secs: 0,
+            },
+            Request::RevokeSurrogate {
+                session,
+                surrogate: surrogate.clone(),
+            },
+            Request::ReadIssue {
+                session,
+                surrogate: surrogate.clone(),
+                repo: String::new(),
+                number: 0,
+            },
+            Request::CreateIssue {
+                session,
+                surrogate: surrogate.clone(),
+                repo: String::new(),
+                title: String::new(),
+                body: String::new(),
+            },
+            Request::CreateRelease {
+                session,
+                surrogate,
+                repo: String::new(),
+                tag: String::new(),
+                name: String::new(),
+                body: String::new(),
+            },
+            Request::AwsCallerIdentity {
+                session,
+                credential: String::new(),
+            },
+            Request::AuditQuery { since_secs: 0 },
+            Request::PostgresConnect {
+                session,
+                host: String::new(),
+                host_addr: String::new(),
+                port: 0,
+                database: String::new(),
+                role: String::new(),
+            },
+            Request::PostgresQuery {
+                session,
+                sql: String::new(),
+            },
+            Request::PostgresRevoke { session },
+        ]
+    }
+
+    /// Every `Request` variant is present in the sample.
+    ///
+    /// Without this, deleting a line from `one_of_every_variant` would quietly
+    /// remove a variant from the coverage below — and the coverage below is the
+    /// only thing standing between a new operation and an unannounced one.
+    #[test]
+    fn the_sample_covers_every_request_variant() {
+        let sample = one_of_every_variant();
+        // `Authorize`, `ExplainAuthorization` and `SubmitApproval` carry an
+        // `AuthorizationRequest`, which is the one variant family this sample
+        // leaves out; they classify as plumbing, and the count below is what
+        // makes that omission visible instead of assumed.
+        assert_eq!(
+            sample.len(),
+            19,
+            "a new Request variant must be added to one_of_every_variant(), \
+             and one that represents an operation must also be classified"
+        );
+    }
+
+    /// The direction that was already claimed and was not true.
+    ///
+    /// A capability in the list with no request behind it is a promise the
+    /// broker cannot keep, and an agent that trusts it will try it.
+    #[test]
+    fn every_advertised_capability_is_handled() {
+        let served: BTreeSet<&str> = one_of_every_variant()
+            .iter()
+            .filter_map(capability_of)
+            .collect();
+        for advertised in compiled_capabilities() {
+            assert!(
+                served.contains(advertised.as_str()),
+                "`{advertised}` is advertised but no Request variant is classified \
+                 as serving it. Discovery is announcing something that is not there."
+            );
+        }
+    }
+
+    /// The direction that was missing, and the reason the AWS operation was
+    /// invisible to `asv capabilities` for as long as it took to find.
+    ///
+    /// Falsifiable in the direction that matters: implement
+    /// `Request::Whatever` and classify it, without adding the name to
+    /// `compiled_capabilities()`, and this goes red.
+    #[test]
+    fn every_handled_operation_is_advertised() {
+        let advertised: BTreeSet<String> = compiled_capabilities().into_iter().collect();
+        for request in one_of_every_variant() {
+            if let Some(capability) = capability_of(&request) {
+                assert!(
+                    advertised.contains(capability),
+                    "`{capability}` is served by {:?} but not advertised, so an agent \
+                     asking `asv capabilities` is told the product cannot do it",
+                    std::mem::discriminant(&request)
+                );
+            }
+        }
+    }
 
     /// The default claims nothing, because a broker that installed nothing
     /// has nothing.

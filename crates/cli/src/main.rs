@@ -106,6 +106,11 @@ enum Command {
         #[command(subcommand)]
         command: GithubCommand,
     },
+    /// Act as an AWS role, without ever holding a credential.
+    Aws {
+        #[command(subcommand)]
+        command: AwsCommand,
+    },
     /// List credential metadata. Never values.
     Credentials {
         /// Emit the `asv.agent/v1` envelope instead of prose.
@@ -216,6 +221,34 @@ enum GithubCommand {
     /// Act on a release.
     #[command(subcommand)]
     Release(GithubReleaseCommand),
+}
+
+/// The AWS verbs.
+///
+/// **There is no `--role`, no `--region` and no `--audience`**, and their
+/// absence is the design rather than a gap. Those three come from the
+/// deployment the operator configured, because SigV4 signs the host: a caller
+/// that could name the destination could have the broker sign a call for one
+/// place and send it somewhere else, and the signature would be the only thing
+/// in the request that disagreed with where it went.
+#[derive(Subcommand)]
+enum AwsCommand {
+    /// Report which AWS identity the broker would act as.
+    ///
+    /// Answers the question an agent has to be able to ask before it does
+    /// anything else, and the question an auditor asks afterwards. Nothing
+    /// printed here is a credential: the ARN, the user id and the account are
+    /// all things AWS itself records in CloudTrail.
+    Whoami {
+        /// Vault id of the long-lived AWS credential, as `asv credentials`
+        /// prints it. A *reference*: the broker resolves it, and neither the
+        /// secret access key nor the session token ever reaches this process.
+        #[arg(long, value_name = "ID")]
+        credential: String,
+        /// Emit the `asv.agent/v1` envelope instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -330,6 +363,7 @@ async fn main() -> std::io::Result<()> {
         // of that session is a lexical scope rather than something spread
         // across the single-request path below.
         Command::Github { command } => return run_github(&socket, command),
+        Command::Aws { command } => return run_aws(&socket, command),
         Command::Setup { json } => return run_setup(*json),
         Command::Doctor { json } => return run_doctor(&socket, *json),
         Command::Agent {
@@ -428,6 +462,9 @@ async fn main() -> std::io::Result<()> {
         Command::Github { .. } => {
             unreachable!("github opens its own session and is handled before broker IPC")
         }
+        Command::Aws { .. } => {
+            unreachable!("aws opens its own session and is handled before broker IPC")
+        }
         Command::Setup { .. }
         | Command::Doctor { .. }
         | Command::Capabilities { .. }
@@ -520,6 +557,7 @@ pub fn response_kind(response: &Response) -> &'static str {
         Response::IssueRead { .. } => "IssueRead",
         Response::IssueCreated { .. } => "IssueCreated",
         Response::ReleaseCreated { .. } => "ReleaseCreated",
+        Response::AwsCallerIdentity { .. } => "AwsCallerIdentity",
         Response::AuditRecords { .. } => "AuditRecords",
         Response::PostgresConnected { .. } => "PostgresConnected",
         Response::PostgresResult { .. } => "PostgresResult",
@@ -1065,6 +1103,88 @@ fn run_github(socket: &std::path::Path, command: &GithubCommand) -> std::io::Res
     }
 }
 
+/// Runs one AWS verb.
+///
+/// **No surrogate, and that is the whole difference from `run_github`.** A
+/// surrogate is a bearer token this process would hold; a GitHub token is a
+/// single value with a use count, and holding one is a deliberate, bounded
+/// exposure. An AWS session is three values, and the whole point of R2.C.3 is
+/// that this process gets none of them — so there is nothing to mint, nothing to
+/// redeem, and nothing to revoke on the way out. The broker mints, signs, and
+/// answers with the identity AWS reported.
+fn run_aws(socket: &std::path::Path, command: &AwsCommand) -> std::io::Result<()> {
+    let AwsCommand::Whoami { credential, json } = command;
+
+    // Validated before a session exists, for the reason `run_github` does it:
+    // a malformed id would be accepted here and then miss in the broker, and the
+    // operator would be told a credential does not exist.
+    if CredentialId::from_wire(credential).is_err() {
+        eprintln!("asv: the --credential value is not a vault id; copy it from `asv credentials`");
+        std::process::exit(2);
+    }
+
+    let session = match github_call(
+        socket,
+        &Request::CreateSession {
+            workspace: std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        },
+    ) {
+        Response::SessionCreated { session, .. } => session,
+        other => {
+            return Err(std::io::Error::other(format!(
+                "asv aws could not open a session: {other:?}"
+            )))
+        }
+    };
+
+    let response = github_call(
+        socket,
+        &Request::AwsCallerIdentity {
+            session,
+            credential: credential.clone(),
+        },
+    );
+
+    // Ended before the answer is reported, so a report that never arrives is
+    // still bounded by the session's own lifetime. A session that will not close
+    // does not unmake the answer the broker already gave, and turning a
+    // completed read into "connection failed" would be a worse lie than leaving
+    // the grant to expire.
+    let _ = call(socket, &Request::EndSession { session });
+
+    match &response {
+        Response::AwsCallerIdentity { arn, user_id, account } => {
+            if *json {
+                let result = ipc::from_response(&response);
+                println!("{}", render::json::envelope(&render::json::for_result(&result)));
+            } else {
+                println!("arn:     {arn}");
+                println!("user_id: {user_id}");
+                println!("account: {account}");
+            }
+            Ok(())
+        }
+        Response::Error { code, message } => {
+            if *json {
+                let result = ipc::from_response(&response);
+                println!("{}", render::json::envelope(&render::json::for_result(&result)));
+            } else {
+                eprintln!("asv aws refused ({code:?}): {message}");
+            }
+            // Distinct from a connection failure (2), for the reason the GitHub
+            // verb documents it: "the broker said no" and "there was no broker"
+            // are different events and a script must not retry both alike.
+            std::process::exit(1);
+        }
+        other => Err(std::io::Error::other(format!(
+            "asv aws got an unexpected answer: {other:?}"
+        ))),
+    }
+}
+
 /// Dials the broker, or reports the failure the way every other verb does.
 ///
 /// A connection failure is exit 2 and the `ASV_CONNECTION_FAILED` line, not a
@@ -1079,6 +1199,11 @@ fn run_github(socket: &std::path::Path, command: &GithubCommand) -> std::io::Res
 /// function did exactly that, and both mistakes were visible only by running
 /// the binary.
 fn github_call(socket: &std::path::Path, request: &Request) -> Response {
+    // Named for the first caller, and now used by `asv aws` too. Renaming it
+    // would touch the GitHub path for a cosmetic reason, and the behaviour it
+    // implements -- exit 2 and `ASV_CONNECTION_FAILED` on a transport failure,
+    // never a `Response::Error` -- is the verb-agnostic contract every call
+    // site already depends on.
     match call(socket, request) {
         Ok(response) => response,
         Err(error) => {
@@ -1358,6 +1483,15 @@ fn call(socket: &std::path::Path, request: &Request) -> std::io::Result<Response
 
 fn print_response(response: &Response) {
     match response {
+        // Not reached from `asv aws whoami`, which renders these three itself so
+        // it can label them. Present because the match is exhaustive on purpose:
+        // an unhandled response must be a compile error, not a silent blank line
+        // to an operator who has just asked AWS a question.
+        Response::AwsCallerIdentity { arn, user_id, account } => {
+            println!("arn:     {arn}");
+            println!("user_id: {user_id}");
+            println!("account: {account}");
+        }
         Response::Pong { protocol } => {
             println!("broker reachable, protocol v{protocol}");
         }

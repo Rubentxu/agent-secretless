@@ -672,6 +672,25 @@ pub enum Action {
     /// fail-closed reading, and widening it is an operator's explicit policy
     /// edit rather than a side effect of writing a config file.
     ConnectRoute,
+    /// Asks AWS which identity a request is actually acting as (M11-R2.C.3).
+    ///
+    /// A *semantic* operation, for the reason every other one here is: a
+    /// generic "sign this for this host" verb is not authorizable, and a SigV4
+    /// signature is bound to a host, a path and a body — so a caller who could
+    /// name the host could present a valid-looking signature to a destination it
+    /// was never signed for. The agent names an operation from a closed set and
+    /// the broker decides the role, the region and the audience.
+    ///
+    /// Read-only and parameterless, which is why it is the first one: it is the
+    /// only AWS API that answers *which identity is this request acting as*, and
+    /// answering that needs no addressing and no body.
+    ///
+    /// Note what it is **not** evidence of. AWS documents that this operation
+    /// requires no permissions and returns the same information when access is
+    /// denied, so a provider that answers it has not checked a signature. The
+    /// permission being authorized here is the broker's own, and it is what
+    /// stops an agent from naming a credential it was not granted.
+    AwsStsCallerIdentity,
 }
 
 impl fmt::Display for Action {
@@ -691,6 +710,7 @@ impl fmt::Display for Action {
             Self::PostgresDropTable => "postgres.drop_table",
             Self::PostgresAlterTable => "postgres.alter_table",
             Self::ConnectRoute => "connect.route",
+            Self::AwsStsCallerIdentity => "aws.sts.caller_identity",
         };
         f.write_str(s)
     }

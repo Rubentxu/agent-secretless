@@ -53,7 +53,7 @@
     }
   ],
   "product_version": "<product_version>",
-  "protocol_version": 8,
+  "protocol_version": 9,
   "schema": "asv.agent/v1",
   "status": "blocked",
   "warnings": [

@@ -71,6 +71,22 @@ permit (principal, action == Action::"postgres_read", resource is Database);
 // for a surface that was not there before, and widening it is an explicit
 // policy edit an operator can see in a diff, rather than a side effect of
 // writing a JSON file.
+//
+// `aws_sts_caller_identity` has **no permit rule either, for the same reason**.
+// It is a surface that did not exist when this text was written, and permitting
+// it here would mean every deployment that upgrades starts answering AWS on
+// behalf of every agent session, with no operator having decided that. The
+// action is in the *schema* -- without it, a policy naming it would fail
+// strict validation at load rather than deny at evaluation, and a load-time
+// crash for a rule an operator wrote on purpose is the wrong failure mode. So an
+// operator who wants it writes:
+//
+//   permit (principal, action == Action::"aws_sts_caller_identity",
+//           resource is Api && resource.audience == "sts.eu-west-1.amazonaws.com");
+//
+// and naming the audience there is the point: the broker evaluates against the
+// *deployment's* audience, so the rule is about one declared destination rather
+// than about AWS in general.
 "#;
 
 /// Audiences a semantic HTTP action may ever target (D6; the design v2 open
@@ -79,7 +95,24 @@ permit (principal, action == Action::"postgres_read", resource is Database);
 /// This is the approval half of the allowlist. [`Authority`] proves a host is
 /// *spelled* one way; this proves it is *approved*. Both are required, because
 /// `evil.example` canonicalizes perfectly and would otherwise pass.
-pub(crate) const ALLOWED_AUDIENCES: &[&str] = &["api.github.com"];
+///
+/// `sts.amazonaws.com` joined it in R2.C.3, and finding out that it had to was
+/// the point of running the vertical: the AWS operation reached the policy and
+/// was refused with "no matching policy", which reads like a Cedar problem and
+/// is not one. This list runs in Rust *before* Cedar, deliberately, so no policy
+/// text can widen the reachable host set — which means a new provider cannot be
+/// permitted by writing a policy rule. It has to be declared here first, and
+/// that two-step is the control working rather than an obstacle.
+///
+/// **Regional STS endpoints are NOT listed, and that is an open item rather than
+/// an oversight.** AWS also serves `sts.<region>.amazonaws.com`, and a static
+/// list of those goes stale with every region AWS adds. The narrow rule would be
+/// "the global endpoint, or the regional endpoint whose region equals the one the
+/// deployment configured" — which needs the region passed alongside the audience,
+/// so it is a change to this function's contract rather than one more string.
+/// Until that exists, an AWS deployment must use the global endpoint, which is
+/// what `asv_broker::aws::client::STS_ENDPOINT` already pins.
+pub(crate) const ALLOWED_AUDIENCES: &[&str] = &["api.github.com", "sts.amazonaws.com"];
 
 /// Whether an audience may be targeted at all (D6).
 ///
@@ -262,6 +295,20 @@ const SCHEMA_JSON: &str = r#"{
         "appliesTo": {
           "principalTypes": ["AgentSession"],
           "resourceTypes": ["Host"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
+      "aws_sts_caller_identity": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Api"],
           "context": {
             "type": "Record",
             "attributes": {
@@ -838,6 +885,7 @@ fn action_name(action: &Action) -> &'static str {
         Action::GitHubIssueCreate => "github_issue_create",
         Action::GitHubReleaseCreate => "github_release_create",
         Action::ConnectRoute => "connect_route",
+        Action::AwsStsCallerIdentity => "aws_sts_caller_identity",
     }
 }
 

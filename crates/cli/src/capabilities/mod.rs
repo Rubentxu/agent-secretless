@@ -215,6 +215,17 @@ fn configured_for(name: &str) -> Option<bool> {
         n if n.starts_with("postgres.") => None,
         // GitHub goes through a session and a leased credential.
         n if n.starts_with("github.") => Some(true),
+        // Same shape, one step further out: the AWS *deployment* — which
+        // credential, which audience, which role — is broker configuration this
+        // CLI cannot read, so the honest answer is that the client needs
+        // nothing to try. Whether a deployment is actually configured is the
+        // broker's fact and is answered when the operation runs.
+        //
+        // Reporting `false` here would be a claim nobody measured, and `n/a`
+        // would be the truthful-but-useless answer: a reader seeing `n/a` cannot
+        // tell "I cannot see it" from "there is nothing to see", and that
+        // distinction is the whole reason this field is a tri-state.
+        n if n.starts_with("aws.") => Some(true),
         _ => None,
     }
 }

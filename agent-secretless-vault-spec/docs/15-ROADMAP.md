@@ -74,7 +74,7 @@ is not listed, and a block with a residual says so in its own row.
 | **R1** | closed | `r1_isolated_reachability` 11/11 and `r1_isolated_e2e` 6/6, both from the product surface. One caveat, recorded because it changes how the evidence should be read: 21 tests across three files return early when unprivileged user namespaces are unavailable, and Cargo reports that as **passed**, not as skipped. The R1 full-suite result was therefore re-opened and is being corrected (`bl-bl-01M44FDFNF0003888YSWEGPXM0`). |
 | **R2.A** | closed, with one half `host-dependent` | `r2a_github_vertical` 11/11 in-process against a real TLS origin, and `r2a_cli_reachability` 4/4 against the real binaries. The live call against the real `api.github.com` is **not** measured and is not claimed; see *Status of item 1* below. |
 | **R2.B** | partial, with the strong form `host-dependent` | `r2b_oauth2_revocation` 5/5 with four falsifications run. The revocation gap is closed and the property is structural — `forget` is required on `SecretPort` with no default. Two things are **not** closed: compatibility with an operator's real IdP needs a host that has one, and the requested scope is still operator-configured rather than policy-derived, which is R4's work. |
-| **R2.C** | foundation only, one layer deeper, and the first operation built | `aws::sigv4` 16/16 against the AWS documentation's own vectors, `aws::sts` 34/34 and `aws::calendar` 9/9 against an oracle written from the specifications, `aws::port` 12/12 with no socket in it, `aws::identity` 12/12 against two documented AWS samples, and `r2c2b_sts_vertical` 18/18 against a real TLS origin. **79 mutations** across the five, and the number is the sum of the harness files rather than an inherited figure: 25 `sts`, 13 `client`, 14 `calendar`, 13 `port`, 14 `identity`. Of those, **77 red, 1 refused by the compiler, 1 a recorded survivor** (the post-read size bound, unexercised because the fake origin always declares a `content-length`). One gap named rather than hidden: R2.C.1's `sigv4` campaign was run inline and has **no saved harness**, so unlike every other figure here it cannot be re-derived. **Still no broker operation, no CLI verb, and no agent-reachable surface**, so item 2 is not closed under M11's rule. See *Status of item 2*. |
+| **R2.C** | one operation reachable from the product surface; item 2 still not closed | `aws::sigv4` 16/16 against the AWS documentation's own vectors, `aws::sts` 34/34 and `aws::calendar` 9/9 against an oracle written from the specifications, `aws::port` 12/12 with no socket in it, `aws::identity` 12/12 against two documented AWS samples, `r2c2b_sts_vertical` 18/18 against a real TLS origin, and `r2c3_aws_vertical` 13/13 from the product surface — CLI verb, typed IPC, real vault, real policy, real origin, and the advertisement an agent reads to find the verb at all. **88 mutations** across six harnesses, and the number is the sum of the harness files rather than an inherited figure: 25 `sts`, 13 `client`, 14 `calendar`, 13 `port`, 14 `identity`, 9 `r2c3`. Of those, **85 red, 1 refused by the compiler, 2 recorded survivors** (the post-read size bound, unexercised because the fake origin always declares a `content-length`; and the binding's `Debug`, which cannot leak because `AwsSecretPort`'s own `Debug` does not). One gap named rather than hidden: R2.C.1's `sigv4` campaign was run inline and has **no saved harness**, so unlike every other figure here it cannot be re-derived. **One operation is not a catalogue** — `s3:GetObject`, the regional STS endpoints and the live call are open, so item 2 is not closed under M11's rule. See *Status of item 2*. |
 
 **The R1 row is the one worth reading twice.** `uat_040`'s file-injection row was
 asserting that the staged secret reached the redacted channel in cleartext — a
@@ -1108,26 +1108,32 @@ stub, not a test. So item 2 is construction rather than repair, and the failure
 mode is different from item 1's: there was no existing path to inherit a
 property from, so a subtly wrong signing primitive would be the whole problem.
 
-**R2.C.1 was the signing core. R2.C.2.a is the `AssumeRole` protocol in both
-directions, and it is still not a provider.** There is no socket, no
-`SecretPort` and no broker operation, so no agent can ask for an AWS credential,
-and **per M11's rule a provider does not count as closed on an encoding plus a
-signing core.**
+**R2.C.1 was the signing core, R2.C.2.a the `AssumeRole` protocol in both
+directions, R2.C.2.b the socket, the cache and the `SecretPort`, and R2.C.3 the
+first request signed with a session and the first one an agent can ask for.**
+What is still missing is named below rather than summarised as "more work":
+`s3:GetObject`, a live call, and the regional STS endpoints. **Per M11's rule a
+provider does not count as closed on an encoding plus a signing core, and it does
+not count as closed on one operation either** — see *The first agent-reachable
+operation* below for what R2.C.3 does and does not establish.
 
 What is left, in order:
 
-- **R2.C.2.b.** The live HTTPS client, the `SecretPort` and a short-lived
-  session that is cached and revocable — reusing the `forget` machinery from
-  R2.B.1 rather than inventing a second invalidation path. The split from
-  `.a` is deliberate: a block that mixes a socket with a parser has twice the
-  surface to be wrong in and half the attention to give each.
-- **R2.C.3.** A broker operation and a CLI verb, so the agent names an
-  *operation* and never sees an AWS secret. That is what satisfies "the agent
-  must never need to know the secret key" in its strongest form; handing the
-  agent a session token would be a weaker property wearing the same label.
+- **`s3:GetObject`**, named explicitly and excluded from R2.C.3 rather than
+  implied. It is the obvious second operation and it is not free: S3 addressing,
+  percent-encoding of the key inside the canonical path, and a body that is not a
+  document. The reader's rule — *a document that is not understood is rejected,
+  not guessed* — applies to a response body as much as to a policy file.
+- **Regional STS endpoints.** `ALLOWED_AUDIENCES` covers `sts.amazonaws.com` and
+  nothing else, so an operator who pinned a region cannot have it honoured yet.
+  Fixing it properly means threading the region into `audience_is_approved`,
+  which changes a contract rather than adding a string, so it is declared open
+  in the code rather than quietly left.
 - **A live call against AWS**, which is `host-dependent` for the same reason
   item 1's is: it needs a real account and real credentials on a machine with
-  network, and no repository check asserts it.
+  network, and no repository check asserts it. And if AWS accepts the exact
+  percent-encoding the body emits is still open, so this is a measurement, not a
+  formality.
 
 #### The XML reader, and why there is no parser
 
@@ -1302,6 +1308,146 @@ nothing and the campaign falsified `sts.rs` while saying nothing whatsoever
 about the port. `sts.rs` was verified restored, the wiring fixed, and the
 campaign re-run — and the harness now names its target file in its own header so
 that a mismatch is visible in the first line of the output.
+
+#### The first agent-reachable operation
+
+R2.C.3 is the increment that makes the provider *usable*, and the whole of it is
+one idea: **the agent names an operation and a credential id, and never sees an
+AWS secret.** Handing the agent a session token would be a weaker property
+wearing the same label, so it was never on the table — and the strongest form of
+that property turned out to be structural rather than a refusal.
+
+`Response::AwsCallerIdentity { arn, user_id, account }` has **no field in which
+a secret fits.** There is nowhere to put an access key, a session token or a
+signature. That is a stronger claim than "the broker refuses to return one",
+because a refusal is a branch somebody can delete, and an absent field is not a
+branch. The same argument drove the request: the agent sends a `CredentialId`,
+and the broker resolves it, mints, signs and answers with the provider's own
+reply.
+
+What that required, in order:
+
+- `Action::AwsStsCallerIdentity` in the domain, with a deliberately breaking
+  variant — `action_name` is exhaustive on purpose, so the compiler forces
+  every reader to decide rather than letting a wildcard answer.
+- `Request::AwsCallerIdentity` / `Response::AwsCallerIdentity` in the protocol,
+  and `PROTOCOL_VERSION` **8 → 9**. A wire change is not free, and pretending
+  otherwise is how two peers disagree about what they are holding.
+- `AwsDeployment` / `AwsBinding` in the broker: the operator's declaration of
+  *which credential, which audience, which region, which role*. The audience
+  comes from the **deployment**, never from the request, so a policy permitting
+  `sts.eu-west-1.amazonaws.com` permits it there and not on a host a request
+  asked for.
+- `asv aws whoami --credential <id>`, and `r2c3_aws_vertical` 13/13 from the
+  product surface against a real TLS origin, a real vault and a real policy.
+
+**The operation was built and not announced, and every row above was green.**
+`compiled_capabilities()` is what `asv capabilities` and `asv discover` read, and
+it did not name `aws.sts.caller_identity` — so a fully working AWS path was
+invisible to the only surface an agent uses to find out what a product can do.
+This is R1's lesson applied to discovery rather than to execution, and it is the
+more embarrassing half of the gap: the operation worked, and no user could tell.
+
+The module that owns the list also **cited a test that did not exist.**
+`every_advertised_capability_is_handled` was named in a doc comment as the thing
+keeping the list and the dispatch in step; grep found the citation and nothing
+else. A guard asserted in prose is worth nothing, and the direction that was
+actually missing — a handled operation that is not advertised — is the one no
+existing test looked at in either direction.
+
+Both directions now exist and are checked against a sample that covers every
+`Request` variant: `every_advertised_capability_is_handled` (the direction the
+doc claimed) and `every_handled_operation_is_advertised` (the direction that
+found the defect). A third row, `the_sample_covers_every_request_variant`, exists
+because deleting a line from that sample would silently remove a variant from the
+coverage of both — and a coverage check you can quietly delete is not coverage.
+The classification is an exhaustive `match`, so adding a variant does not compile
+until someone has decided what capability it is.
+
+**The stock policy does not permit `aws_sts_caller_identity`.** That is the
+`connect_route` precedent: a new surface does not start allowed because a release
+added it. It *is* in the schema, because strict validation would otherwise reject
+at load time a rule the operator wrote on purpose. The order is: a provider is
+declared in `ALLOWED_AUDIENCES` in Rust, then in the policy. Both halves, or the
+operation cannot be reached.
+
+**Two properties are worth stating because they are structural, not tested.**
+Ending the session stops further AWS calls, because the deployment is only
+reachable through a session-owned peer; and the encoded response carries no
+credential, because the type has nowhere to put one. Both were rows, and both
+have a mutation that turns them red.
+
+#### The deadlock the evidence found, and what it says about the other path
+
+The most serious defect in the block was found by `eu-stack` on a hung test, not
+by reading: `authorize_aws` held the session-store guard across the policy
+evaluation, and `evaluate` wants the **same** `std::sync::Mutex`. Every
+successful `asv aws` call would have hung the real broker. It was found because
+the vertical ran the success path in-process against a real store rather than
+mocking one.
+
+The fix is a method, `session_owned_by`, that takes the guard, answers, and drops
+it. **`authorize_github` was rewritten to go through it too**, which is the
+finding worth keeping: the same latent shape existed on the GitHub path and was
+only visible once the second caller existed. Two callers is the minimum for a
+lock-ordering defect to be a pattern rather than an anecdote.
+
+The other four defects in this increment were smaller and are recorded because
+the same thing is true of all of them — a green row that asserted the wrong
+thing:
+
+- **The deployment was indexed by label instead of by `CredentialId`,** so every
+  call was refused with "no AWS deployment configured for …". A refusal that is
+  always taken is a feature that never worked, and the row that caught it was the
+  one asserting the success path.
+- **`ALLOWED_AUDIENCES` had no AWS entry,** so every request was rejected before
+  Cedar was ever consulted. The rejection was correct *for the reason given* and
+  the reason was wrong.
+- **`SessionStore::belongs_to` compares only `pid`,** so a second
+  `WorkloadIdentity` in the same process *is* the same peer. The row asserting
+  "another peer is refused" was therefore unfalsifiable as written; it now
+  asserts a session *this peer does not own*, which is the property that exists
+  and can be broken.
+- Two of the row's own expectations were wrong: the action name the broker
+  reports is `aws_sts_caller_identity` where the variant is
+  `aws.sts.caller_identity`, and the `Host` the client compares is the
+  **authority**, not the string it was handed.
+
+**The 9 mutations partition into 8 red, 0 refused by the compiler, 0 unmeasured,
+1 a recorded survivor.** The survivor is kept rather than deleted: printing the
+port from the binding's `Debug` does not leak, because `AwsSecretPort` has a
+hand-written `Debug` that prints the margin and the credential ids and nothing
+else — the property `port_falsify.py` already falsifies with two mutations of its
+own. The defence is two layers down, so the row is a regression net and not the
+evidence, and saying so is the point.
+
+Of the eight, the two that matter most are the ones that came last. *Build the
+operation and never announce it* is the mutation that corresponds to the defect
+this increment actually shipped with, and it is worth noting that every one of
+the eleven rows that existed before it stayed green under it. A vertical that
+proves an operation works is not evidence that anything can find it. *Announce it
+under a name that reads like a retrieval* is the second: the capability is
+spelled for what the caller gets back, not after the AWS API action it calls, so
+`aws.sts.get_caller_identity` — the obvious name, and the one the API uses — is
+refused by a substring rule as well as by a row.
+
+One harness defect is recorded with it. The ownership mutation's snippet opened
+on the two guards that `authorize_github` and `authorize_aws` share, so the
+harness counted two matches and **measured nothing** — reported as a skip, which
+is exactly what it was. Anchoring the snippet on the line only `authorize_aws`
+has made it a measurement. A falsification harness that silently declines to
+measure is worse than no harness, because its total still looks like a number.
+
+**Where these six harnesses live is itself an open item, and naming it is the
+point.** They are at `~/agent-secretless-tmp/` — `sts_falsify.py`,
+`client_falsify.py`, `calendar_falsify.py`, `port_falsify.py`,
+`identity_falsify.py` and `r2c3_falsify.py` — which is persistent but is **not
+in this repository**. So the 86 is re-derivable today, by a person on this host,
+and it is not re-derivable from a clean checkout by anyone else. Until they are
+committed, R2.C's mutation figure stands in exactly the position R2.C.1's already
+did, and the honest thing is to say so rather than let "re-derivable" imply more
+than it does. Moving them under `tests/` is the fix, and it is a small one;
+it is backlog rather than done.
 
 ---
 
