@@ -68,6 +68,17 @@ decimal, so the row was green under the one mutation it was written for. It now
 checks both spellings. That is the failure the accounting exists for: a row
 that looks adversarial and is not.
 
+**Do not copy this repository out of an isolated working copy while a campaign
+is running against it.** This is written down because it happened, and the
+consequence was worse than a failed run: the copy that the campaign mutates and
+restores is *not* a safe source of truth while it runs, and reading a file from
+it mid-campaign can hand you a file with the first mutation still applied. A
+commit made from that copy shipped a broker that signed the identity the
+requester asked for — the exact defect this module exists to prevent — and the
+only thing that caught it was running the rows in the real repository, where
+seven of them went red. The harness restored the working copy correctly; the
+copy-out did not know that.
+
 **Why this harness has a second loop.** The base harness edits exactly one
 file, and the canonicalization bypass is a mutation of `grant.rs`. Rather than
 fork the bucket accounting — which is the one number in the file nobody checks

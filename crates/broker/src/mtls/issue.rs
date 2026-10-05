@@ -281,7 +281,7 @@ pub fn issue_client_certificate(
     } = parsed;
 
     let identity = grant.identity().as_str().to_string();
-    let mut params = { let mut taken = requested_identity.clone(); taken.not_before = OffsetDateTime::now_utc(); taken.not_after = taken.not_before + time::Duration::try_from(ttl).unwrap_or_default(); taken };
+    let params = certificate_params(&identity, ttl, &requested_identity)?;
 
     let certificate = rcgen::CertificateSigningRequestParams { params, public_key }
         .signed_by(&ca.intermediate_cert, &ca.intermediate_key)

@@ -84,7 +84,7 @@ impl Fixture {
     /// assertion below compare two unrelated public keys and fail for a
     /// reason that had nothing to do with the module under test.
     fn spki_of_key(&self) -> Vec<u8> {
-        let mut params =
+        let params =
             rcgen::CertificateParams::new(vec!["probe.invalid".to_string()]).expect("SAN");
         let serialized = params
             .serialize_request(&self.key)
