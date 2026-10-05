@@ -56,9 +56,11 @@
 //! returning one would make stashing it the caller's easiest option.
 
 pub mod client;
+pub mod metadata;
 pub mod port;
 pub mod request;
 
 pub use client::{K8sClient, K8sClientError, K8sReply};
+pub use metadata::{MetadataError, SecretMetadata, secret_metadata};
 pub use port::{K8sSecretPort, MAX_TOKEN_BYTES};
 pub use request::{ApiError, ApiRequest, Scope, Verb};

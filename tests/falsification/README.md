@@ -67,6 +67,7 @@ has: no source edits while a campaign or a suite is in flight.
 | `k8s_request_falsify.py` | `crates/broker/src/k8s/request.rs` | 24 |
 | `k8s_port_falsify.py` | `crates/broker/src/k8s/port.rs` | 8, taking 9 of its 15 rows red |
 | `k8s_client_falsify.py` | `crates/broker/src/k8s/client.rs` | 11, against 17 rows |
+| `k8s_metadata_falsify.py` | `crates/broker/src/k8s/metadata.rs` | 7 red + 2 compiler-refused, against 13 rows |
 
 `sts_falsify.py` is also the base harness the others import, which is why its
 mutation list is a module-level `MUTATIONS` that callers replace. That has a
@@ -169,3 +170,44 @@ said. Reaching this row needs a mutation that *adds* a format site for the
 token somewhere — a plausible future guard such as "token longer than 4 KiB"
 whose message includes the value — plus a row that exercises it. Two sites, so
 it is filed as compound rather than counted as a green row.
+
+`k8s_metadata_falsify.py` is the one harness here whose result is not a single
+number, because two of its nine mutations are *supposed* to stop the build.
+
+`no_field_of_the_answer_can_hold_the_value` is a destructuring row. The
+mutations that would carry a Secret's value — or its key names — into the answer
+add a field to `SecretMetadata`, so the crate stops compiling rather than an
+assertion failing. That lands in the **compiler-refused** bucket, which is a
+stronger answer than a red row and not a weaker one: the type is the guard, and
+it fires before the test can run. Reporting those two as survivors would be
+reporting the harness missing something it was built to catch.
+
+Both mutations are filed against `SecretMetadata` rather than the private view
+on purpose. A field added only to the view compiles, is never read, and changes
+nothing an agent can observe — filing there would have produced two more
+survivors while proving nothing at all.
+
+So: 13 rows, 7 taken red one-for-one, 2 held by a compile-time guard, and 4
+unreached. Of the 4, three are positive rows — an empty Secret still answers, a
+Secret with no metadata still answers, and a filter refusing everything would
+fail — and the fourth is the base64 row, which the type guard covers and the
+campaign cannot.
+
+Three defects in this harness's own first draft are recorded rather than
+cleaned away, because all three were caught by the harness refusing to report a
+number it had not measured:
+
+Two mutations anchored on a snippet that appears twice in the file, and were
+reported as SKIP — "snippet not unique" — rather than silently applied to the
+first match. One used `unwrap_or_default()` on a type with no `Default`, and was
+reported as compiler-refused rather than as a red row it never earned. And one
+was filed against a row it could not reach: a document with no `data` member
+goes through serde's `#[serde(default)]` and never enters the map visitor, so
+no mutation of the visitor can touch that row. It needed its own, and now has
+one — removing the `default`.
+
+The docstring of the harness also claimed the kind-check mutation would take two
+rows red. The campaign measured one. A document with no `kind` falls to the
+`None` arm, which is still a refusal, so the two arms are the same refusal and
+one mutation does not reach the other. The claim was corrected to the number
+that was measured.
