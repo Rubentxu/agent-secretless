@@ -16,35 +16,49 @@
 //! socket, no clock, no token, no vault — which is the only reason it can be
 //! checked against an oracle at all.
 //!
-//! **R2.D.2** is the transport and the `SecretPort`, and **`port` is its
-//! secretless half**: the projected ServiceAccount token read, checked and
-//! lent, so that it is a borrowed value for the length of one `accept` and
-//! nothing afterwards. A Kubernetes token is a *single* bearer value, so it fits
-//! the base [`SecretPort`](asv_connector_http::SecretPort) contract unchanged —
-//! which is the very contract
+//! **`port` is R2.D.2's secretless half**: the projected ServiceAccount token
+//! read, checked and lent, so that it is a borrowed value for the length of one
+//! `accept` and nothing afterwards. A Kubernetes token is a *single* bearer
+//! value, so it fits the base [`SecretPort`](asv_connector_http::SecretPort)
+//! contract unchanged — which is the very contract
 //! [`AwsSecretPort`](crate::aws::port::AwsSecretPort) refuses, because an AWS
 //! session is three values and the single-value sink builds a bearer header. The
 //! shape that forced AWS to refuse is the shape Kubernetes fits exactly, which
 //! is the argument for keeping the base contract narrow rather than growing a
 //! trait per provider.
 //!
-//! **R2.D.3** is the broker operation and the CLI verb, and the transport that
-//! actually opens the socket. Neither exists. Nothing in this module is
-//! reachable from a product surface, and the module says so rather than letting
-//! a test imply otherwise: per M11's rule a provider does not count as closed on
-//! an encoding and a port together.
+//! **`client` is R2.D.3.1**: the transport that actually opens the socket. It
+//! borrows from the pinned client the rest of the product already uses rather
+//! than assembling an HTTP stack of its own, and it is where the bearer header
+//! is built — which is the one place in this module where the token exists
+//! outside the port, and it exists there for the length of a single attempt.
 //!
-//! # What R2.D.3 must not do
+//! **What R2.D.3 still owes** is the broker operation and the CLI verb. Neither
+//! exists, so nothing in this module is reachable from a product surface yet,
+//! and the module says so rather than letting a test imply otherwise: per M11's
+//! rule a provider does not count as closed on an encoding, a port and a
+//! transport together.
 //!
-//! The token is lent as borrowed bytes and the `Authorization` header is
-//! assembled **inside** the sink and sent before the borrow ends. A `String`
-//! holding `Bearer <token>` that outlives the call is the same leak under
-//! another name, and it is why `SecretPort` takes a `&mut dyn SecretSink`
-//! rather than returning bytes: the sink is a thing that *uses* the credential,
-//! and returning one would make stashing it the caller's easiest option.
+//! # The difference from AWS, and why this module is careful about it
+//!
+//! Every other provider here *signs*. An AWS SigV4 signature is derived from
+//! the long-lived key and can be held, replayed against the host it was signed
+//! for, and logged without consequence. A Kubernetes bearer token has no such
+//! transform: `Authorization: Bearer <token>` **is** the credential, so anything
+//! that reads the header can act as the ServiceAccount.
+//!
+//! That is why the header is assembled inside the sink, handed out exactly
+//! once, re-borrowed from the port on every redirect hop rather than carried
+//! forward, and never followed across an origin boundary. A `String` holding
+//! `Bearer <token>` that outlives the call is the same leak under another name,
+//! and it is why `SecretPort` takes a `&mut dyn SecretSink` rather than
+//! returning bytes: the sink is a thing that *uses* the credential, and
+//! returning one would make stashing it the caller's easiest option.
 
+pub mod client;
 pub mod port;
 pub mod request;
 
+pub use client::{K8sClient, K8sClientError, K8sReply};
 pub use port::{K8sSecretPort, MAX_TOKEN_BYTES};
 pub use request::{ApiError, ApiRequest, Scope, Verb};

@@ -66,6 +66,7 @@ has: no source edits while a campaign or a suite is in flight.
 | `r2c3_falsify.py` | `lib.rs`, `aws_binding.rs`, `selfreport.rs` | 9, in three passes |
 | `k8s_request_falsify.py` | `crates/broker/src/k8s/request.rs` | 24 |
 | `k8s_port_falsify.py` | `crates/broker/src/k8s/port.rs` | 8, taking 9 of its 15 rows red |
+| `k8s_client_falsify.py` | `crates/broker/src/k8s/client.rs` | 11, against 17 rows |
 
 `sts_falsify.py` is also the base harness the others import, which is why its
 mutation list is a module-level `MUTATIONS` that callers replace. That has a
@@ -127,3 +128,44 @@ edit to force one would measure a rewrite rather than a defect.
 
 Both numbers belong in any summary of the campaign. A total that reported only
 the first would be the same overstatement this file exists to prevent.
+
+`k8s_client_falsify.py` files 11 mutations against 17 rows. The other 6 are not
+reachable by a single-site edit, and "not covered" without saying *which kind*
+is the same overstatement in a different font, so they are grouped.
+
+**Two are positive** — the row that asserts a well-formed get reaches the
+origin with its bearer header, and the row that says a client which never sent
+anything would fail. A client that stops sending is not one edit away; it needs
+the send removed and the returns reworked.
+
+**Two are structural.** `a_client_is_refused_when_the_audience_is_a_private_address`
+and `a_client_is_refused_when_the_port_is_zero` re-assert `PinnedClient`'s own
+refusals. They are kept because a client that assembled its own transport
+instead of borrowing the pinned one would silently lose both, and they would
+catch that. No edit *in `client.rs`* can undo them: `assemble` has one call into
+the transport and it is the one that checks. Falsifying them belongs to
+`transport.rs`, which already has the rows.
+
+**Two need a compound edit**, and both came out of the campaign rather than out
+of foresight, so the reasoning is kept.
+
+`a_lend_error_means_no_header_and_no_request` has *two* defences between a
+failed `lend` and a socket: the `?` on the call, and the sink's own refusal to
+hand over a header it was never fed. The first pass filed the mutation that
+removes the `?` against this row and got a survivor — the right measurement and
+the wrong conclusion, because removing one of two defences does not break
+*whether* a request is sent, it degrades the *diagnosis*: "the token file could
+not be read" becomes "the port lent nothing to sign", which is true and useless.
+That is a real defect, and
+`a_lend_refusal_names_the_cause_rather_than_the_consequence` was added to catch
+it.
+
+`no_refusal_this_client_produces_contains_the_token` is a **misfiling that was
+corrected rather than dropped**. The mutation filed against it put the
+*response body* into the oversized-body refusal, expecting it to repeat the
+token. It does not: the token is in the request header and never in the
+response, so the row stayed green because the mutation did not do what its label
+said. Reaching this row needs a mutation that *adds* a format site for the
+token somewhere — a plausible future guard such as "token longer than 4 KiB"
+whose message includes the value — plus a row that exercises it. Two sites, so
+it is filed as compound rather than counted as a green row.
