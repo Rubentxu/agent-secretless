@@ -1,0 +1,35 @@
+[package]
+name = "asv-integrations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Credential workflow adapters: describe a tool's configuration without reading its secrets."
+
+[dependencies]
+# The vocabulary, and nothing else. `Authority` is the reason an audience here
+# is provably one spelling: a discovered registry host is canonicalized rather
+# than passed through, so the binding an operator plans against is the binding
+# the broker would authorize.
+#
+# This crate does NOT depend on the broker, the vault, the policy engine or the
+# connectors, and must not. `discover` has no authority to lend, so a step that
+# could reach a vault is a step that could be *made* to — and the report is the
+# one artefact in R3 that travels furthest before anything is written.
+asv-domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The fingerprint's digest. Already in the workspace for the vault and the SSH
+# agent, so this is a shared dependency rather than a new one.
+sha2.workspace = true
+thiserror.workspace = true
+# `geteuid`, for the ownership check. The alternative is `nix`, which is in the
+# workspace and would work, but it carries socket and scheduler features into a
+# crate whose whole job is reading files. libc is already in the lock for
+# ssh-agent and connector-pg, so this is a dependency rather than a new one --
+# and it is the only unsafe call in the crate, in one function.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

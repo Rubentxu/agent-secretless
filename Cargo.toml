@@ -14,6 +14,7 @@ members = [
     "crates/ebpfd",
     "crates/tls-acceptor",
     "crates/operator-core",
+    "crates/integrations",
 ]
 # `apps/desktop` is deliberately NOT a member. It is a separate workspace with
 # its own `[workspace]` table, because the GUI needs webkit2gtk-4.1 / gtk+-3.0
@@ -36,6 +37,10 @@ repository = "https://github.com/rubentxu/agent-secretless"
 
 [workspace.dependencies]
 asv-domain = { path = "crates/domain" }
+# R3: the credential workflow adapters. Depends on the vocabulary and nothing
+# else -- a discovery step that could reach a vault would be a step that could be
+# made to, and `discover` has no authority to lend.
+asv-integrations = { path = "crates/integrations" }
 asv-ipc-protocol = { path = "crates/ipc-protocol" }
 asv-identity = { path = "crates/identity" }
 asv-ssh-agent = { path = "crates/ssh-agent" }

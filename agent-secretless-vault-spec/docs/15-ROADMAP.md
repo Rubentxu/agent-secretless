@@ -2140,6 +2140,125 @@ starting point for the remaining work.
 
 ---
 
+## M14 — Credential workflow adapters (R3)
+
+The pipeline the rebaseline puts at R3, ahead of the M11 residual:
+`discover → safe parse → plan → adopt → binding → project → execute → verify →
+scrub → receipt`. **R3.A.1 builds the first two steps and the surface they
+report through.** `plan` onward is R3.A.2 and later, and is not started.
+
+The exit criterion for R3 is *"a new adapter addable without touching broker or
+domain"*, which is a statement about the shape of the tree rather than about how
+many adapters exist. So the first increment is the shape: a crate that depends
+on the vocabulary and on nothing else.
+
+### R3.A.1 — describe a tool's configuration without reading its secrets
+
+`crates/integrations` is a new workspace crate. It depends on `asv-domain`,
+`serde`, `serde_json`, `sha2`, `thiserror` and `libc`, and on **nothing that
+lends**. That is the constraint that makes the rest of the design fall out
+rather than be argued for: `discover` reads files its caller could already
+read, so a round-trip through the broker would authorize nothing, and a step
+that *could* reach a vault is a step that could be made to. `plan` and `adopt`
+will need the broker; `discover` must not be able to use it.
+
+Measured: **40 rows green** in `asv-integrations` (10 fingerprint, 17 npm, 11
+audience, 2 crate), **5 rows green** in the product vertical
+`crates/broker/tests/r3a_npm_discovery.rs`, **23 mutations, 23 red, 0 survivors,
+0 compiler-refused, 0 unmeasured** across four passes (`leak`, `parse`,
+`fingerprint`, `audience`).
+
+**The report has nowhere to put a secret, so it cannot carry one.** This is a
+property of types rather than of redaction: a selector is reported as *field +
+registry + length*, and a setting this parser does not model is recorded as
+`Opaque { len }` — present and undescribed, which is a different statement from
+"there is nothing here". No digest of a value is published, deliberately: a
+digest of an extracted value is an oracle, and `_auth` is base64 of
+`user:password`, which is low entropy. The digest *of the file* is safe and is
+what the fingerprint publishes. The two central rows assert over the
+**serialised JSON** and the `Debug` rendering rather than over the struct,
+because a claim about today's fields is not a claim about what a caller
+receives — and what a caller receives reaches a terminal, a log and an agent's
+context.
+
+**`RegistryAudience` is its own type, and not `asv_domain::Authority`.** This
+was the one architectural finding worth the detour. Reusing `Authority` for a
+registry imported a restriction that belongs to a different question: `Authority`
+rejects a port and a single-label host, both by design, because it answers *the
+audience of an API* — a multi-level host. A registry answers *an endpoint*, and
+`localhost:4873` is Verdaccio's default, i.e. the most common private npm
+registry there is. Reusing the type would have made the adapter refuse the
+registry it exists to find. So `RegistryAudience` accepts `host`, `host:port`,
+`[ipv6]` and `[ipv6]:port`, and refuses a scheme, a path, userinfo, an
+unbracketed IPv6 literal, port zero or out of range, and an empty label — each
+because guessing which of two readings the operator meant is how a credential
+reaches a service they did not name.
+
+**The fingerprint is integrity, not confidentiality, and the line is drawn
+between what another user can write and what they can read.** Refused: not a
+regular file, a symlink whose target is outside a *named* root, a foreign
+owner uid, and group- or world-writable. Reported rather than refused:
+group- or world-readable — npm itself writes `.npmrc` at 0644, so refusing it
+would make discovery fail on almost every real machine, which is a tool that
+cannot see the file it exists to fix. The symlink allowance is compared
+component-wise, because a string prefix hands out `/home/u/.config-backup` to an
+allowance meant for `/home/u/.config`.
+
+**The parser is fail-closed about its own ignorance.** `include:` refuses the
+whole file, because `plan` cannot revalidate a file `discover` never read. A
+line that is not `key = value` refuses the file, because reporting the lines
+that did parse produces a report that reads complete about a file whose meaning
+the parser does not have. `${VAR}` is **named, never resolved** — the
+environment is the caller's, not the file's, and the name is what an operator
+needs in order to know what to project. No registry is invented for a file that
+declares none.
+
+**The campaign found three rows that could not fail, and all three were
+defects in the rows rather than in the code.** They are recorded because the
+pattern generalises to every campaign in this file:
+
+- A row that read the environment reference but left the variable **unset**
+  could not distinguish a resolver from a non-resolver: an unset variable makes
+  both return the literal's length. It now sets a canary of a different length
+  and asserts the two lengths differ, which is what makes the row falsifiable
+  at all. The property being measured is *never reads the environment*, and a
+  read that returns `None` is invisible to a row that has nothing to resolve.
+- Two mutations aimed at the branch that records an unmodelled setting were
+  filed against a row whose fixture is an `//`-prefixed key — and that returns
+  long before the branch, because an unrecognised *auth field* is
+  `AuthField::Unrecognised` and never becomes a `SettingValue` at all. **Two
+  rows that both end in the word "unrecognised", neither measuring the other's
+  code.** Both mutations were re-filed against a row that owns the property,
+  and the auth-field path — which had no mutation of its own — was given one.
+- One mutation was `compiler-refused` rather than red. It removed the `include`
+  guard by deleting two lines, which moved `key` and `value` and left `E0382`
+  for every later use. A compile error says the mutation was **malformed**,
+  and a malformed mutation measures nothing about the property it was written
+  to attack; the base harness reports it as a stronger answer than green, and
+  for a campaign that is not true. Rewritten as `if false`, which still
+  type-checks, still borrows and does not run. The row went red.
+
+**`discover` runs the real binary.** `asv integrations discover --json` emits
+`asv.discovery/v1`, and emits it on the error path too, so a caller parsing the
+output has one shape to handle. `--allow-symlink-root` is the only way to widen
+the fingerprint's refusal, it is a named root rather than a flag, and an unknown
+family exits non-zero with the list of families this build knows.
+
+**Not closed, and not simulated.** The `ForeignOwner` refusal is real and
+**cannot be falsified in this environment**: it needs a second uid to `chown` to,
+and that needs privileges this session does not have. Declared rather than
+mocked. A host with a foreign-owned `.npmrc` has never been observed here.
+
+**Two houses to note before a later step depends on them.** The new crate *does*
+read the process environment, in its tests, to prove it does not read it
+otherwise; `D9`/`uat_017_env_scan` forbids `std::env` in **broker and
+connector**, and this is a file-reading surface that depends on neither, so the
+rule is untouched — but the distinction is worth writing down rather than
+discovering later. And `discover` reaches no broker, which is correct for this
+step and will have to change at `plan`.
+
+---
+
 ## v1.0 — Certified product line
 
 > **Sequenced by the rebaseline above; scope below unchanged.** `V1-C0`–`V1-C5`

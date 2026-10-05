@@ -13,6 +13,10 @@ path = "src/main.rs"
 
 [dependencies]
 asv-domain.workspace = true
+# R3: the discovery surface. A local filesystem read with no broker round
+# trip, because `discover` has no authority to lend -- so there is nothing for
+# a broker to authorise and a round trip would be a door with nothing behind it.
+asv-integrations.workspace = true
 asv-ipc-protocol.workspace = true
 asv-ssh-agent.workspace = true
 # `asv setup` creates the vault during installation, so the CLI links the

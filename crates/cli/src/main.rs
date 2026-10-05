@@ -200,6 +200,47 @@ enum Command {
         #[arg(long, value_name = "DURATION")]
         since: Option<String>,
     },
+    /// Credential workflow adapters (R3). What a tool's configuration declares,
+    /// read without reading its secrets.
+    Integrations {
+        #[command(subcommand)]
+        command: IntegrationsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum IntegrationsCommand {
+    /// Describe what a tool's configuration file declares — R3's first stage.
+    ///
+    /// Reads the configuration and prints what it says: which registries, which
+    /// scopes, which auth selectors, and a fingerprint of each file. **The
+    /// report contains no credential**, and that is a property of the report's
+    /// types rather than a filter applied on the way out — there is nowhere in
+    /// them to put one. An auth selector is reported as its field, its
+    /// registry and the *length* of its value.
+    ///
+    /// This reads the filesystem and nothing else. It does not open a session
+    /// and does not reach the vault, because a step that could read a secret
+    /// would be a step that could be made to.
+    Discover {
+        /// The tool family. `npm` today; the list grows by adding an adapter.
+        #[arg(long, value_name = "FAMILY", default_value = "npm")]
+        family: String,
+        /// Emit the `asv.discovery/v1` envelope instead of prose.
+        #[arg(long)]
+        json: bool,
+        /// Directory holding the project-level configuration.
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        cwd: String,
+        /// Home directory holding the user- and global-level configuration.
+        #[arg(long, value_name = "DIR")]
+        home: Option<String>,
+        /// Follow a configuration symlink whose target resolves inside this
+        /// directory. Refused by default, and naming the root is the decision
+        /// the default refuses to make on the operator's behalf.
+        #[arg(long, value_name = "DIR")]
+        allow_symlink_root: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -409,6 +450,7 @@ async fn main() -> std::io::Result<()> {
         Command::Github { command } => return run_github(&socket, command),
         Command::Aws { command } => return run_aws(&socket, command),
         Command::Oauth2 { command } => return run_oauth2(&socket, command),
+        Command::Integrations { command } => return run_integrations(command),
         Command::Setup { json } => return run_setup(*json),
         Command::Doctor { json } => return run_doctor(&socket, *json),
         Command::Agent {
@@ -540,10 +582,15 @@ async fn main() -> std::io::Result<()> {
         Command::Oauth2 { .. } => {
             unreachable!("oauth2 opens its own session and is handled before broker IPC")
         }
+        // `integrations discover` reads the filesystem and is handled above.
+        // It is listed here rather than left to `_` so that the next command
+        // someone adds gets a compile error telling them to decide, instead of
+        // silently inheriting this arm.
         Command::Setup { .. }
         | Command::Doctor { .. }
         | Command::Capabilities { .. }
-        | Command::Agent { .. } => {
+        | Command::Agent { .. }
+        | Command::Integrations { .. } => {
             unreachable!("these are handled before broker IPC")
         }
     };
@@ -1280,6 +1327,138 @@ fn run_aws(socket: &std::path::Path, command: &AwsCommand) -> std::io::Result<()
 /// expires on the *provider's* clock. So there is nothing to mint, nothing to
 /// redeem, and nothing to revoke on the way out — the broker borrows, asks, and
 /// answers with what the resource reported.
+/// R3's `discover`: describe a tool's configuration without its secrets.
+///
+/// No session, no socket, no broker. That is not a shortcut — `discover` reads
+/// files the caller can already read, so a broker round trip would authorise
+/// nothing and would create a dependency from the reporting surface to the
+/// credential plane for no gain. `plan` and `adopt` do need the broker, and they
+/// are the stages where a secret is actually moved.
+fn run_integrations(command: &IntegrationsCommand) -> std::io::Result<()> {
+    // The trait, for `Npm::discover`.
+    use asv_integrations::Adapter as _;
+
+    let IntegrationsCommand::Discover {
+        family,
+        json,
+        cwd,
+        home,
+        allow_symlink_root,
+    } = command;
+
+    let home = match home {
+        Some(home) => std::path::PathBuf::from(home),
+        // `HOME` rather than a passwd lookup: this is the *caller's* home, and
+        // the crate takes it as an argument precisely so that a library can
+        // never decide whose configuration it is reading. The CLI is the layer
+        // entitled to answer that, and it answers it about itself.
+        None => match std::env::var_os("HOME") {
+            Some(home) => std::path::PathBuf::from(home),
+            None => {
+                eprintln!(
+                    "asv: HOME is not set, so the user-level configuration cannot be located; \
+                     pass --home"
+                );
+                std::process::exit(2);
+            }
+        },
+    };
+    let cwd = std::path::PathBuf::from(cwd);
+
+    let mut policy = asv_integrations::FingerprintPolicy::strict();
+    if let Some(root) = allow_symlink_root {
+        policy = policy.allowing_symlink_root(root);
+    }
+
+    let discovery = match family.as_str() {
+        "npm" => asv_integrations::Npm
+            .discover(&policy, &home, &cwd)
+            .map(asv_integrations::NpmDiscovery::into_discovery)
+            .map_err(|error| error.to_string()),
+        other => Err(format!(
+            "no adapter for {other:?}; this build knows `npm`. Adding one is a module in \
+             asv-integrations and one match arm here."
+        )),
+    };
+
+    let discovery = match discovery {
+        Ok(discovery) => discovery,
+        Err(message) => {
+            if *json {
+                // A failure in the `asv.discovery/v1` shape, so a consumer
+                // parsing this command's output has one shape to handle rather
+                // than two: prose on the happy path, JSON on the sad one, is a
+                // contract nobody can implement against.
+                let failure = serde_json::json!({
+                    "schema": asv_integrations::DISCOVERY_SCHEMA,
+                    "family": family,
+                    "error": message,
+                });
+                println!("{}", serde_json::to_string_pretty(&failure).unwrap_or_default());
+            } else {
+                eprintln!("asv: {message}");
+            }
+            std::process::exit(1);
+        }
+    };
+
+    if *json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&discovery).expect("the report serialises")
+        );
+        return Ok(());
+    }
+    print_discovery_prose(&discovery);
+    Ok(())
+}
+
+/// The human form of a discovery report.
+///
+/// Every line is something the operator would otherwise have to read out of a
+/// JSON document by hand, and **every line is about a registry or a selector** —
+/// there is no line here that could be a credential, because the report has none
+/// to print.
+fn print_discovery_prose(discovery: &asv_integrations::Discovery) {
+    let asv_integrations::AnyReport::Npm(report) = &discovery.report;
+    if report.files.is_empty() {
+        println!("no .npmrc was found for this project or this account");
+        return;
+    }
+    for file in &report.files {
+        let origin = match file.origin {
+            asv_integrations::npm::Origin::Project => "project",
+            asv_integrations::npm::Origin::User => "user",
+            asv_integrations::npm::Origin::Global => "global",
+        };
+        let readable = if file.fingerprint.is_untrusted_readable() {
+            "  (readable by group or other — a token in here is exposed)"
+        } else {
+            ""
+        };
+        println!("{origin} {}", file.fingerprint.path.display());
+        println!("  {}{readable}", file.fingerprint.digest);
+        if let Some(registry) = &file.registry {
+            println!("  registry  {}", registry.audience);
+        }
+        for scoped in &file.scoped_registries {
+            // `scope` already carries its own `@` — npm spells it that way, and
+            // the first version printed `@@acme` by adding one.
+            println!("  {}  {}", scoped.scope, scoped.registry.audience);
+        }
+        for selector in &file.auth_selectors {
+            let source = match &selector.env_reference {
+                Some(name) => format!("from ${name}"),
+                None => format!("{} bytes", selector.value_len),
+            };
+            println!(
+                "  credential  {} {} ({source})",
+                selector.registry.audience, selector.field
+            );
+        }
+    }
+}
+
 fn run_oauth2(socket: &std::path::Path, command: &Oauth2Command) -> std::io::Result<()> {
     let Oauth2Command::Whoami { credential, json } = command;
 
