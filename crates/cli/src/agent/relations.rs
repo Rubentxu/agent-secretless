@@ -101,6 +101,15 @@ pub enum AgentRel {
     GithubIssueRead,
     GithubIssueCreate,
     GithubReleaseCreate,
+    // R2.F.3. Published because the verbs exist and the broker answers them;
+    // the same condition the three above were dark until. **Not published**
+    // would have been the easy mistake: a registry pull works, so an agent
+    // that reads `asv capabilities` and finds no registry relation concludes
+    // the product cannot pull, and it is right about what it read and wrong
+    // about what the product can do. That is the "built and unannounced"
+    // failure this module's own header is about.
+    RegistryManifestRead,
+    RegistryBlobRead,
     // Declared, not yet published. See `operational()` for why each is
     // waiting; the comment is the reason so that adding the capability later
     // is a one-line change with the reasoning still attached.
@@ -138,6 +147,8 @@ impl AgentRel {
             AgentRel::GithubIssueRead => "asv://rels/github/issue/read",
             AgentRel::GithubIssueCreate => "asv://rels/github/issue/create",
             AgentRel::GithubReleaseCreate => "asv://rels/github/release/create",
+            AgentRel::RegistryManifestRead => "asv://rels/registry/manifest/read",
+            AgentRel::RegistryBlobRead => "asv://rels/registry/blob/read",
             AgentRel::PostgresConnect => "asv://rels/postgres/connect",
             AgentRel::PostgresQuery => "asv://rels/postgres/query",
             AgentRel::SshSign => "asv://rels/ssh/sign",
@@ -158,6 +169,8 @@ impl AgentRel {
             AgentRel::GithubIssueRead => "github.issue.read",
             AgentRel::GithubIssueCreate => "github.issue.create",
             AgentRel::GithubReleaseCreate => "github.release.create",
+            AgentRel::RegistryManifestRead => "registry.manifest.read",
+            AgentRel::RegistryBlobRead => "registry.blob.read",
             AgentRel::PostgresConnect => "postgres.connect",
             AgentRel::PostgresQuery => "postgres.query",
             AgentRel::SshSign => "ssh.sign",
@@ -241,6 +254,22 @@ impl AgentRel {
                 true,
                 "Create a GitHub release through a broker-leased credential",
             ),
+            AgentRel::RegistryManifestRead => AgentLink::new(
+                self.uri(),
+                self.operation(),
+                &["registry", "manifest", "read"],
+                Safety::BoundedExecution,
+                true,
+                "Read an OCI manifest through a broker-leased credential",
+            ),
+            AgentRel::RegistryBlobRead => AgentLink::new(
+                self.uri(),
+                self.operation(),
+                &["registry", "blob", "read"],
+                Safety::BoundedExecution,
+                true,
+                "Read an OCI blob, verified against its content address",
+            ),
             AgentRel::PostgresConnect => AgentLink::new(
                 self.uri(),
                 self.operation(),
@@ -322,6 +351,8 @@ impl AgentRel {
             AgentRel::GithubIssueRead,
             AgentRel::GithubIssueCreate,
             AgentRel::GithubReleaseCreate,
+            AgentRel::RegistryManifestRead,
+            AgentRel::RegistryBlobRead,
         ]
     }
 
@@ -438,6 +469,39 @@ mod tests {
                 "--credential",
                 "00000000-0000-4000-8000-000000000000",
             ],
+            // R2.F.3. The credential placeholder is a vault *id* and never a
+            // token, for the same reason the three above are: the link a
+            // consumer completes must ask for a reference, because a link that
+            // asked for the secret would be the product handing the agent the
+            // thing it exists to withhold.
+            //
+            // `--registry` is here as a *selector*, and its example is a real
+            // host rather than a syntactically valid placeholder. The link
+            // promises that the broker resolves a declaration by equality and
+            // dials what the operator wrote, so a caller supplying an
+            // undeclared host gets a refusal rather than a connection to
+            // somewhere it invented — which is the answer the link should
+            // lead to, and not something the completion should hide.
+            "asv://rels/registry/manifest/read" => &[
+                "--registry",
+                "registry-1.docker.io",
+                "--repository",
+                "library/alpine",
+                "--reference",
+                "latest",
+                "--credential",
+                "00000000-0000-4000-8000-000000000000",
+            ],
+            "asv://rels/registry/blob/read" => &[
+                "--registry",
+                "registry-1.docker.io",
+                "--repository",
+                "library/alpine",
+                "--digest",
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "--credential",
+                "00000000-0000-4000-8000-000000000000",
+            ],
             _ => return None,
         })
     }
@@ -496,6 +560,11 @@ mod tests {
                 "asv://rels/github/issue/read",
                 "asv://rels/github/issue/create",
                 "asv://rels/github/release/create",
+                // R2.F.3. A registry pull is two relations because it is two
+                // requests, and an agent choosing an operation needs to know
+                // which one it is asking for.
+                "asv://rels/registry/manifest/read",
+                "asv://rels/registry/blob/read",
             ]
         );
     }

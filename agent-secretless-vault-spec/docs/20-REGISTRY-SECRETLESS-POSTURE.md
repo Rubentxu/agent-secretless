@@ -458,3 +458,71 @@ used as a way around the allowlist.
 last surface, and until it exists an agent can be *granted* a pull and has no
 way to ask for one — which is the same "declared but unreachable" defect
 R2.A was written to end, one level up.
+
+## R2.F.3c, the product surface — and two defects of the same shape
+
+R2.F.3b left the pull reachable from a session and not from a product. Closing
+that gap surfaced **three** defects that all have the same shape: a thing that
+worked, that was tested, and that nobody could reach.
+
+**1. The pull was built and not advertised.** `selfreport::capability_of`
+classifies each request into a capability name, and `PullManifest` and
+`PullBlob` fell through to the plumbing arm. So the answer to "can this product
+pull from a registry" was no. Nothing failed: the vertical was green, the
+falsification campaign was 9/9 red, and the product was unreachable in the only
+way an agent would ever learn it exists.
+
+**2. The allowlist was unreachable by any deployment.** `BrokerState::default()`
+leaves `registries` empty, and empty is the correct fail-closed reading — but
+nothing ever *wrote* it outside a test. Until `--registries` was added, a real
+`asv-brokerd` refused every registry pull forever and no operator could have got
+past it. The code was complete, falsified, documented, and unusable.
+
+**3. The row that should have caught #1 could not.** `capability_of`'s coverage
+row was called `the_sample_covers_every_request_variant` and its docstring said
+that without it "deleting a line from `one_of_every_variant` would quietly remove
+a variant from the coverage". It would not: the assertion counted a literal list
+against a literal number. It stayed green while two variants went missing.
+
+The third is the one worth carrying forward. It is the same defect class the
+roadmap already records for R1 — *a row that reported passing without running* —
+arrived by a different route: a row that reported passing without **deriving**
+anything. Deriving it properly needs the variants enumerated from the enum,
+which on stable Rust means a derive macro this crate does not take, and a new
+dependency in a crate that holds credential metadata is not worth a test. So the
+row is now **named for what it proves** (`the_sample_has_the_size_this_file_claims`)
+and says so, and a second row was added that does have teeth: two requests may
+not classify as one capability name.
+
+### Where `--registries` loads, and why not beside `--oauth2-clients`
+
+The daemon's `--registries` validation runs **before** the listener is created,
+so a declaration file the broker cannot use means no socket is ever created.
+`--oauth2-clients` does not: it is read after the bind, so a broker can accept a
+connection and then exit. That asymmetry is not a design decision, and it is
+recorded here as **negative knowledge** rather than fixed — a broker that binds
+and then refuses its configuration is a smaller problem than the three above,
+and changing the OAuth2 path would touch a provider with its own evidence
+behind it. The bind site already carries a comment claiming "everything that
+could refuse has refused"; that sentence was not true of the OAuth2 flag, and
+the registry flag is placed so it is now true of that one.
+
+### What the CLI half does and does not prove
+
+A pull cannot succeed through a real binary. `AddressPolicy` has exactly one
+relaxation, `allow_loopback`, and production leaves it off — the same limit
+`r2a_cli_reachability.rs` states for GitHub, and for the same reason: an
+address-policy override in a production binary is exactly the switch this design
+refuses to have. So `r2f_cli_reachability.rs` measures **refusals** against the
+real `asv` and `asv-brokerd`, and the success half stays in-process in
+`r2f_registry_vertical.rs`. Neither file claims the other's evidence.
+
+The rows that needed two credentials to be meaningful turned up two fixtures
+that would have passed for the wrong reason:
+
+- a vault with **one** credential makes "a surrogate for another credential is
+  refused" untestable, because the second surrogate could not be minted at all;
+- a daemon that binds **before** validating makes "refuses to start" false — the
+  socket exists, a client connects, and the process then exits. The first
+  version of that row waited for the socket and passed against the exact defect
+  it was written to catch.

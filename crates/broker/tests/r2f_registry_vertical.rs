@@ -1237,3 +1237,86 @@ fn a_digest_that_is_not_a_content_address_is_refused() {
     }
     assert_eq!(v.connections(), 0);
 }
+// ---------------------------------------------------------------------------
+// The advertisement
+// ---------------------------------------------------------------------------
+
+/// The broker says it can pull, so an agent does not have to guess.
+///
+/// This row exists because of a defect this very work introduced. `PullManifest`
+/// and `PullBlob` were added to the enum, dispatched, tested — and **not
+/// announced**: `selfreport::capability_of` classifies each request, and both
+/// fell through to the plumbing arm, so the answer to "can this product pull
+/// from a registry" was no. Nothing failed. The vertical above was green, the
+/// campaign above was 9/9 red, and the product was unreachable in the only way
+/// an agent would ever learn it exists.
+///
+/// The mutation is to drop either name from `compiled_capabilities`.
+///
+/// Note what this row does *not* cover: the CLI verb. A broker that advertises
+/// an operation whose verb does not exist is the mirror defect, and it is
+/// covered in `crates/cli` by
+/// `every_operational_relation_parses_as_a_real_command`.
+#[test]
+fn an_agent_asking_what_the_broker_can_do_is_told_about_registry() {
+    let mut v = Vertical::declared();
+    let response = handle(
+        &mut v.state,
+        &v.peer,
+        Request::AgentInfo {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+        },
+    );
+    let capabilities = match response {
+        Response::BrokerInfo { capabilities, .. } => capabilities,
+        other => panic!("expected a self-description, got {other:?}"),
+    };
+    for expected in ["registry.manifest.read", "registry.blob.read"] {
+        assert!(
+            capabilities.iter().any(|c| c == expected),
+            "the broker serves {expected} and does not advertise it, so an agent \
+             reading its capabilities is told the product cannot do it: {capabilities:?}"
+        );
+    }
+}
+
+/// The two advertised names are two, not one collapsed name.
+///
+/// An agent that sees one `registry.read` cannot tell whether fetching a
+/// manifest also fetches the layers it names. Collapsing the pair into one
+/// capability would make the advertisement true and useless: it would state a
+/// guarantee the broker does not make, because a manifest names content
+/// addresses that have to be asked for separately.
+///
+/// The mutation that puts it red is dropping either name from
+/// `selfreport::compiled_capabilities`. **Not** mapping both requests onto one
+/// string in `capability_of`: that function lives inside `#[cfg(test)]`, so it
+/// is what the sync rows read rather than what the broker advertises, and no
+/// mutation of it changes what an agent reads. `every_advertised_capability_is_
+/// handled` and `every_handled_operation_is_advertised` are the rows that read
+/// it.
+#[test]
+fn a_manifest_and_a_blob_are_advertised_as_two_operations() {
+    let mut v = Vertical::declared();
+    let response = handle(
+        &mut v.state,
+        &v.peer,
+        Request::AgentInfo {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+        },
+    );
+    let capabilities = match response {
+        Response::BrokerInfo { capabilities, .. } => capabilities,
+        other => panic!("expected a self-description, got {other:?}"),
+    };
+    let registry: Vec<&String> = capabilities
+        .iter()
+        .filter(|c| c.starts_with("registry."))
+        .collect();
+    assert_eq!(
+        registry.len(),
+        2,
+        "a registry pull is two requests and one name would hide which is \
+         being served: {registry:?}"
+    );
+}

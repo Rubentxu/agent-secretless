@@ -226,6 +226,15 @@ fn configured_for(name: &str) -> Option<bool> {
         // tell "I cannot see it" from "there is nothing to see", and that
         // distinction is the whole reason this field is a tri-state.
         n if n.starts_with("aws.") => Some(true),
+        // Same shape one step further out. A registry pull needs a
+        // *declaration* — which host, which credential — that lives in the
+        // daemon's configuration, and this CLI cannot read it. So the honest
+        // answer is that the client needs nothing to try: the link is
+        // published, and whether a deployment has declared anything is the
+        // broker's fact, answered when the pull runs. Reporting `false` would
+        // be a claim nobody measured, and it would be wrong for a deployment
+        // that *has* declared one.
+        n if n.starts_with("registry.") => Some(true),
         _ => None,
     }
 }
@@ -246,6 +255,16 @@ fn relations_for(capabilities: &[String]) -> Vec<String> {
                     capabilities.iter().any(|c| c == "credentials.metadata")
                 }
                 "session.run" => capabilities.iter().any(|c| c == "session.run"),
+                // Driven by the broker's own advertisement rather than by a
+                // hard-coded list, so a registry relation cannot be published
+                // by a broker that does not serve it — which is R9 again:
+                // discovery announcing a feature that is not there.
+                //
+                // The GitHub three are deliberately *not* written this way. They
+                // are, and reading one list for those and another for these
+                // would be the drift this line is meant to remove; they keep
+                // their explicit arms until this arm is the only arm.
+                op if op.starts_with("registry.") => capabilities.iter().any(|c| c == op),
                 _ => false,
             }
         })

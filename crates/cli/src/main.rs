@@ -120,6 +120,11 @@ enum Command {
         #[command(subcommand)]
         command: Oauth2Command,
     },
+    /// Read from a declared OCI registry, without ever holding a credential.
+    Registry {
+        #[command(subcommand)]
+        command: RegistryCommand,
+    },
     /// List credential metadata. Never values.
     Credentials {
         /// Emit the `asv.agent/v1` envelope instead of prose.
@@ -407,6 +412,92 @@ enum AwsCommand {
     },
 }
 
+/// `asv registry` — reading an OCI registry through the broker.
+///
+/// **Two nouns because an OCI pull is two requests, and `--registry` is a
+/// selector rather than a destination.** Everything the other providers lack is
+/// missing here for the same reason: there is no `--domain`, no `--auth-url` and
+/// no way to name where the token endpoint is. Those come from the deployment's
+/// registry declarations, because a registry names its own authentication host
+/// in its `401` and a caller that could name the token endpoint could have the
+/// long credential sent to one of its own choosing.
+///
+/// `--credential` is **not** redundant with `--registry`, and that is the point.
+/// The declaration already knows which credential serves the host, so the broker
+/// could have looked it up. Making the caller name it is what keeps the
+/// equality between "the credential this session was granted" and "the
+/// credential this registry is served by" load-bearing: a derived credential
+/// would make that comparison trivially true and turn the check into
+/// decoration. Naming it is how a mismatch becomes a refusal the agent can act
+/// on.
+#[derive(Subcommand)]
+enum RegistryCommand {
+    /// Act on a manifest.
+    #[command(subcommand)]
+    Manifest(RegistryManifestCommand),
+    /// Act on a blob.
+    #[command(subcommand)]
+    Blob(RegistryBlobCommand),
+}
+
+/// The manifest nouns.
+#[derive(Subcommand)]
+enum RegistryManifestCommand {
+    /// Read a manifest. Writes the bytes and prints its content address.
+    Read {
+        /// Vault id of the credential the deployment lent this registry, as
+        /// `asv credentials` prints it. A *reference*: the broker resolves it
+        /// and refuses if it is not the credential this registry is served by.
+        #[arg(long, value_name = "ID")]
+        credential: String,
+        /// Registry host, e.g. `registry-1.docker.io`. Selects a declaration;
+        /// the broker dials the authority the declaration names.
+        #[arg(long, value_name = "HOST")]
+        registry: String,
+        /// Repository path, e.g. `library/alpine`.
+        #[arg(long, value_name = "NAME")]
+        repository: String,
+        /// Tag or digest to read, e.g. `latest`.
+        #[arg(long, value_name = "REF")]
+        reference: String,
+        /// Write the manifest here instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<std::path::PathBuf>,
+        /// Emit the `asv.agent/v1` envelope instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// The blob nouns.
+#[derive(Subcommand)]
+enum RegistryBlobCommand {
+    /// Read a blob, verified against the digest it was asked for.
+    Read {
+        /// Vault id of the credential the deployment lent this registry. See
+        /// `manifest read` for why this is not redundant with `--registry`.
+        #[arg(long, value_name = "ID")]
+        credential: String,
+        /// Registry host. Selects a declaration; never a destination.
+        #[arg(long, value_name = "HOST")]
+        registry: String,
+        /// Repository path, e.g. `library/alpine`.
+        #[arg(long, value_name = "NAME")]
+        repository: String,
+        /// Content address to read, e.g. `sha256:…`. Only a digest: a tag
+        /// names whatever the registry currently holds, and under a content
+        /// address that is a claim about bytes nothing has checked.
+        #[arg(long, value_name = "DIGEST")]
+        digest: String,
+        /// Write the blob here instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<std::path::PathBuf>,
+        /// Emit the `asv.agent/v1` envelope instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// `asv oauth2` — the second M11 provider, and the first one where the broker
 /// trades one credential for another before doing anything.
 ///
@@ -556,6 +647,7 @@ async fn main() -> std::io::Result<()> {
         Command::Github { command } => return run_github(&socket, command),
         Command::Aws { command } => return run_aws(&socket, command),
         Command::Oauth2 { command } => return run_oauth2(&socket, command),
+        Command::Registry { command } => return run_registry(&socket, command),
         // `plan` opens a session and `discover` does not, so the whole
         // subcommand tree is dispatched here rather than in the single-request
         // path below: the two halves differ in whether they have a reason to
@@ -691,6 +783,9 @@ async fn main() -> std::io::Result<()> {
         }
         Command::Oauth2 { .. } => {
             unreachable!("oauth2 opens its own session and is handled before broker IPC")
+        }
+        Command::Registry { .. } => {
+            unreachable!("registry opens its own session and is handled before broker IPC")
         }
         // `integrations discover` reads the filesystem and is handled above.
         // It is listed here rather than left to `_` so that the next command
@@ -1182,6 +1277,15 @@ fn run_isolated(
 /// could use it. A longer default would buy nothing and would make the
 /// "one operation" claim depend on a timer rather than on `max_uses`.
 const GITHUB_SURROGATE_TTL_SECS: u64 = 60;
+
+/// The lifetime of a registry pull's surrogate.
+///
+/// Same minute as the GitHub verbs and for the same reason: the grant covers
+/// one request that happens immediately, and anything longer would be a
+/// bearer capability outliving the reason it was minted. There is no
+/// operator-tunable value here on purpose — a longer TTL is a policy change,
+/// and it belongs in the surrogate's class rather than in a flag.
+const REGISTRY_SURROGATE_TTL_SECS: u64 = 60;
 
 /// One GitHub operation, from the product surface to a typed answer.
 ///
@@ -1843,6 +1947,258 @@ fn print_discovery_prose(discovery: &asv_integrations::Discovery) {
                 selector.registry.audience, selector.field
             );
         }
+    }
+}
+
+/// Runs one registry verb, from the product surface to the bytes.
+///
+///     asv registry manifest read    the product surface
+///         -> unix socket            versioned IPC
+///         -> CreateSession         a real session, owned by this process
+///         -> MintSurrogate         one use, one minute, from a vault *id*
+///         -> PullManifest          the broker lends the secret per request
+///         -> EndSession            the grant cannot outlive the command
+///
+/// # What is deliberately not here
+///
+/// There is no path in this function that can produce a registry token, and no
+/// field anywhere below that could hold one — the same negative statement the
+/// GitHub verb makes, reached the same way. `--registry` names a *selector*:
+/// the authority this process connects to is the one the deployment declared,
+/// and if the two disagree the broker refuses before it resolves anything.
+///
+/// # Where the bytes go, and why the digest is the answer
+///
+/// The content goes to `--out` or stdout, raw, because a layer is not a
+/// sentence and a JSON string with escaped newlines in it would be something
+/// every caller had to undo. The digest goes to **stderr** in the human form,
+/// and into the envelope in the JSON form, and it is the value worth reading:
+/// the broker computed it from the bytes that arrived, so a caller can verify
+/// whatever it wrote without trusting the registry that sent it.
+///
+/// `--json` deliberately does **not** carry the body. It carries the content
+/// address, the media type and the length, which is enough to check a file that
+/// is already on disk; embedding megabytes of layer in an envelope would make
+/// the envelope a thing with a size limit nobody wrote down.
+fn run_registry(socket: &std::path::Path, command: &RegistryCommand) -> std::io::Result<()> {
+    let (credential_arg, registry, repository, selector, out, json) = match command {
+        RegistryCommand::Manifest(RegistryManifestCommand::Read {
+            credential,
+            registry,
+            repository,
+            reference,
+            out,
+            json,
+        }) => (credential, registry, repository, Selector::Reference(reference), out, json),
+        RegistryCommand::Blob(RegistryBlobCommand::Read {
+            credential,
+            registry,
+            repository,
+            digest,
+            out,
+            json,
+        }) => (credential, registry, repository, Selector::Digest(digest), out, json),
+    };
+
+    // Validated before a session exists, for the reason `run_github` does it: a
+    // malformed id would be accepted here and then miss in the vault, and the
+    // operator would be told a credential does not exist. The parse error
+    // carries no text, so nothing they typed comes back out.
+    let credential = match CredentialId::from_wire(credential_arg) {
+        Ok(id) => id,
+        Err(_) => {
+            eprintln!(
+                "asv: the --credential value is not a vault id; copy it from `asv credentials`"
+            );
+            std::process::exit(2);
+        }
+    };
+
+    let session = match github_call(
+        socket,
+        &Request::CreateSession {
+            workspace: std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        },
+    ) {
+        Response::SessionCreated { session, .. } => session,
+        other => {
+            return Err(std::io::Error::other(format!(
+                "asv registry could not open a session: {other:?}"
+            )))
+        }
+    };
+
+    let outcome = github_call(
+        socket,
+        &Request::MintSurrogate {
+            session,
+            credential,
+            max_uses: 1,
+            ttl_secs: REGISTRY_SURROGATE_TTL_SECS,
+        },
+    );
+
+    let response = match &outcome {
+        Response::SurrogateMinted { surrogate, .. } => github_call(
+            socket,
+            &selector.request(session, surrogate.clone(), registry, repository),
+        ),
+        // The mint itself was refused, or answered something else. Reporting
+        // that answer *is* the operation's outcome — there is no pull without a
+        // surrogate, and inventing one would be the whole bug this path exists
+        // to avoid.
+        other => other.clone(),
+    };
+
+    // Ended before the answer is written, so a report that never arrives is
+    // still bounded by the session's own lifetime. A session that will not
+    // close does not unmake bytes the broker already sent, and turning a
+    // completed read into "connection failed" would be a worse lie than
+    // leaving the grant to expire.
+    let _ = call(socket, &Request::EndSession { session });
+
+    let (body, digest, media_type) = match &response {
+        Response::ManifestRead {
+            body,
+            digest,
+            media_type,
+        } => (body.clone(), digest.clone(), media_type.clone()),
+        Response::BlobRead { bytes, digest } => {
+            (bytes.clone(), digest.clone(), None)
+        }
+        // A refusal and an unexpected answer are reported by the arms below,
+        // which distinguish "the broker said no" from "I did not understand
+        // the answer". Returning here rather than falling through to the write
+        // is what keeps a zero-length file from looking like an empty layer.
+        _ => return report_registry_refusal(&response, *json),
+    };
+
+    let destination = match out {
+        Some(path) => {
+            std::fs::write(path, &body).map_err(|error| {
+                std::io::Error::other(format!(
+                    "asv registry could not write {}: {error}",
+                    path.display()
+                ))
+            })?;
+            path.display().to_string()
+        }
+        None => {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(&body).map_err(|error| {
+                std::io::Error::other(format!("asv registry could not write to stdout: {error}"))
+            })?;
+            stdout
+                .flush()
+                .map_err(|error| std::io::Error::other(format!("asv registry: {error}")))?;
+            "-".to_string()
+        }
+    };
+
+    if *json {
+        // The content address is the answer; the bytes are at `out`. See the
+        // function's doc for why the envelope does not carry them.
+        let result = ipc::from_response(&response);
+        let mut data = match result {
+            ipc::ApplicationResult::Ok { data, .. } => data,
+            _ => serde_json::json!({}),
+        };
+        data["digest"] = serde_json::json!(digest);
+        data["bytes"] = serde_json::json!(body.len());
+        data["out"] = serde_json::json!(destination);
+        if let Some(media_type) = &media_type {
+            data["media_type"] = serde_json::json!(media_type);
+        }
+        println!(
+            "{}",
+            render::json::envelope(&render::json::for_result(
+                &ipc::ApplicationResult::Ok {
+                    summary: format!("{body_len} byte(s) at {destination}", body_len = body.len()),
+                    data,
+                }
+            ))
+        );
+    } else {
+        // stderr, so that `... > layer.tar.gz` gets exactly the bytes and an
+        // agent reading the metadata is not reading its own payload.
+        eprintln!("digest: {digest}");
+        eprintln!("bytes:  {}", body.len());
+        if let Some(media_type) = &media_type {
+            eprintln!("type:   {media_type}");
+        }
+        eprintln!("out:    {destination}");
+    }
+    Ok(())
+}
+
+/// What a registry verb is asked for.
+///
+/// A type rather than two functions because the two requests differ in exactly
+/// one field, and a pair of functions would let the session, surrogate,
+/// registry and repository arguments drift between them — which is the shape
+/// of a bug where a blob read silently carries a manifest's reference.
+enum Selector<'a> {
+    /// A tag or digest naming a manifest.
+    Reference(&'a String),
+    /// A content address naming a blob.
+    Digest(&'a String),
+}
+
+impl Selector<'_> {
+    fn request(
+        &self,
+        session: asv_domain::AgentSessionId,
+        surrogate: String,
+        registry: &String,
+        repository: &String,
+    ) -> Request {
+        match self {
+            Selector::Reference(reference) => Request::PullManifest {
+                session,
+                surrogate,
+                registry: registry.clone(),
+                repository: repository.clone(),
+                reference: (*reference).clone(),
+            },
+            Selector::Digest(digest) => Request::PullBlob {
+                session,
+                surrogate,
+                registry: registry.clone(),
+                repository: repository.clone(),
+                digest: (*digest).clone(),
+            },
+        }
+    }
+}
+
+/// Reports a refusal from a registry verb.
+///
+/// Split out so both the refusal and the "I did not understand this answer"
+/// cases exit the same way they do in `run_aws`, and so the exit codes mean
+/// the same thing here: **1** is "the broker said no" and **2** is "you called
+/// me wrong". A script that retries one and not the other is the whole reason
+/// those codes are distinct.
+fn report_registry_refusal(response: &Response, json: bool) -> std::io::Result<()> {
+    match response {
+        Response::Error { code, message } => {
+            if json {
+                let result = ipc::from_response(response);
+                println!(
+                    "{}",
+                    render::json::envelope(&render::json::for_result(&result))
+                );
+            } else {
+                eprintln!("asv registry refused ({code:?}): {message}");
+            }
+            std::process::exit(1);
+        }
+        other => Err(std::io::Error::other(format!(
+            "asv registry got an unexpected answer: {other:?}"
+        ))),
     }
 }
 

@@ -169,6 +169,11 @@ pub fn compiled_capabilities() -> Vec<String> {
         // library vertical into a surface. Before this, the daemon mounted
         // `OAuth2SecretPort` and no request could name it.
         "oauth2.identity".to_string(),
+        // R2.F.3: the two halves of an OCI pull. See `capability_of` for why
+        // these are two names and why the policy underneath evaluates a single
+        // `registry_pull`.
+        "registry.manifest.read".to_string(),
+        "registry.blob.read".to_string(),
     ];
     out.sort();
     out.dedup();
@@ -180,7 +185,7 @@ mod tests {
     use super::*;
     use asv_domain::{AgentSessionId, CredentialId, CredentialKind};
     use asv_ipc_protocol::{OpaqueSecret, Request, PROTOCOL_VERSION};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     /// The capability a request is served by, or `None` for the requests that
     /// are plumbing rather than an operation an agent would name.
@@ -204,6 +209,26 @@ mod tests {
             Request::CreateRelease { .. } => "github.release.create",
             Request::AwsCallerIdentity { .. } => "aws.sts.caller_identity",
             Request::OAuth2Identity { .. } => "oauth2.identity",
+            // R2.F.3. Named for the two halves an OCI pull is made of rather
+            // than for the HTTP verb, for the same reason as the two lines
+            // above: the agent receives content, not a capability request.
+            //
+            // **Two names, not one, and the split is not cosmetic.** The
+            // broker answers a manifest read and a blob read from different
+            // code, spends a surrogate on each, and a manifest names digests
+            // that the agent then asks for by content address. Collapsing them
+            // into one capability would tell an agent that fetching a manifest
+            // fetches everything it names, which is the belief that turns a
+            // policy permitting a read into a policy permitting a whole image.
+            //
+            // Both still resolve to the single `Action::RegistryPull` the
+            // policy evaluates, because the registry's own scope treats them
+            // as one: `repository:<name>:pull` covers both halves. The
+            // advertisement is finer than the policy on purpose — an agent
+            // choosing an operation wants to know which one it is asking for,
+            // while an operator writing a rule does not.
+            Request::PullManifest { .. } => "registry.manifest.read",
+            Request::PullBlob { .. } => "registry.blob.read",
             Request::PostgresConnect { .. } => "postgres.connect",
             Request::PostgresQuery { .. } => "postgres.query",
             // Session lifecycle, authorisation, surrogate revocation, approval
@@ -281,7 +306,7 @@ mod tests {
             },
             Request::CreateRelease {
                 session,
-                surrogate,
+                surrogate: surrogate.clone(),
                 repo: String::new(),
                 tag: String::new(),
                 name: String::new(),
@@ -309,16 +334,52 @@ mod tests {
                 sql: String::new(),
             },
             Request::PostgresRevoke { session },
+            Request::PullManifest {
+                session,
+                surrogate: surrogate.clone(),
+                registry: String::new(),
+                repository: String::new(),
+                reference: String::new(),
+            },
+            Request::PullBlob {
+                session,
+                surrogate: surrogate.clone(),
+                registry: String::new(),
+                repository: String::new(),
+                digest: String::new(),
+            },
         ]
     }
 
-    /// Every `Request` variant is present in the sample.
+    /// The sample's size, asserted.
     ///
-    /// Without this, deleting a line from `one_of_every_variant` would quietly
-    /// remove a variant from the coverage below — and the coverage below is the
-    /// only thing standing between a new operation and an unannounced one.
+    /// **This is a tripwire, not an exhaustiveness check, and it is named as
+    /// one because it used to claim otherwise.** The row was called
+    /// `the_sample_covers_every_request_variant` and its docstring said that
+    /// without it "deleting a line from `one_of_every_variant` would quietly
+    /// remove a variant from the coverage below". It would not. The assertion
+    /// counted a literal list against a literal number, so it kept passing when
+    /// `PullManifest` and `PullBlob` were added to the enum and left out of the
+    /// sample — which is the exact failure the module's own header cites as
+    /// having already happened once, for `aws.sts.caller_identity`.
+    ///
+    /// Making it genuinely exhaustive needs the variants *derived from the
+    /// enum*, which on stable Rust means a derive macro (`strum::EnumIter`)
+    /// this crate does not take, or a hand-maintained list of method names that
+    /// is the same manual list with a different spelling. Neither is worth a
+    /// new dependency in a crate that holds credential metadata, so the honest
+    /// thing is to say what this row proves.
+    ///
+    /// What still holds the line is the pair below, in the other direction:
+    /// `every_advertised_capability_is_handled` and
+    /// `every_handled_operation_is_advertised` both read this sample, so a
+    /// request that is classified but missing from the sample is invisible to
+    /// them — and an unclassified request is classified as plumbing and simply
+    /// not advertised. The gap is real and it is one-directional: the rules
+    /// catch an advertisement with no request behind it, and they cannot catch
+    /// a request with no advertisement. See the closeout for the follow-up.
     #[test]
-    fn the_sample_covers_every_request_variant() {
+    fn the_sample_has_the_size_this_file_claims() {
         let sample = one_of_every_variant();
         // `Authorize`, `ExplainAuthorization` and `SubmitApproval` carry an
         // `AuthorizationRequest`, which is the one variant family this sample
@@ -326,10 +387,35 @@ mod tests {
         // makes that omission visible instead of assumed.
         assert_eq!(
             sample.len(),
-            20,
+            22,
             "a new Request variant must be added to one_of_every_variant(), \
              and one that represents an operation must also be classified"
         );
+    }
+
+    /// Every classified operation names a *distinct* capability.
+    ///
+    /// Added because the sample can now be extended by hand, and the failure
+    /// this catches is two requests mapping to one capability string: the
+    /// second row then proves nothing about the second request, and an agent
+    /// reading the advertisement cannot tell the two operations apart.
+    #[test]
+    fn two_operations_do_not_share_one_capability_name() {
+        let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+        for request in one_of_every_variant() {
+            if let Some(capability) = capability_of(&request) {
+                *seen.entry(capability).or_default() += 1;
+            }
+        }
+        for (capability, count) in &seen {
+            assert_eq!(
+                *count,
+                1,
+                "{count} requests classify as {capability}; an agent reading the \
+                 advertisement cannot tell them apart, and the row that checks the \
+                 second one proves nothing"
+            );
+        }
     }
 
     /// The direction that was already claimed and was not true.

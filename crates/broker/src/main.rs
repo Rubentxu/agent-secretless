@@ -247,6 +247,14 @@ fn main() -> std::io::Result<()> {
     // It carries no secret: the client secret stays in the vault and the
     // loader refuses a file that tries to name one.
     let mut oauth2_clients: Option<PathBuf> = None;
+    // M11 (R2.F): the OCI registries this broker will reach, and which stored
+    // credential serves each. A file for the same reason as `--oauth2-clients`
+    // above: it is structured, it is operator configuration rather than code,
+    // and a flag carrying host/credential pairs is a separator waiting to be
+    // wrong. **Empty is the default and refuses every registry pull** — a
+    // deployment that has not said which registries it may reach is not one
+    // that gets to reach whatever a request names.
+    let mut registries: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         let arg = match arg.into_string() {
             Ok(s) => s,
@@ -353,6 +361,13 @@ fn main() -> std::io::Result<()> {
                 oauth2_clients = args.next().map(PathBuf::from);
                 if oauth2_clients.is_none() {
                     eprintln!("asv: --oauth2-clients requires a path argument");
+                    std::process::exit(1);
+                }
+            }
+            "--registries" => {
+                registries = args.next().map(PathBuf::from);
+                if registries.is_none() {
+                    eprintln!("asv: --registries requires a path argument");
                     std::process::exit(1);
                 }
             }
@@ -656,6 +671,32 @@ fn main() -> std::io::Result<()> {
         state.workers = std::sync::Arc::new(registry);
     }
 
+    // R2.F.3: the registry allowlist, validated *before* the listener exists.
+    //
+    // Placed here rather than beside `--oauth2-clients`, which is read later,
+    // because a declaration file the broker cannot use should mean no socket is
+    // ever created -- not a socket an agent connects to, finds nothing behind,
+    // and has to diagnose from a daemon that has already exited. The sentence
+    // above this function's bind already claims that everything that could
+    // refuse has refused; this is the flag that made that true of it.
+    //
+    // And the refusal is a startup refusal for the same reason `--oauth2-clients`
+    // is: an operator who wrote a registry file the broker half-understands
+    // would otherwise learn it at the first pull, as a mystery.
+    if let Some(path) = &registries {
+        match asv_broker::registry_declaration::load(path) {
+            Ok(declarations) => {
+                let declared = declarations.len();
+                tracing::info!(declared, "OCI registries declared");
+                state.registries = declarations;
+            }
+            Err(error) => {
+                eprintln!("asv: --registries {} cannot be used: {error}", path.display());
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Bound only now: everything the operator declared has been read, and
     // everything that could refuse has refused.
     let listener = UnixListener::bind(&socket_path)?;
@@ -832,12 +873,14 @@ fn main() -> std::io::Result<()> {
                 routing
             }
         });
+
         tracing::info!(
             vault = %vault_path.display(),
             credentials = inventory.loaded,
             skipped = inventory.skipped,
             collisions = inventory.collisions,
             oauth2_clients = oauth2_clients.as_ref().map(|p| p.display().to_string()),
+            registries = registries.as_ref().map(|p| p.display().to_string()),
             "vault opened and unlocked"
         );
     }
