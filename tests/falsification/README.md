@@ -65,6 +65,7 @@ has: no source edits while a campaign or a suite is in flight.
 | `identity_falsify.py` | `crates/broker/src/aws/identity.rs` | 14, in three passes |
 | `r2c3_falsify.py` | `lib.rs`, `aws_binding.rs`, `selfreport.rs` | 9, in three passes |
 | `k8s_request_falsify.py` | `crates/broker/src/k8s/request.rs` | 24 |
+| `k8s_port_falsify.py` | `crates/broker/src/k8s/port.rs` | 8, taking 9 of its 15 rows red |
 
 `sts_falsify.py` is also the base harness the others import, which is why its
 mutation list is a module-level `MUTATIONS` that callers replace. That has a
@@ -98,3 +99,31 @@ narrowing of `Verb::takes_name` to `Verb::Get` was filed against a row that
 still passes under it, and would have been reported as a survivor — which reads
 as a gap in the test rather than a gap in the filing. What it actually breaks is
 `delete` ceasing to require a name, so that is the row it is filed against now.
+
+## Rows that no single-site mutation can reach
+
+Not every row is falsifiable, and the number that is not is reported rather than
+folded into a total that would then read as more coverage than exists.
+
+`k8s_port_falsify.py` files 8 mutations and takes **9** of its module's 15 rows
+red. The two numbers differ because one mutation breaks two rules: the empty and
+the relative token path are a single condition, so removing it fails both path
+rows at once. That was measured rather than argued — applying that mutation on
+its own and running the whole module gives `13 passed; 2 failed`. The harness
+credits one row per mutation, so it reports the relative row; the empty row is
+counted in the total without a second attribution.
+
+The other six rows fall into two groups. Three assert a **structural** fact: the
+port has no getter, the constructor reads nothing, and `forget` takes `&self`
+over a port that holds no state. No edit to the file undoes any of them —
+breaking them needs a mutation that *adds* a method, a read, or a field.
+
+Three are **positive** rows — a well-formed token arriving verbatim, the row
+that says a port refusing everything would fail, and the row that says the token
+never appears in the port's own rendering. These are the rows that catch the
+port being useless rather than leaky, and breaking one needs a *compound*
+mutation: a port that lends nothing is not one edit away. Filing a multi-site
+edit to force one would measure a rewrite rather than a defect.
+
+Both numbers belong in any summary of the campaign. A total that reported only
+the first would be the same overstatement this file exists to prevent.

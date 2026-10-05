@@ -16,26 +16,35 @@
 //! socket, no clock, no token, no vault — which is the only reason it can be
 //! checked against an oracle at all.
 //!
-//! **R2.D.2** is the transport and the `SecretPort`, and **R2.D.3** is the
-//! broker operation and the CLI verb. Neither exists. Nothing in this module is
+//! **R2.D.2** is the transport and the `SecretPort`, and **`port` is its
+//! secretless half**: the projected ServiceAccount token read, checked and
+//! lent, so that it is a borrowed value for the length of one `accept` and
+//! nothing afterwards. A Kubernetes token is a *single* bearer value, so it fits
+//! the base [`SecretPort`](asv_connector_http::SecretPort) contract unchanged —
+//! which is the very contract
+//! [`AwsSecretPort`](crate::aws::port::AwsSecretPort) refuses, because an AWS
+//! session is three values and the single-value sink builds a bearer header. The
+//! shape that forced AWS to refuse is the shape Kubernetes fits exactly, which
+//! is the argument for keeping the base contract narrow rather than growing a
+//! trait per provider.
+//!
+//! **R2.D.3** is the broker operation and the CLI verb, and the transport that
+//! actually opens the socket. Neither exists. Nothing in this module is
 //! reachable from a product surface, and the module says so rather than letting
 //! a test imply otherwise: per M11's rule a provider does not count as closed on
-//! an encoding alone.
+//! an encoding and a port together.
 //!
-//! # What R2.D.2 must not do
+//! # What R2.D.3 must not do
 //!
-//! The token is a single bearer value, so it fits the existing
-//! [`SecretPort`](asv_connector_http::SecretPort) shape unchanged —
-//! `lend` hands borrowed bytes to a sink that builds the request and takes them
-//! back, and `forget` is required with no default, so a cache of a derived
-//! token is something a new port cannot forget to consider.
-//!
-//! The property R2.D.2 has to preserve is the one this module establishes: the
-//! `Authorization` header is assembled **inside** the sink and sent before the
-//! borrow ends. A `String` holding `Bearer <token>` that outlives the call is
-//! the same leak with a different name, and it is the reason the OAuth2 port
-//! takes a `&mut dyn SecretSink` rather than returning bytes.
+//! The token is lent as borrowed bytes and the `Authorization` header is
+//! assembled **inside** the sink and sent before the borrow ends. A `String`
+//! holding `Bearer <token>` that outlives the call is the same leak under
+//! another name, and it is why `SecretPort` takes a `&mut dyn SecretSink`
+//! rather than returning bytes: the sink is a thing that *uses* the credential,
+//! and returning one would make stashing it the caller's easiest option.
 
+pub mod port;
 pub mod request;
 
+pub use port::{K8sSecretPort, MAX_TOKEN_BYTES};
 pub use request::{ApiError, ApiRequest, Scope, Verb};
