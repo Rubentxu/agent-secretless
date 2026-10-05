@@ -14,6 +14,7 @@
 //! R2.C.2.b is the one that has to earn it.
 
 pub mod calendar;
+pub mod client;
 pub mod sigv4;
 pub mod sts;
 
