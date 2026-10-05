@@ -95,6 +95,14 @@ pub struct OriginResponse {
     /// Headers to send, in order. A name repeated here is sent twice, which is
     /// what a caller asking for that wants.
     pub headers: Vec<(String, String)>,
+    /// Whether to frame the body as `transfer-encoding: chunked` instead of
+    /// declaring a `content-length`.
+    ///
+    /// False by default, so every existing fixture keeps the framing it had.
+    /// True is the only way to produce a response whose size a client cannot
+    /// learn before reading it, which is the case a read-time size bound exists
+    /// to handle.
+    pub chunked: bool,
     /// The body, as bytes. Its length is what `content-length` says, always.
     ///
     /// Bytes and not a `String` because a registry blob is not text, and a
@@ -110,6 +118,7 @@ impl OriginResponse {
             status,
             headers: Vec::new(),
             body: body.into().into_bytes(),
+            chunked: false,
         }
     }
 
@@ -122,6 +131,7 @@ impl OriginResponse {
             status,
             headers: Vec::new(),
             body: body.into(),
+            chunked: false,
         }
     }
 
@@ -147,6 +157,27 @@ impl OriginResponse {
     pub fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_string(), value.to_string()));
         self
+    }
+
+    /// A response whose length is never declared: `transfer-encoding: chunked`
+    /// instead of `content-length`.
+    ///
+    /// A client cannot learn how much is coming, so only a cap on the read
+    /// itself stops an oversized body. That is the half of a size bound that a
+    /// `content-length`-framed fixture cannot reach, and the reason this method
+    /// exists rather than a fixture that sends a wrong length — a wrong length
+    /// is a truncated or broken response, which the HTTP client rejects on its
+    /// own and which therefore proves nothing about a bound.
+    pub fn chunked(status: u16, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            status,
+            headers: vec![(
+                "transfer-encoding".to_string(),
+                "chunked".to_string(),
+            )],
+            body: body.into(),
+            chunked: true,
+        }
     }
 }
 
@@ -557,12 +588,34 @@ fn rustls_config(
 ///
 /// `content-length` is derived here and nowhere else, so it cannot drift from
 /// the body, and the caller's headers are written after the status line.
+///
+/// **Unless the fixture asks for chunked.** A response that declares its length
+/// is refused by a size check *before* the body moves, which is the cheap path
+/// and the one a well-behaved registry takes. The other path — a length that is
+/// never declared, so the reader only stops because it was told to — cannot be
+/// exercised at all while every response carries a `content-length`. That is
+/// not a hypothetical: the R2.C falsification campaign recorded the post-read
+/// size bound as a survivor for exactly this reason.
+///
+/// [`OriginResponse::chunked`] exists so a caller can close that gap.
 fn render(response: &OriginResponse) -> Vec<u8> {
     let extra = response
         .headers
         .iter()
         .map(|(name, value)| format!("{name}: {value}\r\n"))
         .collect::<String>();
+    if response.chunked {
+        // Chunked framing, written by hand because the harness speaks HTTP/1.1
+        // directly. One chunk for the whole body rather than several: the
+        // property under test is that the *reader* stops, and splitting the body
+        // into many chunks would make a slow fixture for no extra coverage.
+        let mut wire = format!("HTTP/1.1 {}\r\n{extra}connection: close\r\n\r\n", status_line(response.status))
+            .into_bytes();
+        wire.extend_from_slice(format!("{:x}\r\n", response.body.len()).as_bytes());
+        wire.extend_from_slice(&response.body);
+        wire.extend_from_slice(b"\r\n0\r\n\r\n");
+        return wire;
+    }
     let mut wire = format!(
         "HTTP/1.1 {}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n",
         status_line(response.status),

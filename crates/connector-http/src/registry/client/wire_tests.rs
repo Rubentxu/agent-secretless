@@ -1053,3 +1053,100 @@ fn el_digest_que_el_registry_afirma_en_una_cabecera_no_sustituye_al_hash() {
         "the refusal repeated the registry's own claim instead of naming the bytes: {error:?}"
     );
 }
+
+/// A registry that answers more than this client reads is refused.
+///
+/// **The row that a green run almost did not mean.** An earlier version of this
+/// fixture pointed the challenge at a realm that does not resolve, so the token
+/// exchange failed first and the refusal this row asserts arrived from the
+/// wrong place — green for a reason that had nothing to do with the size bound.
+/// It is written the way the other rows in this file write it: the realm is a
+/// real origin created *first*, and the challenge names its own URL. If the
+/// `realm` string below is ever a placeholder again, the mutation that should
+/// turn this red will not, which is the check to run before trusting it.
+///
+/// Two fixtures, because the bound has two halves and neither alone is
+/// sufficient: one declares an oversized `content-length` and is stopped before
+/// a byte moves, the other is chunked and declares nothing, so only the cap on
+/// the read itself can stop it.
+///
+/// The mutation that puts this red is removing the bound from `outcome()`.
+/// **Individually neither half is falsable here** — dropping the `.take(...)`
+/// alone leaves the length check to catch it, and dropping the length check
+/// alone leaves the `take` to. What the row pins is the bound as a whole, and
+/// the separate claim that the *allocation* is bounded is structural, not
+/// observable from a functional test.
+#[test]
+fn a_registry_that_sends_more_than_the_bound_is_refused() {
+    let oversized: Arc<Vec<u8>> = Arc::new(vec![b'x'; super::MAX_RESPONSE_BYTES as usize + 1]);
+
+    // Real realm first, and the challenge below names its URL. A placeholder
+    // here fails the token exchange before the body is ever read.
+    let realm = token_origin("repository:library/alpine:pull,push", 200);
+    let challenge = format!(
+        r#"Bearer realm="{}",service="registry.docker.io",scope="repository:library/alpine:pull,push""#,
+        realm.url("/token")
+    );
+    // Honest: declares what it is about to send.
+    let honest_body = Arc::clone(&oversized);
+    let honest_challenge = challenge.clone();
+    let honest = TlsOrigin::start(
+        NAME,
+        Arc::new(move |observed: &Observed| {
+            if !has_bearer(observed) {
+                return OriginResponse::new(401, "")
+                    .with_header("www-authenticate", &honest_challenge);
+            }
+            OriginResponse::bytes(200, honest_body.as_slice().to_vec())
+                .with_header("content-type", "application/json")
+        }),
+    );
+
+    // Silent: chunked, so no `content-length` exists to check. Only the cap on
+    // the read itself can stop this one.
+    let silent_body = Arc::clone(&oversized);
+    let silent_challenge = challenge.clone();
+    let silent = TlsOrigin::start(
+        NAME,
+        Arc::new(move |observed: &Observed| {
+            if !has_bearer(observed) {
+                return OriginResponse::new(401, "")
+                    .with_header("www-authenticate", &silent_challenge);
+            }
+            OriginResponse::chunked(200, silent_body.as_slice().to_vec())
+        }),
+    );
+
+    for (what, origin) in [
+        ("an honest content-length", honest),
+        ("no content-length", silent),
+    ] {
+        let port = RecordingPort::new();
+        let client = client_for(&[&origin, &realm], Arc::clone(&port) as Arc<dyn SecretPort>);
+        let read = client.get_manifest(&pinned_to(&origin), &repository(), &reference());
+        assert!(
+            matches!(read, Err(RegistryError::Transport(_))),
+            "a response past the bound must be refused, but {what} was served: {:?}",
+            read.map(|r| r.body.len())
+        );
+        // The token was actually spent, so the refusal came from reading the
+        // registry's body and not from anything earlier in the exchange.
+        assert_eq!(
+            port.lent().len(),
+            1,
+            "{what}: the credential must have been lent for the registry \
+             request, so the failure was the body and not the token exchange"
+        );
+    }
+}
+
+/// Whether `observed` is the post-challenge request, the one that carries the
+/// minted token. Split out because the fixtures branch on exactly this and the
+/// alternative — comparing against the token itself — puts a credential in a
+/// comparison a reader can see.
+fn has_bearer(observed: &Observed) -> bool {
+    observed
+        .headers
+        .iter()
+        .any(|(name, value)| name == "authorization" && value.starts_with("Bearer "))
+}

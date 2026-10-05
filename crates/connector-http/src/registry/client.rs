@@ -46,6 +46,21 @@ use crate::transport::{AddressPolicy, PinnedClient, ResolvedAudience, TransportE
 /// specification's tag grammar.
 const MAX_REFERENCE_LENGTH: usize = 128;
 
+/// The most a registry response body may be, in bytes.
+///
+/// **Lower than the IPC limit on purpose, and that asymmetry is the design.**
+/// `asv_ipc_protocol::MAX_MESSAGE_BYTES` is 64 KiB, so nothing larger than that
+/// could be returned to an agent anyway; anything past it is either an error or
+/// an attack, and this constant catches it where it is cheapest to catch — at
+/// the socket, before the bytes exist in this process.
+///
+/// An OCI *layer* is megabytes, so a real image cannot be pulled whole. That is
+/// a known limit of this transport rather than a number to raise on request:
+/// streaming a layer needs a ranged or chunked read that this client does not
+/// implement, and raising the bound to "fit a big layer" would hand the decision
+/// back to whoever is on the other end of the TLS connection.
+const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
+
 /// The port a token endpoint is reached on. Written here as well as in the
 /// supermodule because this is the one that builds the token request, and a
 /// client that reached the realm on a different port than the realm rule allows
@@ -862,13 +877,50 @@ fn finish(
         });
     }
     let headers = response.headers().clone();
+    // Bounded twice, and both bounds are load-bearing.
+    //
+    // The declared `content-length` is checked first so a registry that
+    // *admits* it is oversized is refused without moving a gigabyte into this
+    // process's heap to find out. Then the read itself is capped, because a
+    // response that declares nothing and streams anyway is the same attack with
+    // the header removed, and `read_to_end` without a `take` would grow the
+    // buffer until the allocator refused.
+    //
+    // Without both, a compromised or spoofed registry — the one this broker
+    // dials on the operator's behalf, from a realm it vetted — decides how much
+    // memory this process uses. Same shape as `MAX_RESPONSE_BYTES` in
+    // `github.rs`, for the same reason.
+    if let Some(declared) = response.content_length() {
+        if declared > MAX_RESPONSE_BYTES {
+            return Err(RegistryError::Transport(TransportError::RequestFailed {
+                audience: "the registry".to_string(),
+                reason: format!(
+                    "the registry declared {declared} bytes, past the {MAX_RESPONSE_BYTES} \
+                     this client reads"
+                ),
+            }));
+        }
+    }
     let mut body = Vec::new();
-    std::io::Read::read_to_end(&mut response, &mut body).map_err(|e| {
+    // `Read::take` consumes its receiver, so this borrows the response rather
+    // than moving it: the headers above were cloned off the same value and the
+    // response is still the thing being read from.
+    let mut limited = std::io::Read::take(&mut response, MAX_RESPONSE_BYTES + 1);
+    std::io::Read::read_to_end(&mut limited, &mut body).map_err(|e| {
         TransportError::RequestFailed {
             audience: "the registry".to_string(),
             reason: e.to_string(),
         }
     })?;
+    if body.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(RegistryError::Transport(TransportError::RequestFailed {
+            audience: "the registry".to_string(),
+            reason: format!(
+                "the registry sent more than {MAX_RESPONSE_BYTES} bytes and did not \
+                 declare it; the read was stopped at the bound"
+            ),
+        }));
+    }
     Ok(Outcome { headers, body })
 }
 
