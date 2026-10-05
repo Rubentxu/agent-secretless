@@ -1239,6 +1239,95 @@ resource variant rather than a field added to `Resource::Api`" is now half-done
 for a different reason, since the variant exists for the approval argument above
 rather than for the scope, and it will carry the scope when step 2 arrives.
 
+#### The attribute mechanism, which is what step 2 actually needs
+
+R2.B.2 found that the rule `POLICY_TEXT` recommends for AWS could never match,
+and it recorded the cause: `cedar_decision` passed `&Entities::empty()` to
+`is_authorized`, so no resource entity existed and no attribute was ever
+available to compare. That was fixed separately, and the reason it is its own
+block rather than a line inside R2.B.2 is that **step 2 is impossible to build
+correctly without it**: making the scope a policy resource means writing
+conditions on attributes, and an attribute mechanism that does not supply
+attributes is a mechanism that silently denies every rule written against it.
+Building step 2 first would have produced a scope nobody could author a policy
+for, and the rows would have passed while the feature did not work — the same
+failure R2.B.2 was written to end.
+
+The mechanism, in full:
+
+- Cedar resolves a resource's attributes from the **`Entities` store**, not from
+  the `Request` — a `Request` is three entity ids and a context. The original
+  code passed an empty store, which is the whole defect.
+- `resource_attributes` names the attribute per variant, and the store is built
+  **with** the schema so Cedar rejects an attribute the schema does not declare.
+  That matters in the direction that is easy to miss: no policy can reference an
+  undeclared attribute, so an undeclared one reaching the evaluator would not
+  look wrong while the mechanism quietly stopped working.
+- `Request::new` now receives the schema too, so the request shape is validated
+  on every evaluation rather than trusted.
+- The engine's error is **carried into the denial's reason** rather than
+  discarded as `"policy engine failure"`. This was not a nicety: the first
+  attempt at the fix used `RestrictedExpression::from_str`, which parses a Cedar
+  *expression* rather than reading a string, so `api.github.com` became a path
+  reference to a non-existent entity and **every** `Api` authorization failed
+  closed. With the error discarded that presented as three rows saying
+  `assertion failed` and a decision indistinguishable from a policy denial. A
+  fix that turns every authorization into a quiet deny is the most dangerous kind
+  of broken, and the only reason it was found in minutes rather than shipped is
+  that the reason was legible.
+
+**The reachable host set is unchanged, and that is the claim rather than an
+assertion of good intentions.** An unapproved audience is still refused in Rust
+before Cedar is consulted; supplying the attribute only lets a rule *narrow*
+within the set D6 already approved. Supplying an attribute is a fidelity change,
+and the row that holds the distinction is
+`audience_attributes_do_not_widen_the_reachable_set`.
+
+The documented rule also **did not parse**, which is the third defect stacked in
+one sentence and the reason a row loads the exact text the docs print. Cedar
+4.7.1 rejects both `resource is Api && x` and `(resource is Api) && x`; the
+grammar wants a `when` clause:
+
+```
+permit (principal, action == Action::"aws_sts_caller_identity",
+        resource is Api) when { resource.audience == "sts.eu-west-1.amazonaws.com" };
+```
+
+So the original recommendation was a condition that could never match, inside a
+rule that would not load, in documentation nothing in the tree exercised. All
+three are gone and the rule is now a row.
+
+Measured: `asv-policy` 22/22, four of them new and aimed at the two directions —
+fidelity (`the_documented_audience_rule_now_matches_and_only_its_own_audience`,
+`a_resource_entity_carries_exactly_what_its_schema_declares`,
+`an_attribute_the_schema_does_not_declare_is_refused_by_the_store`,
+`a_schema_that_does_not_declare_the_supplied_attribute_is_refused`) and
+reachability (`audience_attributes_do_not_widen_the_reachable_set`).
+Falsified by `tests/falsification/policy_attrs_falsify.py`: **7 mutations in two
+passes, 7 red, 0 survivors, 0 measured nothing.**
+
+One survivor became a row rather than a deletion, and the reason generalises. A
+mutation dropping `Some(&self.schema)` left the direct-Cedar row green —
+correctly, since a *correctly named* attribute is accepted either way, so no row
+could tell. The row that makes it observable does not call Cedar at all: it
+builds an engine whose `Api` type declares no shape, so the production path
+supplies an attribute that schema does not declare. **A row that proves a
+library behaves is not a row that proves this code is wired to use it.**
+
+Also found, and fixed because it made the above undiagnosable:
+`ExplainResult::reason` is a `ReasonCode` and reads `NoMatchingPolicy` for *both*
+"the policy did not match" and "the engine refused", so the two are
+indistinguishable from the outside. The free text lives on the decision. Worth
+naming because a row asserting the wrong field reported a *correct* store
+refusal as an acceptance.
+
+Cedar 4.7.1's schema violation message is `entity does not conform to the
+schema` and does not name the offending attribute. A row asserting it did was
+wrong, in the same class as the defect this block fixes — claiming a diagnostic
+the library does not produce — so it was corrected to the guarantee that holds:
+a drift **denies** rather than comparing against nothing. Naming the attribute
+would be better and is not written; it is a one-line wrapper on the way in.
+
 Open, and not closed by any of the above: a live exchange against a real
 third-party IdP needs a host that has one; `IDENTITY_TIMEOUT` bounds the call but
 no row measures a hung resource, because a ten-second test is not a better test;

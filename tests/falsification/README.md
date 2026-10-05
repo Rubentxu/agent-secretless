@@ -73,6 +73,7 @@ has: no source edits while a campaign or a suite is in flight.
 | `s3_object_falsify.py` | `crates/broker/src/aws/s3/object.rs` | 9, against 15 rows |
 | `aws_audience_falsify.py` | `crates/broker/src/aws/audience.rs` | 9 red + 1 compiler-refused, against 14 rows |
 | `r2b2_falsify.py` | `lib.rs`, `oauth2_binding.rs`, `policy/src/lib.rs`, `selfreport.rs` | 15, in five passes |
+| `policy_attrs_falsify.py` | `crates/policy/src/lib.rs` | 7, in two passes |
 
 `sts_falsify.py` is also the base harness the others import, which is why its
 mutation list is a module-level `MUTATIONS` that callers replace. That has a
@@ -125,6 +126,24 @@ narrowing of `Verb::takes_name` to `Verb::Get` was filed against a row that
 still passes under it, and would have been reported as a survivor — which reads
 as a gap in the test rather than a gap in the filing. What it actually breaks is
 `delete` ceasing to require a name, so that is the row it is filed against now.
+
+`policy_attrs_falsify.py` is the shortest campaign here — 7 mutations over one
+file, five for supplying a Cedar resource attribute and two for the direction
+that must *not* change — and it is filed separately from `r2b2_falsify.py`
+because its two passes answer different questions. "Does the mechanism work?" and
+"does making it work widen what a policy can reach?" are not the same
+measurement, and a fix that got the first right and the second wrong would be a
+worse outcome than the bug it fixed.
+
+It also produced the sharpest single survivor-to-row conversion in this file.
+A mutation that dropped `Some(&self.schema)` left the direct Cedar row green,
+correctly: a *correctly named* attribute is accepted with or without the schema,
+so nothing could tell. The row that made it observable does not call Cedar
+directly at all — it builds an engine whose `Api` type declares no shape, so the
+production path supplies an attribute that schema does not declare, and the
+difference appears in the decision. A row that proves a library behaves is not a
+row that proves *this code* is wired to use it, and the second is the one that
+was missing.
 
 `r2b2_falsify.py` is the second campaign to file something wrongly, and it did
 so twice, so the pattern is worth having in one place:

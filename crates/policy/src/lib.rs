@@ -9,11 +9,12 @@
 
 use asv_domain::{Action, AgentSessionId, ApprovalId, Authority, CapabilityId, Decision, Resource};
 use cedar_policy::{
+    Entity,
     Authorizer, Context, Entities, EntityUid, PolicySet, Request, RestrictedExpression, Schema,
     ValidationMode, Validator,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -82,7 +83,19 @@ permit (principal, action == Action::"postgres_read", resource is Database);
 // operator who wants it writes:
 //
 //   permit (principal, action == Action::"aws_sts_caller_identity",
-//           resource is Api && resource.audience == "sts.eu-west-1.amazonaws.com");
+//           resource is Api) when { resource.audience == "sts.eu-west-1.amazonaws.com" };
+//
+// **The `when` clause is not decoration, and getting the form wrong is the third
+// defect stacked in this one sentence.** Cedar 4.7.1 rejects both
+// `resource is Api && x` ("unexpected token `&&`") and
+// `(resource is Api) && x` ("unexpected token `(`"); the grammar wants the
+// condition in a `when` block. So the rule as originally written would not have
+// loaded *even now* that the attribute is supplied — a condition that could
+// never match, inside a rule that would not parse, and nothing in the tree ran
+// it to notice either. `the_documented_audience_rule_now_matches_and_only_its_own_audience`
+// is the row that loads the exact text printed here, so a future Cedar upgrade
+// that changes the grammar fails a test rather than silently invalidating every
+// operator's policy.
 //
 // and naming the audience there is the point: the broker evaluates against the
 // *deployment's* audience, so the rule is about one declared destination rather
@@ -563,6 +576,11 @@ pub struct PolicyEngine {
     policies: PolicySet,
     store: Mutex<Store>,
     clock: Arc<dyn Clock>,
+    /// Kept because `Entity::new` needs it: building a resource with its
+    /// attributes is how a policy condition on an attribute is answered, and
+    /// Cedar validates the entity against the same schema the policies were
+    /// validated against. One schema, held once, so the two cannot drift.
+    schema: Arc<Schema>,
 }
 
 impl fmt::Debug for PolicyEngine {
@@ -598,7 +616,7 @@ impl PolicyEngine {
             .map_err(|error| PolicyError::Engine(format!("invalid built-in schema: {error}")))?;
         let policies = PolicySet::from_str(policy_text)
             .map_err(|error| PolicyError::Engine(error.to_string()))?;
-        let validator = Validator::new(schema);
+        let validator = Validator::new(schema.clone());
         let validation = validator.validate(&policies, ValidationMode::Strict);
         if !validation.validation_passed() {
             return Err(PolicyError::Engine(format!(
@@ -611,6 +629,7 @@ impl PolicyEngine {
             policies,
             store: Mutex::new(Store::default()),
             clock,
+            schema: Arc::new(schema),
         })
     }
 
@@ -778,8 +797,18 @@ impl PolicyEngine {
             Ok(false) => Decision::Deny {
                 reason: "no matching policy".into(),
             },
-            Err(_) => Decision::Deny {
-                reason: "policy engine failure".into(),
+            // The reason is carried rather than discarded. "policy engine
+            // failure" with nothing behind it is a dead end for an operator, and
+            // it made this class of bug invisible while it was being fixed: a
+            // Cedar error and a policy denial produced the same decision, so a
+            // change that broke *every* authorization still read as a quiet
+            // deny. Failing closed was never in question — the decision is still
+            // a Deny — but a refusal nobody can diagnose is not much of one.
+            //
+            // Nothing secret reaches here: it is Cedar's complaint about a
+            // resource *type* or a missing attribute, never a value.
+            Err(error) => Decision::Deny {
+                reason: format!("policy engine failure: {error}"),
             },
         };
         if matches!(decision, Decision::Allow) {
@@ -900,6 +929,68 @@ impl PolicyEngine {
             request.resource_name()
         ))
         .map_err(|error| PolicyError::Engine(error.to_string()))?;
+        // The resource's own attributes, which `SCHEMA_JSON` has been declaring
+        // since M4 and which nothing ever supplied.
+        //
+        // `Request::new`'s last argument is where a resource's attributes go, and
+        // it was `None` — so `Api::audience` was a declared-but-absent field, and
+        // a policy condition on it (`resource.audience == "api.github.com"`, the
+        // rule this file's own `POLICY_TEXT` tells an operator to write) could
+        // never be true. Not "fail-closed", which is what an absent *resource*
+        // would be: the condition simply had nothing to compare, so the rule
+        // denied forever and the operator got no explanation.
+        //
+        // **This is a fidelity fix and not a reachability fix, and the
+        // difference is the whole safety argument.** An unapproved audience is
+        // still refused a dozen lines above, in Rust, before Cedar is
+        // consulted — so the set of hosts a policy can reach is unchanged, and
+        // this only lets a rule *narrow* within the set D6 already approved. The
+        // row that holds that is
+        // `unapproved_audience_is_denied_even_though_it_canonicalizes`, and
+        // `audience_attributes_do_not_widen_the_reachable_set` is the one that
+        // would go red if this ever started answering a different question.
+        let mut resource_attrs: HashMap<String, RestrictedExpression> = HashMap::new();
+        for (name, value) in resource_attributes(&request.resource) {
+            // `new_string`, **not** `from_str`. `RestrictedExpression::from_str`
+            // parses a *Cedar expression*, so handing it `api.github.com` builds
+            // a path expression referring to the entity `api.github.com` — which
+            // does not exist, and which fails closed with `invalid member access
+            // api.github, api has no fields or methods`. Every audience in this
+            // system is a dotted host, so every value would have hit it.
+            //
+            // The failure was invisible because `authorize` discarded the engine
+            // error and answered `"policy engine failure"`, which is the same
+            // decision a policy denial produces: the change turned *every* `Api`
+            // authorization into a quiet deny and three rows said "assertion
+            // failed" with nothing behind them. The two fixes belong together —
+            // a string literal, and an error an operator can read.
+            resource_attrs.insert(name.to_string(), RestrictedExpression::new_string(value));
+        }
+        // **This is where the attributes go, and the fact that they did not go
+        // here is the whole defect.** Cedar resolves a resource's attributes from
+        // the `Entities` store handed to `is_authorized`, *not* from the
+        // `Request` — `Request::new`'s fifth argument is the schema, and a
+        // `Request` is three uids and a context. So the original call passed
+        // `&Entities::empty()` and every attribute was structurally unreachable:
+        // `SCHEMA_JSON` declared `Api::audience`, the policies were validated
+        // against that declaration, and a rule could be written, loaded, and be
+        // denied forever because the value it compared against did not exist.
+        //
+        // The entity store is built with the schema, so Cedar checks each
+        // attribute against the declaration as it is added. That makes both
+        // failure directions loud rather than silent: an attribute the schema
+        // does not declare is refused here, and — because the schema declares
+        // `audience` and a missing required attribute is also an error — a
+        // variant whose `resource_attributes` arm was forgotten is refused here
+        // too, instead of quietly making every condition on it unanswerable.
+        let entities = if resource_attrs.is_empty() {
+            Entities::empty()
+        } else {
+            let entity = Entity::new(resource.clone(), resource_attrs, HashSet::new())
+                .map_err(|error| PolicyError::Engine(error.to_string()))?;
+            Entities::from_entities(vec![entity], Some(&self.schema))
+                .map_err(|error| PolicyError::Engine(error.to_string()))?
+        };
         let protected = if request.context.is_protected_main() {
             "true"
         } else {
@@ -918,11 +1009,14 @@ impl PolicyEngine {
             ),
         ])
         .map_err(|error| PolicyError::Engine(error.to_string()))?;
-        let request = Request::new(principal, action, resource, context, None)
+        // The schema goes here rather than as `None` so Cedar validates the
+        // request shape — principal type, action, resource type — on every
+        // evaluation instead of trusting that the code and the schema agree.
+        let request = Request::new(principal, action, resource, context, Some(&self.schema))
             .map_err(|error| PolicyError::Engine(error.to_string()))?;
         Ok(self
             .authorizer
-            .is_authorized(&request, &self.policies, &Entities::empty())
+            .is_authorized(&request, &self.policies, &entities)
             .decision()
             == cedar_policy::Decision::Allow)
     }
@@ -980,6 +1074,31 @@ fn resource_name(resource: &Resource) -> String {
         // entity namespaces apart, and it is here rather than in the type name
         // because Cedar sees only a string.
         Resource::OAuth2Client { credential, .. } => format!("oauth2:{credential}"),
+    }
+}
+
+/// The attributes a resource entity carries, as `(name, value)` string pairs.
+///
+/// **Every variant here must match a shape declared in `SCHEMA_JSON`, and an
+/// attribute that does not is a load-time error rather than a silently absent
+/// field** — which is the property that makes this function's output trustworthy
+/// rather than hopeful. An entity built with an attribute the schema does not
+/// declare fails `Entity::new`, so a typo here stops the broker rather than
+/// producing another rule that can never match.
+///
+/// Only `Api` has a shape, and so only `Api` produces an attribute.
+/// `OAuth2Client` is deliberately empty today: R2.B.2 gave the type no attribute
+/// precisely because the mechanism did not work, and shipping a declared field
+/// nothing supplied would have been the same defect one level down. It carries
+/// the scope when the scope becomes a policy resource, and the machinery to
+/// carry it is now here.
+fn resource_attributes(resource: &Resource) -> Vec<(&'static str, String)> {
+    match resource {
+        Resource::Api { audience } => vec![("audience", audience.to_string())],
+        Resource::Repository { .. }
+        | Resource::Database { .. }
+        | Resource::Host { .. }
+        | Resource::OAuth2Client { .. } => Vec::new(),
     }
 }
 
@@ -1083,6 +1202,319 @@ mod tests {
         assert_eq!(evil.resource_name(), "api:evil.example");
         // ...and policy must.
         assert!(!engine.authorize(&evil, None, None).decision.is_allowed());
+    }
+
+    /// **The row the whole change exists for.** The rule `POLICY_TEXT` tells an
+    /// operator to write — `resource.audience == "sts.amazonaws.com"` — now
+    /// matches, and a rule naming a different audience does not.
+    ///
+    /// Both halves are asserted because the interesting failure is a rule that
+    /// matches *everything*, which would look identical to "it works" if only the
+    /// first half were checked. A condition on an attribute that silently
+    /// evaluated to nothing is the previous behaviour, and it denied; a condition
+    /// that silently evaluated to true would be a new one, and it would allow.
+    #[test]
+    fn the_documented_audience_rule_now_matches_and_only_its_own_audience() {
+        let engine = PolicyEngine::from_policy_text(
+            r#"permit (principal, action == Action::"github_issue_read",
+                   resource is Api) when { resource.audience == "sts.amazonaws.com" };"#,
+        )
+        .expect("the documented rule now loads and is valid");
+        // The audience the rule names: permitted.
+        assert!(
+            engine
+                .authorize(
+                    &api_request(Action::GitHubIssueRead, "sts.amazonaws.com"),
+                    None,
+                    None
+                )
+                .decision
+                .is_allowed(),
+            "a rule naming the resource's own audience still denies"
+        );
+        // The other approved audience: denied, so the condition discriminates
+        // rather than merely being satisfiable.
+        assert!(
+            !engine
+                .authorize(
+                    &api_request(Action::GitHubIssueRead, "api.github.com"),
+                    None,
+                    None
+                )
+                .decision
+                .is_allowed(),
+            "the condition is satisfiable by any Api, not by the one it names"
+        );
+    }
+
+    /// **The safety row, and the one that must exist for the row above to be
+    /// allowed to exist.** Supplying the attribute changed what a policy can say,
+    /// so the reachable set has to be re-measured rather than assumed.
+    ///
+    /// The policy here is as permissive as the grammar allows — `resource is
+    /// Api`, no audience condition at all — and the audience is unapproved. It is
+    /// denied by `audience_is_approved` in Rust, before Cedar is consulted, which
+    /// is the layer that has always held and the layer this change does not
+    /// touch. The point of the row is that populating an attribute did not move
+    /// that check, and a regression that popped the `if let Resource::Api` would
+    /// make it red.
+    #[test]
+    fn audience_attributes_do_not_widen_the_reachable_set() {
+        let engine = PolicyEngine::from_policy_text(
+            r#"permit (principal, action == Action::"github_issue_read", resource is Api);"#,
+        )
+        .expect("the most permissive Api rule is valid");
+        // Permitted audience: allowed, so the rule is genuinely permissive and
+        // the denial below is about the audience rather than about the policy.
+        assert!(
+            engine
+                .authorize(
+                    &api_request(Action::GitHubIssueRead, "api.github.com"),
+                    None,
+                    None
+                )
+                .decision
+                .is_allowed(),
+            "the fixture policy is not permissive, so the denial below proves nothing"
+        );
+        // Unapproved audience: denied, with the attribute present and populated.
+        let denied = engine.authorize(
+            &api_request(Action::GitHubIssueRead, "evil.example"),
+            None,
+            None,
+        );
+        assert!(
+            !denied.decision.is_allowed(),
+            "an unapproved audience became reachable once its attribute was supplied"
+        );
+        // And it is refused by the Rust-side check rather than by a rule that
+        // happened not to match — the distinction an operator needs, because the
+        // first is "this host is not approved" and the second is "you did not
+        // write a rule for it".
+        assert!(
+            !format!("{:?}", denied.reason).contains("policy engine failure"),
+            "the refusal came from the engine rather than the allowlist: {:?}",
+            denied.reason
+        );
+    }
+
+    /// The attribute a resource carries is exactly the one its schema declares,
+    /// and nothing more.
+    ///
+    /// A resource entity built with an attribute `SCHEMA_JSON` does not declare
+    /// is refused by `Entities::from_entities`, which is the property that makes
+    /// `resource_attributes` trustworthy: it cannot quietly grow a field no
+    /// policy can reference, and it cannot lose one every rule depends on,
+    /// without a policy evaluation failing loudly rather than denying in silence.
+    #[test]
+    fn a_resource_entity_carries_exactly_what_its_schema_declares() {
+        let schema = Schema::from_json_str(SCHEMA_JSON).expect("the built-in schema parses");
+        let audience = Authority::canonicalize("api.github.com").expect("valid");
+        let resource = Resource::Api {
+            audience: audience.clone(),
+        };
+        // Declared: `Api` has a shape with one String attribute.
+        assert_eq!(
+            resource_attributes(&resource),
+            vec![("audience", audience.to_string())]
+        );
+        // And the entity Cedar builds from it is accepted by that schema.
+        let uid = EntityUid::from_str(&format!(
+            "Api::\"{}\"",
+            resource_name(&resource)
+        ))
+        .expect("the resource name is a valid entity id");
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "audience".to_string(),
+            RestrictedExpression::new_string(audience.to_string()),
+        );
+        let entity = Entity::new(uid.clone(), attrs, HashSet::new())
+            .expect("an entity with a declared attribute builds");
+        Entities::from_entities(vec![entity], Some(&schema))
+            .expect("and the schema accepts it");
+        // The types with no shape carry nothing, which is why they need no
+        // entity at all: supplying an empty one would be a no-op with a cost.
+        for resource_without_attributes in [
+            Resource::Repository {
+                owner: "a".into(),
+                name: "b".into(),
+            },
+            Resource::Database {
+                name: "a".into(),
+                role: "b".into(),
+            },
+            Resource::Host {
+                hostname: "a".into(),
+            },
+            Resource::OAuth2Client {
+                credential: "x".into(),
+                audience: "y".into(),
+            },
+        ] {
+            assert!(
+                resource_attributes(&resource_without_attributes).is_empty(),
+                "{resource_without_attributes:?} declares no shape, so it must carry no attribute"
+            );
+        }
+    }
+
+    /// A resource attribute the schema does not declare is refused by the
+    /// entity store, which is what makes a schema/attribute drift **loud**.
+    ///
+    /// `resource_attributes` names `"audience"` and `SCHEMA_JSON` declares it,
+    /// so the two cannot disagree silently today. If one is edited and the other
+    /// is not, `Entities::from_entities` refuses the entity and every `Api`
+    /// authorization becomes a denial — correct, and useless on its own, because
+    /// a denial is what a *policy* produces too. The operator could not tell
+    /// "your policy does not permit this" from "this build is broken", and a
+    /// broken build that denies everything is the quietest failure available.
+    ///
+    /// The misspelling here is deliberate and is the shape a real drift takes: a
+    /// one-word edit on one side of a pair nothing else checks.
+    #[test]
+    fn an_attribute_the_schema_does_not_declare_is_refused_by_the_store() {
+        let engine = PolicyEngine::default();
+        let schema = Schema::from_json_str(SCHEMA_JSON).expect("the built-in schema parses");
+        let uid = EntityUid::from_str(&format!(
+            "Api::\"{}\"",
+            resource_name(&Resource::Api {
+                audience: Authority::canonicalize("api.github.com").expect("valid")
+            })
+        ))
+        .expect("the resource name is a valid entity id");
+
+        // The declared name builds and the schema accepts it.
+        let declared: HashMap<String, RestrictedExpression> = [(
+            "audience".to_string(),
+            RestrictedExpression::new_string("api.github.com".into()),
+        )]
+        .into_iter()
+        .collect();
+        let accepted = Entity::new(uid.clone(), declared, HashSet::new())
+            .map_err(|error| error.to_string())
+            .and_then(|entity| {
+                Entities::from_entities(vec![entity], Some(&schema)).map_err(|e| e.to_string())
+            });
+        assert!(
+            accepted.is_ok(),
+            "the declared attribute is refused, so the schema is not the shape the code writes: {accepted:?}"
+        );
+
+        // The misspelled one does not.
+        //
+        // **The refusal is loud but generic**, and that is worth stating rather
+        // than papering over: Cedar 4.7.1 says `entity does not conform to the
+        // schema` and does not name the attribute. The first version of this row
+        // asserted it did, and was wrong — the same mistake this file's whole
+        // change is about, in the opposite direction: claiming a diagnostic the
+        // library does not produce.
+        //
+        // So the guarantee is precisely "a drift denies rather than silently
+        // comparing against nothing", and the *diagnosis* is the operator's
+        // because the message points at the shape rather than the value. The
+        // `audience` string is one line away in `resource_attributes` and one
+        // line away in `SCHEMA_JSON`, which is what makes that acceptable.
+        let typo: HashMap<String, RestrictedExpression> = [(
+            "audiant".to_string(),
+            RestrictedExpression::new_string("api.github.com".into()),
+        )]
+        .into_iter()
+        .collect();
+        let refused = Entity::new(uid, typo, HashSet::new())
+            .map_err(|error| error.to_string())
+            .and_then(|entity| {
+                Entities::from_entities(vec![entity], Some(&schema)).map_err(|e| e.to_string())
+            })
+            .expect_err("an undeclared attribute is accepted, so a drift would be silent");
+        assert!(
+            refused.contains("schema"),
+            "the refusal does not even mention the schema, so it reads like any \
+             other construction failure: {refused}"
+        );
+        // And a correct build is unaffected by any of this.
+        assert!(
+            engine
+                .authorize(
+                    &api_request(Action::GitHubIssueRead, "api.github.com"),
+                    None,
+                    None
+                )
+                .decision
+                .is_allowed()
+        );
+    }
+
+    /// **The row that makes `Some(&schema)` load-bearing.** It is the one thing
+    /// the previous row could not measure, and the reason is worth stating: that
+    /// row calls `Entities::from_entities` itself, so it proves Cedar refuses an
+    /// undeclared attribute while saying nothing about whether the *production*
+    /// path passes the schema. Mutating `Some(&self.schema)` to `None` left it
+    /// green, correctly, because a correctly-named attribute is accepted either
+    /// way.
+    ///
+    /// So the schema is doctored instead: an engine whose `Api` type declares no
+    /// shape, built through the same fields production builds. The production
+    /// path then supplies an `audience` attribute that *this* schema does not
+    /// declare, and the question becomes observable: with the schema passed, the
+    /// request is refused as a schema violation; without it, the entity is
+    /// accepted and a permissive policy allows the call.
+    ///
+    /// That is the whole value of the schema argument. A future edit that drops
+    /// it would let an attribute the schema never declared reach the evaluator,
+    /// and no policy can reference such an attribute — so nothing would look
+    /// wrong while the mechanism quietly stopped working.
+    #[test]
+    fn a_schema_that_does_not_declare_the_supplied_attribute_is_refused() {
+        // `Api` with no shape, so `audience` is undeclared for this engine.
+        let doctored = SCHEMA_JSON.replace(
+            r#""Api": {
+        "shape": {
+          "type": "Record",
+          "attributes": {
+            "audience": { "type": "String" }
+          }
+        }
+      }"#,
+            r#""Api": {}"#,
+        );
+        assert_ne!(
+            doctored, SCHEMA_JSON,
+            "the doctored schema is identical to the real one, so this row \
+             would pass for the wrong reason"
+        );
+        let schema = Schema::from_json_str(&doctored).expect("the doctored schema parses");
+        let base = PolicyEngine::from_policy_text(
+            r#"permit (principal, action == Action::"github_issue_read", resource is Api);"#,
+        )
+        .expect("the fixture policy is valid against the real schema");
+        let engine = PolicyEngine {
+            schema: Arc::new(schema),
+            ..base
+        };
+        let decided = engine.authorize(
+            &api_request(Action::GitHubIssueRead, "api.github.com"),
+            None,
+            None,
+        );
+        // `ExplainResult::reason` is a `ReasonCode` and is `NoMatchingPolicy`
+        // for *both* "the policy did not match" and "the engine refused", which
+        // is why the first version of this assertion read the wrong field and
+        // looked like the store had accepted the entity. The free text lives on
+        // the decision, and that is the field an operator sees in a denial.
+        let Decision::Deny { reason } = &decided.decision else {
+            panic!("the call was allowed, so the schema argument is not applied: {decided:?}");
+        };
+        assert!(
+            reason.contains("policy engine failure"),
+            "the refusal does not say the engine refused it, so it is \
+             indistinguishable from a policy that simply did not match: {reason}"
+        );
+        assert!(
+            reason.contains("schema"),
+            "and it does not mention the schema, which is the only thing that \
+             was actually wrong: {reason}"
+        );
     }
 
     /// The approved audience is reachable for the semantic read, and the
