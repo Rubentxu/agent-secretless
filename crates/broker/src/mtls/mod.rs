@@ -84,12 +84,14 @@
 //! already use to reach a subdirectory from a module that is itself a single
 //! file.
 
+pub mod deployment;
 pub mod grant;
 pub mod issue;
 pub mod present;
 
+pub use deployment::{ClientBinding, DeploymentError, MtlsDeployment};
 pub use grant::{ClientGrant, MIN_CLIENT_CERT_TTL};
-pub use issue::{ClientCertError, ClientCsr, IssuedClientCert, issue_client_certificate};
+pub use issue::{issue_client_certificate, ClientCertError, ClientCsr, IssuedClientCert};
 pub use present::ClientIdentity;
 
 #[cfg(test)]

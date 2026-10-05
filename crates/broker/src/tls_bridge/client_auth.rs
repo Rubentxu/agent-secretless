@@ -27,10 +27,11 @@ use std::time::{Duration, Instant};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{RootCertStore, ServerConfig, ServerConnection, StreamOwned};
 
+use super::mtls::deployment::{ClientBinding, MtlsDeployment};
 use super::mtls::{ClientGrant, ClientIdentity};
 use super::{
-    Authority, AuthorityEndpoint, Bridge, BridgeError, ConnectPolicy, SessionCa,
-    UpstreamTransportPolicy, issue_leaf,
+    issue_leaf, Authority, AuthorityEndpoint, Bridge, BridgeError, ConnectPolicy, SessionCa,
+    UpstreamTransportPolicy,
 };
 use crate::connect_routes::UpstreamTransport;
 
@@ -89,7 +90,9 @@ impl TlsDestination {
             let _ = socket.set_read_timeout(Some(Duration::from_secs(10)));
             let connection = ServerConnection::new(Arc::new(config)).map_err(|e| e.to_string())?;
             let mut tls = StreamOwned::new(connection, socket);
-            tls.conn.complete_io(&mut tls.sock).map_err(|e| e.to_string())?;
+            tls.conn
+                .complete_io(&mut tls.sock)
+                .map_err(|e| e.to_string())?;
             // The destination's own record of what arrived. Not a
             // re-derivation of it.
             Ok(tls
@@ -121,10 +124,7 @@ impl TlsDestination {
 struct AlwaysTls;
 
 impl UpstreamTransportPolicy for AlwaysTls {
-    fn transport_for(
-        &self,
-        _target: &AuthorityEndpoint,
-    ) -> Result<UpstreamTransport, BridgeError> {
+    fn transport_for(&self, _target: &AuthorityEndpoint) -> Result<UpstreamTransport, BridgeError> {
         Ok(UpstreamTransport::Tls)
     }
 }
@@ -273,8 +273,13 @@ fn una_identidad_caducada_no_se_presenta() {
     let grant = ClientGrant::for_identity("svc-a.internal", HOUR).expect("name");
     // Issued an hour and a second ago, so it is past the lifetime it was
     // granted even though its CA is still perfectly valid.
-    let stale = ClientIdentity::issue(&ca, &grant, HOST, Instant::now() - HOUR - Duration::from_secs(1))
-        .expect("issuance");
+    let stale = ClientIdentity::issue(
+        &ca,
+        &grant,
+        HOST,
+        Instant::now() - HOUR - Duration::from_secs(1),
+    )
+    .expect("issuance");
     assert!(stale.is_expired(Instant::now()));
 
     let destination = TlsDestination::start(&ca, true);
@@ -363,7 +368,12 @@ fn una_identidad_no_se_emite_para_un_host_que_no_es_un_host() {
     let ca = SessionCa::new("s-r2e2", 20, HOUR);
     let grant = ClientGrant::for_identity("svc-a.internal", HOUR).expect("name");
 
-    for host in ["", "internal.svc.example:443", "user@internal.svc.example", "*.svc.example"] {
+    for host in [
+        "",
+        "internal.svc.example:443",
+        "user@internal.svc.example",
+        "*.svc.example",
+    ] {
         let refusal = ClientIdentity::issue(&ca, &grant, host, Instant::now())
             .expect_err("a non-destination is not a destination");
         assert!(
@@ -371,4 +381,62 @@ fn una_identidad_no_se_emite_para_un_host_que_no_es_un_host() {
             "expected an unusable destination, got {refusal:?}"
         );
     }
+}
+
+/// **Mutation: mint the identity from whatever the request names, skipping the
+/// declaration** — this row goes red, and the chain it measures is the one
+/// that makes `MtlsDeployment` reachable from a product surface at all:
+/// declaration, then identity, then bridge, then a real destination.
+///
+/// Everything upstream of here resolves a destination; nothing upstream
+/// resolves it *from an operator's decision*, which is what this row is the
+/// only place to check.
+#[test]
+fn una_declaracion_del_operador_produce_la_identidad_que_llega_al_destino() {
+    let ca = SessionCa::new("s-r2e2", 21, HOUR);
+    let deployment = MtlsDeployment::new(vec![
+        ClientBinding::new("svc-a.internal", HOST, HOUR).expect("a canonical pair")
+    ])
+    .expect("one destination, one identity");
+
+    let declared = deployment
+        .identity_for(&ca, HOST, Instant::now())
+        .expect("issuance")
+        .expect("the destination is declared");
+
+    let destination = TlsDestination::start(&ca, true);
+    let bridge = bridge(&ca, Some(Arc::new(declared)));
+
+    dial(&bridge, &destination).expect("the destination accepted the declared identity");
+    let presented = destination
+        .finish()
+        .expect("the destination completed the handshake");
+    assert_eq!(
+        presented.len(),
+        2,
+        "the destination accepted a leaf and the intermediate it needed to chain"
+    );
+}
+
+/// **Mutation: resolve the declaration by suffix, or fall back to a default
+/// identity when nothing matches** — the row above stays green and the
+/// destination, which was never declared, is authenticated anyway.
+#[test]
+fn una_declaracion_para_otro_destino_no_produce_una_identidad_usable() {
+    let ca = SessionCa::new("s-r2e2", 22, HOUR);
+    let deployment = MtlsDeployment::new(vec![ClientBinding::new(
+        "svc-a.internal",
+        "other.svc.example",
+        HOUR,
+    )
+    .expect("pair")])
+    .expect("ok");
+
+    assert!(
+        deployment
+            .identity_for(&ca, HOST, Instant::now())
+            .expect("no error")
+            .is_none(),
+        "a destination nobody declared must have no identity to attach"
+    );
 }

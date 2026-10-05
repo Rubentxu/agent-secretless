@@ -841,10 +841,7 @@ impl Bridge {
     /// second without the first would present a client identity to a
     /// destination whose certificate it never checked, which is how a client
     /// certificate becomes a credential for an impostor.
-    pub fn with_client_identity(
-        mut self,
-        identity: std::sync::Arc<mtls::ClientIdentity>,
-    ) -> Self {
+    pub fn with_client_identity(mut self, identity: std::sync::Arc<mtls::ClientIdentity>) -> Self {
         self.client_identity = Some(identity);
         self
     }

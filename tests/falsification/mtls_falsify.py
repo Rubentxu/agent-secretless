@@ -12,8 +12,29 @@ passed unless the harness is built so it cannot say otherwise.
 
 **R2.E.1 has twenty-six rows and this campaign files twenty mutations against
 them, and four of the twenty-six are not falsifiable and are counted as such
-rather than quietly folded into the total. R2.E.2 has ten rows and ten more
-mutations, of which one row is positive and one is half compile-time.**
+rather than quietly folded into the total. R2.E.2 has twelve rows and ten
+mutations, of which one row is positive and one is half compile-time. R2.E.3,
+the operator's declaration, has ten rows and four mutations, of which two are
+not falsifiable.**
+
+**One R2.E.3 mutation was compiler-refused on its first run and that was the
+mutation's fault, not the type's.** It reached for `super::super::grant::…` from
+a file that already imports those names, so the refusal was `cannot find
+'grant' in 'super'` and nothing about the property was measured. The base
+harness says this out loud elsewhere in this repository and the rule applies
+here: a mutation that stops compiling because it is malformed is not evidence,
+and filing it as a structural refusal would be the harness flattering itself.
+Re-pointed at the names actually in scope, it compiles and the row goes red.
+
+**The two R2.E.3 rows the campaign cannot turn red fail for a reason worth
+stating.** `un_nombre_no_canonico_no_se_declara` would be falsified by
+canonicalising nothing, and `un_destino_repetido_con_otra_ortografia_tambien_se_rechaza`
+by comparing a destination before it is canonical. Both are changes of a
+field's type rather than of a line: `asv_domain::Authority` has no public
+constructor from a raw string, so a binding that stored one would have to stop
+storing an `Authority`. What pins the behaviour instead is
+`el_host_se_canonicaliza_antes_de_resolver`, which a one-line mutation does
+reach, and which is the half that a route actually depends on.
 
 **One of the four is structural, and it is the module's whole posture.**
 `ni_la_peticion_ni_el_certificado_tienen_clave_privada` is a compiler-refused
@@ -113,6 +134,7 @@ import sts_falsify as f  # noqa: E402
 ISSUE = f.REPO / "crates/broker/src/mtls/issue.rs"
 GRANT = f.REPO / "crates/broker/src/mtls/grant.rs"
 PRESENT = f.REPO / "crates/broker/src/mtls/present.rs"
+DEPLOYMENT = f.REPO / "crates/broker/src/mtls/deployment.rs"
 BRIDGE = f.REPO / "crates/broker/src/tls_bridge.rs"
 
 # (label, old, new, test that must go red) -- all in ISSUE.
@@ -425,6 +447,48 @@ BRIDGE_MUTATIONS = [
 ]
 
 
+# R2.E.3 -- the operator's declaration. Every mutation attacks the resolution:
+# which destination an identity comes out for, and what happens to a list that
+# is ambiguous.
+DEPLOYMENT_MUTATIONS = [
+    (
+        # First-one-wins would be the alternative, and it makes the file's
+        # formatting decide which identity a destination is authenticated as.
+        "resolve a repeated destination by order instead of refusing it",
+        "        for (index, binding) in bindings.iter().enumerate() {\n            if let Some(first) = bindings[..index]\n                .iter()\n                .find(|other| other.destination() == binding.destination())\n            {\n                return Err(DeploymentError::DuplicateDestination {\n                    destination: binding.destination().to_string(),\n                    first: first.identity().to_string(),\n                    second: binding.identity().to_string(),\n                });\n            }\n        }",
+        "        let _ = &bindings;",
+        "un_destino_declarado_dos_veces_se_rechaza",
+    ),
+    (
+        # A declaration for `svc.example` would then mint an identity for
+        # `other.svc.example`, and the client certificate would be presented
+        # to a host the operator never named.
+        "resolve a declared destination by suffix",
+        "            .find(|binding| binding.destination() == canonical.as_str())",
+        "            .find(|binding| canonical.as_str().ends_with(binding.destination()))",
+        "la_resolucion_es_exacta_y_no_por_sufijo",
+    ),
+    (
+        # The failure the whole module exists to prevent, in its purest form:
+        # an identity for any destination asked about, which is a client
+        # certificate handed to whoever routed here.
+        "mint an identity for whichever host was asked for",
+        "        else {\n            return Ok(None);\n        };",
+        "        else {\n            let fallback = ClientGrant::for_identity(\"fallback.internal\", MIN_CLIENT_CERT_TTL)?;\n            return Ok(Some(ClientIdentity::issue(ca, &fallback, canonical.as_str(), now)?));\n        };",
+        "un_destino_sin_declaracion_no_produce_identidad",
+    ),
+    (
+        # The declaration holds the canonical form and the route names the same
+        # host in another case, so the identity silently stops existing and
+        # every request reads like a routing fault rather than a spelling one.
+        "compare the declared destination against the host as it was asked for",
+        "            .find(|binding| binding.destination() == canonical.as_str())",
+        "            .find(|binding| binding.destination() == host)",
+        "el_host_se_canonicaliza_antes_de_resolver",
+    ),
+]
+
+
 def run_phase(path: Path, mutations: list, title: str) -> tuple[int, dict, list]:
     """Apply `mutations` to one file and return the four-bucket tally.
 
@@ -483,6 +547,7 @@ PHASES = [
     (GRANT, "tls_bridge::mtls::tests::", GRANT_MUTATIONS, "R2.E.1 grant"),
     (PRESENT, "tls_bridge::client_auth::", PRESENT_MUTATIONS, "R2.E.2 identity"),
     (BRIDGE, "tls_bridge::client_auth::", BRIDGE_MUTATIONS, "R2.E.2 presentation"),
+    (DEPLOYMENT, "tls_bridge::mtls::deployment::tests::", DEPLOYMENT_MUTATIONS, "R2.E.3 declaration"),
 ]
 
 

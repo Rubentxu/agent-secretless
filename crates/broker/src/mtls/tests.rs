@@ -12,11 +12,11 @@
 use std::time::{Duration, Instant};
 
 use super::grant::{ClientGrant, MIN_CLIENT_CERT_TTL};
-use super::issue::{ClientCertError, ClientCsr, IssuedClientCert, issue_client_certificate};
+use super::issue::{issue_client_certificate, ClientCertError, ClientCsr, IssuedClientCert};
 use crate::tls_bridge::SessionCa;
 
 use x509_parser::extensions::GeneralName;
-use x509_parser::prelude::{FromDer, X509CertificationRequest, X509Certificate};
+use x509_parser::prelude::{FromDer, X509Certificate, X509CertificationRequest};
 
 const HOUR: Duration = Duration::from_secs(3600);
 
@@ -36,7 +36,10 @@ impl Fixture {
     /// A request whose subject and SANs are all attacker-chosen, which is the
     /// shape this module has to survive.
     fn hostile() -> Self {
-        Self::asking("CN=admin,O=attacker", &["*.internal", "*.example.com", "attacker.test"])
+        Self::asking(
+            "CN=admin,O=attacker",
+            &["*.internal", "*.example.com", "attacker.test"],
+        )
     }
 
     /// A request that asks for `subject` and `sans`.
@@ -84,8 +87,7 @@ impl Fixture {
     /// assertion below compare two unrelated public keys and fail for a
     /// reason that had nothing to do with the module under test.
     fn spki_of_key(&self) -> Vec<u8> {
-        let params =
-            rcgen::CertificateParams::new(vec!["probe.invalid".to_string()]).expect("SAN");
+        let params = rcgen::CertificateParams::new(vec!["probe.invalid".to_string()]).expect("SAN");
         let serialized = params
             .serialize_request(&self.key)
             .expect("the probe request serializes");
@@ -97,11 +99,7 @@ impl Fixture {
 fn request_spki(der: &[u8]) -> Vec<u8> {
     let (_remaining, request) =
         X509CertificationRequest::from_der(der).expect("the request parses");
-    request
-        .certification_request_info
-        .subject_pki
-        .raw
-        .to_vec()
+    request.certification_request_info.subject_pki.raw.to_vec()
 }
 
 /// A CA with the given life.
@@ -254,7 +252,10 @@ fn una_autoridad_sin_raiz_no_firma_nada() {
     )
     .expect_err("a CA with no root issues a certificate nothing can chain");
 
-    assert_eq!(refusal, ClientCertError::NoRoot(authority.session_id.clone()));
+    assert_eq!(
+        refusal,
+        ClientCertError::NoRoot(authority.session_id.clone())
+    );
 }
 
 /// **Mutation: delete the empty-intermediate check** — a CA carrying no
@@ -392,7 +393,10 @@ fn el_certificado_no_puede_ser_una_autoridad() {
         .basic_constraints()
         .expect("the extension parses")
         .expect("CA:FALSE is written explicitly, not omitted");
-    assert!(!constraints.value.ca, "a client certificate must not be a CA");
+    assert!(
+        !constraints.value.ca,
+        "a client certificate must not be a CA"
+    );
 }
 
 /// **Mutation: add `KeyCertSign` to the usages** — the holder can sign
@@ -460,7 +464,10 @@ fn la_vida_se_acota_al_resto_de_la_autoridad() {
     // alive. The window below is the test's own clock, not a tolerance chosen
     // to make the row pass: with the `min` removed the granted life is 24
     // hours and the first assertion fails by a factor of 144.
-    assert!(granted <= short, "granted {granted:?} outlasts the CA's {short:?}");
+    assert!(
+        granted <= short,
+        "granted {granted:?} outlasts the CA's {short:?}"
+    );
     assert!(
         granted >= short.saturating_sub(Duration::from_secs(5)),
         "granted {granted:?} is not the CA's remaining life"
@@ -523,8 +530,14 @@ fn una_autoridad_casi_caducada_no_firma_nada() {
     match refusal {
         ClientCertError::CaNearlyExpired { remaining, minimum } => {
             assert_eq!(minimum, MIN_CLIENT_CERT_TTL);
-            assert!(remaining < minimum, "{remaining:?} is not below {minimum:?}");
-            assert!(remaining <= expiring, "{remaining:?} exceeds the CA's own life");
+            assert!(
+                remaining < minimum,
+                "{remaining:?} is not below {minimum:?}"
+            );
+            assert!(
+                remaining <= expiring,
+                "{remaining:?} exceeds the CA's own life"
+            );
         }
         other => panic!("expected the CA's own life to be the limit, got {other:?}"),
     }
@@ -701,5 +714,8 @@ fn el_debug_de_una_peticion_no_imprime_sus_bytes() {
             "the request's bytes leaked as {spelling:?}: {rendered}"
         );
     }
-    assert!(rendered.contains("der_len"), "the length is the useful part");
+    assert!(
+        rendered.contains("der_len"),
+        "the length is the useful part"
+    );
 }

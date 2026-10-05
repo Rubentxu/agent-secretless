@@ -65,7 +65,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ClientConfig, RootCertStore};
 
 use super::grant::ClientGrant;
-use super::issue::{ClientCertError, ClientCsr, issue_client_certificate};
+use super::issue::{issue_client_certificate, ClientCertError, ClientCsr};
 use crate::tls_bridge::SessionCa;
 
 /// A client certificate and the key that matches it, held in the broker.
@@ -73,6 +73,13 @@ use crate::tls_bridge::SessionCa;
 /// Deliberately not `Clone`. An `Arc` of this is already cheap to share, so a
 /// `Clone` implementation would exist for exactly one purpose: a second copy
 /// of a private key somewhere the first copy's lifetime does not govern.
+///
+/// For the same reason it carries neither `PartialEq` nor `PartialOrd`. An
+/// equality on this type is an equality between two private keys, and the
+/// first caller to reach for it would be a test asserting that two identities
+/// differ, which says nothing about the identity and a great deal about the
+/// key. What a caller legitimately wants to know — which name a destination
+/// will see, and which destination it is bound to — has accessors.
 pub struct ClientIdentity {
     identity: String,
     /// The one destination this identity may be presented to.
@@ -120,9 +127,9 @@ impl ClientIdentity {
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, identity.clone());
-        let request = params
-            .serialize_request(&key)
-            .map_err(|e| ClientCertError::Unusable(format!("the request does not serialize: {e}")))?;
+        let request = params.serialize_request(&key).map_err(|e| {
+            ClientCertError::Unusable(format!("the request does not serialize: {e}"))
+        })?;
         let csr = ClientCsr::from_der(request.der().to_vec());
 
         let issued = issue_client_certificate(ca, grant, &csr, now)?;

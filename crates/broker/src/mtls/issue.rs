@@ -18,8 +18,8 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::CertificateSigningRequestDer;
 use time::OffsetDateTime;
 
-use super::grant::{ClientGrant, MIN_CLIENT_CERT_TTL};
 use super::super::SessionCa;
+use super::grant::{ClientGrant, MIN_CLIENT_CERT_TTL};
 
 /// A certificate signing request: the public half of a key, and a request for
 /// an identity to go with it.
@@ -60,10 +60,9 @@ impl ClientCsr {
     /// decode is the whole of what this function does, and a caller that
     /// ignored the result would be holding an empty request.
     pub fn from_pem(pem: &str) -> Result<Self, ClientCertError> {
-        let der =
-            CertificateSigningRequestDer::from_pem_slice(pem.as_bytes()).map_err(|e| {
-                ClientCertError::UnreadableCsr(format!("the PEM holds no certificate request: {e}"))
-            })?;
+        let der = CertificateSigningRequestDer::from_pem_slice(pem.as_bytes()).map_err(|e| {
+            ClientCertError::UnreadableCsr(format!("the PEM holds no certificate request: {e}"))
+        })?;
         Ok(Self { der })
     }
 }
@@ -259,18 +258,17 @@ pub fn issue_client_certificate(
     // The request. `from_der` parses the structure *and* verifies the
     // request's own signature, so a request whose SPKI was edited after
     // signing is refused here rather than certified.
-    let parsed =
-        rcgen::CertificateSigningRequestParams::from_der(&csr.der).map_err(|e| {
-            // `rcgen` reports a signature failure and a structural failure
-            // through one error type. The distinction is worth keeping because
-            // only one of them is an attack, so it is recovered from the
-            // message rather than flattened into "unreadable".
-            if matches!(e, rcgen::Error::RingUnspecified) {
-                ClientCertError::CsrSignatureInvalid
-            } else {
-                ClientCertError::UnreadableCsr(e.to_string())
-            }
-        })?;
+    let parsed = rcgen::CertificateSigningRequestParams::from_der(&csr.der).map_err(|e| {
+        // `rcgen` reports a signature failure and a structural failure
+        // through one error type. The distinction is worth keeping because
+        // only one of them is an attack, so it is recovered from the
+        // message rather than flattened into "unreadable".
+        if matches!(e, rcgen::Error::RingUnspecified) {
+            ClientCertError::CsrSignatureInvalid
+        } else {
+            ClientCertError::UnreadableCsr(e.to_string())
+        }
+    })?;
 
     // **The line this module exists for.**
     //
