@@ -69,6 +69,7 @@ has: no source edits while a campaign or a suite is in flight.
 | `k8s_client_falsify.py` | `crates/broker/src/k8s/client.rs` | 11, against 17 rows |
 | `k8s_metadata_falsify.py` | `crates/broker/src/k8s/metadata.rs` | 7 red + 2 compiler-refused, against 13 rows |
 | `k8s_binding_falsify.py` | `crates/broker/src/k8s/binding.rs` | 12, one-for-one against 20 rows |
+| `s3_falsify.py` | `crates/broker/src/aws/s3.rs` | 13, one-for-one against 23 rows |
 
 `sts_falsify.py` is also the base harness the others import, which is why its
 mutation list is a module-level `MUTATIONS` that callers replace. That has a
@@ -259,3 +260,51 @@ the product and the row compares it against the documented string.
 the DNS pin — so the binding could not be built in a row at all, and `serves`,
 the one method that decides which cluster a request reaches, had no coverage.
 It now takes the client, the same split `AwsBinding::new` already uses.
+
+`s3_falsify.py` is 13 mutations against 23 rows, 13 red one for one, and the
+module it falsifies exists to hold one property: **the path that is signed is
+the path that is sent.** The type has a single `path` field, so there is no
+second one to drift; two of the mutations try to break it anyway, one by
+re-encoding the canonical form and one by rebuilding it from the parts. Neither
+is easy to write against this shape, which is the point of the shape — an
+implementation with two path fields would have exactly the second one in it, and
+the signature would be computed over one resource while the request fetched
+another. AWS reports that as a credentials error, not an encoding one.
+
+Ten rows are not reached. Four test `encode_component`, which lives in `sigv4`
+and has its own campaign of sixteen rows against AWS's published vectors —
+re-filing them here would measure the same code twice and go stale the day
+`sigv4` changed. Three are the other half of a rule whose mutation is filed
+elsewhere. Two are positive, and one is the path-style `match` arm.
+
+**The campaign found two defects, and they are not symmetric, which is the
+interesting part.**
+
+The bucket validator had an explicit `is_ascii_uppercase` arm with its own
+message. Filing the mutation that deletes it produced a survivor — the catch-all
+below already refuses `Acme` — so the arm was redundant and is gone.
+
+The underscore arm survived the same treatment and **stayed**. Removing it does
+not change whether `acme_artifacts` is refused, because `_` is outside the
+catch-all's set. What it changes is the message: the row asserts the refusal
+names the rule, and the catch-all does not mention underscores. A check that
+earns its keep through the diagnosis rather than through the effect is still
+load-bearing, and a campaign that had reported it as redundant would have been
+wrong.
+
+Two other findings are about the campaign rather than the code, and both are the
+kind the harness exists to make impossible to miss:
+
+The first pass filed a mutation against deleted code, because the arm it named
+had just been removed. The second pass produced two survivors that were
+**artifacts of mine** — I edited the isolated checkout while the campaign was
+running against it, which invalidated both the measurement and the file the
+campaign restored. A third pass on an untouched copy gave 13 red and no
+survivors. The rule is already in the harness contract in this file's own
+header; it is repeated here because it was learned by breaking it.
+
+And the harness docstring predicted sixteen rows red, on the argument that three
+mutations would each take a second row for the other half of their rule. They
+do not — the harness credits one row per mutation, and a second attribution
+would be a claim nothing checked. The number in the file is the one that was
+measured.
