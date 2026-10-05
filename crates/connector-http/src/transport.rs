@@ -5,7 +5,7 @@
 //! connect time, so a rebind between resolve and dial buys nothing.
 //! Address resolution, policy and client construction (D1, D7).
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use asv_domain::Authority;
 use url::Url;
@@ -71,6 +71,10 @@ impl AddressPolicy {
     /// The refusals are: loopback, unspecified, private, link-local (which
     /// covers cloud metadata at 169.254.169.254), shared address space, and
     /// the documentation/benchmark ranges that should never be an API peer.
+    /// Multicast is refused for the same reason as the rest: it is a destination
+    /// that is not a host, and a registry — or anything that can answer a DNS
+    /// query for one — naming one is naming something this broker has no
+    /// business sending an `Authorization` header to.
     pub fn permits(&self, address: IpAddr) -> bool {
         match address {
             IpAddr::V4(v4) => {
@@ -81,6 +85,8 @@ impl AddressPolicy {
                     && !v4.is_private()
                     && !v4.is_link_local()
                     && !v4.is_broadcast()
+                    // 224.0.0.0/4. Not a peer: a datagram goes to a group.
+                    && !v4.is_multicast()
                     && !v4.is_documentation()
                     && !Self::is_shared_v4(v4)
                     && !Self::is_reserved_v4(v4)
@@ -95,6 +101,30 @@ impl AddressPolicy {
                     && v6.segments()[0] & 0xfe00 != 0xfc00
                     // link local, fe80::/10
                     && v6.segments()[0] & 0xffc0 != 0xfe80
+                    // site local, fec0::/10 — deprecated by RFC 3879 and
+                    // never routed, but nothing stops a name resolving to it
+                    && v6.segments()[0] & 0xffc0 != 0xfec0
+                    // multicast, ff00::/8
+                    && v6.segments()[0] & 0xff00 != 0xff00
+                    // 6to4, 2002::/16, whose embedded v4 is not checked by the
+                    // v4 arm above and which a relay will happily route
+                    && v6.segments()[0] != 0x2002
+                    // NAT64 well-known prefix, 64:ff9b::/96, plus the local-use
+                    // variant 64:ff9b:1::/48 (RFC 8215). This is the one that
+                    // matters. `64:ff9b::a9fe:a9fe` is the NAT64 translation of
+                    // 169.254.169.254 — the cloud metadata address the v4 arm
+                    // refuses by name — so without this the IPv4 refusals are
+                    // trivially bypassed on any host with DNS64 (464XLAT,
+                    // routine on IPv6-only cloud networks).
+                    //
+                    // `to_ipv4_mapped` cannot catch it: that recognises only the
+                    // `::ffff:a.b.c.d` form, and NAT64 is not that form.
+                    //
+                    // `/96` is six segments, so the embedded IPv4 starts at
+                    // segment 6 and only segments 2..=5 are prefix. Checking
+                    // segment 6 as well would compare the metadata address
+                    // against zero and pass it.
+                    && !Self::is_nat64(v6)
                     // an IPv4-mapped address inherits the v4 verdict verbatim
                     && !v6
                         .to_ipv4_mapped()
@@ -112,6 +142,33 @@ impl AddressPolicy {
     /// `240.0.0.0/4`, reserved for future use.
     fn is_reserved_v4(v4: Ipv4Addr) -> bool {
         v4.octets()[0] & 0xf0 == 0xf0
+    }
+
+    /// Whether `v6` is one of the two NAT64 well-known prefixes.
+    ///
+    /// Both are named because a resolver on a host with DNS64 picks between
+    /// them by configuration, and refusing only the one that happens to be
+    /// configured here would be a refusal of the example rather than the
+    /// mechanism:
+    ///
+    /// - `64:ff9b::/96` (RFC 6052) — the well-known prefix. Segment 6 onward
+    ///   is the embedded IPv4 address.
+    /// - `64:ff9b:1::/48` (RFC 8215) — the local-use prefix, whose embedding
+    ///   layout varies, so the whole /48 is refused rather than parsed.
+    ///
+    /// `/96` is six segments, which is why only `2..=5` is compared here: the
+    /// embedded address starts at segment 6, and testing segment 6 against zero
+    /// would refuse the prefix and permit every address in it.
+    fn is_nat64(v6: Ipv6Addr) -> bool {
+        let s = v6.segments();
+        s[0] == 0x0064
+            && s[1] == 0xff9b
+            && (match s[2..=5] {
+                [0, 0, 0, 0] => true,
+                // 64:ff9b:1::/48
+                [1, 0, 0, 0] => true,
+                _ => false,
+            })
     }
 
     fn is_documentation_v4(v4: Ipv4Addr) -> bool {
@@ -626,6 +683,82 @@ mod tests {
         assert!(rendered.contains("api.github.com"), "{rendered}");
         assert!(rendered.contains("169.254.169.254"), "{rendered}");
     }
+/// The refusals that were missing from `permits`, and the reason each one is a
+/// refusal rather than an oversight.
+///
+/// Every address here is a *destination that is not a host*, or a host that the
+/// IPv4 arm already refuses by name. The v4 refusals are the ones the policy
+/// advertises in its own doc comment — private, link-local, metadata, shared —
+/// and this row is what stops an IPv6 spelling of one of them from walking past
+/// them.
+///
+/// The mutation that puts this red is removing the corresponding condition from
+/// `permits`, and for the NAT64 entry the mutation that *passes today* is
+/// removing nothing: it is permitted now.
+#[test]
+fn a_v6_spelling_of_a_refused_v4_destination_is_also_refused() {
+    let policy = AddressPolicy::default();
+
+    // Multicast in both families. A datagram address is not a peer, and the
+    // broker has no reason to put an `Authorization` header on one.
+    for hostile in ["224.0.0.1", "239.255.255.250", "255.255.255.255"] {
+        assert!(
+            !policy.permits(IpAddr::V4(hostile.parse().expect("valid v4"))),
+            "must refuse the multicast address {hostile}"
+        );
+    }
+    for hostile in ["ff02::1", "ff0e::1", "ffff::1"] {
+        assert!(
+            !policy.permits(IpAddr::V6(v6(hostile))),
+            "must refuse the multicast address {hostile}"
+        );
+    }
+
+    // Deprecated site-local, which nothing routes and nothing should dial.
+    assert!(!policy.permits(IpAddr::V6(v6("fec0::1"))));
+
+    // 6to4 carries an IPv4 destination in segments 1..4 of the address, and the
+    // v4 arm never sees it.
+    assert!(!policy.permits(IpAddr::V6(v6("2002:a9fe:a9fe::"))));
+
+    // NAT64, the one that is a real bypass rather than a shape nobody uses.
+    // `64:ff9b::a9fe:a9fe` translates to 169.254.169.254 — the cloud metadata
+    // endpoint the v4 arm refuses by name — so on a host with DNS64 this one
+    // entry decides whether the whole IPv4 policy holds.
+    assert!(
+        !policy.permits(IpAddr::V6(v6("64:ff9b::a9fe:a9fe"))),
+        "the NAT64 translation of the metadata address must be refused; the \
+         v4 refusals are worthless if this spelling walks past them"
+    );
+
+    // The prefix itself, and a public address through the same prefix, to pin
+    // the range rather than the single address that motivated it.
+    assert!(!policy.permits(IpAddr::V6(v6("64:ff9b::0808:0808"))));
+    assert!(!policy.permits(IpAddr::V6(v6("64:ff9b::1"))));
+
+    // And the control: a real global unicast address is still permitted, so
+    // this row cannot be satisfied by refusing everything.
+    assert!(policy.permits(IpAddr::V6(v6("2606:4700:4700::1111"))));
+}
+
+/// The `::ffff:a.b.c.d` form is still recognised, so tightening the policy does
+/// not cost the one address a caller is most likely to use.
+///
+/// Separate from the row above because it is the counterweight to it: a policy
+/// that refuses every IPv6 address would make that row green forever. The two
+/// mutations that put *this* red are removing the `to_ipv4_mapped` arm, and
+/// widening the NAT64 condition to cover `::ffff:`.
+#[test]
+fn a_public_v4_mapped_v6_is_still_permitted() {
+    let policy = AddressPolicy::default();
+    assert!(policy.permits(IpAddr::V6(v6("::ffff:8.8.8.8"))));
+    // …and a mapped *hostile* address inherits the v4 refusal, which is what
+    // the arm exists for.
+    assert!(!policy.permits(IpAddr::V6(v6("::ffff:169.254.169.254"))));
+    assert!(!policy.permits(IpAddr::V6(v6("::ffff:10.0.0.1"))));
+    assert!(!policy.permits(IpAddr::V6(v6("::ffff:192.0.2.1"))));
+}
+
 }
 
 /// The end-to-end transport tests. These are the ones that make the DoD claims
