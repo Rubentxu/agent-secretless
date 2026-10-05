@@ -599,7 +599,7 @@ pub enum Response {
     /// token, and no `OpaqueSecret` wrapper because there is nothing to wrap.
     ///
     /// A refusal does not come back as one of these with empty fields: it comes
-    /// back as [`ErrorCode::Denied`] or [`ErrorCode::Provider`], so an agent can
+    /// back as [`ErrorCode::Denied`] or [`ErrorCode::Upstream`], so an agent can
     /// never mistake "I could not ask" for "I am nobody".
     AwsCallerIdentity {
         /// For example `arn:aws:sts::123456789012:assumed-role/demo/asv-session`.

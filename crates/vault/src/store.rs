@@ -15,7 +15,7 @@
 //! retrieval path the moment a connector or IPC handler wraps it.
 //!
 //! Instead the payload is encrypted as one authenticated blob, and the only
-//! read path is [`VaultStore::with_payload`], which lends the plaintext to a
+//! read path is [`VaultStore::with_secret`], which lends the plaintext to a
 //! caller-supplied closure and zeroizes it before returning. A closure cannot
 //! stash the bytes in a longer-lived structure without doing so explicitly, so
 //! the retrieval surface stays visible in review.

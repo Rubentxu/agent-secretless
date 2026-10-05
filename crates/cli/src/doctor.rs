@@ -9,7 +9,7 @@
 //! about each.
 //!
 //! So the unit of report is a [`Check`] with an id, a state and a remedy, and
-//! [`Status`] is *derived* from the set rather than reported beside it. Two
+//! [`Status`](crate::agent::schema::Status) is *derived* from the set rather than reported beside it. Two
 //! installations that are equally unusable produce the same `status` and
 //! different `checks`, and the difference is the entire content of the
 //! command. A consumer that only reads `status` still gets a correct coarse

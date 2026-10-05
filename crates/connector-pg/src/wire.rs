@@ -27,7 +27,7 @@
 //! tag. The startup packet is the exception: it has no tag, and its length is
 //! offset by four to account for its own version field.
 //!
-//! The length is validated against [`MAX_MESSAGE_BYTES`] on every read. A
+//! The length is validated against [`MAX_MESSAGE_BYTES`](crate::wire::MAX_MESSAGE_BYTES) on every read. A
 //! server that announces a huge length gets the socket closed rather than an
 //! allocation of whatever it asked for; a broker that trusts a length field
 //! from the network is a denial-of-service primitive with a remote trigger.

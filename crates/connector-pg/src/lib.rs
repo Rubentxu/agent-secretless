@@ -60,7 +60,7 @@ pub mod live;
 
 /// How the broker reaches a PostgreSQL server.
 ///
-/// Separated from [`LiveConnectorFactory`] in the broker so this crate states
+/// Separated from `LiveConnectorFactory` in the broker so this crate states
 /// what a connection needs and the broker decides what it is willing to supply.
 /// The password is a borrowed slice rather than a field: this struct is `Debug`
 /// and `Clone`, and a password that could be printed is a password that will be.

@@ -10,7 +10,7 @@
 //!
 //! # The credential never gets a name
 //!
-//! [`SecretPort::with_credential`] lends the secret to a closure and takes it
+//! [`SecretPort::lend`] lends the secret to a closure and takes it
 //! back afterwards. That is the whole security argument of this module, and it
 //! is structural rather than conventional:
 //!

@@ -47,7 +47,7 @@
 //!   correct refusals of a request whose length disagrees with the command.
 //! * **The profile's selection width is something the device confirms, not
 //!   something this client asserts.** `PCR_Read` answers with the
-//!   `TPMS_PCR_SELECTION` it used, and [`Tpm2Device::pcr_read`] requires that
+//!   `TPMS_PCR_SELECTION` it used, and [`Tpm2Device::pcr_read`](crate::tpm2::Tpm2Device::pcr_read) requires that
 //!   echo to match the request byte for byte. A device with a wider or narrower
 //!   bank is refused rather than read wrongly.
 //! * **`TPM2_GetCapability` is not used to discover the PCR banks.** The command
@@ -65,7 +65,7 @@
 //! # What is not here yet
 //!
 //! Object sealing. `seal` and `unseal` answer
-//! [`TpmError::Unsupported`](crate::tpm::TpmError::Unsupported) rather than
+//! [`TpmError::TpmRefused`](crate::tpm::TpmError::TpmRefused) rather than
 //! doing something that looks like it worked. `TPM2_CreatePrimary`,
 //! `TPM2_Create`, `TPM2_Load` and the public-area encoding are the next piece,
 //! and a `SoftwareTpm`-shaped answer here would be worse than no answer: the
@@ -256,7 +256,7 @@ const TPM_ALG_SHA256: u16 = 0x000B;
 /// profile, rounded up to a byte boundary.
 ///
 /// A profile constant, and named as one. What makes it more than a constant is
-/// that [`Tpm2Device::pcr_read`] requires the device to echo it back before it
+/// that [`Tpm2Device::pcr_read`](crate::tpm2::Tpm2Device::pcr_read) requires the device to echo it back before it
 /// will believe the answer: a device whose banks are a different width is
 /// refused rather than read with a bitmap of the wrong size, which would come
 /// back as a PCR that reads as zero rather than as an error.
@@ -411,7 +411,7 @@ pub enum Tpm2Error {
     /// The code is kept raw rather than translated, because a translated one
     /// loses the distinction between "this TPM cannot do that" and "you asked
     /// wrongly", and those send an operator to different places. A decoded name
-    /// is available through [`Tpm2Error::code_name`].
+    /// is available through `code_name`.
     #[error("tpm2 refused: 0x{code:08x} ({name})")]
     Refused {
         /// The device's own response code, untranslated.
