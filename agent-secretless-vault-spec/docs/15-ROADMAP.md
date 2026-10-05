@@ -1503,6 +1503,29 @@ session that is still writing, and an amend or a rebase to fix a message would
 trade a documented misattribution for an undocumented one. The honest repair is
 the one available: say so here, where the authority is read.
 
+**The same class of incident, one direction over, and it is worth separating
+because the tool behaved reasonably and the result is still wrong.** R2.B.2d's
+commit `f85556f` staged an explicit list of eleven files and committed cleanly.
+Its *alignment acknowledgement* was bound to work item `b259f5bd` — "R2.F.1
+registry challenge, scope narrowing and realm vetting", in cycle
+`p-20a1ee316faf2ba3/r2f-registry` — which is the other session's work, because
+the only open cycle at the time was theirs. `git sddk-align` names the active
+work item and does not read the staged diff, so following it exactly as
+documented produced a receipt attributing an OAuth2 policy change to a Docker
+registry work item. The correct work item was created afterwards
+(`fec4f163`, cycle `p-20a1ee316faf2ba3/oauth2-scope-policy`) and the closeout
+carries the real contribution, decisions, discoveries and unknowns.
+
+Two things follow, and the second is the one that generalises. The staging rule
+above is necessary and it was **not sufficient** — the commit content was right
+and the ledger was still wrong, so an audit that trusts the receipt alone would
+have read this change as registry work. And the cause is the mirror image of
+`bb710f5`: there, a path absorbed another writer's file; here, an active-item
+default absorbed this writer's work. **With two writers on one index, both a
+loose path and a correct-but-unscoped default are ways to attribute work to
+somebody else's item**, and the receipt has to be read against the diff, not
+against itself.
+
 It also has a second-order consequence worth stating, because the campaign ran
 during the same window: the `policy` pass first reported three
 `compiler-refused` results that were **not measurements at all**. The other
