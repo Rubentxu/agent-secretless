@@ -555,7 +555,7 @@ def c14_argv_runs_on_the_real_parser(files: dict[str, str], truth: dict) -> None
             if not argv:
                 check(False, f"{variant} has an argv in the source")
                 continue
-            probe = list(argv) + _completion_for(variant, argv)
+            probe = list(argv) + _completion_for(argv, home)
             _, out = run_cli(probe, home)
             parse_error = re.search(
                 r"unrecognized subcommand|unexpected argument|invalid value|"
@@ -571,44 +571,70 @@ def c14_argv_runs_on_the_real_parser(files: dict[str, str], truth: dict) -> None
 #: real credential existing anywhere near a test.
 _PLACEHOLDER_ID = "00000000-0000-4000-8000-000000000000"
 
+#: The shape of one required argument as clap prints it on a `Usage:` line: the
+#: long flag, then the value's declared type in angle brackets.
+_REQUIRED_FLAG = re.compile(r"(--[\w-]+)\s+<([^<>]+)>")
 
-def _completion_for(variant: str, argv: list[str]) -> list[str]:
+#: Values for those declared types. The key is the *type*, not the relation, so
+#: a command added tomorrow that wants a `--count <NUMBER>` is completed without
+#: anyone teaching this file that the command exists.
+_PLACEHOLDERS = {
+    "ID": _PLACEHOLDER_ID,
+    "NUMBER": "1",
+    "FILE": "/dev/null",
+    "PATH": "/dev/null",
+}
+
+
+def _placeholder_value(token: str) -> str:
+    token = token.strip("<>")
+    if token in _PLACEHOLDERS:
+        return _PLACEHOLDERS[token]
+    return "owner/repo" if "/" in token else "x"
+
+
+def _required_flags(argv: list[str], home) -> list[str]:
+    """Ask the parser which flags this command insists on, instead of assuming.
+
+    clap prints every *required* argument on the `Usage:` line and only those:
+    `[OPTIONS]` is the optional part, and each `<...>` wraps the value's declared
+    type. Reading the rule off the line is the whole completion step, and it
+    lives in the binary rather than in this file.
+
+    That matters because the previous version hardcoded the GitHub family and
+    returned nothing for everything else. The assumption held for `status
+    --json`, which takes no required flag, and broke the moment R2.F published
+    a spine whose every input is a named flag: `asv registry manifest read`
+    was reported as not parsing, when the binary parses it the moment the flags
+    are supplied. A real command reported as broken because the *checker* was
+    wrong is the mirror-image failure this file exists to prevent — a guard
+    that cries wolf gets disabled, and a disabled guard is worth less than the
+    bug it was hiding.
+
+    A required argument this table cannot supply a sane value for is not
+    quietly worked around: a wrong value fails the parse assertion in the
+    caller, which is the honest outcome. This can go red; it cannot go green by
+    omission.
+    """
+    _, out = run_cli([*argv, "--help"], home)
+    usage = next((ln for ln in out.splitlines() if ln.startswith("Usage:")), "")
+    flags: list[str] = []
+    for name, token in _REQUIRED_FLAG.findall(usage):
+        flags += [name, _placeholder_value(token)]
+    return flags
+
+
+def _completion_for(argv: list[str], home) -> list[str]:
     """What a consumer appends to a published argv before running it.
 
-    The old version of this guard appended `["--", "true"]` to anything that
-    was not already a `run` link, which was correct for exactly one shape: a
-    template whose payload is free-form positional text. R2.A's GitHub links
-    are not that shape — they are complete commands whose every input is a
-    named flag — so the blanket completion appended a stray `true` to
-    `asv github issue view` and the guard reported a parse failure for a
-    command that parses fine. It would equally have appended `true` to
-    `asv status --json`, which is not a template at all.
-
-    That is the failure this whole file exists to prevent, in the mirror image:
-    not a link that works but is undocumented, but a real command reported as
-    broken because the *checker* was wrong. A guard that cries wolf gets
-    disabled, and a disabled guard is worth less than the bug it was hiding.
-
-    The shape is read off the argv itself rather than hardcoded per relation,
-    so a descriptor that changes shape is completed correctly without this
-    function being told.
+    Two shapes exist, and only two. A template ends in `--` and the payload is
+    the consumer's own words. A spine is a complete command whose every input
+    is a named flag, and the parser — not this file — knows which ones it will
+    not run without.
     """
     if argv and argv[-1] == "--":
-        # A template: the payload is the consumer's own words.
         return ["true"]
-    if variant.startswith("Github"):
-        # A complete command whose every input is a named flag. The credential
-        # is a vault *id*, which is the whole claim `asv github` makes.
-        common = ["--credential", _PLACEHOLDER_ID]
-        if variant == "GithubIssueRead":
-            return ["--repo", "owner/repo", "--number", "1", *common]
-        if variant == "GithubIssueCreate":
-            return ["--repo", "owner/repo", "--title", "a title",
-                    "--body", "/dev/null", *common]
-        return ["--repo", "owner/repo", "--tag", "v1", "--name", "a name",
-                "--body", "/dev/null", *common]
-    # Already the whole command.
-    return []
+    return _required_flags(argv, home)
 
 
 def check_truth_is_not_vacuous(truth: dict) -> None:
@@ -626,12 +652,16 @@ def check_truth_is_not_vacuous(truth: dict) -> None:
     codes = set(truth["codes"]) | set(truth["warn_codes"])
     check(len(rels) >= 14, f"parsed {len(rels)} relations from relations.rs")
     # An exact count, not a floor. The number went 6 -> 9 in R2.A when the three
-    # GitHub relations were republished against a real command, and a `>=` here
-    # would have let the published set grow by any amount without this noticing.
-    # The tripwire is also the thing that makes the skill update mandatory: a
-    # release cannot pass with a skill that has not caught up.
-    check(len(operational) == 9,
-          f"parsed {len(operational)} published relations, expected 9")
+    # GitHub relations were republished against a real command, and 9 -> 13 in
+    # R2.F when the four registry relations were published against real verbs. A
+    # `>=` here would have let the published set grow by any amount without this
+    # noticing. The tripwire is also the thing that makes the skill update
+    # mandatory: a release cannot pass with a skill that has not caught up. So
+    # this number tracks the *product* and moves the moment a relation ships;
+    # the four per-relation checks below are what track the *skill*, and they
+    # stay red until the sibling checkout actually documents them.
+    check(len(operational) == 13,
+          f"parsed {len(operational)} published relations, expected 13")
     check(len(argv) == len(rels) and len(argv) >= 14,
           f"parsed an argv for every relation ({len(argv)} of {len(rels)})")
     check(len(codes) >= 5, f"parsed {len(codes)} error and warning codes")
