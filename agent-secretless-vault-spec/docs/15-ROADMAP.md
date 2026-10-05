@@ -74,7 +74,7 @@ is not listed, and a block with a residual says so in its own row.
 | **R1** | closed | `r1_isolated_reachability` 11/11 and `r1_isolated_e2e` 6/6, both from the product surface. One caveat, recorded because it changes how the evidence should be read: 21 tests across three files return early when unprivileged user namespaces are unavailable, and Cargo reports that as **passed**, not as skipped. The R1 full-suite result was therefore re-opened and is being corrected (`bl-bl-01M44FDFNF0003888YSWEGPXM0`). |
 | **R2.A** | closed, with one half `host-dependent` | `r2a_github_vertical` 11/11 in-process against a real TLS origin, and `r2a_cli_reachability` 4/4 against the real binaries. The live call against the real `api.github.com` is **not** measured and is not claimed; see *Status of item 1* below. |
 | **R2.B** | partial, with the strong form `host-dependent` | `r2b_oauth2_revocation` 5/5 with four falsifications run. The revocation gap is closed and the property is structural — `forget` is required on `SecretPort` with no default. Two things are **not** closed: compatibility with an operator's real IdP needs a host that has one, and the requested scope is still operator-configured rather than policy-derived, which is R4's work. |
-| **R2.C** | one operation reachable from the product surface; item 2 still not closed | `aws::sigv4` 16/16 against the AWS documentation's own vectors, `aws::sts` 34/34 and `aws::calendar` 9/9 against an oracle written from the specifications, `aws::port` 12/12 with no socket in it, `aws::identity` 12/12 against two documented AWS samples, `r2c2b_sts_vertical` 18/18 against a real TLS origin, and `r2c3_aws_vertical` 13/13 from the product surface — CLI verb, typed IPC, real vault, real policy, real origin, and the advertisement an agent reads to find the verb at all. **88 mutations** across six harnesses, and the number is the sum of the harness files rather than an inherited figure: 25 `sts`, 13 `client`, 14 `calendar`, 13 `port`, 14 `identity`, 9 `r2c3`. Of those, **85 red, 1 refused by the compiler, 2 recorded survivors** (the post-read size bound, unexercised because the fake origin always declares a `content-length`; and the binding's `Debug`, which cannot leak because `AwsSecretPort`'s own `Debug` does not). One gap named rather than hidden: R2.C.1's `sigv4` campaign was run inline and has **no saved harness**, so unlike every other figure here it cannot be re-derived. **One operation is not a catalogue** — `s3:GetObject`, the regional STS endpoints and the live call are open, so item 2 is not closed under M11's rule. See *Status of item 2*. |
+| **R2.C** | one operation reachable from the product surface; item 2 still not closed | `aws::sigv4` 16/16 against the AWS documentation's own vectors, `aws::sts` 34/34 and `aws::calendar` 9/9 against an oracle written from the specifications, `aws::port` 12/12 with no socket in it, `aws::identity` 12/12 against two documented AWS samples, `r2c2b_sts_vertical` 18/18 against a real TLS origin, and `r2c3_aws_vertical` 13/13 from the product surface — CLI verb, typed IPC, real vault, real policy, real origin, and the advertisement an agent reads to find the verb at all. **113 mutations** across seven harnesses, and the number is the sum of the harness files rather than an inherited figure: 25 `sigv4`, 25 `sts`, 13 `client`, 14 `calendar`, 13 `port`, 14 `identity`, 9 `r2c3`. Of those, **110 red, 1 refused by the compiler, 2 recorded survivors** (the post-read size bound, unexercised because the fake origin always declares a `content-length`; and the binding's `Debug`, which cannot leak because `AwsSecretPort`'s own `Debug` does not). All seven are in the repository at `tests/falsification/` and every one was re-run from there, so the figure is re-derivable rather than merely asserted. **One operation is not a catalogue** — `s3:GetObject`, the regional STS endpoints and the live call are open, so item 2 is not closed under M11's rule. See *Status of item 2*. |
 
 **The R1 row is the one worth reading twice.** `uat_040`'s file-injection row was
 asserting that the staged secret reached the redacted channel in cleartext — a
@@ -1438,16 +1438,35 @@ is exactly what it was. Anchoring the snippet on the line only `authorize_aws`
 has made it a measurement. A falsification harness that silently declines to
 measure is worse than no harness, because its total still looks like a number.
 
-**Where these six harnesses live is itself an open item, and naming it is the
-point.** They are at `~/agent-secretless-tmp/` — `sts_falsify.py`,
-`client_falsify.py`, `calendar_falsify.py`, `port_falsify.py`,
-`identity_falsify.py` and `r2c3_falsify.py` — which is persistent but is **not
-in this repository**. So the 86 is re-derivable today, by a person on this host,
-and it is not re-derivable from a clean checkout by anyone else. Until they are
-committed, R2.C's mutation figure stands in exactly the position R2.C.1's already
-did, and the honest thing is to say so rather than let "re-derivable" imply more
-than it does. Moving them under `tests/` is the fix, and it is a small one;
-it is backlog rather than done.
+**The seven harnesses are in this repository, at `tests/falsification/`,** and the
+113 is re-derivable from a clean checkout by running them. Getting there was a
+defect of its own: six of them lived at `~/agent-secretless-tmp` with `REPO`,
+`CARGO_TARGET_DIR`, `PATH`, `HOME` and the backup directory all written out as
+absolute paths for one machine. A campaign file that resolves to someone else's
+home directory is in the repository in name only, and the figure it produces is
+reproducible only by the person who wrote it. `REPO` now comes from `__file__`
+and the environment is inherited rather than replaced, so the only thing a
+second machine needs is a checkout and a cargo.
+
+Seven runs from the new location reproduce the seven numbers in the table above
+unchanged, which is the point of having done it: 25, 25, 13, 14, 13, 14 and 9.
+
+**The seventh is the one this closes.** R2.C.1's `sigv4` campaign was run inline
+and left no harness, so for the whole of this block the signing core — the part
+every other figure rests on — was the single number a second person could not
+re-derive, and the roadmap said so in three places rather than quietly rounding
+it up. It now has one: **25 mutations, 25 red, 0 survivors, 0 unmeasured.** No
+gap remains in R2.C's evidence, and the sentence that named the gap is gone
+because it is no longer true.
+
+The ordering inside that campaign is the part worth keeping. The *arithmetic* —
+the four HMAC steps and the encoding rules — comes first, because those are what
+the published vectors pin down. The *property* the module argues for comes
+second, because the vectors cannot establish it: every vector is a request that
+should succeed, so only a row that refuses a request can check it. A signer that
+computes the right HMAC and drops the host requirement passes all six vectors and
+replays across destinations, which is why the mutations that matter most there
+are the ones that delete a refusal.
 
 ---
 
