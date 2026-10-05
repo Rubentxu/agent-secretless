@@ -71,7 +71,7 @@ is not listed, and a block with a residual says so in its own row.
 | Block | State | Measured by |
 |---|---|---|
 | **R0** | closed | `tests/r0_gate.py` — 4 passed, 0 failed, 0 unavailable. Signature verification reachable from a clean install, 46 negative provenance checks, the official skill published outside this repository and cross-repo verified at 105 checks. |
-| **R1** | closed | `r1_isolated_reachability` 11/11 and `r1_isolated_e2e` 6/6, both from the product surface. One caveat, recorded because it changes how the evidence should be read: 21 tests across three files return early when unprivileged user namespaces are unavailable, and Cargo reports that as **passed**, not as skipped. The R1 full-suite result was therefore re-opened and is being corrected (`bl-bl-01M44FDFNF0003888YSWEGPXM0`). |
+| **R1** | closed, and the caveat that qualified it is gone | `r1_isolated_reachability` 11/11 and `r1_isolated_e2e` 6/6, both from the product surface, and `uat_040_isolated_worker_runtime` 15/15. This row previously carried a caveat that 21 tests returned early when their substrate was missing and Cargo reported that as **passed**. The figure was right and the file count was wrong — it is three files, not five, and the split is 18 plus 3. All 18 now **refuse** with `UNAVAILABLE_SUBSTRATE` and are falsified by `tests/falsification/r1_substrate_falsify.py`: 18 red, 14 green, 0 unmeasured. The remaining 3 are the PostgreSQL rows, which already had the better shape (`ASV_UAT033_REQUIRE=1`) and are left alone. See *The rows that reported passing without running*. |
 | **R2.A** | closed, with one half `host-dependent` | `r2a_github_vertical` 11/11 in-process against a real TLS origin, and `r2a_cli_reachability` 4/4 against the real binaries. The live call against the real `api.github.com` is **not** measured and is not claimed; see *Status of item 1* below. |
 | **R2.B** | partial, with the strong form `host-dependent` | `r2b_oauth2_revocation` 5/5 with four falsifications run. The revocation gap is closed and the property is structural — `forget` is required on `SecretPort` with no default. Two things are **not** closed: compatibility with an operator's real IdP needs a host that has one, and the requested scope is still operator-configured rather than policy-derived, which is R4's work. |
 | **R2.C** | one operation reachable from the product surface; item 2 still not closed | `aws::sigv4` 16/16 against the AWS documentation's own vectors, `aws::sts` 34/34 and `aws::calendar` 9/9 against an oracle written from the specifications, `aws::port` 12/12 with no socket in it, `aws::identity` 12/12 against two documented AWS samples, `r2c2b_sts_vertical` 18/18 against a real TLS origin, and `r2c3_aws_vertical` 13/13 from the product surface — CLI verb, typed IPC, real vault, real policy, real origin, and the advertisement an agent reads to find the verb at all. **113 mutations** across seven harnesses, and the number is the sum of the harness files rather than an inherited figure: 25 `sigv4`, 25 `sts`, 13 `client`, 14 `calendar`, 13 `port`, 14 `identity`, 9 `r2c3`. Of those, **110 red, 1 refused by the compiler, 2 recorded survivors** (the post-read size bound, unexercised because the fake origin always declares a `content-length`; and the binding's `Debug`, which cannot leak because `AwsSecretPort`'s own `Debug` does not). All seven are in the repository at `tests/falsification/` and every one was re-run from there, so the figure is re-derivable rather than merely asserted. **One operation is not a catalogue** — `s3:GetObject`, the regional STS endpoints and the live call are open, so item 2 is not closed under M11's rule. See *Status of item 2*. |
@@ -84,6 +84,52 @@ run that R2.A's exit gate required is what surfaced it. A block can be declared
 closed with a red test inside it, and the way that happened here was a row that
 never ran being indistinguishable from a row that passed. Fixed in `9d3d556`;
 the structural half is backlog.
+
+#### The rows that reported passing without running
+
+That half is no longer backlog, and it was worse than the row above suggested.
+
+**Eighteen rows across three files** — `r1_isolated_reachability.rs`,
+`r1_isolated_e2e.rs` and `uat_040_isolated_worker_runtime.rs` — probed for
+unprivileged user namespaces and, finding none, printed a line to stderr and
+`return`ed. Cargo reports a `return` as **passed**. So on a host without that
+kernel feature, eighteen evidence rows produced eighteen green ticks having
+examined nothing, and nothing in the suite-size guard could see it: the guard
+re-derives what is *enumerated*, and all eighteen were enumerated and passing.
+
+The fix is a `require_userns(row)` that panics with `UNAVAILABLE_SUBSTRATE`
+naming the row. The three states the full gate already distinguishes —
+`PASS`, `FAIL`, `SKIPPED`, `UNAVAILABLE_SUBSTRATE` — are not reachable from a
+`return`, because Cargo has no "skipped" state for an early return; the only
+attribute that produces one is `#[ignore]`, and that is a compile-time decision
+about a host nobody knows at compile time. **So a skip here can only be a
+failure**, and the message says which of the two it is rather than leaving a
+reader to guess from a red X.
+
+**The PostgreSQL suites already had the better answer and were left alone.**
+`uat033_broker.rs` and `uat033_live.rs` skip by default and turn a missing
+substrate into a failure under `ASV_UAT033_REQUIRE=1`. That is right for a
+substrate a developer may legitimately lack, and it is a deliberate design
+rather than an oversight — so the honest record is that this repository now has
+two conventions for the same problem, and why. The userns rows cannot use the
+second one without reintroducing the phantom pass, because the default *is* the
+lie.
+
+Falsified by `tests/falsification/r1_substrate_falsify.py`, which makes the
+probe answer "unavailable" the way a locked-down host would and asserts **18
+red, 14 green, 0 unmeasured**. The second half is the point: a campaign that
+only checked the guarded rows go red would also be satisfied by a guard that
+panicked unconditionally, which would turn eighteen evidence rows into eighteen
+refusals. The mutation has to be the *availability*, not the guard.
+
+Two harness defects are recorded because both produced output that looked fine.
+The first version passed `--test <target>` as a single argv element, so cargo
+matched no test for all thirty-two rows and the campaign reported `no-run` across
+the board — the four-bucket accounting is what made that visible rather than a
+result. And one row name was written from memory rather than read out of the
+file, which produced one `no-run` in a run where the other thirty-one were
+correct. Both are the same lesson as `9d3d556`, one level down: a harness that
+cannot say "I measured nothing" will eventually say "green".
 
 ### What moved, and what stayed
 

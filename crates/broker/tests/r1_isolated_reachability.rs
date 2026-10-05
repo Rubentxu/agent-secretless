@@ -199,16 +199,34 @@ fn request(session: AgentSessionId, worker: &str, args: &[&str]) -> Request {
     }
 }
 
-// --------------------------------------------------------------- the vertical
+/// Refuse the host that cannot run these rows, loudly.
+///
+/// These rows used to `eprintln!` and `return`, which Cargo reports as
+/// **passed**. A row that examined nothing and a row that passed were
+/// indistinguishable in the output, which is the same failure as the one R1
+/// was reopened for: a claim nothing measured. It also made the deficit
+/// invisible to the suite-size guard, because a `return` produces a passing
+/// test rather than an ignored one.
+///
+/// The distinction that matters: `unshare -Ur` failing is **`UNAVAILABLE
+/// SUBSTRATE`**, a host that cannot run the row. A row that runs and fails is
+/// **`FAIL`**. Neither is `PASS`, and the full gate keeps them apart on
+/// purpose. A release requirement that cannot run is not a pass.
+fn require_userns(row: &str) {
+    if !userns_available() {
+        panic!(
+            "UNAVAILABLE_SUBSTRATE: {row} needs unprivileged user namespaces, which \
+             this host does not provide. Reported as a failure rather than a \
+             return, because a return is reported as a pass."
+        );
+    }
+}
 
 /// The exit test. A request on the public surface produces a real isolated
 /// child and a typed answer carrying the posture label.
 #[test]
 fn r1_a_request_on_the_public_surface_runs_a_real_isolated_process() {
-    if !userns_available() {
-        eprintln!("skipping: unprivileged user namespaces are unavailable on this host");
-        return;
-    }
+    require_userns("r1_a_request_on_the_public_surface_runs_a_real_isolated_process");
     let peer = pinned_peer();
     let mut state = state_with(vec![template("echoer", "/bin/echo", &[])]);
     let session = open_session(&mut state, &peer);
@@ -255,10 +273,7 @@ fn r1_a_request_on_the_public_surface_runs_a_real_isolated_process() {
 /// shell fragment arrives at the child as one literal argument.
 #[test]
 fn r1_caller_arguments_reach_the_child_as_arguments() {
-    if !userns_available() {
-        eprintln!("skipping: unprivileged user namespaces are unavailable on this host");
-        return;
-    }
+    require_userns("r1_caller_arguments_reach_the_child_as_arguments");
     let peer = pinned_peer();
     let mut state = state_with(vec![template("echoer", "/bin/echo", &[])]);
     let session = open_session(&mut state, &peer);
@@ -325,10 +340,7 @@ fn r1_a_broker_with_no_declared_workers_runs_nothing() {
 /// unpinned peer is refused for the same reason surrogate minting is.
 #[test]
 fn r1_an_unpinned_session_is_refused() {
-    if !userns_available() {
-        eprintln!("skipping: unprivileged user namespaces are unavailable on this host");
-        return;
-    }
+    require_userns("r1_an_unpinned_session_is_refused");
     let peer = unpinned_peer();
     let mut state = state_with(vec![template("echoer", "/bin/echo", &[])]);
     let session = open_session(&mut state, &peer);
@@ -367,10 +379,7 @@ fn r1_a_session_the_peer_does_not_own_is_refused() {
 /// outcome and the posture — not the arguments and not the output.
 #[test]
 fn r1_an_isolated_run_is_recorded_in_the_audit_chain() {
-    if !userns_available() {
-        eprintln!("skipping: unprivileged user namespaces are unavailable on this host");
-        return;
-    }
+    require_userns("r1_an_isolated_run_is_recorded_in_the_audit_chain");
     let peer = pinned_peer();
     let mut state = state_with(vec![template("echoer", "/bin/echo", &[])]);
     let session = open_session(&mut state, &peer);
@@ -455,10 +464,7 @@ fn r1_the_audit_log_type_is_the_one_the_broker_holds() {
 /// is a credential exfiltration path with a sandbox attached.
 #[test]
 fn r1_a_lent_credential_does_not_come_back_in_the_response() {
-    if !userns_available() {
-        eprintln!("skipping: unprivileged user namespaces are unavailable on this host");
-        return;
-    }
+    require_userns("r1_a_lent_credential_does_not_come_back_in_the_response");
     let peer = pinned_peer();
     let mut state = state_with(vec![echo_secret_template()]);
     state.secrets = Some(std::sync::Arc::new(FixturePort));
@@ -507,10 +513,7 @@ fn r1_a_lent_credential_does_not_come_back_in_the_response() {
 /// cannot itself become a place the secret is written down.
 #[test]
 fn r1_the_injected_credential_reaches_the_child() {
-    if !userns_available() {
-        eprintln!("skipping: unprivileged user namespaces are unavailable on this host");
-        return;
-    }
+    require_userns("r1_the_injected_credential_reaches_the_child");
     let peer = pinned_peer();
     let mut template = echo_secret_template();
     template.arguments = vec!["-c".into(), r#"printf %s "$LEAK_TEST" | wc -c"#.into()];

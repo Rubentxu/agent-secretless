@@ -53,6 +53,27 @@ fn userns_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Refuse the host that cannot run these rows, loudly.
+///
+/// These rows used to `eprintln!` and `return`, which Cargo reports as
+/// **passed**. A row that examined nothing and a row that passed were
+/// indistinguishable in the output, which is the same failure as the one R1
+/// was reopened for: a claim nothing measured.
+///
+/// The distinction that matters: `unshare -Ur` failing is **`UNAVAILABLE
+/// SUBSTRATE`**, a host that cannot run the row. A row that runs and fails is
+/// **`FAIL`**. Neither is `PASS`, and the full gate keeps them apart on
+/// purpose. A release requirement that cannot run is not a pass.
+fn require_userns(row: &str) {
+    if !userns_available() {
+        panic!(
+            "UNAVAILABLE_SUBSTRATE: {row} needs unprivileged user namespaces, which \
+             this host does not provide. Reported as a failure rather than a \
+             return, because a return is reported as a pass."
+        );
+    }
+}
+
 /// A temp directory that cleans itself, so a failing row leaves a readable
 /// message rather than a pile.
 struct Scratch(PathBuf);
@@ -145,10 +166,7 @@ fn run_isolated(sock: &Path, worker: &str, args: &[&str]) -> std::process::Outpu
 /// and the isolated child's output came back through the product's own command.
 #[test]
 fn an_operator_declared_worker_runs_and_answers_through_the_cli() {
-    if !userns_available() {
-        eprintln!("skipping: unprivileged user namespaces are unavailable on this host");
-        return;
-    }
+    require_userns("an_operator_declared_worker_runs_and_answers_through_the_cli");
     let dir = scratch("declared");
     let (vault, passphrase) = vault_and_principal(&dir.0);
 
@@ -210,10 +228,7 @@ fn a_broker_declared_no_workers_runs_nothing() {
 /// A worker the file does not declare is refused by name.
 #[test]
 fn a_worker_the_file_does_not_declare_is_refused() {
-    if !userns_available() {
-        eprintln!("skipping: unprivileged user namespaces are unavailable on this host");
-        return;
-    }
+    require_userns("a_worker_the_file_does_not_declare_is_refused");
     let dir = scratch("undeclared");
     let (vault, passphrase) = vault_and_principal(&dir.0);
     let workers = dir.0.join("workers.json");

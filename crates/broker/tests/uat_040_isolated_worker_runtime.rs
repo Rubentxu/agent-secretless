@@ -69,6 +69,35 @@ fn userns_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Refuse the host that cannot run these rows, loudly.
+///
+/// These rows used to `eprintln!` and `return`, which Cargo reports as
+/// **passed**. A row that examined nothing was indistinguishable from a row
+/// that passed — the same failure R1 was reopened for in `9d3d556`, where a
+/// test that never ran was indistinguishable from one that passed. It also
+/// made the deficit invisible to the suite-size guard, because a `return`
+/// produces a passing test rather than an ignored one.
+///
+/// The PostgreSQL suites take the other shape, `ASV_UAT033_REQUIRE=1` turning a
+/// missing substrate into a failure on demand. That is the right answer for a
+/// substrate a developer may legitimately lack, and it is not available here:
+/// Cargo has no "skipped" state for an early return, so a skip is a pass. The
+/// only way a row can report that it did not run is by failing.
+///
+/// The distinction that matters: `unshare` failing is **`UNAVAILABLE
+/// SUBSTRATE`**, a host that cannot run the row. A row that runs and fails is
+/// **`FAIL`**. Neither is `PASS`, and the full gate keeps them apart on
+/// purpose. A release requirement that cannot run is not a pass.
+fn require_userns(row: &str) {
+    if !userns_available() {
+        panic!(
+            "UNAVAILABLE_SUBSTRATE: {row} needs unprivileged user namespaces, which \
+             this host does not provide. Reported as a failure rather than a \
+             return, because a return is reported as a pass."
+        );
+    }
+}
+
 fn deny_template(name: &str, binary: &str, args: &[&str]) -> WorkerTemplate {
     WorkerTemplate {
         name: name.into(),
@@ -126,10 +155,7 @@ fn uat_040_allow_policy_is_refused_not_downgraded() {
 
 #[test]
 fn uat_040_deny_worker_sees_only_loopback_and_cannot_reach_out() {
-    if !userns_available() {
-        eprintln!("SKIPPED: no unprivileged userns on this host");
-        return;
-    }
+    require_userns("uat_040_deny_worker_sees_only_loopback_and_cannot_reach_out");
     let t = deny_template(
         "net-probe",
         "/bin/sh",
@@ -232,10 +258,7 @@ fn uat_040_exec_failure_without_hook_marker_remains_io_error() {
 
 #[test]
 fn uat_040_env_injection_reaches_child_only() {
-    if !userns_available() {
-        eprintln!("SKIPPED: no unprivileged userns on this host");
-        return;
-    }
+    require_userns("uat_040_env_injection_reaches_child_only");
     let env_count_before = std::env::vars_os().count();
     let mut t = deny_template(
         "env-worker",
@@ -270,10 +293,7 @@ fn uat_040_env_injection_reaches_child_only() {
 
 #[test]
 fn uat_040_file_injection_is_0600_and_cleaned_up() {
-    if !userns_available() {
-        eprintln!("SKIPPED: no unprivileged userns on this host");
-        return;
-    }
+    require_userns("uat_040_file_injection_is_0600_and_cleaned_up");
     let dir = std::env::temp_dir().join(format!("asv-uat040-{}", std::process::id()));
     let path = dir.join("secret.bin");
     let mut t = deny_template(
@@ -336,10 +356,7 @@ fn uat_040_file_injection_is_0600_and_cleaned_up() {
 
 #[test]
 fn uat_040_landlock_profile_denies_unlisted_paths() {
-    if !userns_available() {
-        eprintln!("SKIPPED: no unprivileged userns on this host");
-        return;
-    }
+    require_userns("uat_040_landlock_profile_denies_unlisted_paths");
     let mut t = deny_template(
         "ll-worker",
         "/bin/sh",
@@ -379,10 +396,7 @@ fn uat_040_landlock_profile_denies_unlisted_paths() {
 
 #[test]
 fn uat_040_read_allow_does_not_grant_execute() {
-    if !userns_available() {
-        eprintln!("SKIPPED: no unprivileged userns on this host");
-        return;
-    }
+    require_userns("uat_040_read_allow_does_not_grant_execute");
     let dir = std::env::temp_dir().join(format!("asv-uat040-exec-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("fixture dir");
     let copied_binary = dir.join("true");
@@ -420,10 +434,7 @@ fn uat_040_read_allow_does_not_grant_execute() {
 
 #[test]
 fn uat_040_large_stdout_and_stderr_are_drained_concurrently() {
-    if !userns_available() {
-        eprintln!("SKIPPED: no unprivileged userns on this host");
-        return;
-    }
+    require_userns("uat_040_large_stdout_and_stderr_are_drained_concurrently");
     if !Path::new("/usr/bin/python3").is_file() {
         eprintln!("SKIPPED: no /usr/bin/python3 for the pipe-capacity probe");
         return;
@@ -449,10 +460,7 @@ fn uat_040_large_stdout_and_stderr_are_drained_concurrently() {
 
 #[test]
 fn uat_040_seccomp_bite_kills_worker_calling_bpf() {
-    if !userns_available() {
-        eprintln!("SKIPPED: no unprivileged userns on this host");
-        return;
-    }
+    require_userns("uat_040_seccomp_bite_kills_worker_calling_bpf");
     // Use libc's syscall binding from Python with the target's compiled
     // SYS_bpf number. This is a live syscall probe, not a bpftool check.
     let python = Path::new("/usr/bin/python3");
@@ -485,10 +493,7 @@ fn uat_040_seccomp_bite_kills_worker_calling_bpf() {
 
 #[test]
 fn uat_040_runaway_worker_is_killed_at_timeout() {
-    if !userns_available() {
-        eprintln!("SKIPPED: no unprivileged userns on this host");
-        return;
-    }
+    require_userns("uat_040_runaway_worker_is_killed_at_timeout");
     let t = deny_template("sleeper", "/bin/sleep", &["30"]);
     let r = WorkerRegistry::new(vec![t]);
     let mut audit = AuditLog::new(16);
@@ -518,10 +523,7 @@ fn uat_040_runaway_worker_is_killed_at_timeout() {
 
 #[test]
 fn uat_040_secret_in_stdout_is_redacted_transformed_is_not() {
-    if !userns_available() {
-        eprintln!("SKIPPED: no unprivileged userns on this host");
-        return;
-    }
+    require_userns("uat_040_secret_in_stdout_is_redacted_transformed_is_not");
     // UAT-022's honesty contract: the exact-byte redactor removes the
     // secret, does NOT magically catch base64, and the run record
     // still carries the ISOLATED_PROCESS_EXPOSURE posture.
@@ -574,10 +576,7 @@ fn uat_040_secret_in_stdout_is_redacted_transformed_is_not() {
 
 #[test]
 fn uat_040_completed_run_is_audited_with_metadata_only() {
-    if !userns_available() {
-        eprintln!("SKIPPED: no unprivileged userns on this host");
-        return;
-    }
+    require_userns("uat_040_completed_run_is_audited_with_metadata_only");
     let t = deny_template("ok-worker", "/bin/true", &[]);
     let r = WorkerRegistry::new(vec![t]);
     let mut audit = AuditLog::new(16);
