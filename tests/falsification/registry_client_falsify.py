@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""Falsification for R2.F.2, the registry request loop.
+
+Three phases over one file: the reference grammar, the token query, and the
+loop that spends what the query asked for. The phases are named in the output
+and tallied separately, because "which half survived" is the first question to
+ask of a survivor.
+
+Same five-bucket accounting as `registry_falsify.py` -- red, compiler-refused,
+green survivor, measured nothing, and a snippet this harness could not find,
+which is a defect in the harness rather than a result about the code.
+
+**Nineteen rows, seventeen mutations, three of the nineteen with no mutation of
+their own, and the reasons are worth stating.**
+
+`the_stored_credential_reaches_the_realm_and_nothing_else` is the row a
+reviewer looks for first, and there is no mutation for it. The stored
+credential exists only as the borrowed bytes a `SecretSink::accept` receives,
+inside one `SecretPort::lend` call. There is no line to change: a mutation that
+put the password on the registry request would need a variable holding it, and
+no such variable is in scope in `build_request`. That is a stronger claim than
+"there is no test" -- the row still measures the property, by reading both
+origins' recorded requests, and it is what would go red the day the sink's shape
+changed.
+
+`a_realm_the_vetting_refuses_never_receives_a_connection` is filed as compound
+because the rule it exercises lives in `registry.rs`, where the R2.F.1 campaign
+already falsified it. What is new here is the socket: the trap origin records
+zero connections, which is the only way to see that a refusal happened *before*
+the request rather than during it.
+
+`a_reply_can_carry_the_header_a_registry_would` measures the fixture, not the
+module. It is here because a `401` without `WWW-Authenticate` is not a `401`,
+and every row in the loop phase depends on that variant existing.
+
+**The mutation to read first is the one that forwards the challenge's scope.**
+`token_query` is four lines and the whole argument of R2.F is in them: the
+challenge is the sender's request, and what reaches the token endpoint is what
+this side decided. Docker Hub answers `pull,push` to a pull, so a client that
+forwarded the challenge would ask for a push-capable token while reading an
+image, and every other check in the loop would still pass. The wire row reads
+the token endpoint's own record of its request line rather than the code that
+built it, so it is the query string on the wire that is being asserted and not
+the string in memory.
+
+**The second is skipping the narrowing.** The token is already in memory when
+`narrow` is called, so `let _ = narrow(...)` compiles, every other check still
+passes, and a grant of `repository:someone/else:pull,push` is spent against
+`library/alpine`. That is the confused deputy, and one character is the
+difference between refusing it and doing it.
+
+**Two rows were green for a reason that was not the code they named, and both
+were found by this campaign.**
+
+`a_push_body_arrives_at_the_registry_exactly_as_it_was_given` compared the body
+the fake origin recorded, and the fixture reads bodies as text. A mutation that
+re-encodes the body through `String::from_utf8_lossy` therefore agreed with the
+row, because both were lossy in the same way. The row is now
+`a_push_body_reaches_the_request_byte_for_byte` and reads the bytes out of the
+built request, where they are still bytes.
+
+`a_refusal_without_a_challenge_is_not_a_puzzle` came back green with the
+`BearerChallenge::parse` line replaced, because a `401` carrying no challenge
+header is refused one line earlier -- at the `ok_or(NoChallenge)` -- and the
+parse is never reached. The mutation now sits on the `ok_or`, which is the line
+the row was always about.
+
+**One defect was found while building this campaign, and it was in the harness
+rather than the code.** The first run reported a row as a survivor when the
+mutation had not been applied at all, because the snippet it looked for had
+been re-wrapped by `rustfmt`. That is the reason `harness error` is a bucket
+of its own: a mutation that did not run and a row that resisted a mutation are
+both a "no" and only one of them says anything about the code.
+
+Run:  python3 registry_client_falsify.py
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import sts_falsify as f  # noqa: E402
+
+CLIENT = f.REPO / "crates/connector-http/src/registry/client.rs"
+
+UNIT = "registry::client::tests::"
+WIRE = "registry::client::wire_tests::"
+
+# (label, old, new, test that must go red)
+REFERENCE_MUTATIONS = [
+    (
+        # A digest that is not a digest is a lookup the registry will answer
+        # about a blob nobody named.
+        "accept a digest of any length",
+        "if digest.len() != 64\n                || !digest\n                    .bytes()\n                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())\n            {",
+        "if false {",
+        "a_digest_reference_is_a_real_sha256_and_nothing_else",
+    ),
+    (
+        # `sha256` digests are lowercase hex. Two spellings of one address means
+        # two cache keys for one blob, and a comparison that treats them as
+        # different.
+        "accept an uppercase digest",
+        ".all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())",
+        ".all(|b| b.is_ascii_hexdigit())",
+        "a_digest_reference_is_a_real_sha256_and_nothing_else",
+    ),
+    (
+        # The traversal. A reference is interpolated into a URL path, so
+        # `latest/../other` addresses a different resource on the same registry
+        # and `/v2/../v2/admin/manifests/x` is a pull from `admin`.
+        "accept any reference without a control character",
+        "        if !raw\n            .bytes()\n            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))\n        {",
+        "        if !raw.bytes().all(|b| !b.is_ascii_control()) {",
+        "a_reference_cannot_step_out_of_its_own_repository",
+    ),
+    (
+        # A very long reference is a very long string for every hop to read.
+        "stop bounding the reference length",
+        "if raw.len() > MAX_REFERENCE_LENGTH {",
+        "if false {",
+        "an_over_long_reference_is_refused_as_a_length",
+    ),
+    (
+        # The push body is the agent's data. A connector that re-encodes it is a
+        # connector that can change it, and a manifest that survived a lossy
+        # round trip is a manifest nobody asked for. Filed here rather than in
+        # the loop phase because the row reads the built request, not a socket.
+        "re-encode the push body on the way out",
+        "        builder = builder.body(body.to_vec());",
+        "        builder = builder.body(String::from_utf8_lossy(body).as_bytes().to_vec());",
+        "a_push_body_reaches_the_request_byte_for_byte",
+    ),
+    (
+        "build the manifest path with the halves the wrong way round",
+        "        \"/v2/{}/manifests/{}\",\n        repository.as_str(),\n        reference.as_str()",
+        "        \"/v2/{}/manifests/{}\",\n        reference.as_str(),\n        repository.as_str()",
+        "the_manifest_path_is_built_from_the_two_checked_halves",
+    ),
+]
+
+# (label, old, new, test that must go red)
+QUERY_MUTATIONS = [
+    (
+        # The mutation to read first. The challenge is a request from the party
+        # being authenticated; this query is the decision.
+        "ask the token endpoint for the challenge's scope",
+        '    query.push(("scope".to_string(), asked.as_str()));',
+        '    query.push(("scope".to_string(), "repository:library/alpine:pull,push".to_string()));',
+        "the_token_query_carries_the_asked_scope_and_not_the_challenges",
+    ),
+    (
+        # Without the service, the token endpoint cannot tell which registry
+        # asked, and answers for the wrong one or not at all.
+        "leave the service out of the token query",
+        '    if let Some(service) = service {\n        query.push(("service".to_string(), service.to_string()));\n    }',
+        '    let _ = service;',
+        "the_token_query_carries_the_asked_scope_and_not_the_challenges",
+    ),
+    (
+        # A push that asked for a pull. The operation is the only input, so
+        # this is the shape a "just add what the challenge said" change takes.
+        "ask for every action whatever the operation is",
+        '    query.push(("scope".to_string(), asked.as_str()));\n    query\n}',
+        '    query.push(("scope".to_string(), "repository:library/alpine:pull,push".to_string()));\n    query\n}',
+        "the_token_query_names_the_operation_and_not_the_operation_set",
+    ),
+]
+
+# (label, old, new, test that must go red)
+LOOP_MUTATIONS = [
+    (
+        # A `200` is not a reason to redeem a token. Taking this branch away
+        # makes every anonymous pull ask the vault for a credential nobody
+        # requested.
+        "redeem a token whether or not there was a challenge",
+        "        if response.status() != reqwest::StatusCode::UNAUTHORIZED {",
+        "        if false {",
+        "an_anonymous_pull_never_opens_the_vault",
+    ),
+    (
+        # Inventing a token endpoint is inventing a credential source, and
+        # inventing one on a registry's say-so is how a redirect becomes SSRF.
+        #
+        # The first version of this mutation replaced the `BearerChallenge::parse`
+        # line and came back green, and the reason is the third thing this
+        # campaign found about its own tests: a `401` with no challenge header
+        # is refused one line *earlier*, by the `ok_or(NoChallenge)`, so the
+        # parse was never reached and nothing about it had been measured. The
+        # mutation belongs on the `ok_or`.
+        "guess a realm when the registry names none",
+        "            .ok_or(RegistryError::NoChallenge)?\n            .to_string();",
+        '            .unwrap_or(r#"Bearer realm="https://auth.docker.io/token""#)\n            .to_string();',
+        "a_refusal_without_a_challenge_is_not_a_puzzle",
+    ),
+    (
+        # The token is already in memory here, so dropping the check compiles
+        # and everything else still passes.
+        "spend a grant that does not cover the operation",
+        "        narrow(&asked, &granted)?;",
+        "        let _ = narrow(&asked, &granted);",
+        "a_grant_that_does_not_cover_the_operation_never_reaches_the_retry",
+    ),
+    (
+        # The confused deputy, spelled out: a token for `someone/else` spent
+        # against `library/alpine`.
+        "spend a grant for another repository",
+        "        let granted = granted_scope_from_token_response(&outcome.body)?;\n        narrow(&asked, &granted)?;",
+        "        let granted = granted_scope_from_token_response(&outcome.body)?;\n        let _ = narrow(&asked, &granted);",
+        "a_grant_for_another_repository_never_reaches_the_retry",
+    ),
+    (
+        # A locked vault has to stop the exchange. Treating a failed lend as an
+        # empty token sends the retry unauthenticated and calls it a refusal.
+        "carry on when the vault would not open",
+        "        self.port.lend(&self.credential, &mut sink)?;",
+        "        let _ = self.port.lend(&self.credential, &mut sink);",
+        "a_locked_vault_stops_the_exchange",
+    ),
+    (
+        # `403` from a token endpoint means the credential is not entitled to
+        # this scope, which is a different thing from a transport failure and
+        # leads the operator somewhere else entirely.
+        "ignore a token endpoint that refused",
+        "        if !outcome.status.is_success() {",
+        "        if false {",
+        "a_refusing_token_endpoint_names_its_status",
+    ),
+    (
+        # A `401` is a step in this protocol, so a second one is not a manifest.
+        "read the body whatever the registry answered",
+        "    if response.status().as_u16() != expected {",
+        "    if false {",
+        "a_second_refusal_is_reported_and_not_read_as_a_manifest",
+    ),
+    (
+        # A `PUT` answers `201`. Expecting `200` would make every push fail
+        # against a registry that followed the specification.
+        "expect a 200 from a push",
+        "        RegistryOperation::Push => 201,",
+        "        RegistryOperation::Push => 200,",
+        "a_push_asks_for_a_push_and_takes_the_answered_manifest",
+    ),
+]
+
+
+def run_phase(path: Path, prefix: str, mutations: list, title: str) -> tuple[int, dict, list]:
+    """Apply `mutations` to one file and return the five-bucket tally.
+
+    A snippet this harness cannot find exactly once is a defect in the harness,
+    not a result about the code, and it has its own bucket for that reason.
+    """
+    original = path.read_text()
+    buckets = {
+        "red": 0,
+        "compiler-refused": 0,
+        "green (SURVIVOR)": 0,
+        "measured nothing": 0,
+        "harness error": 0,
+    }
+    problems: list = []
+    f.TEST_PREFIX = prefix
+    try:
+        for label, old, new, test in mutations:
+            if original.count(old) != 1:
+                buckets["harness error"] += 1
+                problems.append(
+                    (label, test, f"snippet counts {original.count(old)}, want 1 -- harness defect")
+                )
+                print(f"SKIP  {label!r}: snippet is not unique ({original.count(old)})", flush=True)
+                continue
+            path.write_text(original.replace(old, new, 1))
+            try:
+                verdict, out = f.run_test(test)
+            finally:
+                path.write_text(original)
+            if verdict == "red":
+                buckets["red"] += 1
+                print(f"ok    [{title}] {label}\n      -> {test} went red", flush=True)
+            elif verdict == "green":
+                buckets["green (SURVIVOR)"] += 1
+                problems.append((label, test, "the row stayed green"))
+                print(f"SURVIVOR  [{title}] {label}\n      -> {test} stayed GREEN  <-- the finding", flush=True)
+            elif verdict == "refused":
+                buckets["compiler-refused"] += 1
+                first = next(
+                    (ln.strip() for ln in out.splitlines() if ln.strip().startswith("error")), "?"
+                )
+                print(f"ok*   [{title}] {label}\n      -> {test}: refused by the compiler\n         {first}", flush=True)
+            else:
+                buckets["measured nothing"] += 1
+                problems.append((label, test, verdict))
+                print(f"BAD   [{title}] {label}\n      -> {test}: {verdict}", flush=True)
+    finally:
+        path.write_text(original)
+    assert path.read_text() == original, f"{path} was not restored"
+    assert sum(buckets.values()) == len(mutations), (buckets, len(mutations))
+    return len(mutations), buckets, problems
+
+
+# (prefix, mutations, phase title)
+PHASES = [
+    (UNIT, REFERENCE_MUTATIONS, "R2.F.2 reference"),
+    (UNIT, QUERY_MUTATIONS, "R2.F.2 token query"),
+    (WIRE, LOOP_MUTATIONS, "R2.F.2 the loop"),
+]
+
+
+def main() -> int:
+    f.CARGO_TARGET = "--lib"
+    f.PACKAGE = "asv-connector-http"
+    f.MUTATIONS[:] = REFERENCE_MUTATIONS
+    f.STS = CLIENT
+
+    total = sum(len(m) for _, m, _ in PHASES)
+    print(f"# falsifying R2.F.2 with {total} mutations across {len(PHASES)} phases\n")
+
+    tally = {}
+    problems = []
+    for index, (prefix, mutations, title) in enumerate(PHASES, start=1):
+        f.STS = CLIENT
+        print(f"## phase {index} -- {title} ({CLIENT.relative_to(f.REPO)})")
+        _, buckets, found = run_phase(CLIENT, prefix, mutations, title)
+        tally[title] = buckets
+        problems += found
+        print()
+
+    merged = {}
+    for buckets in tally.values():
+        for key, value in buckets.items():
+            merged[key] = merged.get(key, 0) + value
+    assert sum(merged.values()) == total, (merged, total)
+
+    print(f"mutations: {total}  (the five buckets partition the run)")
+    for name, count in merged.items():
+        print(f"  {name:<22}: {count}")
+    print()
+    for title, buckets in tally.items():
+        line = ", ".join(f"{k}={v}" for k, v in buckets.items() if v)
+        print(f"  {title}: {line or 'none'}")
+
+    for label, test, why in problems:
+        print(f"\nFINDING: {label}\n  test: {test}\n  {why}")
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

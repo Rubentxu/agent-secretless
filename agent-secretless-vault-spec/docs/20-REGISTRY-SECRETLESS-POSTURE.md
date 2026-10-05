@@ -1,9 +1,10 @@
 # R2.F — Docker/registry: what secretless posture is actually reachable
 
-Status: research, decided, and the first increment is implemented. The core
-lives in `crates/connector-http/src/registry.rs`, not under the broker: the
-`SecretPort` it will eventually feed is defined in that crate, and the
-challenge carries no session or policy state of its own.
+Status: research, decided, and two increments implemented. The core lives in
+`crates/connector-http/src/registry.rs` and the request loop that spends what
+it decides lives in `crates/connector-http/src/registry/client.rs` — not under
+the broker, because the `SecretPort` it feeds is defined in that crate and
+neither file carries session or policy state.
 
 ## The question the mandate asks first
 
@@ -174,3 +175,48 @@ and the reason the campaign is worth more than the review that preceded it:
 
 Neither was found by reading the code. Both were found by asking what else could
 be holding a green row up.
+
+## R2.F.2, the request loop
+
+`RegistryClient` spends what R2.F.1 decides. The shape of the loop is the
+posture in three lines:
+
+1. Ask the registry for the resource, with no credential attached.
+2. On a `401`, read the challenge, vet the `realm`, ask the `realm` for a token
+   with **this side's** scope, and narrow the grant on the way out.
+3. Retry once with the token, and stop.
+
+The stored credential is lent exactly once, by `SecretPort::lend`, to build one
+`Basic` header on the token request. It is never a variable anything else can
+reach, which is why a mutation that put it on the registry request does not
+compile rather than merely failing a test. The token is what the retry carries,
+and it is spent inside one connection.
+
+**A row reads the token endpoint's own record of what it was asked for, rather
+than the code that built the query.** The query string is the only place the
+scope decision becomes visible to a third party, and Docker Hub answers
+`pull,push` to a pull, so a client that forwarded the challenge would ask for a
+push-capable token while reading an image — with every other check in the loop
+still passing.
+
+**Nineteen rows, seventeen mutations, seventeen red.** Two more rows were green
+for reasons that were not the code they named:
+
+- The push-body row compared what the fake origin recorded, and the fixture
+  reads bodies as text. A mutation re-encoding the body through
+  `String::from_utf8_lossy` therefore agreed with the row, because both were
+  lossy in the same way. The row now reads the bytes out of the built request,
+  where they are still bytes.
+- The "no challenge is not a puzzle" row came back green with its
+  `BearerChallenge::parse` line replaced, because a `401` with no challenge
+  header is refused one line earlier. The mutation was measuring the wrong
+  line, and moving it one line up is what turned the row red.
+
+## What is still missing
+
+The loop is not yet reachable from a session. A real request has to arrive from
+a brokered session, a `Request` has to name a registry operation, and the broker
+has to decide which repository an agent may touch — which means `Action` in the
+domain, dispatch in the policy engine, and a verb in the CLI. Those are
+R2.F.3, and they are the same three files every remaining roadmap row needs, so
+they are the next thing to unblock rather than the next thing to start.

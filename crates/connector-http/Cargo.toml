@@ -23,6 +23,10 @@ thiserror.workspace = true
 # it builds from a borrowed secret is scrubbed as soon as the request is built.
 serde_json.workspace = true
 zeroize.workspace = true
+# R2.F: the registry token endpoint takes the stored credential base64-encoded
+# inside a `Basic` header. Already in the tree for the OAuth2 client-secret
+# case, so this is a move rather than a new dependency.
+base64.workspace = true
 # Only ever reached through `test-support`. Declared optional so the default
 # build carries neither of them.
 rcgen = { version = "0.13", optional = true }

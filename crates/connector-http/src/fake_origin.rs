@@ -312,6 +312,19 @@ pub enum Reply {
     /// makes more requests than it planned still terminates rather than
     /// hanging on an empty queue.
     Sequence(Vec<Reply>),
+
+    /// A status with headers this caller chose, and no scripting.
+    ///
+    /// This exists because a `401` is not a status: a registry's `401` carries
+    /// the `WWW-Authenticate` header that names the token endpoint, and a
+    /// fixture that can only produce a status cannot produce the thing a
+    /// registry client actually has to read. `Status` was enough while the only
+    /// consumer parsed JSON bodies.
+    WithHeaders {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: String,
+    },
 }
 
 impl Reply {
@@ -324,10 +337,23 @@ impl Reply {
             }
             Reply::Json(body) => OriginResponse::json(200, body.clone()),
             Reply::Status { status, body } => OriginResponse::new(*status, body.clone()),
-            Reply::StatusWithoutLocation { status } => OriginResponse::new(*status, String::new()),
-            Reply::StatusWithLocation { status, body, location } => {
-                OriginResponse::new(*status, body.clone()).with_header("location", location)
+            Reply::WithHeaders {
+                status,
+                headers,
+                body,
+            } => {
+                let mut response = OriginResponse::new(*status, body.clone());
+                for (name, value) in headers {
+                    response = response.with_header(name, value);
+                }
+                response
             }
+            Reply::StatusWithoutLocation { status } => OriginResponse::new(*status, String::new()),
+            Reply::StatusWithLocation {
+                status,
+                body,
+                location,
+            } => OriginResponse::new(*status, body.clone()).with_header("location", location),
             // A sequence is resolved to one reply before it gets here, so a
             // nested sequence would mean a scripting mistake rather than a shape
             // the wire can express.

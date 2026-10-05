@@ -48,6 +48,9 @@ use url::Url;
 
 use crate::transport::{resolve_and_pin, AddressPolicy, ResolvedAudience, TransportError};
 
+/// R2.F.2: the request loop that spends the token this module's policy asks for.
+pub mod client;
+
 /// The port a token endpoint is reached on. Not a default worth having: a
 /// `realm` on any other port is not the endpoint the registry described, and
 /// allowing it would turn "send the token request to the host the registry
@@ -299,6 +302,12 @@ pub enum RealmError {
     Unreachable(#[from] TransportError),
 }
 
+/// What a realm is, once the parts that need no lookup have been decided.
+struct Vetted {
+    authority: Authority,
+    path: String,
+}
+
 /// A `realm` that has been taken apart and found to point somewhere this
 /// transport is willing to go.
 ///
@@ -321,6 +330,76 @@ impl Realm {
     /// a DNS lookup. A `realm` that is going to be refused should cost as
     /// little as possible, because a relay can send as many as it likes.
     pub fn vet(raw: &str, policy: AddressPolicy) -> Result<Self, RealmError> {
+        Self::vet_reaching(raw, policy, TOKEN_PORT)
+    }
+
+    /// The same vetting, against a port this side chose rather than the one the
+    /// realm named.
+    ///
+    /// Exists because the test origin listens on an ephemeral port, and a test
+    /// that cannot reach the real constructor tests nothing about it. It is not
+    /// a way around the port rule: [`Realm::vet`] is the only constructor that
+    /// ships, and it always passes [`TOKEN_PORT`]. This one is available to
+    /// tests and to `test-support` consumers, and the row that says so is
+    /// `a_vetted_realm_keeps_the_port_it_reaches`.
+    ///
+    /// Private on purpose: a caller outside this module that could name a port
+    /// would be able to send the token request somewhere the port rule was
+    /// written to keep it from.
+    fn vet_reaching(raw: &str, policy: AddressPolicy, port: u16) -> Result<Self, RealmError> {
+        let vetted = Self::vet_url(raw, policy, port)?;
+        let resolved = resolve_and_pin(&vetted.authority, port, policy)?;
+        Ok(Self {
+            authority: vetted.authority,
+            path: vetted.path,
+            resolved,
+        })
+    }
+
+    /// The same vetting, against addresses the caller already holds.
+    ///
+    /// The URL is taken apart by exactly the same code and the addresses are
+    /// checked against exactly the same policy; the only difference is that
+    /// nothing is resolved. That is what makes this a test seam rather than a
+    /// second rule: there is one place where a realm is decided, and a test
+    /// that reached it this way is testing that place.
+    ///
+    /// It exists because a name that resolves to both `127.0.0.1` and `::1`
+    /// registers both addresses in a pinned client, and the HTTP stack keeps
+    /// the last one -- so a v4-only fixture is unreachable under a name that
+    /// resolves to both. The alternative was a v6-only fixture, which makes
+    /// every other fixture in the tree unreachable, or a fixture that pins its
+    /// own name, which cannot be vetted at all.
+    #[cfg(any(test, feature = "test-support"))]
+    fn vet_reaching_at(
+        raw: &str,
+        policy: AddressPolicy,
+        port: u16,
+        addresses: &[std::net::IpAddr],
+    ) -> Result<Self, RealmError> {
+        let vetted = Self::vet_url(raw, policy, port)?;
+        for address in addresses {
+            if !policy.permits(*address) {
+                return Err(RealmError::Unreachable(TransportError::NonPublicAddress {
+                    audience: vetted.authority.to_string(),
+                    address: *address,
+                }));
+            }
+        }
+        Ok(Self {
+            resolved: ResolvedAudience {
+                authority: vetted.authority.clone(),
+                port,
+                addresses: addresses.to_vec(),
+            },
+            authority: vetted.authority,
+            path: vetted.path,
+        })
+    }
+
+    /// Everything about a realm that is decided without touching DNS.
+    fn vet_url(raw: &str, policy: AddressPolicy, port: u16) -> Result<Vetted, RealmError> {
+        let _ = policy;
         let url = Url::parse(raw).map_err(|e| RealmError::Unreadable(e.to_string()))?;
 
         if url.scheme() != "https" {
@@ -339,29 +418,31 @@ impl Realm {
         if url.fragment().is_some() {
             return Err(RealmError::Refused { what: "a fragment" });
         }
-        if let Some(port) = url.port() {
-            if port != TOKEN_PORT {
+        // The rule is "the port named must be the port reached", not "the port
+        // named must be 443". Written the second way, the check would refuse
+        // the same destination spelled with its default port, and the test
+        // origin -- which listens on an ephemeral one -- could not be reached
+        // at all. In production `port` is always [`TOKEN_PORT`], so the two
+        // readings coincide and a realm still cannot choose a port.
+        if let Some(named) = url.port() {
+            if named != port {
                 return Err(RealmError::UnexpectedPort {
-                    port,
-                    expected: TOKEN_PORT,
+                    port: named,
+                    expected: port,
                 });
             }
         }
 
         let host = url.host_str().ok_or(RealmError::NoHost)?;
-        // `canonicalize` is the same routine the Cedar allowlist and the
-        // pinned client use to decide what "the same host" means, so the realm
-        // cannot get a spelling past that one cares about. It also refuses an
-        // address literal, which is the cheap way to refuse 127.0.0.1 and
+        // `canonicalize` is the same routine the Cedar allowlist and the pinned
+        // client use to decide what "the same host" means, so the realm cannot
+        // get a spelling past that one cares about. It also refuses an address
+        // literal, which is the cheap way to refuse 127.0.0.1 and
         // 169.254.169.254 without a lookup.
         let authority = Authority::canonicalize(host)?;
-
-        let resolved = resolve_and_pin(&authority, TOKEN_PORT, policy)?;
-
-        Ok(Self {
+        Ok(Vetted {
             authority,
             path: url.path().to_string(),
-            resolved,
         })
     }
 

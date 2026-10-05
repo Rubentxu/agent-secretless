@@ -223,6 +223,7 @@ name = "asv-connector-http"
 version = "0.29.0"
 dependencies = [
  "asv-domain",
+ "base64 0.22.1",
  "rcgen",
  "reqwest",
  "rustls",
