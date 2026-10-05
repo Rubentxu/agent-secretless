@@ -74,7 +74,7 @@ is not listed, and a block with a residual says so in its own row.
 | **R1** | closed | `r1_isolated_reachability` 11/11 and `r1_isolated_e2e` 6/6, both from the product surface. One caveat, recorded because it changes how the evidence should be read: 21 tests across three files return early when unprivileged user namespaces are unavailable, and Cargo reports that as **passed**, not as skipped. The R1 full-suite result was therefore re-opened and is being corrected (`bl-bl-01M44FDFNF0003888YSWEGPXM0`). |
 | **R2.A** | closed, with one half `host-dependent` | `r2a_github_vertical` 11/11 in-process against a real TLS origin, and `r2a_cli_reachability` 4/4 against the real binaries. The live call against the real `api.github.com` is **not** measured and is not claimed; see *Status of item 1* below. |
 | **R2.B** | partial, with the strong form `host-dependent` | `r2b_oauth2_revocation` 5/5 with four falsifications run. The revocation gap is closed and the property is structural — `forget` is required on `SecretPort` with no default. Two things are **not** closed: compatibility with an operator's real IdP needs a host that has one, and the requested scope is still operator-configured rather than policy-derived, which is R4's work. |
-| **R2.C** | foundation only, one layer deeper | `aws::sigv4` 16/16 against the AWS documentation's own vectors, `aws::sts` 34/34 and `aws::calendar` 9/9 against an oracle written from the specifications, and `r2c2b_sts_vertical` 11/11 against a real TLS origin. 49 mutations run across the three: 47 falsified the row they name, 1 refused by the compiler, 1 recorded as unmeasured. **Still no broker operation, no CLI verb, and no agent-reachable surface**, so item 2 is not closed under M11's rule. See *Status of item 2*. |
+| **R2.C** | foundation only, two layers deeper | `aws::sigv4` 16/16 against the AWS documentation's own vectors, `aws::sts` 34/34 and `aws::calendar` 9/9 against an oracle written from the specifications, `aws::port` 12/12 with no socket in it, and `r2c2b_sts_vertical` 11/11 against a real TLS origin. 62 mutations run across the four: 60 falsified the row they name, 1 refused by the compiler, 1 recorded as unmeasured. **Still no broker operation, no CLI verb, and no agent-reachable surface**, so item 2 is not closed under M11's rule. See *Status of item 2*. |
 
 **The R1 row is the one worth reading twice.** `uat_040`'s file-injection row was
 asserting that the staged secret reached the redacted channel in cleartext — a
@@ -1213,6 +1213,95 @@ sentence anyone can write about a signing primitive.
 and `hmac` was already resolved through the vault; `Cargo.lock` gains one line
 and no package. `aws-sigv4` was not used: a new name in a signed SBOM to avoid
 a four-step HMAC chain is the wrong trade.
+
+#### The cache, and the three values that will not become one
+
+`AwsSecretPort` is where R2.C.2 earns its name, and its central decision is a
+**refusal**. An AWS session is three values — access key id, secret access key,
+session token — and the `SecretPort` trait this tree already has hands over one
+`&[u8]`, whose only consumer builds a bearer `Authorization` header out of it.
+So `lend` always returns `Unavailable` with a message saying why, and the
+method a caller actually uses is `lend_session`, whose sink takes all three or
+nothing. The refusal is structural rather than a missing feature: there is no
+conversion from three values to one, so nobody can add one without writing it,
+and `AwsSession` has neither `Clone` nor public getters on the two secret fields
+for the same reason — so the cache cannot duplicate the values to hand them out
+twice. `Arc<AwsSession>` is a handle, not a copy.
+
+`forget` is required on `SecretPort` with no default since R2.B, so the
+revocation property is enforced by the type rather than by this port's
+good manners. Two rows hold it from both directions, because a `forget` that
+does nothing and a `forget` that clears everything both pass a test that only
+ever used one credential.
+
+**The margin rule is where the silent case lives**, and it is the same trap R2.B
+found on the OAuth2 port: a margin at or above the session lifetime does not
+make the port refuse, it makes every call re-mint — nothing fails, and the only
+symptom is STS sitting on the critical path of every request. The port **cannot**
+refuse it, because the lifetime is whatever the role allows and the role is only
+consulted at mint time, so a check in the constructor would be a check against
+nothing. What it can do is make the arithmetic public in `serve_for`, whose
+answer for a degenerate configuration is `Duration::ZERO` rather than a negative
+number nobody notices. The boundary is **strict**: a session with exactly the
+margin left is not usable, because a request signed now and sent a moment later
+arrives with the margin already spent.
+
+#### Five defects the port's own evidence found
+
+Three were in the code and two were in the rows, and the distinction is the
+point of recording them together.
+
+- **`with_margin` documented a refusal it structurally could not perform.** It
+  returned `Result<Self, StsClientError>` and claimed in its doc that it
+  "refuses a value that would make the cache useless" — while accepting
+  everything, because there is no lifetime to compare a margin against at
+  construction. A constructor that validates is the specific thing whose absence
+  let the OAuth2 port's silent case stay silent. It returns `Self` now and says
+  why it cannot refuse.
+- **`Debug` printed a count where the receipt needs the names.** The row
+  asserting the printed form identifies the cached credential went red against
+  the implementation, and the implementation was wrong: a count of one is not
+  actionable for an operator. It prints the credential ids — vault names, not
+  secrets — and still prints none of the three values behind them.
+- **The margin boundary row was one second on the wrong side.** It asked for a
+  session with 61 seconds left against a 60-second margin and asserted a
+  re-mint; the port served it, correctly. "A bit inside the margin" is not a
+  thing: the row now pins both sides of the strict boundary, because a row that
+  cannot tell the two apart is not measuring the rule.
+- **The concurrency row could not fail, and would have hung rather than
+  failed.** It claimed to catch a lock held across the exchange, but its
+  exchange returned immediately, so nothing was ever contended — and under the
+  mutation it names, the row would have deadlocked rather than failed. It now
+  *holds* the first exchange open, asks for a second credential while it is in
+  flight, and waits with a deadline. Under the mutation it gets a red row; it no
+  longer gets a hang. A test that hangs is worse than a test that fails, and the
+  first version was the former.
+- **A row's leak assertion was defended by a different file.** "Printing the
+  port never prints a session" cannot fail on the secret values, because
+  `AwsSession` redacts its own `Debug` — that is R2.C.2.a's row. As written the
+  assertion read as if *this* file kept the values out. It now also asserts that
+  the listing carries none of the session's own detail, which is a property of
+  this file and is falsifiable here.
+
+**Two rows were replaced because they were unfalsifiable, not because they
+passed.** "A failing exchange is not cached" cannot be broken from this file at
+all: the `?` precedes the insert, and no reachable mutation can put a session
+into the cache on the error path without a constructor that does not exist. It
+is now two rows that can be broken — *a failure leaves the cache alone* (caught
+by an error path that calls `cache.clear()`, turning one unreachable STS into
+every credential re-minting at once) and *a failure does not buy a stale
+session* (caught by the tempting fallback that serves whatever is cached when
+STS is down, which converts a clean local refusal into a signature AWS rejects
+with a name pointing at the credential rather than at the margin).
+
+**The 13 mutations partition into 13 red, 0 refused by the compiler, 0
+survivors, 0 unmeasured.** A fourth harness defect is recorded because the first
+run of it reported on the wrong file: the base harness reads its mutation list
+out of its own module namespace, so assigning a same-named list locally did
+nothing and the campaign falsified `sts.rs` while saying nothing whatsoever
+about the port. `sts.rs` was verified restored, the wiring fixed, and the
+campaign re-run — and the harness now names its target file in its own header so
+that a mismatch is visible in the first line of the output.
 
 ---
 

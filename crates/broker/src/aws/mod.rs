@@ -8,13 +8,20 @@
 //! so; see [`sigv4`] for what is deliberately not there.
 //!
 //! **R2.C.2.a is `sts:AssumeRole` in both directions** — the request ASV signs
-//! and the response it reads. It is also not a provider: there is no socket, no
-//! `SecretPort` and no broker operation behind it, so nothing about it is
-//! reachable by an agent yet. That half is [`sts`]'s last paragraph, and
-//! R2.C.2.b is the one that has to earn it.
+//! and the response it reads. [`sts`].
+//!
+//! **R2.C.2.b is the transport and the cache.** [`client`] signs and sends over
+//! a pinned, private-address-refusing transport; [`port`] caches the
+//! short-lived session and hands out its three signing values through a sink
+//! that takes all three.
+//!
+//! **None of it is reachable by an agent.** There is no broker operation and no
+//! CLI verb behind any of these types, so per M11's rule item 2 stays open — a
+//! caller exists, but no agent can name one. That is R2.C.3.
 
 pub mod calendar;
 pub mod client;
+pub mod port;
 pub mod sigv4;
 pub mod sts;
 
