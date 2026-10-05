@@ -43,6 +43,17 @@ use zeroize::Zeroize;
 
 use crate::http_frame;
 
+/// R2.E — client certificates for mTLS, signed by the same [`SessionCa`] this
+/// module defines.
+///
+/// Reached through `#[path]` rather than registered in `lib.rs` because it is a
+/// subdirectory of this module's concern, not a separate top-level domain: it
+/// borrows this module's CA, this module's expiry check and this module's
+/// two-tier chain, and adds only the ability to sign a key the broker did not
+/// generate. The attribute is the same one `crates/cli/src/main.rs` uses.
+#[path = "mtls/mod.rs"]
+pub mod mtls;
+
 /// Default TTL for a session CA: 8 hours.
 pub const DEFAULT_SESSION_CA_TTL: Duration = Duration::from_secs(8 * 3600);
 

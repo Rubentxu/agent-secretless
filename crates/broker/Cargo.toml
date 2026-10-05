@@ -82,7 +82,22 @@ serde = { workspace = true }
 # M9 runtime: the per-session CA and its leaves are real x509. `rcgen` and
 # `time` are already in the lock through connector-http's test-support, so this
 # promotes them to real broker dependencies rather than adding anything new.
-rcgen = { workspace = true }
+#
+# R2.E: the `x509-parser` feature is what makes a certificate signing request
+# readable. Without it `rcgen` can only *produce* a CSR, not consume one, and
+# the broker could sign keys it generated but never a key an agent generated --
+# which is the only kind worth signing, because it is the only one whose private
+# half never enters this process. The feature is on the existing `rcgen` rather
+# than a direct `x509-parser` dependency so the ASN.1 reader and the x509 writer
+# come from the same version of the same crate, and there is no second parser
+# of this format in the graph to drift from the first. Measured cost: twelve new
+# crates, `x509-parser` plus its `der-parser`/`asn1-rs` tree.
+rcgen = { workspace = true, features = ["x509-parser"] }
+# R2.E: the CSR's own type. `rustls-pki-types` is already in the lock through
+# `rustls`; `rcgen` does not re-export it, so this promotes it to a direct
+# dependency rather than adding a crate. Naming the type instead of passing
+# `&[u8]` is what keeps "this is a CSR" in the signature.
+rustls-pki-types = "1"
 time = { workspace = true }
 # M11 / C3: the issuer talks to a provider's token endpoint over real HTTPS.
 # `reqwest` because it is already the workspace's HTTP stack with the same
@@ -116,6 +131,15 @@ asv-connector-http = { workspace = true, features = ["test-support"] }
 # the produced signatures with `ed25519_dalek::Verifier`.
 asv-ssh-agent = { workspace = true }
 ed25519-dalek = "2"
+# R2.E: the rows need to read back the certificate this module signed, and the
+# only way to assert that the subject, the SANs, the issuer and the public key
+# are what the module claims is to parse the real DER rather than trust the
+# struct that produced it. `x509-parser` is already in the graph through
+# `rcgen`'s `x509-parser` feature, so this makes it nameable in the test scope
+# without adding a crate; it is deliberately *not* a normal dependency, because
+# nothing in the broker's own code should ever be parsing a certificate it did
+# not just mint.
+x509-parser = "0.16"
 # M6 UAT-039: the broker's integration test for the PostgreSQL
 # connector lives here. The broker is already a normal dep, but the
 # test also needs to reach the connector-pg types directly to
