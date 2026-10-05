@@ -120,6 +120,81 @@ fn token_origin(scope: &str, status: u16) -> TlsOrigin {
     )
 }
 
+/// A realm that says nothing about how long its token lives, which is a shape
+/// the specification permits and this client has to survive.
+fn forgetful_token_origin(scope: &str) -> TlsOrigin {
+    let body = format!(r#"{{"token":"{TOKEN}","scope":"{scope}"}}"#);
+    TlsOrigin::start(
+        NAME,
+        Arc::new(move |_| OriginResponse::json(200, body.clone())),
+    )
+}
+
+/// The scope a request line asked for, decoded.
+///
+/// `reqwest` percent-encodes the query, and a fixture that guessed the encoding
+/// would be a fixture that only works for the spelling it guessed.
+fn asked_scope(request_line: &str) -> String {
+    request_line
+        .split("scope=")
+        .nth(1)
+        // The query ends at the `&` and at the space before `HTTP/1.1`, and
+        // both of those were part of the scope the first version built -- which
+        // is a reminder that a fixture which reads the wire is a fixture that
+        // has to read the wire correctly.
+        .and_then(|rest| rest.split(['&', ' ']).next())
+        .unwrap_or("")
+        .replace("%3A", ":")
+        .replace("%2F", "/")
+}
+
+/// A realm that grants exactly the scope it was asked for.
+///
+/// An earlier version widened the grant with the second action, so that a pull
+/// and a push could both be covered by one exchange -- and a scope is one
+/// `repository:<name>:<actions>`, so a grant naming two repositories is not a
+/// grant, it is a parse error the row then blamed on the client. Returning
+/// what was asked is also what a real endpoint does, and it leaves the
+/// narrowing in R2.F.1 to be the thing under test rather than this fixture.
+fn exact_token_origin() -> TlsOrigin {
+    TlsOrigin::start(
+        NAME,
+        Arc::new(|observed: &Observed| {
+            let asked = asked_scope(&observed.request_line);
+            OriginResponse::json(
+                200,
+                format!(r#"{{"token":"{TOKEN}","expires_in":300,"scope":"{asked}"}}"#),
+            )
+        }),
+    )
+}
+
+/// A registry that answers both halves of the surface, so one client can be
+/// asked to pull and then to push against the same origin.
+fn both_ways_origin(realm_url: &str) -> TlsOrigin {
+    let challenge = format!(
+        r#"Bearer realm="{realm_url}",service="registry.docker.io",scope="repository:library/alpine:pull,push""#
+    );
+    TlsOrigin::start(
+        NAME,
+        Arc::new(move |observed: &Observed| {
+            let bearer = observed
+                .headers
+                .iter()
+                .any(|(name, value)| name == "authorization" && value.starts_with("Bearer "));
+            if !bearer {
+                return OriginResponse::new(401, "").with_header("www-authenticate", &challenge);
+            }
+            if observed.request_line.starts_with("PUT ") {
+                OriginResponse::new(201, "")
+            } else {
+                OriginResponse::new(200, r#"{"schemaVersion":2}"#)
+                    .with_header("content-type", "application/vnd.oci.image.manifest.v1+json")
+            }
+        }),
+    )
+}
+
 /// A registry that refuses anything without a bearer and serves the manifest
 /// to anything with one.
 fn registry_origin(realm_url: &str) -> TlsOrigin {
@@ -613,5 +688,193 @@ fn a_reply_can_carry_the_header_a_registry_would() {
     assert!(
         scripted.url("/x").starts_with("https://"),
         "the scripted origin still builds a URL"
+    );
+}
+
+// ------------------------------------------------------------------ the cache
+
+/// A pull is dozens of requests. Redeeming a token for each of them is not a
+/// connector, it is a load generator pointed at the token endpoint.
+///
+/// The row counts the token endpoint's connections rather than the client's
+/// state, because the thing being claimed is about the wire.
+///
+/// Mutation: skip the cache lookup, or store nothing after a redemption.
+#[test]
+fn un_token_se_canjea_una_vez_para_varias_peticiones() {
+    let realm = token_origin("repository:library/alpine:pull,push", 200);
+    let registry = registry_origin(&realm.url("/token"));
+    let client = client_for(
+        &[&registry, &realm],
+        RecordingPort::new() as Arc<dyn SecretPort>,
+    );
+
+    for _ in 0..4 {
+        client
+            .get_manifest(&pinned_to(&registry), &repository(), &reference())
+            .expect("each read completes");
+    }
+
+    // Two requests per read: the anonymous one and the authenticated retry.
+    assert_eq!(registry.observed().len(), 8, "the reads did not all happen");
+    assert_eq!(
+        realm.observed().len(),
+        1,
+        "the token endpoint was asked {} times",
+        realm.observed().len()
+    );
+}
+
+/// A token redeemed for a pull is not reachable from a push, which is the whole
+/// reason the action is in the cache key. Docker Hub grants `pull,push` to a
+/// pull, so the token this client holds genuinely can push -- and the client
+/// must still not hand it to the push path.
+///
+/// Mutation: drop `action` from the key.
+#[test]
+fn un_token_cacheado_para_un_pull_nunca_sirve_para_un_push() {
+    let realm = token_origin("repository:library/alpine:pull,push", 200);
+    let registry = both_ways_origin(&realm.url("/token"));
+    let client = client_for(
+        &[&registry, &realm],
+        RecordingPort::new() as Arc<dyn SecretPort>,
+    );
+
+    client
+        .get_manifest(&pinned_to(&registry), &repository(), &reference())
+        .expect("the pull completes");
+    client
+        .put_manifest(&pinned_to(&registry), &repository(), &reference(), b"{}")
+        .expect("the push completes");
+
+    assert_eq!(
+        realm.observed().len(),
+        2,
+        "the push reused the pull's token, which carries a push grant"
+    );
+    // And the push asked for a push, so the second redemption was not a
+    // widened one either.
+    let asked = realm.observed();
+    assert!(
+        asked[1].request_line.contains("push"),
+        "{}",
+        asked[1].request_line
+    );
+    assert!(
+        !asked[1].request_line.contains("pull"),
+        "{}",
+        asked[1].request_line
+    );
+}
+
+/// A token for one repository is not a token for another, and the cache has to
+/// know that rather than the token endpoint having to be asked twice to prove
+/// it.
+///
+/// Mutation: drop `repository` from the key.
+#[test]
+fn un_token_de_otro_repositorio_no_se_reutiliza() {
+    let realm = exact_token_origin();
+    let registry = registry_origin(&realm.url("/token"));
+    let client = client_for(
+        &[&registry, &realm],
+        RecordingPort::new() as Arc<dyn SecretPort>,
+    );
+
+    for name in ["library/alpine", "library/other", "library/alpine"] {
+        client
+            .get_manifest(
+                &pinned_to(&registry),
+                &RepositoryName::parse(name).expect("valid"),
+                &reference(),
+            )
+            .unwrap_or_else(|e| panic!("{name} could not be read: {e}"));
+    }
+
+    // Two redemptions for three reads: `library/alpine` twice, `library/other`
+    // once. The registry challenged for `library/alpine` on all three, and the
+    // read of `library/other` still asked the token endpoint for
+    // `library/other` -- which is property 1 of R2.F.1 measured on the wire
+    // rather than in memory.
+    assert_eq!(
+        realm.observed().len(),
+        2,
+        "the second repository reused a token"
+    );
+    let observed = realm.observed();
+    let asked: Vec<&str> = observed.iter().map(|o| o.request_line.as_str()).collect();
+    assert!(
+        asked
+            .iter()
+            .any(|line| line.contains("library%2Fother") || line.contains("library/other")),
+        "the read of library/other never asked for it: {asked:?}"
+    );
+}
+
+/// A deleted credential stops being served, which is the obligation
+/// `SecretPort::forget` exists to place on this side of the port.
+///
+/// Mutation: make `forget` a no-op, or clear more than the named credential.
+#[test]
+fn una_credencial_retirada_deja_de_servirse() {
+    let realm = token_origin("repository:library/alpine:pull,push", 200);
+    let registry = registry_origin(&realm.url("/token"));
+    let port = RecordingPort::new();
+    let client = client_for(
+        &[&registry, &realm],
+        Arc::clone(&port) as Arc<dyn SecretPort>,
+    );
+
+    client
+        .get_manifest(&pinned_to(&registry), &repository(), &reference())
+        .expect("the first read completes");
+    assert_eq!(client.cached_tokens(), 1);
+
+    // The port is told first, then the token it redeemed is dropped: the order
+    // matters, because a port that is told and a client that still answers is
+    // a deleted credential that keeps working.
+    port.forget(CREDENTIAL);
+    client.forget(CREDENTIAL);
+    assert_eq!(
+        client.cached_tokens(),
+        0,
+        "the token outlived the credential"
+    );
+
+    client
+        .get_manifest(&pinned_to(&registry), &repository(), &reference())
+        .expect("the second read completes");
+    assert_eq!(
+        realm.observed().len(),
+        2,
+        "the read after the deletion was served from a token that should be gone"
+    );
+}
+
+/// A token endpoint that does not say how long its token lives gets no cache,
+/// because a guessed lifetime for a credential this side cannot watch is how a
+/// cache becomes a way to serve something the provider has withdrawn.
+///
+/// Mutation: store a token whose response carried no `expires_in`.
+#[test]
+fn un_token_sin_expires_in_no_se_cachea() {
+    let realm = forgetful_token_origin("repository:library/alpine:pull,push");
+    let registry = registry_origin(&realm.url("/token"));
+    let client = client_for(
+        &[&registry, &realm],
+        RecordingPort::new() as Arc<dyn SecretPort>,
+    );
+
+    for _ in 0..3 {
+        client
+            .get_manifest(&pinned_to(&registry), &repository(), &reference())
+            .expect("each read completes");
+    }
+
+    assert_eq!(client.cached_tokens(), 0, "an un-timed token was cached");
+    assert_eq!(
+        realm.observed().len(),
+        3,
+        "a token with no stated end was served more than once"
     );
 }

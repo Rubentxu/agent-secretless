@@ -24,7 +24,9 @@
 //! that could step outside the repository they name. The scope comes from the
 //! operation, so there is no input here that could widen a pull into a write.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::Value;
@@ -48,6 +50,49 @@ const MAX_REFERENCE_LENGTH: usize = 128;
 /// client that reached the realm on a different port than the realm rule allows
 /// would be the same defect wearing a different constant.
 const TOKEN_PORT: u16 = 443;
+
+/// How long before its stated expiry a cached token stops being handed out.
+///
+/// The distribution specification says a client should not be handed less than
+/// sixty seconds, so ten leaves fifty useful and covers a registry whose clock
+/// runs behind this one's. A token with less than this left is not cached at
+/// all rather than cached and refused a moment later.
+const TOKEN_EXPIRY_MARGIN: Duration = Duration::from_secs(10);
+
+/// What decides whether a token already held can answer this operation.
+///
+/// Every part of it is there because leaving it out would be a widening:
+/// without `action`, a pull's token would serve a push; without `repository`,
+/// one repository's token would serve another's; without `realm`, a token
+/// redeemed at one token endpoint would be presented to another; without
+/// `credential`, a token from a retired credential would outlive its deletion.
+/// The first two are the property; the last two are the reason `forget` works.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TokenKey {
+    credential: String,
+    realm: String,
+    repository: RepositoryName,
+    action: String,
+}
+
+/// A token already redeemed, and how long it may still be handed out.
+struct CachedToken {
+    token: Zeroizing<String>,
+    valid_until: Instant,
+}
+
+impl CachedToken {
+    /// Whether this token may be used at `now`.
+    ///
+    /// A separate function rather than a comparison at the call site so the
+    /// margin is a rule with rows rather than a subtraction somebody can move.
+    fn usable_at(&self, now: Instant) -> bool {
+        let Some(left) = self.valid_until.checked_duration_since(now) else {
+            return false;
+        };
+        left > TOKEN_EXPIRY_MARGIN
+    }
+}
 
 /// A manifest reference: a tag or a digest, and nothing that could leave the
 /// repository.
@@ -202,6 +247,16 @@ pub struct RegistryClient {
     /// real handshake; `PinnedClient::build_with_roots` with nothing in it is
     /// `build`, so an empty list grants nothing.
     extra_roots: Vec<reqwest::Certificate>,
+    /// Tokens already redeemed, keyed by everything that decides whether one
+    /// may answer this operation.
+    ///
+    /// A pull is dozens of requests and redeeming a token for each of them is
+    /// not a connector, it is a denial of service against the token endpoint.
+    /// Caching is why this field exists, and [`TokenKey`] is why it is safe:
+    /// the key carries the action, so a cached pull token cannot be found by a
+    /// push, and `forget` can find every token derived from a credential
+    /// without knowing anything else about them.
+    tokens: Mutex<HashMap<TokenKey, CachedToken>>,
 }
 
 impl RegistryClient {
@@ -222,7 +277,34 @@ impl RegistryClient {
             #[cfg(any(test, feature = "test-support"))]
             realm_addresses: Vec::new(),
             extra_roots: Vec::new(),
+            tokens: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Drops every token derived from `credential`.
+    ///
+    /// This is the `SecretPort::forget` obligation on the other side of the
+    /// port: the port is told to stop answering, and this is the token that
+    /// the port redeemed on its behalf. Without it, a deleted credential keeps
+    /// working until its last token expires, which is exactly the window
+    /// `SecretPort::forget` was added to close and the reason it has no
+    /// default.
+    ///
+    /// Scoped to the credential on purpose. Ending a *session* must not call
+    /// this: the derived token belongs to the credential, which outlives any
+    /// session, and a session ending would throw away a still-valid token for
+    /// no reason.
+    pub fn forget(&self, credential: &str) {
+        self.tokens
+            .lock()
+            .expect("uncontended")
+            .retain(|key, _| key.credential != credential);
+    }
+
+    /// How many tokens this client is holding, for the rows that count them.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cached_tokens(&self) -> usize {
+        self.tokens.lock().expect("uncontended").len()
     }
 
     /// Reaches the token endpoint at `addresses` rather than at whatever the
@@ -266,6 +348,7 @@ impl RegistryClient {
             #[cfg(any(test, feature = "test-support"))]
             realm_addresses: Vec::new(),
             extra_roots,
+            tokens: Mutex::new(HashMap::new()),
         }
     }
 
@@ -395,6 +478,15 @@ impl RegistryClient {
             )?
         };
         let asked = scope_to_request(operation, repository);
+        let now = Instant::now();
+        let key = self.key_for(&realm_identity(&realm), operation, repository);
+
+        // A token already redeemed for exactly this operation is one less trip
+        // to the token endpoint, and the key is what makes the reuse safe: a
+        // cached pull token is simply not reachable from a push.
+        if let Some(token) = self.cached_token(&key, now) {
+            return Ok(token);
+        }
 
         // `Realm::vet` pins the authority against port 443, which is the only
         // port a realm may name. The pinned client is built from that same
@@ -433,9 +525,86 @@ impl RegistryClient {
             .or_else(|| value.get("access_token"))
             .and_then(Value::as_str)
             .ok_or(RegistryError::NoTokenInResponse)?;
+        let expires_in = value.get("expires_in").and_then(Value::as_u64);
 
-        Ok(Zeroizing::new(token.to_string()))
+        let token = Zeroizing::new(token.to_string());
+        // A response with no stated lifetime is not cached. Guessing a
+        // lifetime for a credential this side cannot see the end of is how a
+        // cache becomes a way to serve a revoked token.
+        if let Some(seconds) = expires_in {
+            self.store_token(key, token.clone(), Duration::from_secs(seconds), now);
+        }
+        Ok(token)
     }
+
+    /// The cache key for one operation, in one place.
+    ///
+    /// It is a method and not an inline literal because the key is the whole
+    /// safety argument of the cache, and an argument with two spellings is one
+    /// of them wrong. A row that rebuilds the key by hand measures its own
+    /// hand -- which is how the first version of
+    /// `la_clave_de_cache_no_olvida_ninguna_parte_de_la_decision` came back
+    /// green under all four of its mutations.
+    fn key_for(
+        &self,
+        realm: &str,
+        operation: RegistryOperation,
+        repository: &RepositoryName,
+    ) -> TokenKey {
+        TokenKey {
+            credential: self.credential.clone(),
+            realm: realm.to_string(),
+            repository: repository.clone(),
+            action: operation.action().to_string(),
+        }
+    }
+
+    /// The token already held for this key, if it may still be used.
+    fn cached_token(&self, key: &TokenKey, now: Instant) -> Option<Zeroizing<String>> {
+        let mut cache = self.tokens.lock().expect("uncontended");
+        match cache.get(key) {
+            Some(entry) if entry.usable_at(now) => Some(entry.token.clone()),
+            // An entry that is too close to its expiry is dropped rather than
+            // left for a later caller to make the same decision about.
+            Some(_) => {
+                cache.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Keeps a token, unless what the registry said about it is too short to
+    /// be worth keeping.
+    fn store_token(
+        &self,
+        key: TokenKey,
+        token: Zeroizing<String>,
+        lifetime: Duration,
+        now: Instant,
+    ) {
+        if lifetime <= TOKEN_EXPIRY_MARGIN {
+            return;
+        }
+        self.tokens.lock().expect("uncontended").insert(
+            key,
+            CachedToken {
+                token,
+                valid_until: now + lifetime,
+            },
+        );
+    }
+}
+
+/// How a realm is written down in a cache key.
+///
+/// The authority and the path, and nothing else. The port is deliberately
+/// left out: `Realm::vet` refuses a realm that names a port other than the one
+/// being reached, so two realms that differ only in a port cannot both have
+/// survived, and a key that separated them would be a key describing a state
+/// the vetting already rules out.
+fn realm_identity(realm: &Realm) -> String {
+    format!("{}{}", realm.authority(), realm.path())
 }
 
 /// The result of one completed request.

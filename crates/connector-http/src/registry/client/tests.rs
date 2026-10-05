@@ -8,6 +8,8 @@
 use super::*;
 use crate::transport::{AddressPolicy, PinnedClient, ResolvedAudience};
 use asv_domain::Authority;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// A reference is interpolated into a URL path, so a reference that could
 /// step out of its own repository is a pull from somewhere else.
@@ -275,4 +277,264 @@ fn repository() -> RepositoryName {
 
 fn reference() -> ImageReference {
     ImageReference::parse("latest").expect("valid")
+}
+
+// ------------------------------------------------------------------- the cache
+
+/// A client for the cache rows, with nothing reachable and nothing lent.
+fn caching_client() -> RegistryClient {
+    caching_client_named("registry-credential")
+}
+
+fn caching_client_named(credential: &str) -> RegistryClient {
+    RegistryClient::new(
+        Arc::new(NoPort) as Arc<dyn crate::github::SecretPort>,
+        credential,
+        AddressPolicy {
+            allow_loopback: true,
+        },
+    )
+}
+
+/// A port that is never asked for anything; the cache rows are about what this
+/// client already holds, not about what it redeems.
+struct NoPort;
+
+impl crate::github::SecretPort for NoPort {
+    fn forget(&self, _credential: &str) {}
+
+    fn lend(
+        &self,
+        credential: &str,
+        _sink: &mut dyn crate::github::SecretSink,
+    ) -> Result<(), crate::github::SecretError> {
+        Err(crate::github::SecretError::Unavailable(
+            credential.to_string(),
+        ))
+    }
+}
+
+/// The key the loop would build, through the loop's own constructor.
+///
+/// Not a hand-rolled `TokenKey`. The first version of this file spelled the
+/// struct out here, and the campaign came back green under all four key
+/// mutations, because the row was measuring its own hand rather than the one
+/// `redeem` uses. A duplicate spelling of the thing under test is a row that
+/// passes no matter what.
+fn key(
+    client: &RegistryClient,
+    operation: RegistryOperation,
+    repository: &str,
+    realm: &str,
+) -> TokenKey {
+    client.key_for(
+        realm,
+        operation,
+        &RepositoryName::parse(repository).expect("valid"),
+    )
+}
+
+/// A token is only handed out with real time left on it.
+///
+/// Mutation: compare against the remainder rather than against the margin,
+/// which hands out a token that is about to expire -- and the registry that
+/// issued it is under no obligation to honour a request that raced its clock.
+#[test]
+fn a_token_a_punto_de_caducar_no_se_reutiliza() {
+    let now = Instant::now();
+    for (left, usable) in [
+        (Duration::from_secs(0), false),
+        (Duration::from_secs(5), false),
+        (Duration::from_secs(10), false),
+        (Duration::from_secs(11), true),
+        (Duration::from_secs(300), true),
+    ] {
+        let entry = CachedToken {
+            token: Zeroizing::new("t".to_string()),
+            valid_until: now + left,
+        };
+        assert_eq!(
+            entry.usable_at(now),
+            usable,
+            "a token with {left:?} left must be {}",
+            if usable { "handed out" } else { "refused" }
+        );
+    }
+}
+
+/// A token whose stated end has passed is not handed out at all, and asking at
+/// a later moment does not bring it back.
+///
+/// Mutation: treat an elapsed token as one with an infinite remainder.
+#[test]
+fn a_token_caducado_no_se_reutiliza() {
+    let client = caching_client();
+    let k = key(
+        &client,
+        RegistryOperation::Pull,
+        "library/alpine",
+        "https://auth.test/token",
+    );
+    let now = Instant::now();
+
+    // Put in by hand rather than through `store_token`, because that one
+    // refuses a short lifetime and the point here is what the client does when
+    // it *holds* an expired entry anyway.
+    client.tokens.lock().expect("uncontended").insert(
+        k.clone(),
+        CachedToken {
+            token: Zeroizing::new("old".to_string()),
+            valid_until: now - Duration::from_secs(1),
+        },
+    );
+
+    assert!(client.cached_token(&k, now).is_none());
+    assert!(
+        client.tokens.lock().expect("uncontended").is_empty(),
+        "the expired entry was kept rather than dropped"
+    );
+}
+
+/// A response that says nothing about how long the token lives is not cached,
+/// and neither is one whose lifetime is shorter than the margin.
+///
+/// Mutation: store it anyway, with a guessed lifetime.
+#[test]
+fn un_token_sin_tiempo_de_vida_no_se_cachea() {
+    let client = caching_client();
+    let k = key(
+        &client,
+        RegistryOperation::Pull,
+        "library/alpine",
+        "https://auth.test/token",
+    );
+    let now = Instant::now();
+
+    for lifetime in [
+        Duration::from_secs(0),
+        Duration::from_secs(9),
+        TOKEN_EXPIRY_MARGIN,
+    ] {
+        client.store_token(k.clone(), Zeroizing::new("t".to_string()), lifetime, now);
+        assert_eq!(client.cached_tokens(), 0, "{lifetime:?} must not be cached");
+        assert!(client.cached_token(&k, now).is_none());
+    }
+
+    // And one that is worth keeping is.
+    client.store_token(
+        k.clone(),
+        Zeroizing::new("t".to_string()),
+        TOKEN_EXPIRY_MARGIN + Duration::from_secs(1),
+        now,
+    );
+    assert_eq!(client.cached_tokens(), 1);
+    assert!(client.cached_token(&k, now).is_some());
+}
+
+/// The key is the whole safety argument, so the row checks each part: change
+/// one thing, get a different key. A key missing `action` is a cached pull
+/// token reachable from a push -- and the token really does carry a push
+/// grant, because the endpoint answers `pull,push` to a pull.
+///
+/// Mutation: drop any one of the four fields.
+#[test]
+fn la_clave_de_cache_no_olvida_ninguna_parte_de_la_decision() {
+    let client = caching_client();
+    let base = key(
+        &client,
+        RegistryOperation::Pull,
+        "library/alpine",
+        "https://auth.test/token",
+    );
+    for (changed, why) in [
+        (
+            key(
+                &client,
+                RegistryOperation::Push,
+                "library/alpine",
+                "https://auth.test/token",
+            ),
+            "a different action",
+        ),
+        (
+            key(
+                &client,
+                RegistryOperation::Pull,
+                "library/other",
+                "https://auth.test/token",
+            ),
+            "a different repository",
+        ),
+        (
+            key(
+                &client,
+                RegistryOperation::Pull,
+                "library/alpine",
+                "https://other.test/token",
+            ),
+            "a different realm",
+        ),
+        (
+            // A second credential, and the only way to be one is to build a
+            // second client.
+            key(
+                &caching_client_named("another-credential"),
+                RegistryOperation::Pull,
+                "library/alpine",
+                "https://auth.test/token",
+            ),
+            "a different credential",
+        ),
+    ] {
+        assert_ne!(base, changed, "{why} must not share a cache entry");
+    }
+}
+
+/// `forget` drops everything derived from one credential and nothing else.
+///
+/// Mutation: clear the whole cache, or nothing.
+#[test]
+fn forget_deja_solo_lo_que_no_venia_de_esa_credencial() {
+    let client = caching_client();
+    let another = caching_client_named("another-credential");
+    let now = Instant::now();
+    for (owner, operation) in [
+        (&client, RegistryOperation::Pull),
+        (&client, RegistryOperation::Push),
+        (&another, RegistryOperation::Pull),
+    ] {
+        client.store_token(
+            key(
+                owner,
+                operation,
+                "library/alpine",
+                "https://auth.test/token",
+            ),
+            Zeroizing::new("t".to_string()),
+            Duration::from_secs(300),
+            now,
+        );
+    }
+    assert_eq!(client.cached_tokens(), 3);
+
+    client.forget("registry-credential");
+    assert_eq!(
+        client.cached_tokens(),
+        1,
+        "forget took more or less than the one credential's tokens"
+    );
+    assert!(
+        client
+            .cached_token(
+                &key(
+                    &another,
+                    RegistryOperation::Pull,
+                    "library/alpine",
+                    "https://auth.test/token",
+                ),
+                now
+            )
+            .is_some(),
+        "another credential's token was dropped"
+    );
 }

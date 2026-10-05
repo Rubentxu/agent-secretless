@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Falsification for R2.F.2, the registry request loop.
+"""Falsification for R2.F.2 (the registry request loop) and R2.F.4 (its token
+cache).
 
-Three phases over one file: the reference grammar, the token query, and the
-loop that spends what the query asked for. The phases are named in the output
-and tallied separately, because "which half survived" is the first question to
-ask of a survivor.
+Five phases over one file: the reference grammar, the token query, the loop
+that spends what the query asked for, and then the cache key, the cache clock,
+and the cache as the wire sees it. The phases are named in the output and
+tallied separately, because "which half survived" is the first question to ask
+of a survivor.
 
 Same five-bucket accounting as `registry_falsify.py` -- red, compiler-refused,
 green survivor, measured nothing, and a snippet this harness could not find,
 which is a defect in the harness rather than a result about the code.
 
-**Nineteen rows, seventeen mutations, three of the nineteen with no mutation of
-their own, and the reasons are worth stating.**
+**Twenty-nine mutations, twenty-nine red, and four rows with no mutation of
+their own. The reasons are worth stating.**
 
 `the_stored_credential_reaches_the_realm_and_nothing_else` is the row a
 reviewer looks for first, and there is no mutation for it. The stored
@@ -49,8 +51,17 @@ passes, and a grant of `repository:someone/else:pull,push` is spent against
 `library/alpine`. That is the confused deputy, and one character is the
 difference between refusing it and doing it.
 
-**Two rows were green for a reason that was not the code they named, and both
-were found by this campaign.**
+**Three rows were green for a reason that was not the code they named, and all
+three were found by this campaign.**
+
+`la_clave_de_cache_no_olvida_ninguna_parte_de_la_decision` spelled `TokenKey`
+out by hand in the test file, and came back green under all four of its
+mutations -- because a row that rebuilds the thing under test is measuring its
+own hand, and the four mutations were all on the copy `redeem` uses. The key is
+now built by one constructor, `RegistryClient::key_for`, and the row goes
+through it. That is the same lesson as the two below in a stronger form: a
+duplicate spelling of the code under test is a row that passes no matter what
+the code does.
 
 `a_push_body_arrives_at_the_registry_exactly_as_it_was_given` compared the body
 the fake origin recorded, and the fixture reads bodies as text. A mutation that
@@ -245,6 +256,105 @@ LOOP_MUTATIONS = [
 ]
 
 
+# (label, old, new, test that must go red)
+#
+# The cache is what makes the loop usable and what could quietly make it a
+# widening, so its rows are about the key and the clock rather than about the
+# request. A key missing its action is a pull's token reachable from a push --
+# and the token really does carry a push grant, because Docker Hub answers
+# `pull,push` to a pull and R2.F.1 only narrows what this side *asks* for.
+KEY_MUTATIONS = [
+    (
+        "drop the action from the cache key",
+        "            action: operation.action().to_string(),",
+        "            action: String::new(),",
+        "la_clave_de_cache_no_olvida_ninguna_parte_de_la_decision",
+    ),
+    (
+        "drop the repository from the cache key",
+        "            repository: repository.clone(),",
+        '            repository: RepositoryName::parse("library/alpine").expect("a fixed name"),',
+        "la_clave_de_cache_no_olvida_ninguna_parte_de_la_decision",
+    ),
+    (
+        "drop the realm from the cache key",
+        "            realm: realm.to_string(),",
+        "            realm: String::new(),",
+        "la_clave_de_cache_no_olvida_ninguna_parte_de_la_decision",
+    ),
+    (
+        "drop the credential from the cache key",
+        "            credential: self.credential.clone(),",
+        "            credential: String::new(),",
+        "forget_deja_solo_lo_que_no_venia_de_esa_credencial",
+    ),
+    (
+        # A token with ten seconds left is a token that expires while the
+        # request that carries it is still being written.
+        "hand out a token that has expired",
+        "        left > TOKEN_EXPIRY_MARGIN",
+        "        left >= Duration::ZERO",
+        "a_token_a_punto_de_caducar_no_se_reutiliza",
+    ),
+    (
+        "treat an elapsed token as one with time left",
+        "        let Some(left) = self.valid_until.checked_duration_since(now) else {\n            return false;\n        };\n        left > TOKEN_EXPIRY_MARGIN",
+        "        let _ = self.valid_until.checked_duration_since(now);\n        true",
+        "a_token_caducado_no_se_reutiliza",
+    ),
+    (
+        "keep a token whose stated lifetime is shorter than the margin",
+        "        if lifetime <= TOKEN_EXPIRY_MARGIN {",
+        "        if lifetime <= Duration::ZERO {",
+        "un_token_sin_tiempo_de_vida_no_se_cachea",
+    ),
+    (
+        # `forget` exists so a deleted credential stops being served. Clearing
+        # everything is the other half of the same bug: it works, and it
+        # revokes credentials nobody deleted.
+        "let forget clear the whole cache",
+        "            .retain(|key, _| key.credential != credential);",
+        "            .retain(|_, _| false);",
+        "forget_deja_solo_lo_que_no_venia_de_esa_credencial",
+    ),
+]
+
+# (label, old, new, test that must go red)
+#
+# The rows here are the socket's, so they measure the exchange rather than the
+# map: how many times the token endpoint was spoken to, and what survived a
+# credential being retired.
+CACHE_WIRING_MUTATIONS = [
+    (
+        "ask the token endpoint again even with a usable token held",
+        "        if let Some(token) = self.cached_token(&key, now) {\n            return Ok(token);\n        }",
+        "        if let Some(token) = self.cached_token(&key, now).filter(|_| false) {\n            return Ok(token);\n        }",
+        "un_token_se_canjea_una_vez_para_varias_peticiones",
+    ),
+    (
+        "keep a token whose response said nothing about its lifetime",
+        "        if let Some(seconds) = expires_in {\n            self.store_token(key, token.clone(), Duration::from_secs(seconds), now);\n        }",
+        "        if let Some(seconds) = expires_in {\n            self.store_token(key, token.clone(), Duration::from_secs(seconds), now);\n        } else {\n            self.store_token(key, token.clone(), Duration::from_secs(300), now);\n        }",
+        "un_token_sin_expires_in_no_se_cachea",
+    ),
+    (
+        "redeem a token and then not keep it",
+        "            self.store_token(key, token.clone(), Duration::from_secs(seconds), now);\n        }",
+        "            let _ = (key, token.clone(), seconds, now);\n        }",
+        "una_credencial_retirada_deja_de_servirse",
+    ),
+    (
+        # The same key without its action, filed against the socket row: the
+        # token this client holds after a pull really can push, because the
+        # endpoint granted it one.
+        "drop the action from the cache key (observed on the wire)",
+        "            action: operation.action().to_string(),",
+        "            action: String::new(),",
+        "un_token_cacheado_para_un_pull_nunca_sirve_para_un_push",
+    ),
+]
+
+
 def run_phase(path: Path, prefix: str, mutations: list, title: str) -> tuple[int, dict, list]:
     """Apply `mutations` to one file and return the five-bucket tally.
 
@@ -304,6 +414,8 @@ PHASES = [
     (UNIT, REFERENCE_MUTATIONS, "R2.F.2 reference"),
     (UNIT, QUERY_MUTATIONS, "R2.F.2 token query"),
     (WIRE, LOOP_MUTATIONS, "R2.F.2 the loop"),
+    (UNIT, KEY_MUTATIONS, "R2.F.4 cache key and clock"),
+    (WIRE, CACHE_WIRING_MUTATIONS, "R2.F.4 cache on the wire"),
 ]
 
 

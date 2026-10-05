@@ -220,3 +220,41 @@ has to decide which repository an agent may touch — which means `Action` in th
 domain, dispatch in the policy engine, and a verb in the CLI. Those are
 R2.F.3, and they are the same three files every remaining roadmap row needs, so
 they are the next thing to unblock rather than the next thing to start.
+
+## R2.F.4, the token cache
+
+A pull is dozens of requests — a manifest, a config, a layer per blob — and the
+loop as shipped in R2.F.2 redeems a token for each of them. That is not a
+connector, it is a load generator aimed at the token endpoint, and it is the
+reason the increment had no consumer yet.
+
+So the client keeps the token, and the interesting part is not keeping it. It is
+the key:
+
+| field | what leaving it out would allow |
+|---|---|
+| `action` | a pull's token, found by a push. The endpoint grants `pull,push` to a pull, so this token really can push. |
+| `repository` | one repository's token answering for another. |
+| `realm` | a token redeemed at one token endpoint presented to another. |
+| `credential` | a retired credential outliving its deletion, which is the window `SecretPort::forget` exists to close. |
+
+Two more rules, both about the clock. A token is only handed out with more than
+ten seconds left, because a token that expires while the request carrying it is
+still being written is a failure with a `401` in it. And a response that says
+nothing about how long the token lives is **not cached at all**: guessing a
+lifetime for a credential this side cannot watch is how a cache becomes a way
+to serve something the provider has withdrawn.
+
+`forget` drops every token derived from one credential and nothing else, and it
+is scoped to the credential rather than the session on purpose — the derived
+token belongs to the credential, which outlives any session.
+
+**Ten rows, twelve mutations, twelve red.** The finding was the strongest one
+of the three campaigns: the key row spelled `TokenKey` out by hand in the test
+file and came back green under *all four* of its mutations, because it was
+measuring its own hand rather than the constructor `redeem` uses. The key is
+built in one place now, `RegistryClient::key_for`, and the row goes through it.
+A duplicate spelling of the code under test is a row that passes no matter what
+the code does — which is the same lesson as R2.F.1's `is_err()` row and
+R2.F.2's text-reading body row, and it is the third time this repository has
+paid for it.
