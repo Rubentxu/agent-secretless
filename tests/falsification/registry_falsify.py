@@ -191,24 +191,24 @@ REALM_MUTATIONS = [
         # Port 8443 is a listener this transport never vetted, and it is enough
         # to send the token request somewhere the policy never looked.
         "accept a realm on any port",
-        "        if let Some(port) = url.port() {\n            if port != TOKEN_PORT {",
-        "        if let Some(port) = url.port() {\n            if false {",
+        "        if let Some(named) = url.port() {\n            if named != port {",
+        "        if let Some(named) = url.port() {\n            if false {",
         "a_realm_on_another_port_is_refused",
     ),
     (
         # Forcing loopback on here would make every loopback realm reachable in
         # production, whatever the caller passed.
         "resolve the realm with loopback forced on",
-        "let resolved = resolve_and_pin(&authority, TOKEN_PORT, policy)?;\n",
-        "let resolved = resolve_and_pin(&authority, TOKEN_PORT, AddressPolicy { allow_loopback: true })?;\n",
+        "let resolved = resolve_and_pin(&vetted.authority, port, policy)?;\n",
+        "let resolved = resolve_and_pin(&vetted.authority, port, AddressPolicy { allow_loopback: true })?;\n",
         "a_realm_that_resolves_to_loopback_is_refused",
     ),
     (
         # A `Realm` whose addresses were never checked is the SSRF the whole
         # vetting exists to prevent, wearing the type that says it was.
         "vet the realm without resolving or checking it",
-        "let resolved = resolve_and_pin(&authority, TOKEN_PORT, policy)?;\n\n        Ok(Self {",
-        "let resolved = ResolvedAudience { authority: authority.clone(), port: TOKEN_PORT, addresses: vec![] };\n\n        Ok(Self {",
+        "let resolved = resolve_and_pin(&vetted.authority, port, policy)?;\n        Ok(Self {",
+        "let resolved = ResolvedAudience { authority: vetted.authority.clone(), port, addresses: vec![] };\n        Ok(Self {",
         "a_vetted_realm_reports_the_addresses_it_was_checked_against",
     ),
 ]
@@ -224,8 +224,8 @@ POLICY_MUTATIONS = [
         # The metadata address is the one an SSRF wants, and the useful
         # literals to refuse first are loopback, RFC1918 and link-local.
         "resolve a literal realm under a policy that permits loopback",
-        "let resolved = resolve_and_pin(&authority, TOKEN_PORT, policy)?;\n",
-        "let resolved = resolve_and_pin(&authority, TOKEN_PORT, AddressPolicy { allow_loopback: true })?;\n",
+        "let resolved = resolve_and_pin(&vetted.authority, port, policy)?;\n",
+        "let resolved = resolve_and_pin(&vetted.authority, port, AddressPolicy { allow_loopback: true })?;\n",
         "an_address_literal_realm_is_refused",
     ),
     (
@@ -233,8 +233,8 @@ POLICY_MUTATIONS = [
         # to the policy: with loopback forced on, a literal stops being refused
         # even though nothing about its shape changed.
         "let the shape of a literal decide, whatever the policy says",
-        "let resolved = resolve_and_pin(&authority, TOKEN_PORT, policy)?;\n\n        Ok(Self {",
-        "let resolved = resolve_and_pin(&authority, TOKEN_PORT, AddressPolicy { allow_loopback: true })?;\n\n        Ok(Self {",
+        "let resolved = resolve_and_pin(&vetted.authority, port, policy)?;\n        Ok(Self {",
+        "let resolved = resolve_and_pin(&vetted.authority, port, AddressPolicy { allow_loopback: true })?;\n        Ok(Self {",
         "the_same_literal_is_vetted_by_the_policy_and_not_by_its_shape",
     ),
 ]
