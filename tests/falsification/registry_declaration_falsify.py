@@ -43,7 +43,7 @@ running both `registry-1.docker.io` and `registry.internal.example`, and it is
 a credential handed to the wrong host.
 
 **The second is keeping both entries of a duplicate.** `dos_credenciales_para_
-un_registry_se_rechazan_al_cargar` refuses a file that declares one registry
+un_registry_se_rechusan_al_cargar` refuses a file that declares one registry
 twice, because a registry with two credentials is not a deployment, it is a
 coin toss whose outcome is the order of a JSON array. Letting the lookup take
 the first compiles, passes every other row in this file, and means which secret
@@ -95,7 +95,7 @@ MUTATIONS = [
         "            });\n"
         "        }",
         "        let _ = &authority;",
-        "dos_credenciales_para_un_registry_se_rechazan_al_cargar",
+        "dos_credenciales_para_un_registry_se_rechusan_al_cargar",
     ),
     (
         # The plausible-looking one: a validator that accepts something the
