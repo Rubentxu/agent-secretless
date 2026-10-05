@@ -225,6 +225,15 @@ impl AssumeRole {
     pub const MIN_DURATION_SECONDS: u32 = 900;
     pub const MAX_DURATION_SECONDS: u32 = 43_200;
 
+    /// The documented length bounds, in characters.
+    ///
+    /// Named rather than inlined at the check because a bound that appears in
+    /// two places is a bound that will be updated in one of them, and the copy
+    /// that drifts is the one nobody reads.
+    pub const ROLE_ARN_LEN: std::ops::RangeInclusive<usize> = 20..=2048;
+    pub const SESSION_NAME_LEN: std::ops::RangeInclusive<usize> = 2..=64;
+    pub const EXTERNAL_ID_LEN: std::ops::RangeInclusive<usize> = 2..=1224;
+
     /// Builds a request, refusing what AWS would refuse anyway.
     ///
     /// A caller asking for a year is refused here rather than being sent to AWS
@@ -250,21 +259,21 @@ impl AssumeRole {
     ) -> Result<Self, StsError> {
         let role_arn = role_arn.into();
         let role_session_name = role_session_name.into();
-        if !(20..=2048).contains(&role_arn.chars().count()) {
+        if !Self::ROLE_ARN_LEN.contains(&role_arn.chars().count()) {
             return Err(StsError::IncompleteRequest("role ARN"));
         }
         let session_len = role_session_name.chars().count();
-        if !(2..=64).contains(&session_len) {
+        if !Self::SESSION_NAME_LEN.contains(&session_len) {
             return Err(StsError::IncompleteRequest("role session name"));
         }
         if role_session_name.chars().any(char::is_whitespace) {
             return Err(StsError::IncompleteRequest("role session name"));
         }
-        if !(900..=43_200).contains(&duration_seconds) {
+        if !(Self::MIN_DURATION_SECONDS..=Self::MAX_DURATION_SECONDS).contains(&duration_seconds) {
             return Err(StsError::IncompleteRequest("duration"));
         }
         if let Some(external_id) = &external_id {
-            if !(2..=1224).contains(&external_id.chars().count())
+            if !Self::EXTERNAL_ID_LEN.contains(&external_id.chars().count())
                 || external_id.chars().any(char::is_whitespace)
             {
                 return Err(StsError::IncompleteRequest("external id"));
