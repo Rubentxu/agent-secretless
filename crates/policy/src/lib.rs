@@ -1456,6 +1456,47 @@ mod tests {
         assert!(!engine.authorize(&evil, None, None).decision.is_allowed());
     }
 
+    /// **The allowlist had no row, and this is it.**
+    ///
+    /// `ALLOWED_AUDIENCES` is called a two-entry list in four files and it is
+    /// the control D6 rests on: `audience_is_approved` gates every `Api`, so a
+    /// third entry would let *policy text* name an arbitrary host as an audience
+    /// and have it approved — reopening, for GitHub and AWS, the exact hole D6
+    /// closes. The rows around this one do not catch that. `evil.example` is
+    /// not a host anyone would add, and the documented-rule row only shows two
+    /// named hosts discriminating; both stay green when a third appears.
+    ///
+    /// Both halves, because they fail differently and neither substitutes for
+    /// the other. The membership assertion is the tripwire: it is red for *any*
+    /// widening, including a host no row happens to probe. The probe loop is the
+    /// behaviour, saying what the list is for rather than what it spells today —
+    /// which is the shape of the claim if someone later argues the literal is
+    /// what matters.
+    #[test]
+    fn the_api_allowlist_names_only_the_two_first_party_hosts() {
+        assert_eq!(
+            ALLOWED_AUDIENCES,
+            &["api.github.com", "sts.amazonaws.com"],
+            "the API allowlist gained an entry: a third host would let policy text \
+             name an audience D6 exists to refuse"
+        );
+        // And the list means what the doc above says it means, for the hosts an
+        // author would actually reach for: a generic IdP, a lookalike of GitHub,
+        // and both a regional AWS endpoint and a suffixed global one.
+        for host in [
+            "idp.example.com",
+            "api.github.com.attacker.test",
+            "sts.eu-west-1.amazonaws.com",
+            "sts.amazonaws.com.attacker.test",
+        ] {
+            let authority = Authority::canonicalize(host).expect("a well-formed authority");
+            assert!(
+                !audience_is_approved(&authority),
+                "{host} was approved as an API audience"
+            );
+        }
+    }
+
     /// **The row the whole change exists for.** The rule `POLICY_TEXT` tells an
     /// operator to write — `resource.audience == "sts.amazonaws.com"` — now
     /// matches, and a rule naming a different audience does not.

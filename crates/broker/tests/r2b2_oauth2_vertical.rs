@@ -1145,9 +1145,15 @@ fn a_scope_rule_can_require_a_client_to_carry_exactly_one_grant() {
         (
             "read:pods  read:pods",
             true,
-            "a repeated token is one grant — this is the case that says so, and the first \
-             version of it passed a clean string while claiming repetition, which is a label \
-             that measures nothing",
+            "a repeated token is one grant -- but Cedar's `Set` is a mathematical \
+             set, so this holds whether or not the broker deduplicated it, and it \
+             is NOT the row that pins the deduplication. `scope_order_and_repetition_\
+             are_one_grant_to_both_the_policy_and_the_issuer` in the policy crate is \
+             where that is measured, because the issuer's comparison is where a \
+             duplicate would really read as a narrowing. A first version of this \
+             comment claimed repetition here as the thing under test, which is a label \
+             that measures nothing; the falsification harness records the same survivor \
+             for the same reason",
         ),
         (
             "prefix read:pods suffix",

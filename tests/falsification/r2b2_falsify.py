@@ -273,6 +273,27 @@ POLICY_MUTATIONS = [
         "        }",
         "unapproved_audience_is_denied_even_though_it_canonicalizes",
     ),
+    (
+        # The gap the one above leaves, and it is a real one rather than a
+        # technicality. That mutation widens the list by `evil.example` too, and
+        # `unapproved_audience_is_denied_even_though_it_canonicalizes` probes
+        # exactly that host -- so it goes red. Every other row this crate had
+        # stayed green against a widening that named only a host nobody would
+        # think to probe, and `evil.example` is precisely the host nobody would
+        # add. Probing one known-bad host is not the same claim as pinning the
+        # list, and the mutation below is the second claim.
+        #
+        # Same replacement as the mutation above; a different row, because the
+        # two ask different questions. `INDEPENDENCE_MUTATIONS` asks whether the
+        # OAuth2 surface depends on the allowlist and is *expected* to survive.
+        # This one asks whether anything holds the allowlist for `Api`, where it
+        # does bite, and it is expected to go red.
+        "admit one plausible third audience and nothing else",
+        'pub(crate) const ALLOWED_AUDIENCES: &[&str] = &["api.github.com", "sts.amazonaws.com"];',
+        'pub(crate) const ALLOWED_AUDIENCES: &[&str] =\n'
+        '    &["api.github.com", "sts.amazonaws.com", "idp.example.com"];',
+        "the_api_allowlist_names_only_the_two_first_party_hosts",
+    ),
 ]
 
 
