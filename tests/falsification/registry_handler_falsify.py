@@ -71,14 +71,8 @@ MUTATIONS = [
         # THE mutation. The grant is two statements and this deletes the check
         # that joins them.
         "stop comparing the surrogate's credential with the declared one",
-        "            // surrogate redeems (the shape check `redeem_for` already did) is\n"
-        "            // not enough; it says the credential is the right *class*, not that\n"
-        "            // it is the right credential.\n"
-        "            if credential != declaration.credential {",
-        "            // surrogate redeems (the shape check `redeem_for` already did) is\n"
-        "            // not enough; it says the credential is the right *class*, not that\n"
-        "            // it is the right credential.\n"
-        "            if false && credential != declaration.credential {",
+        "        if credential != declaration.credential {",
+        "        if false && credential != declaration.credential {",
         "a_surrogate_for_another_credential_serves_no_registry",
     ),
     (
@@ -122,14 +116,18 @@ MUTATIONS = [
         # pulls would then serve reads, and the two actions -- which exist
         # separately in the schema -- would be decorative.
         "authorize every registry pull with the push action",
-        "        self.authorize_verb(\n"
-        "            session,\n"
-        "            peer,\n"
-        "            Action::RegistryPull,",
-        "        self.authorize_verb(\n"
-        "            session,\n"
-        "            peer,\n"
-        "            Action::RegistryPush,",
+        "            // it does not do for us are named here on purpose.\n"
+        "            let grant = match state.registry_grant(\n"
+        "                session,\n"
+        "                peer,\n"
+        "                &surrogate,\n"
+        "                Action::RegistryPull,",
+        "            // it does not do for us are named here on purpose.\n"
+        "            let grant = match state.registry_grant(\n"
+        "                session,\n"
+        "                peer,\n"
+        "                &surrogate,\n"
+        "                Action::RegistryPush,",
         "a_policy_that_permits_push_only_refuses_the_pull",
     ),
     (
@@ -161,43 +159,25 @@ MUTATIONS = [
         "                    let digest = ContentDigest::of(b\"\").to_string();",
         "the_manifest_digest_is_computed_and_a_lying_header_is_ignored",
     ),
-    (
-        # The blob arm reaching the registry without asking the declaration.
-        # It is the one shape that would make `PullBlob` a hole around
-        # `authorize_registry`, and nothing else in the file would catch it.
-        "take the blob arm around the declaration",
-        "            let declaration = match state.authorize_registry(session, peer, &registry, &repository)\n"
-        "            {\n"
-        "                Ok(declaration) => declaration,\n"
-        "                Err(denial) => return *denial,\n"
-        "            };\n"
-        "            let credential = match surrogates!(state).redeem_for(\n"
-        "                &surrogate,\n"
-        "                session,\n"
-        "                OperationFamily::Registry,\n"
-        "                now_secs(),\n"
-        "            ) {\n"
-        "                Ok(credential) => credential,\n"
-        "                Err(error) => return surrogate_failure(error),\n"
-        "            };\n"
-        "            // The same equality as above, and for the same reason. A blob is a",
-        "            let credential = match surrogates!(state).redeem_for(\n"
-        "                &surrogate,\n"
-        "                session,\n"
-        "                OperationFamily::Registry,\n"
-        "                now_secs(),\n"
-        "            ) {\n"
-        "                Ok(credential) => credential,\n"
-        "                Err(error) => return surrogate_failure(error),\n"
-        "            };\n"
-        "            let declaration = crate::registry_declaration::RegistryDeclaration {\n"
-        "                authority: Authority::canonicalize(&registry)\n"
-        "                    .expect(\"the manifest arm parsed the same string\"),\n"
-        "                credential,\n"
-        "            };\n"
-        "            // The same equality as above, and for the same reason. A blob is a",
-        "a_blob_read_goes_through_the_declaration_too",
-    ),
+        # RETIRED, and not because the hazard went away.
+        #
+        # This row guarded one shape: the blob arm redeeming a surrogate and
+        # building a `RegistryDeclaration` by hand, so `PullBlob` could reach a
+        # registry without ever asking the declaration. It was the only thing in
+        # the file that would have caught it.
+        #
+        # `registry_grant` makes that shape impossible rather than merely
+        # checked. Declaration, redemption and the equality are one function
+        # every arm has to call, so an arm that wanted to skip them would have
+        # to not call it -- which is what `authorize every registry pull with
+        # the push action` above now covers, and what four arms sharing one
+        # preamble is for.
+        #
+        # Re-pointing it would have been the easy move and worth nothing: a
+        # mutation asserting what the surrounding structure already guarantees
+        # is coverage that only reads as coverage. The row is gone because its
+        # subject is, and the structural guarantee is named here rather than
+        # left for a reader to infer from the absence of a row.
     (
         # An empty declaration file is a deployment that chose nothing, and it
         # refuses everything. Reading it as "no restriction" would make the
