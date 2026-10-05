@@ -68,6 +68,7 @@ has: no source edits while a campaign or a suite is in flight.
 | `k8s_port_falsify.py` | `crates/broker/src/k8s/port.rs` | 8, taking 9 of its 15 rows red |
 | `k8s_client_falsify.py` | `crates/broker/src/k8s/client.rs` | 11, against 17 rows |
 | `k8s_metadata_falsify.py` | `crates/broker/src/k8s/metadata.rs` | 7 red + 2 compiler-refused, against 13 rows |
+| `k8s_binding_falsify.py` | `crates/broker/src/k8s/binding.rs` | 12, one-for-one against 20 rows |
 
 `sts_falsify.py` is also the base harness the others import, which is why its
 mutation list is a module-level `MUTATIONS` that callers replace. That has a
@@ -211,3 +212,50 @@ rows red. The campaign measured one. A document with no `kind` falls to the
 `None` arm, which is still a refusal, so the two arms are the same refusal and
 one mutation does not reach the other. The claim was corrected to the number
 that was measured.
+
+`k8s_binding_falsify.py` is 12 mutations against 20 rows, and the account is
+shorter than the ones above for a reason worth stating: the mutations take the
+rows red **one for one**, with no overlap, so unlike the port and the filter
+there is no gap between the mutation count and the row count to explain.
+
+Eight rows are not reached, in three groups.
+
+**Five are positive** — a declared cluster name is accepted, `cluster.local` is
+accepted, a public audience without the exception is accepted, a binding serves
+the credential it declares, and a check that refused everything would fail. A
+declaration module is almost entirely refusals, and that is precisely the shape
+in which a `check` returning `Err` unconditionally would look perfect.
+
+**One is held by the type in front of it.** `.svc` cannot be constructed as an
+`Authority` at all, so the row about a bare suffix is really a row about
+`Authority`, and the suffix check in this module is not what saves us. Knowing
+*which layer* closes a case is the difference between a check you can reason
+about and one you are relying on by luck.
+
+**Two ride on a derived `Debug`** for the exception field, which no single edit
+here changes. The row about the *binding's* own `Debug` is different and is
+filed, because `finish_non_exhaustive` is a line — and replacing it with a plain
+`finish` is four characters that silently widen what a `{:?}` of a live binding
+reveals.
+
+Most of these mutations are attempts to widen one exception, and the exception
+is the reason this module exists. Kubernetes is the only provider here whose
+correct audience is normally a **private** address: `kubernetes.default.svc`
+resolves to a ClusterIP, and `AddressPolicy` refuses private addresses because
+that is where cloud metadata services live. So the unavoidable exception has to
+be made narrow: an IP literal cannot declare itself in-cluster, the check is
+anchored to the end of the name rather than a fragment of it, and an exception
+on a public audience is refused as the sign of a config nobody read.
+
+Two of the rows here were vacuous before this campaign and are worth naming,
+because both would have passed forever:
+
+`the_projected_token_path_is_the_one_kubernetes_actually_uses` read its path out
+of a fixture in the test file, so it was pinning its own test and would have
+stayed green through any change to the shipped path. The constant now lives in
+the product and the row compares it against the documented string.
+
+`K8sBinding::new` constructed its own client, and constructing a client performs
+the DNS pin — so the binding could not be built in a row at all, and `serves`,
+the one method that decides which cluster a request reaches, had no coverage.
+It now takes the client, the same split `AwsBinding::new` already uses.

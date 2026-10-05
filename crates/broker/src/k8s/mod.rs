@@ -33,6 +33,13 @@
 //! is built — which is the one place in this module where the token exists
 //! outside the port, and it exists there for the length of a single attempt.
 //!
+//! **`binding` is R2.D.3.1c**: what the operator declares for one API server —
+//! the audience, the port, the token path — and the refusals that make at load
+//! what the request never can. It exists because Kubernetes is the one provider
+//! here whose correct audience is normally a *private* address, which the pinned
+//! transport refuses by default; the exception for that is a narrow type rather
+//! than a flag.
+//!
 //! **What R2.D.3 still owes** is the broker operation and the CLI verb. Neither
 //! exists, so nothing in this module is reachable from a product surface yet,
 //! and the module says so rather than letting a test imply otherwise: per M11's
@@ -55,11 +62,13 @@
 //! returning bytes: the sink is a thing that *uses* the credential, and
 //! returning one would make stashing it the caller's easiest option.
 
+pub mod binding;
 pub mod client;
 pub mod metadata;
 pub mod port;
 pub mod request;
 
+pub use binding::{DeploymentError, InCluster, K8sBinding, K8sDeployment};
 pub use client::{K8sClient, K8sClientError, K8sReply};
 pub use metadata::{MetadataError, SecretMetadata, secret_metadata};
 pub use port::{K8sSecretPort, MAX_TOKEN_BYTES};
