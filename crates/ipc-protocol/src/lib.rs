@@ -380,6 +380,66 @@ pub enum Request {
         name: String,
         body: String,
     },
+    /// Semantic OCI registry read (M11-R2.F.3).
+    ///
+    /// **The `registry` field selects a *declaration*, it is not a
+    /// destination.** That distinction is the entire control, and it is worth
+    /// stating precisely because the field looks like an agent-chosen host and
+    /// is not: the broker resolves it by exact equality against what the
+    /// operator declared, and everything downstream — the authority that gets
+    /// dialled, the authority Cedar authorizes, the credential that is lent —
+    /// comes from that declaration. A registry the deployment did not declare
+    /// is refused before a credential is lent and before the policy engine is
+    /// consulted.
+    ///
+    /// The failure this avoids is the one where the field *is* a destination:
+    /// then the declaration becomes a filter over hosts the agent picked, and
+    /// the operator's rule — `resource.authority == "..." &&
+    /// resource.repository == "..."` — silently inverts into "allow everything
+    /// except". Same policy text, opposite meaning.
+    ///
+    /// This is the same bargain `--oauth2-clients` strikes, where the request
+    /// names a credential id and the broker answers with the *declared*
+    /// registration rather than anything the request supplied.
+    ///
+    /// The surrogate is present for the reason it is on every other provider
+    /// request: a session alone is not a credential, and the one that reaches
+    /// the registry is derived from a session-bound token.
+    PullManifest {
+        session: AgentSessionId,
+        surrogate: String,
+        /// Selects a declared registry by equality. Never dialed, never
+        /// authorized, and never forwarded: only the declaration it resolves to
+        /// is.
+        registry: String,
+        /// The OCI repository, as the registry's own grammar spells it. Parsed
+        /// and refused before it becomes part of a URL, in the broker and again
+        /// in the connector — neither is the other's job.
+        repository: String,
+        /// A tag or a digest. **A tag is a mutable name**, and the broker does
+        /// not pretend otherwise: it resolves to whatever the registry currently
+        /// holds, which is why the manifest that comes back carries the digest
+        /// the agent can then pin.
+        reference: String,
+    },
+    /// Semantic OCI registry read, continued (M11-R2.F.3).
+    ///
+    /// A separate request rather than an offset into `PullManifest` because the
+    /// two are authorized against different things: a manifest read is about the
+    /// repository, and a blob read is about one content address inside it. An
+    /// agent that may read `library/alpine` has not thereby been granted every
+    /// digest that repository has ever published, and a policy rule that cannot
+    /// tell the two apart cannot say which it meant.
+    PullBlob {
+        session: AgentSessionId,
+        surrogate: String,
+        registry: String,
+        repository: String,
+        /// `sha256:` plus 64 lowercase hex digits, and refused at the edge
+        /// rather than normalized: a digest that is *nearly* a digest is a
+        /// different content address.
+        digest: String,
+    },
     /// Asks AWS which identity the request would act as (M11-R2.C.3).
     ///
     /// **This request has no surrogate, and that is the whole difference from
@@ -614,6 +674,34 @@ pub enum Response {
     ReleaseCreated {
         tag: String,
         url: String,
+    },
+    /// A manifest, and the digests it names (M11-R2.F.3).
+    ///
+    /// **The body is base64 of bytes, not text**, because a manifest is JSON
+    /// in practice but nothing in the protocol promises that, and a `String`
+    /// field would make the connector's own "read it as text and hope" failure
+    /// the broker's to make instead of the connector's to refuse. The agent
+    /// gets what came off the wire plus the digest it was verified against, and
+    /// it can pin the blobs it wants next by that digest.
+    ManifestRead {
+        /// The manifest as it came off the wire.
+        body: Vec<u8>,
+        /// The digest the *reference* resolved to, which is what the agent
+        /// should pin. A tag read reports the digest the registry gave; it is
+        /// the one value here that survives the registry moving the tag.
+        digest: String,
+        /// The registry's own declared media type, when it declared one.
+        media_type: Option<String>,
+    },
+    /// A blob, its bytes, and the digest they were verified to have.
+    ///
+    /// The digest is a field and not a return value because "which bytes are
+    /// these" is not a question a caller should be able to leave unanswered. The
+    /// connector refuses a mismatch and never constructs one of these, so an
+    /// agent holding this has bytes that carry the digest it asked for.
+    BlobRead {
+        bytes: Vec<u8>,
+        digest: String,
     },
     /// What AWS says the request is acting as, and nothing else (M11-R2.C.3).
     ///
@@ -948,6 +1036,12 @@ impl Request {
             Request::ReadIssue { .. } => "read_issue",
             Request::CreateIssue { .. } => "create_issue",
             Request::CreateRelease { .. } => "create_release",
+            // The two halves of an OCI pull get their own audit names, because
+            // "a pull" is not a question an operator can act on: a repository
+            // being read is a policy decision, and one content address inside it
+            // being read is a different one.
+            Request::PullManifest { .. } => "registry_pull_manifest",
+            Request::PullBlob { .. } => "registry_pull_blob",
             Request::OAuth2Identity { .. } => "oauth2_identity",
             Request::AuditQuery { .. } => "audit_query",
             Request::PostgresConnect { .. } => "postgres_connect",

@@ -389,3 +389,72 @@ to name a registry operation, and the broker has to decide which repository an
 agent may touch — which means `Action` in the domain, dispatch in the policy
 engine, and a verb in the CLI. Those are R2.F.3, and they are the same files
 every remaining roadmap row needs.
+
+## R2.F.3b, the broker arm
+
+`Request::PullManifest` and `Request::PullBlob` now arrive at a session, and the
+handler answers them from the real `RegistryClient`. That closes the gap named
+above: the loop is reachable, and the property the whole design rests on becomes
+observable.
+
+**The property is that an agent chooses the repository and the deployment
+chooses the host.** Every other brokered operation reaches an audience that is
+either a compile-time constant (`GITHUB_AUTHORITY`) or a declared destination
+(`pg_destinations`). A registry is the first where the request carries the host
+as a field, and that field is a *selector*. The failure this design exists to
+prevent is specific: if the lookup fell through to the request's string, then an
+operator's rule `resource.authority == "registry-1.docker.io"` becomes a filter
+over agent-chosen hosts, and an operator who wrote "allow only this one" has
+written "allow everything except this one". Same policy text, opposite meaning,
+and it surfaces as a confusing denial rather than as a hole.
+
+**The property that arrived with the handler, and that no earlier increment
+could have found, is the credential equality.** The grant is two separate
+statements: the *declaration* says which credential serves a registry, and the
+*surrogate* says which credential this session was granted. Neither implies the
+other. A session holding a genuine, unexpired, in-budget surrogate for its own
+`Generic` credential satisfies the second statement completely — and a handler
+that asked only "does this surrogate redeem?" would then dial the declared
+registry with a secret that session was never granted.
+
+`redeem_for` already checks something about the credential, which is what makes
+this a trap rather than a gap: it checks that the credential's **class** backs
+`OperationFamily::Registry`. That is a different question. Both credentials in
+the fixture vault are the same class, both mint successfully, and the check
+passes for both. The check that refuses it is an equality between the credential
+the surrogate stands for and the credential the declaration names.
+
+**Fifteen rows over real sockets, nine mutations, nine red.** The rows run
+against a real `VaultStore`, a real `VaultSecretPort`, a real TLS `401`, a real
+token exchange and a real retry; only Docker Hub is absent. Two of the rows are
+declared structural rather than falsified, and the reasons are part of the
+result:
+
+- `a_different_spelling_of_the_declared_host_is_the_same_host` cannot be made red
+  from the broker. By the time the authority reaches the handler it has been
+  through `Authority::canonicalize`, so the request's spelling and the declared
+  spelling are the same value and there is no second string for a mutation to
+  divert. Canonicalization is spelling independence, not approval, and the
+  approval half is falsified in `registry_declaration_falsify.py`, where the
+  comparison still has two operands.
+- `no_refusal_carries_the_credential` has no mutation because the broker never
+  holds the credential's *value* on these paths — it holds a `CredentialId`, and
+  the value exists only inside a `SecretPort` borrow inside the connector. A
+  mutation that leaked it would have to fetch it first, so it would be a second
+  bug rather than a demonstration that this one is caught.
+
+**One row was written wrong and replaced rather than debugged.**
+`a_blob_read_is_not_covered_by_a_manifest_read` asserted that a blob read is a
+separate *policy* decision from a manifest read. It is not, and the row was
+wrong: both arms ask for `Action::RegistryPull` against the same
+`Resource::Registry`, which is also what the registry's own scope does —
+`repository:<name>:pull` covers both halves. Splitting them here would make the
+broker's model disagree with the protocol's. The replacement row,
+`a_blob_read_goes_through_the_declaration_too`, pins the property that is real
+and falsable: the blob arm runs the same `authorize_registry`, so it cannot be
+used as a way around the allowlist.
+
+**What is still missing from R2.F.3** is the verb. `asv registry pull` is the
+last surface, and until it exists an agent can be *granted* a pull and has no
+way to ask for one — which is the same "declared but unreachable" defect
+R2.A was written to end, one level up.

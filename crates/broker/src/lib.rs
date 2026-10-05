@@ -5,7 +5,13 @@
 //! establishes identity, enforces the protocol boundary, and holds session
 //! state. Vault access and connectors are M1 and M4.
 
-use asv_connector_http::{validate_repo, AddressPolicy, GithubClient, GithubError, SecretPort};
+use asv_connector_http::{
+    registry::{
+        client::{ContentDigest, ImageReference, RegistryClient, RegistryError},
+        RepositoryName,
+    },
+    resolve_and_pin, validate_repo, AddressPolicy, GithubClient, GithubError, SecretPort,
+};
 use asv_connector_pg::{LiveConnectorConfig, PgError, PostgresClient, TlsRoots};
 use asv_domain::{
     Action, AgentSessionId, Authority, CredentialClass, CredentialId, CredentialMetadata, Decision,
@@ -561,6 +567,57 @@ pub trait ConnectorFactory {
         secrets: Arc<dyn SecretPort>,
     ) -> Result<GithubClient, GithubError>;
 
+    /// Builds a client for one declared registry, lending `credential` from
+    /// `secrets`.
+    ///
+    /// The credential arrives as an argument rather than being resolved inside
+    /// the factory, because by the time this is called the broker has already
+    /// decided *which* credential serves the registry: the request named a
+    /// host, the deployment's declaration answered which credential that host
+    /// is lent, and this method only turns that decision into a client. A
+    /// factory that took the host and looked the credential up itself would be
+    /// a second place where the operator's declaration is interpreted, and the
+    /// two could disagree.
+    ///
+    /// The default refuses with [`RegistryError::NoRegistryConnector`], the
+    /// same default-is-refusal rule as [`Self::postgres`]. A factory that
+    /// cannot reach a registry cannot honestly claim to have lent anything to
+    /// one, and the failure belongs to the deployment rather than to the agent
+    /// whose request would have been refused.
+    fn registry(
+        &self,
+        audience: Authority,
+        credential: CredentialId,
+        secrets: Arc<dyn SecretPort>,
+    ) -> Result<asv_connector_http::registry::client::RegistryClient, asv_connector_http::registry::client::RegistryError>
+    {
+        let _ = (audience, credential, secrets);
+        Err(asv_connector_http::registry::client::RegistryError::NoRegistryConnector)
+    }
+
+    /// Resolves a declared registry authority to the addresses a pinned client
+    /// may use.
+    ///
+    /// On the trait for the same reason as [`Self::pg_roots`] and
+    /// [`Self::pg_server_name`], and it matters more here: the default
+    /// implementation performs **real DNS** and refuses every non-public
+    /// address, so a test could not point the very same authorisation path at a
+    /// local origin without it. The trust decision — "this host resolves to
+    /// public addresses only" — is the same decision `ALLOWED_AUDIENCES`
+    /// already makes for GitHub, so putting it on the trait is putting it
+    /// somewhere the whole broker can see rather than only the production type.
+    ///
+    /// The `audience` is the **declared** authority. This method never sees the
+    /// request's string, and a factory that resolved something else would be a
+    /// factory that reintroduces the host the declaration just chose against.
+    fn resolve_registry(
+        &self,
+        audience: &Authority,
+    ) -> Result<asv_connector_http::ResolvedAudience, RegistryError> {
+        resolve_and_pin(audience, REGISTRY_HTTPS_PORT, AddressPolicy::default())
+            .map_err(RegistryError::Transport)
+    }
+
     /// The roots a live PostgreSQL connection should trust.
     ///
     /// A method on the trait rather than a field read through a downcast,
@@ -681,6 +738,26 @@ impl ConnectorFactory for LiveConnectorFactory {
         ))
     }
 
+    /// R2.F.3: a real client for a real declared registry.
+    ///
+    /// The authority is the one the declaration named and the broker already
+    /// checked; the credential is the one the same declaration named. Neither
+    /// is read from the request here, and `RegistryClient` is told the
+    /// credential *by name* so the value only ever exists inside a
+    /// [`SecretPort`] borrow, for the length of one token request.
+    fn registry(
+        &self,
+        _audience: Authority,
+        credential: CredentialId,
+        secrets: Arc<dyn SecretPort>,
+    ) -> Result<RegistryClient, RegistryError> {
+        Ok(RegistryClient::new(
+            secrets,
+            credential.to_wire(),
+            AddressPolicy::default(),
+        ))
+    }
+
     /// Builds a real client, refusing an audience this factory cannot reach.
     ///
     /// Two refusals, and the difference between them is the point. An
@@ -761,6 +838,23 @@ pub struct BrokerState {
     /// fail-closed reading: a broker that cannot reach a credential must not
     /// fall back to a direct or anonymous call.
     pub secrets: Option<Arc<dyn SecretPort>>,
+    /// R2.F.3: the OCI registries this broker will reach, and which credential
+    /// serves each.
+    ///
+    /// **Empty is the default and refuses every registry request**, the same
+    /// fail-closed reading as `secrets`, `runtime` and `aws`. A deployment that
+    /// has not said which registries it may reach is not one that gets to reach
+    /// whatever a request names.
+    ///
+    /// This field is the registry allowlist, and it is here rather than in
+    /// `asv-policy` on purpose: `ALLOWED_AUDIENCES` is two first-party API
+    /// hosts, registries are Docker Hub, GHCR, Quay, self-hosted Artifactory
+    /// and a per-region ECR host, and enumerating them is a list nobody
+    /// maintains whose only cure is editing source. The reachability property
+    /// is obtained structurally instead — the deployment declares, the request
+    /// *selects* a declaration by equality, and the broker answers with the
+    /// declared authority.
+    pub registries: crate::registry_declaration::RegistryDeclarations,
     /// M4 CU-2.2: how to reach GitHub. Injected so a test can point the very
     /// same authorisation path at a local origin.
     pub connectors: Box<dyn ConnectorFactory>,
@@ -903,6 +997,11 @@ impl Default for BrokerState {
             // can run is for something to have opened a vault and said so.
             // There is no `Default` that fabricates a port.
             secrets: None,
+            // No registry unless the operator declares one, for the same
+            // reason `secrets` is None and `aws` is empty: a registry here is
+            // a destination this broker will dial with a stored credential, and
+            // a fabricated default would be one nobody chose.
+            registries: crate::registry_declaration::RegistryDeclarations::default(),
             connectors: Box::new(LiveConnectorFactory::default()),
             postgres: PgSessionMap::default(),
             runtime: None,
@@ -2064,6 +2163,222 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                 Err(error) => surrogate_failure(error),
             }
         }
+        // R2.F.3. The two halves of an OCI pull, and they are separate arms
+        // because they are separate authorization decisions: a manifest read is
+        // about the repository and a blob read is about one content address
+        // inside it. An agent that may read `library/alpine` has not thereby
+        // been granted every digest that repository has published.
+        Request::PullManifest {
+            session,
+            surrogate,
+            registry,
+            repository,
+            reference,
+        } => {
+            // Everything that can refuse this happens first, and none of it
+            // touches a socket. The order is the argument: a denied request has
+            // not reached the registry and cannot have spent a credential.
+            let declaration = match state.authorize_registry(session, peer, &registry, &repository)
+            {
+                Ok(declaration) => declaration,
+                Err(denial) => return *denial,
+            };
+            let credential = match surrogates!(state).redeem_for(
+                &surrogate,
+                session,
+                OperationFamily::Registry,
+                now_secs(),
+            ) {
+                Ok(credential) => credential,
+                Err(error) => return surrogate_failure(error),
+            };
+            // The surrogate says *which credential* this session was granted,
+            // and the declaration says *which credential serves this registry*.
+            // Both must name the same one, and neither substitutes for the
+            // other.
+            //
+            // The failure this refuses is the one that would otherwise be
+            // invisible: a session holding a valid surrogate for its own
+            // `Generic` credential, asking for a pull from a registry the
+            // operator declared against a *different* credential. Both halves
+            // pass on their own — the surrogate is genuine and the registry is
+            // declared — and the broker would then dial the registry with a
+            // secret the session was never granted. Checking only that the
+            // surrogate redeems (the shape check `redeem_for` already did) is
+            // not enough; it says the credential is the right *class*, not that
+            // it is the right credential.
+            if credential != declaration.credential {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: format!(
+                        "this surrogate stands for {}, and the registry {} is served by {}",
+                        credential.to_wire(),
+                        declaration.authority,
+                        declaration.credential.to_wire()
+                    ),
+                };
+            }
+            // Parsed before the client is built so a malformed reference is
+            // reported as a malformed reference rather than as a failed fetch,
+            // and so no socket is opened for a string that was never going to
+            // be sent.
+            let reference = match ImageReference::parse(&reference) {
+                Ok(reference) => reference,
+                Err(error) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("the reference is not an image reference: {error}"),
+                    }
+                }
+            };
+            let repository = match RepositoryName::parse(&repository) {
+                Ok(repository) => repository,
+                Err(error) => {
+                    // Unreachable in practice: `authorize_registry` parsed the
+                    // same string a few lines above and returned on failure.
+                    // Refused rather than unwrapped because a handler that
+                    // panics on a field it validated is a handler whose panic
+                    // someone will one day be able to trigger.
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("the repository is not an OCI name: {error}"),
+                    };
+                }
+            };
+            let client = match state.registry_client(&declaration) {
+                Ok(client) => client,
+                Err(failure) => return *failure,
+            };
+            // Resolution is the only place a name becomes an address, and it
+            // happens here, after the declaration has said which name. Through
+            // the factory rather than inline, because real DNS against the
+            // system resolver is not something a test can point at a local
+            // origin, and an authorisation path no test can reach is one
+            // nobody has checked. The realm's own host goes through the same
+            // policy inside the client.
+            let audience = match state
+                .connectors
+                .resolve_registry(&declaration.authority)
+            {
+                Ok(audience) => audience,
+                Err(error) => {
+                    return Response::Error {
+                        code: registry_code(&error),
+                        message: format!("{} is not reachable: {error}", declaration.authority),
+                    }
+                }
+            };
+            match client.get_manifest(&audience, &repository, &reference) {
+                Ok(read) => {
+                    // Content-addressed here rather than taken from a header,
+                    // so the agent receives an address it can verify the body
+                    // against instead of one the registry asserted. A tag
+                    // reference is mutable, so there is nothing upstream to
+                    // check this against — computing it is what makes the
+                    // answer checkable.
+                    let digest = ContentDigest::of(&read.body).to_string();
+                    Response::ManifestRead {
+                        body: read.body,
+                        digest,
+                        media_type: read.content_type,
+                    }
+                }
+                Err(error) => Response::Error {
+                    code: registry_code(&error),
+                    message: format!("the manifest read failed: {error}"),
+                },
+            }
+        }
+
+        Request::PullBlob {
+            session,
+            surrogate,
+            registry,
+            repository,
+            digest,
+        } => {
+            // Same ordering, same reasons, and deliberately not folded into the
+            // arm above: the policy resource for a blob is not the same
+            // resource, and a handler that treated them as one would let an
+            // operator who wrote a manifest-only rule see blob reads pass.
+            let declaration = match state.authorize_registry(session, peer, &registry, &repository)
+            {
+                Ok(declaration) => declaration,
+                Err(denial) => return *denial,
+            };
+            let credential = match surrogates!(state).redeem_for(
+                &surrogate,
+                session,
+                OperationFamily::Registry,
+                now_secs(),
+            ) {
+                Ok(credential) => credential,
+                Err(error) => return surrogate_failure(error),
+            };
+            // The same equality as above, and for the same reason. A blob is a
+            // different resource and gets its own decision, but it does not get
+            // its own answer to "is this session allowed to spend this registry
+            // credential".
+            if credential != declaration.credential {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: format!(
+                        "this surrogate stands for {}, and the registry {} is served by {}",
+                        credential.to_wire(),
+                        declaration.authority,
+                        declaration.credential.to_wire()
+                    ),
+                };
+            }
+            let digest = match ContentDigest::parse(&digest) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("the digest is not a sha256 content address: {error}"),
+                    }
+                }
+            };
+            let repository = match RepositoryName::parse(&repository) {
+                Ok(repository) => repository,
+                Err(error) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("the repository is not an OCI name: {error}"),
+                    };
+                }
+            };
+            let client = match state.registry_client(&declaration) {
+                Ok(client) => client,
+                Err(failure) => return *failure,
+            };
+            let audience = match state
+                .connectors
+                .resolve_registry(&declaration.authority)
+            {
+                Ok(audience) => audience,
+                Err(error) => {
+                    return Response::Error {
+                        code: registry_code(&error),
+                        message: format!("{} is not reachable: {error}", declaration.authority),
+                    }
+                }
+            };
+            // `get_blob` hashes what arrived and refuses a mismatch, so the
+            // digest this answers with is the one the bytes were *verified* to
+            // have rather than the one that was asked for.
+            match client.get_blob(&audience, &repository, &digest) {
+                Ok(read) => Response::BlobRead {
+                    bytes: read.bytes,
+                    digest: read.digest.to_string(),
+                },
+                Err(error) => Response::Error {
+                    code: registry_code(&error),
+                    message: format!("the blob read failed: {error}"),
+                },
+            }
+        }
+
         Request::AwsCallerIdentity {
             session,
             credential,
@@ -2266,6 +2581,16 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
 /// be able to point a credential at any endpoint that presents a valid
 /// certificate for it, which is the generic HTTP escape hatch M4-R9 rules out.
 const GITHUB_AUTHORITY: &str = "api.github.com";
+
+/// The port a registry — and the token `realm` behind it — is reached on.
+///
+/// Stated here for the same reason as [`GITHUB_AUTHORITY`]: not a request field
+/// and not a config value. The Registry v2 specification puts the API on 443,
+/// and a deployment that needs a registry elsewhere needs a declaration that
+/// says so, not a request that says so. The `realm` a `401` names is vetted
+/// for exactly this port inside the connector, so the two agree by
+/// construction rather than by a reader noticing that they might not.
+const REGISTRY_HTTPS_PORT: u16 = 443;
 
 /// The use budget of every approval the broker mints. UAT-015's "allow once"
 /// cannot be replayed after use; a one-use budget makes the replay
@@ -2606,6 +2931,108 @@ impl BrokerState {
             },
         )?;
         Ok(binding)
+    }
+
+    /// Resolves the registry a request selected, authorizes it, and returns the
+    /// **declared** declaration (R2.F.3).
+    ///
+    /// The order is the argument, and every step of it runs before a socket is
+    /// opened:
+    ///
+    /// 1. **Ownership**, through `session_owned_by`, so its guard is released
+    ///    before the policy is consulted. Holding it across `authorize_verb`
+    ///    deadlocks: `evaluate` locks this same store.
+    /// 2. **A vault**, or there is nothing to lend.
+    /// 3. **The declaration**, by exact equality on a canonicalized `Authority`.
+    ///    An undeclared registry is refused *here*, which is the whole allowlist:
+    ///    a policy cannot un-lend a credential, and an allowlist the policy
+    ///    could widen would not be one.
+    /// 4. **The policy**, against a `Resource::Registry` built from the
+    ///    **declared** authority and the request's repository.
+    ///
+    /// ## Why the request's string is a selector and not a destination
+    ///
+    /// `PullManifest` carries a `registry` field and it does not look like a
+    /// host the broker dials — but it would be if the lookup fell through to
+    /// using it. Everything downstream takes the authority from the
+    /// *declaration*: the address that gets resolved, the authority Cedar
+    /// evaluates, the credential that is lent. The request's string chooses
+    /// which declaration and nothing else, which is the same shape as
+    /// `--oauth2-clients`, where a request names a credential id and the broker
+    /// answers with the declared registration.
+    ///
+    /// The failure being refused is subtle enough to be worth naming: had this
+    /// built `Resource::Registry { authority: from_request, .. }`, then the
+    /// operator's rule `resource.authority == "registry-1.docker.io"` would
+    /// become a filter over agent-chosen hosts, and an operator who wrote
+    /// "allow only this one" would have written "allow everything except this
+    /// one" instead. Same policy text; opposite meaning; and the error surfaces
+    /// as a confusing denial rather than as a hole.
+    fn authorize_registry(
+        &self,
+        session: AgentSessionId,
+        peer: &WorkloadIdentity,
+        registry: &str,
+        repository: &str,
+    ) -> Result<crate::registry_declaration::RegistryDeclaration, Box<Response>> {
+        if !self.session_owned_by(session, peer)? {
+            return Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: "session is not owned by the authenticated peer".into(),
+            }));
+        }
+        if self.secrets.is_none() {
+            return Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: "no credential store is open, so no brokered operation can run".into(),
+            }));
+        }
+        // The repository is checked before the lookup so a malformed one is
+        // reported as a malformed one, rather than as "not declared" for a
+        // registry the operator did declare.
+        let repository = RepositoryName::parse(repository).map_err(|error| {
+            Box::new(Response::Error {
+                code: ErrorCode::InvalidRequest,
+                message: format!("the repository is not an OCI name: {error}"),
+            })
+        })?;
+        // The selection. `Authority::canonicalize` first, then equality, and
+        // never the request's string itself: this is the line where an
+        // agent-chosen host stops being one.
+        let requested = Authority::canonicalize(registry).map_err(|error| {
+            Box::new(Response::Error {
+                code: ErrorCode::InvalidRequest,
+                message: format!("the registry is not a bare host: {error}"),
+            })
+        })?;
+        let declaration = self
+            .registries
+            .credential_for(&requested)
+            .ok_or_else(|| {
+                Box::new(Response::Error {
+                    code: ErrorCode::Denied,
+                    message: format!(
+                        "this deployment does not declare the registry {requested}"
+                    ),
+                })
+            })?;
+        // The policy sees the DECLARED authority and the request's repository.
+        // One half of the resource is the operator's and the other is the
+        // agent's, and the resource type exists precisely because both halves
+        // are answerable.
+        self.authorize_verb(
+            session,
+            peer,
+            Action::RegistryPull,
+            Resource::Registry {
+                authority: requested.clone(),
+                repository: repository.as_str().to_string(),
+            },
+        )?;
+        Ok(crate::registry_declaration::RegistryDeclaration {
+            authority: requested,
+            credential: declaration.clone(),
+        })
     }
 
     /// The OAuth2 registration a request's credential names, or a refusal.
@@ -3222,6 +3649,33 @@ impl BrokerState {
             .github(authority, Arc::clone(secrets))
             .map_err(|error| Box::new(github_failure(error)))
     }
+
+    /// The client for a registry the deployment declared, lending the
+    /// credential that same declaration named (R2.F.3).
+    ///
+    /// Boxed in the error position for the same reason as [`Self::github_client`].
+    /// The `authority` is the *declared* one and never the request's string:
+    /// this is the last point where the broker could reach for the wrong host,
+    /// and reaching here means [`Self::authorize_registry`] already refused
+    /// anything not declared.
+    fn registry_client(
+        &self,
+        declaration: &crate::registry_declaration::RegistryDeclaration,
+    ) -> Result<RegistryClient, Box<Response>> {
+        let secrets = self.secrets.as_ref().ok_or_else(|| {
+            Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: "no credential store is open, so no brokered operation can run".into(),
+            })
+        })?;
+        self.connectors
+            .registry(
+                declaration.authority.clone(),
+                declaration.credential.clone(),
+                Arc::clone(secrets),
+            )
+            .map_err(|error| Box::new(registry_failure(error)))
+    }
 }
 
 /// Why a PostgreSQL operation failed, as an IPC answer.
@@ -3306,7 +3760,55 @@ fn github_failure(error: GithubError) -> Response {
     Response::Error { code, message }
 }
 
-/// Rebinds the client-declared identity context to kernel-attested facts.
+/// The IPC code for a registry failure.
+///
+/// Split out from [`registry_failure`] so the two dispatch arms cannot drift:
+/// the code is the part an agent switches on, and two arms writing their own
+/// would be two places to forget.
+///
+/// The split follows whose fault the answer is, exactly as `github_failure`
+/// does. Anything the *request* got wrong is `InvalidRequest`; anything the
+/// *deployment* got wrong is `Upstream`; and everything the registry said is
+/// `Upstream` too, because a `401` the broker correctly handled is not
+/// something the agent can fix by calling again differently.
+fn registry_code(error: &RegistryError) -> ErrorCode {
+    match error {
+        RegistryError::Reference(_) | RegistryError::Scope(_) => ErrorCode::InvalidRequest,
+        RegistryError::Challenge(_) | RegistryError::Realm(_) => ErrorCode::Denied,
+        RegistryError::Blob(_) | RegistryError::NoChallenge | RegistryError::Transport(_) => {
+            ErrorCode::Upstream
+        }
+        // A token endpoint that answered with a status, or with no token, is
+        // upstream talking. So is a registry answering something other than
+        // what the operation expected — a `404` on a real read is the
+        // registry's answer, not a caller error.
+        RegistryError::TokenEndpointRefused { .. }
+        | RegistryError::NoTokenInResponse
+        | RegistryError::UnexpectedStatus { .. } => ErrorCode::Upstream,
+        // A credential the vault no longer holds is the session's grant being
+        // gone, which is what `Denied` already means elsewhere in the broker.
+        RegistryError::Secret(_) => ErrorCode::Denied,
+        // The deployment cannot reach a registry at all. Not the agent's
+        // fault, so `Upstream` rather than a code that reads like "you called
+        // me wrong".
+        RegistryError::NoRegistryConnector => ErrorCode::Upstream,
+    }
+}
+
+/// A registry failure, as an IPC answer.
+///
+/// Every reason is kept. There is no arm here that swallows a message, because
+/// the operator debugging a failed pull is reading this and an error they
+/// cannot see is an outage they cannot fix — and the upstream body is still
+/// excluded, because an error an agent can read is a place upstream content
+/// would land.
+fn registry_failure(error: RegistryError) -> Response {
+    let code = registry_code(&error);
+    Response::Error {
+        code,
+        message: error.to_string(),
+    }
+}
 ///
 /// `PolicyContext.peer_uid` arrives inside the request body, so it is
 /// attacker-controlled: nothing stopped a caller from claiming `uid: 0` while

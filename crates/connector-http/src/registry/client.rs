@@ -210,6 +210,16 @@ pub enum RegistryError {
     UnexpectedStatus { status: u16, expected: u16 },
     #[error(transparent)]
     Blob(#[from] BlobError),
+    /// This deployment has no way to build a registry client at all.
+    ///
+    /// Not a variant of `UnsupportedStatus` and not `Transport`, because
+    /// neither is what happened: nothing was asked of the network. The broker
+    /// reached for a connector and the factory had none, which is a property
+    /// of the *deployment* rather than of the request — so it is reported as
+    /// such and never dressed up as a malformed repository or a dead host, both
+    /// of which would tell the agent its call was at fault.
+    #[error("this deployment has no registry connector configured")]
+    NoRegistryConnector,
 }
 
 /// What a successful read produced.
