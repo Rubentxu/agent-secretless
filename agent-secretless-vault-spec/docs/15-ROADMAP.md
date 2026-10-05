@@ -2358,6 +2358,90 @@ rule is asked directly against `CredentialClass` rather than through
 recorded here rather than taken unilaterally in a crate another session is
 editing.
 
+### R3.A.3 — adopt: the first step that moves a credential
+
+`asv integrations adopt npm --file … --audience … --field … --label … --from-plan …`.
+The first stage where a secret exists in the process at all, and the first one
+that changes the machine rather than describing it.
+
+Measured: **15 rows** in `asv-integrations` for this stage (75 in the crate),
+**7 rows** in the vertical `crates/broker/tests/r3a3_npm_adopt.rs` against a real
+`VaultStore`, a real `asv-brokerd`, a real socket and a real `.npmrc` holding a
+real token, and **11 mutations across four passes**: 11 red, 0 survivors, 0
+compiler-refused, 0 unmeasured.
+
+**The claim is two halves or neither: the credential is in the vault, and the
+file is byte-identical afterwards.** A credential moved with the file already
+scrubbed has skipped four steps of §10 and a human; a file untouched with
+nothing in the vault has moved nothing. The row asserts both on the same run.
+
+**Doc 04 §10 is why this step does not write the file, and the receipt says so.**
+§10's order is import → verify vault → verify new integration → negative bypass
+test → human approval → scrub → rescan → receipt. This command does the first
+and reports the other five as `outstanding`, so an import can never be mistaken
+for a completed migration. A scrub is the single most consequential thing this
+stage *could* do, and it is the one thing a "while we are here" tidy-up would
+do — which is why the campaign has a mutation that performs one, and why the row
+asserts the bytes rather than trusting a code review.
+
+**The crate's law is narrower than "never touches a value", and stating it
+narrowly is what makes it true.** `discover` and `plan` never materialise a
+value and cannot even reach a vault. `adopt` has to produce one, because moving
+it *is* the job. So the law this module keeps is **"cannot reach a vault"** — no
+client, no socket, no session — and the ordering that makes it safe is that
+*which* credential to move is decided before the value exists, which is why
+`NpmAdoption::extract` takes a selector rather than returning candidates.
+`SecretString` is the return type, and it implements **no** `Display` at all, so
+a format string that would print the value does not compile rather than needing
+review.
+
+**Six refusals, each a control rather than a gap.** Drift since the plan; a
+`${VAR}` with no value in the file to move; an empty value; a misspelled field; a
+field set twice for one registry, where npm's effective value is the last and
+guessing would import something the tool would not use; and a selector whose
+registry the file does not mention. A refusal is printed to a terminal, so the
+error type carries no value either — there is a row for that, because an arm that
+reaches for `value` to be helpful reads as better diagnostics and is the exact
+shape of leak that survives review.
+
+**§6 was unreachable from the product until it was made reachable.** The first
+implementation fingerprinted the file in the CLI and handed that fingerprint
+straight to `extract`, so the drift check compared the file against itself: it
+could detect a concurrent edit during the command and nothing else, and "changed
+since you planned" was impossible. `--from-plan` now takes the fingerprint from
+the `plan` output this import answers, and the command **refuses without it**
+rather than importing unchecked. The plan is what makes the import checkable.
+
+**Three defects found, two of them in the verification itself.**
+
+- **The selector's registry was never checked.** `extract` matched on the field
+  name alone, so an operator asking to adopt the credential for
+  `other.example.test` was served the value written for `registry.example.test`
+  — the wrong credential imported, under a receipt naming the wrong audience,
+  looking like a success. A field name is half a selector's identity and the
+  half that is easy to check is the half that gets checked first.
+- **`IntegrationPlan` could not be read back.** It derived `Deserialize` while
+  carrying `schema: &'static str`, which compiles and cannot work: a `&'static
+  str` deserialises only from data that already lives forever. **A derive is
+  only instantiated when something asks for it**, so the defect looked clean in
+  review and broke the moment `adopt` needed to read a plan off disk. All three
+  schema fields are now `String`, and a round-trip row pins it.
+- Two campaign mutations were aimed wrong and reported as survivors when they
+  were **failed experiments**: one used `FileFingerprint::matches` on the
+  assumption it was a digest comparison (it compares inode too, so it still
+  caught the replacement), and one put the *key* into a refusal message while the
+  row was about the *value*. A mutation that does not remove the thing its row
+  is about has not falsified anything, and reporting it as a survivor would have
+  been the honest-looking mistake.
+
+**Not started, and not simulated.** The projection — leaving behind something
+that points npm at the broker instead of at a token — is R3.A.4, and `adopt`
+does not do it. **A second import of the same selector is not refused**, because
+the vault does not report what audience a credential is registered for, so
+"already adopted" is not a question this step can currently answer; the same gap
+that makes `plan` report two bearer tokens as ambiguous. Recorded rather than
+guessed at.
+
 ---
 
 ## v1.0 — Certified product line

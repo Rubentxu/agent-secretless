@@ -292,6 +292,61 @@ enum IntegrationsCommand {
         #[arg(long)]
         no_vault: bool,
     },
+
+    /// Move a credential out of a tool's configuration and into the vault —
+    /// R3's third stage, and the first one that moves a secret.
+    ///
+    /// Reads the value of one named selector, hands it straight to the broker,
+    /// and prints a receipt naming the credential, the audience and the
+    /// operations. **It does not touch the file.** Doc 04 §10 puts a vault
+    /// verification, an integration verification, a negative bypass test and a
+    /// human approval between an import and a scrub, and none of those happen
+    /// here — the receipt lists them as outstanding so that an import is never
+    /// mistaken for a completed migration.
+    ///
+    /// Every refusal is a control: a configuration that changed since the plan,
+    /// a `${VAR}` reference with no value in the file to move, an empty value,
+    /// a misspelled field, a field set twice for one registry, and an ambiguous
+    /// binding all stop the import rather than producing something that looks
+    /// like a credential.
+    Adopt {
+        /// The tool family.
+        #[arg(value_name = "FAMILY")]
+        family: String,
+        /// Emit the `asv.integrations.adopt/v1` receipt instead of prose.
+        #[arg(long)]
+        json: bool,
+        /// The file holding the credential. Defaults to the user-level
+        /// configuration; the plan's receipt names the file it used.
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
+        /// Home directory, used to find the default file.
+        #[arg(long, value_name = "DIR")]
+        home: Option<String>,
+        /// The registry the selector addresses, canonicalised.
+        #[arg(long, value_name = "AUDIENCE")]
+        audience: String,
+        /// npm's field name for the selector, e.g. `_authToken`.
+        #[arg(long, value_name = "FIELD")]
+        field: String,
+        /// The label to store the credential under.
+        #[arg(long, value_name = "LABEL")]
+        label: String,
+        /// Follow a configuration symlink whose target resolves inside this
+        /// directory. Refused by default, for the reason `discover` refuses it.
+        #[arg(long, value_name = "DIR")]
+        allow_symlink_root: Option<String>,
+        /// The `asv integrations plan npm --json` output this import answers.
+        ///
+        /// **Without it the drift check cannot fail.** `adopt` would fingerprint
+        /// the file itself and compare the result against itself, which detects
+        /// a change during the command and nothing else — so a credential moved
+        /// from bytes that changed since the operator planned would import
+        /// without complaint. Passing the plan makes §6 real: the fingerprint
+        /// comes from the plan, and a file that has moved since is refused.
+        #[arg(long, value_name = "PATH")]
+        from_plan: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -740,6 +795,13 @@ pub fn response_kind(response: &Response) -> &'static str {
         Response::PostgresConnected { .. } => "PostgresConnected",
         Response::PostgresResult { .. } => "PostgresResult",
         Response::PostgresRevoked { .. } => "PostgresRevoked",
+        // R2.F.3b (the other session's in-flight work). Added here because
+        // this match is exhaustive **on purpose** -- its own comment says an
+        // unhandled response must be a compile error -- so a new variant
+        // obliges a name rather than permitting a blank line. Two mechanical
+        // arms, not a review of the feature they belong to.
+        Response::ManifestRead { .. } => "ManifestRead",
+        Response::BlobRead { .. } => "BlobRead",
         Response::Error { .. } => "Error",
     }
 }
@@ -1428,6 +1490,28 @@ fn run_integrations(
             home.as_deref(),
             allow_symlink_root.as_deref(),
             *no_vault,
+        ),
+        IntegrationsCommand::Adopt {
+            family,
+            json,
+            file,
+            home,
+            audience,
+            field,
+            label,
+            allow_symlink_root,
+            from_plan,
+        } => run_integrations_adopt(
+            socket,
+            family,
+            *json,
+            file.as_deref(),
+            home.as_deref(),
+            audience,
+            field,
+            label,
+            allow_symlink_root.as_deref(),
+            from_plan.as_deref(),
         ),
     }
 }
@@ -2196,6 +2280,24 @@ fn call(socket: &std::path::Path, request: &Request) -> std::io::Result<Response
 
 fn print_response(response: &Response) {
     match response {
+        // Registry reads carry bytes, not text: a manifest is JSON in practice
+        // but nothing promises it, and a blob is never text at all. So these
+        // report the **digest and the length** and not the body, which is also
+        // what an operator needs -- they want to confirm the digest, not read
+        // an image through a pager.
+        Response::ManifestRead {
+            body,
+            digest,
+            media_type,
+        } => {
+            println!("manifest {digest} ({} bytes)", body.len());
+            if let Some(media_type) = media_type {
+                println!("  media type: {media_type}");
+            }
+        }
+        Response::BlobRead { bytes, digest } => {
+            println!("blob {digest} ({} bytes)", bytes.len());
+        }
         // Not reached from `asv aws whoami`, which renders these three itself so
         // it can label them. Present because the match is exhaustive on purpose:
         // an unhandled response must be a compile error, not a silent blank line
@@ -2664,4 +2766,292 @@ mod tests {
              legitimately begin with whitespace and `trim()` would corrupt it"
         );
     }
+}
+
+/// R3's `adopt`: move one selector's value into the vault.
+///
+/// **Every buffer this touches is one the secret path already had.** The file
+/// is read into a `Zeroizing<String>`, the selector's value leaves it as a
+/// `secrecy::SecretString`, the request is built with an `OpaqueSecret` that
+/// takes the allocation rather than copying it, and `encode` returns a
+/// `Zeroizing<Vec<u8>>`. Nothing here adds a copy of the credential, and there
+/// is no branch on which the value is printed: the only things this function
+/// writes are the credential's **id** and what is still outstanding.
+///
+/// The decision about *what* moves was made before this function was called —
+/// by the operator, naming an audience and a field — so the moment the value
+/// exists in this process there is no longer a question of which credential to
+/// take. That ordering is the whole of the safety argument, and it is why
+/// `NpmAdoption::extract` takes a selector rather than returning candidates.
+fn run_integrations_adopt(
+    socket: &std::path::Path,
+    family: &str,
+    json: bool,
+    file: Option<&str>,
+    home: Option<&str>,
+    audience: &str,
+    field: &str,
+    label: &str,
+    allow_symlink_root: Option<&str>,
+    from_plan: Option<&str>,
+) -> std::io::Result<()> {
+    use asv_integrations::{AdoptReceipt, AdoptSelector, NpmAdoption};
+
+    if family != "npm" {
+        eprintln!(
+            "asv: no adapter for {family:?}; this build knows `npm`. Adding one is a module in \
+             asv-integrations and one match arm here."
+        );
+        std::process::exit(1);
+    }
+
+    // The field arrives as the operator typed it, and is matched against npm's
+    // own spelling by `Display`. An unknown spelling is refused here rather
+    // than becoming a selector that silently matches nothing.
+    let auth_field = match field {
+        "_authToken" => asv_integrations::npm::AuthField::AuthToken,
+        "_auth" => asv_integrations::npm::AuthField::Auth,
+        "username" => asv_integrations::npm::AuthField::Username,
+        "_password" => asv_integrations::npm::AuthField::Password,
+        other => {
+            eprintln!(
+                "asv: {other:?} is not an npm auth field this build knows; expected one of \
+                 _authToken, _auth, username or _password"
+            );
+            std::process::exit(2);
+        }
+    };
+
+    let path = match file {
+        Some(file) => std::path::PathBuf::from(file),
+        None => {
+            let home = match home {
+                Some(home) => std::path::PathBuf::from(home),
+                None => match std::env::var_os("HOME") {
+                    Some(home) => std::path::PathBuf::from(home),
+                    None => {
+                        eprintln!("asv: HOME is not set, so the configuration cannot be located; pass --file or --home");
+                        std::process::exit(2);
+                    }
+                },
+            };
+            home.join(".npmrc")
+        }
+    };
+
+    let mut policy = asv_integrations::FingerprintPolicy::strict();
+    if let Some(root) = allow_symlink_root {
+        policy = policy.allowing_symlink_root(root);
+    }
+
+    // **The fingerprint this import is checked against comes from the plan, not
+    // from the file it is about to read.** Computing it here and handing it
+    // straight to `extract` would compare the file against itself: it would
+    // catch a concurrent edit during the command and nothing else, and §6's
+    // "changed since you planned" would be unreachable from the product. With
+    // `--from-plan` the identity is the one the operator acted on, and the
+    // refusal is reachable.
+    let planned = match from_plan {
+        Some(plan_path) => match planned_fingerprint(plan_path, &path, audience, &auth_field) {
+            Ok(fingerprint) => Some(fingerprint),
+            Err(message) => {
+                eprintln!("asv: {message}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+    if planned.is_none() {
+        eprintln!(
+            "asv: no --from-plan, so this import cannot tell a configuration that changed since \
+             you planned from one that did not. Pass the `asv integrations plan npm --json` output \
+             this import answers."
+        );
+        std::process::exit(2);
+    }
+    let expected = planned.expect("checked above");
+
+    let selector = AdoptSelector {
+        file: path.to_string_lossy().into_owned(),
+        audience: audience.to_string(),
+        field: auth_field.clone(),
+    };
+
+    let value = match NpmAdoption::extract(&policy, &path, &selector, &expected) {
+        Ok(value) => value,
+        Err(error) => {
+            if json {
+                let failure = serde_json::json!({
+                    "schema": asv_integrations::ADOPT_SCHEMA,
+                    "family": family,
+                    "error": error.to_string(),
+                    "kind": adopt_error_kind(&error),
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&failure).unwrap_or_default()
+                );
+            } else {
+                eprintln!("asv: {error}");
+            }
+            std::process::exit(1);
+        }
+    };
+
+    // The one allocation the operator's credential occupies from here on. Taken
+    // rather than copied, so there is no second copy for a later edit to have
+    // forgotten about.
+    let secret = OpaqueSecret::new(
+        secrecy::ExposeSecret::expose_secret(&value)
+            .as_bytes()
+            .to_vec(),
+    );
+    drop(value);
+
+    let response = call(
+        socket,
+        &Request::CreateCredential {
+            label: label.to_string(),
+            // A registry token is a bearer token as far as the vault is
+            // concerned; the registry it is for is the binding's business, and
+            // `plan` is where that is recorded.
+            kind: asv_domain::CredentialKind::BearerToken,
+            provider: "npm".to_string(),
+            account: audience.to_string(),
+            secret,
+        },
+    );
+
+    let id = match response {
+        Ok(Response::CredentialCreated { id, .. }) => id,
+        Ok(other) => {
+            eprintln!(
+                "asv: the broker answered {} to a credential creation; nothing was imported",
+                response_kind(&other)
+            );
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("asv: could not reach the broker, so nothing was imported: {error}");
+            std::process::exit(2);
+        }
+    };
+
+    let receipt = AdoptReceipt::new(
+        selector,
+        id,
+        label.to_string(),
+        audience.to_string(),
+        std::collections::BTreeSet::from([
+            asv_integrations::Operation::Read,
+            asv_integrations::Operation::Publish,
+        ]),
+        path.to_string_lossy().into_owned(),
+        // Re-read after the import rather than reusing the plan's: the receipt
+        // is evidence about the file as it is *now*, and reusing the plan's
+        // fingerprint would make it evidence about a moment that has passed.
+        match policy.fingerprint(&path) {
+            Ok(fingerprint) => fingerprint,
+            Err(_) => expected,
+        },
+    );
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&receipt).expect("the receipt serialises")
+        );
+    } else {
+        print_adopt_prose(&receipt);
+    }
+    Ok(())
+}
+
+/// A stable machine word per refusal, so a consumer can branch on the *reason*
+/// without parsing prose — the JSON path carries it beside the message.
+fn adopt_error_kind(error: &asv_integrations::AdoptError) -> &'static str {
+    use asv_integrations::AdoptError;
+    match error {
+        AdoptError::ConfigChanged { .. } => "config_changed",
+        AdoptError::Unreadable { .. } => "unreadable",
+        AdoptError::AmbiguousLine { .. } => "ambiguous_line",
+        AdoptError::NoSuchSelector { .. } => "no_such_selector",
+        AdoptError::EnvReference { .. } => "env_reference",
+        AdoptError::EmptyValue { .. } => "empty_value",
+    }
+}
+
+/// The human form of an adopt receipt.
+fn print_adopt_prose(receipt: &asv_integrations::AdoptReceipt) {
+    println!(
+        "imported {field} for {audience} into the vault",
+        field = receipt.selector.field,
+        audience = receipt.audience
+    );
+    println!("  credential: {} ({})", receipt.credential, receipt.label);
+    println!(
+        "  operations: {}",
+        receipt
+            .operations
+            .iter()
+            .map(|op| op.wire_name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!();
+    println!("  {} was NOT modified.", receipt.source_file);
+    println!("  It still contains the credential, and that is deliberate. Before it can be");
+    println!("  scrubbed, doc 04 §10 requires:");
+    for step in &receipt.outstanding {
+        let text = match step {
+            asv_integrations::PendingStep::VerifyVault => {
+                "prove the credential is retrievable from the vault"
+            }
+            asv_integrations::PendingStep::VerifyNewIntegration => {
+                "prove the new integration works"
+            }
+            asv_integrations::PendingStep::NegativeBypassTest => {
+                "prove the old path no longer works"
+            }
+            asv_integrations::PendingStep::HumanApproval => {
+                "a human decides to remove the original"
+            }
+            asv_integrations::PendingStep::ScrubAndRescan => "scrub, rescan, and write the receipt",
+        };
+        println!("    - {text}");
+    }
+}
+
+/// The fingerprint a plan recorded for one selector.
+///
+/// Read from the plan rather than recomputed, because the whole value of §6 is
+/// that the identity is the one the operator *acted on*. Re-deriving it here
+/// would make the comparison a tautology.
+fn planned_fingerprint(
+    plan_path: &str,
+    file: &std::path::Path,
+    audience: &str,
+    field: &asv_integrations::npm::AuthField,
+) -> Result<asv_integrations::FileFingerprint, String> {
+    let raw = std::fs::read_to_string(plan_path)
+        .map_err(|error| format!("could not read the plan at {plan_path}: {error}"))?;
+    let plan: asv_integrations::IntegrationPlan = serde_json::from_str(&raw).map_err(|error| {
+        format!(
+            "{plan_path} is not an {} document: {error}",
+            asv_integrations::PLAN_SCHEMA
+        )
+    })?;
+    let wanted = file.to_string_lossy();
+    plan.entries
+        .into_iter()
+        .find(|entry| {
+            entry.file.as_path() == file && entry.audience == audience && entry.field == *field
+        })
+        .map(|entry| entry.fingerprint)
+        .ok_or_else(|| {
+            format!(
+                "the plan at {plan_path} has no entry for {audience} / {field} in {wanted}; \
+                 re-run `asv integrations plan npm --json` and adopt from that"
+            )
+        })
 }

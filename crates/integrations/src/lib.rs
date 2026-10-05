@@ -60,11 +60,15 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod adopt;
 pub mod fingerprint;
 pub mod npm;
 pub mod plan;
 pub mod registry_audience;
 
+pub use adopt::{
+    selector_for, AdoptError, AdoptReceipt, AdoptSelector, NpmAdoption, PendingStep, ADOPT_SCHEMA,
+};
 pub use fingerprint::{Drift, FileFingerprint, FingerprintError, FingerprintPolicy};
 pub use npm::{Npm, NpmDiscovery, NpmError};
 pub use plan::{
@@ -72,6 +76,12 @@ pub use plan::{
     PlanError, Posture, Strategy, UnboundReason, Why, PLAN_SCHEMA,
 };
 pub use registry_audience::{RegistryAudience, RegistryAudienceError};
+
+// `adopt` names a vault credential in its receipt, so the handle type belongs
+// at this crate's root rather than making every consumer reach into
+// `asv-domain` for it. `Operation` is deliberately *not* re-exported from here:
+// it is this crate's own vocabulary, defined by `plan`.
+pub use asv_domain::CredentialId;
 
 use std::path::{Path, PathBuf};
 
@@ -132,7 +142,15 @@ pub struct Candidate {
 pub struct Discovery {
     /// `asv.discovery/v1`. Named because this crosses into agent context and a
     /// consumer needs to know which shape it is looking at before it parses it.
-    pub schema: &'static str,
+    ///
+    /// A `String` rather than a `&'static str`: this type derives `Deserialize`,
+    /// and `&'static str` can only be deserialised from data that already lives
+    /// forever, so a `&'static str` here would mean *the derive does not
+    /// compile for any runtime input*. It did compile, because `Deserialize` is
+    /// only instantiated when something asks for it — which is exactly the
+    /// failure mode where a derive looks fine and the type is unusable. Found
+    /// when `adopt` needed to read a plan back.
+    pub schema: String,
     pub family: String,
     pub report: AnyReport,
 }
@@ -149,7 +167,7 @@ impl Discovery {
     /// Wraps a family's report with this build's schema and the family's name.
     pub fn new(family: impl Into<String>, report: AnyReport) -> Self {
         Self {
-            schema: DISCOVERY_SCHEMA,
+            schema: DISCOVERY_SCHEMA.to_string(),
             family: family.into(),
             report,
         }

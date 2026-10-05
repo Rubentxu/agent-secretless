@@ -269,7 +269,12 @@ pub struct IntegrationPlan {
     /// `asv.integrations.plan/v1`, set by the constructor rather than by a
     /// caller. A field is something a caller sets and a schema string is
     /// something the build is.
-    pub schema: &'static str,
+    ///
+    /// A `String`, not a `&'static str`, because a plan is **read back**: a
+    /// consumer parses one this build produced. `&'static str` deserialises
+    /// only from data that already lives forever, so it would have made every
+    /// read of a plan a compile error in the consumer rather than an error here.
+    pub schema: String,
     pub family: String,
     /// One entry per discovered auth selector, in the order the tool reads its
     /// files and the order it reads the selectors within them.
@@ -287,7 +292,7 @@ impl IntegrationPlan {
     /// Wraps a family's entries with this build's schema and the family's name.
     pub fn new(family: impl Into<String>, entries: Vec<PlanEntry>, inventory_size: usize) -> Self {
         Self {
-            schema: PLAN_SCHEMA,
+            schema: PLAN_SCHEMA.to_string(),
             family: family.into(),
             entries,
             inventory_size,

@@ -640,3 +640,33 @@ fn plan_for_file(
         &[exportable(metadata("npm-registry", kind), exportability)],
     )
 }
+
+/// **A plan is read back, so it must be readable.** `IntegrationPlan` derived
+/// `Deserialize` while carrying `schema: &'static str`, and that compiles — but
+/// a `&'static str` deserialises only from data that already lives forever, so
+/// the moment `adopt` tried to read a plan back off disk it did not compile.
+/// **A derive is only instantiated when something asks for it**, which is
+/// exactly the shape of defect that looks clean in review and breaks the first
+/// time a second writer needs the type.
+///
+/// This row is the instantiation. Without it the derive is checked by nothing.
+#[test]
+fn a_plan_round_trips_through_the_shape_a_consumer_actually_reads() {
+    let plan = plan_npm(
+        &token_discovery(),
+        &[metadata("npm-registry", CredentialKind::BearerToken)],
+    );
+    let json = serde_json::to_string(&plan).expect("serialises");
+
+    let parsed: IntegrationPlan =
+        serde_json::from_str(&json).expect("a plan this build produced must be readable by one");
+    assert_eq!(
+        parsed.schema, PLAN_SCHEMA,
+        "the schema survives the round trip"
+    );
+    assert_eq!(parsed.entries.len(), plan.entries.len());
+    assert_eq!(
+        parsed, plan,
+        "a plan that does not survive its own round trip is not a contract"
+    );
+}

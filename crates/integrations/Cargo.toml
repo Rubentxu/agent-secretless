@@ -30,6 +30,14 @@ thiserror.workspace = true
 # ssh-agent and connector-pg, so this is a dependency rather than a new one --
 # and it is the only unsafe call in the crate, in one function.
 libc = "0.2"
+# `adopt` is the one step that holds a value, and both of these exist so that
+# holding it leaves no copy behind: `SecretString` redacts on `Debug` and on
+# `Display`, and `Zeroizing` clears the file buffer and the extracted value in
+# place on drop. Neither is a new dependency in the graph -- `add-credential`
+# and every secret port already use them -- so this names a cost the crate was
+# already paying rather than adding one.
+secrecy.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
