@@ -37,11 +37,13 @@
 //! `host-dependent` half, and no repository check asserts it.
 //!
 //! What this file does measure, and what the mutations confirmed: the key never
-//! reaches the wire, the signed header list covers what is sent, the payload
-//! hash is the hash of the sent body, the port is in the `Host`, a cross-origin
-//! hop is refused, a 200 carrying a `Location` is not treated as a redirect, an
-//! unsigned request cannot go out, a named provider refusal is not flattened to
-//! a status, and the port's own refusal reason survives the client.
+//! reaches the wire, every header AWS requires to be signed is signed, the
+//! client holds **one** header list so "signed" and "sent" cannot diverge, the
+//! payload hash is the hash of the sent body, the port is in the `Host`, a
+//! cross-origin hop is refused, a 200 carrying a `Location` is not treated as a
+//! redirect, an unsigned request cannot go out, a named provider refusal is not
+//! flattened to a status, and the port's own refusal reason survives the
+//! client.
 //!
 //! **And one check here is not exercised at all.** `StsClient::send` bounds the
 //! body twice: once on the declared `content-length`, once on the bytes actually
@@ -286,6 +288,60 @@ fn authorization_commits_to(request: &Observed, header: &str) -> bool {
         .unwrap_or_default()
         .split(';')
         .any(|name| name.trim().eq_ignore_ascii_case(header))
+}
+
+/// Every header AWS requires to be signed is signed.
+///
+/// The first draft of this row asserted that *every* header the origin received
+/// was covered, and it failed on `content-length` and `accept` — both of which
+/// the HTTP client adds by itself. That is not a defect in the request: the
+/// AWS reference's own sample request carries `Content-Length: 32` with
+/// `SignedHeaders=host;user-agent;x-amz-date`, so an unsigned `content-length`
+/// is what a correct SigV4 request looks like. The row was wrong about the
+/// rule, not the client.
+///
+/// **The rule is the one the provider enforces:** `host` and every `x-amz-*`
+/// header must be inside the signature, and the rest are the signer's choice.
+/// Stating it that way is what makes the row bite on the case that matters —
+/// because `x-amz-security-token` is an `x-amz-*` header, so a session-signed
+/// request that sent the token without signing it fails this row, and that is
+/// the mistake the temporary-credentials example warns about.
+///
+/// It is also the falsifiable form of the claim that the client has **one**
+/// header list: before the two copies were unified, satisfying this needed them
+/// to agree by hand.
+#[test]
+fn every_header_the_provider_requires_signed_is_signed() {
+    let origin = origin(Reply::Body(assume_role_response()));
+    let (port, _grants) = CountingPort::new(LONG_LIVED_KEY.as_bytes());
+    let client = client_for(&origin);
+    client
+        .assume_role(&port, CREDENTIAL, at(NOW))
+        .expect("the fixture answers");
+
+    let request = &origin.observed()[0];
+    let requires_signing =
+        |name: &str| name.eq_ignore_ascii_case("host") || name.to_ascii_lowercase().starts_with("x-amz-");
+
+    let unsigned: Vec<&str> = request
+        .headers
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| requires_signing(name))
+        .filter(|name| !authorization_commits_to(request, name))
+        .collect();
+    assert!(
+        unsigned.is_empty(),
+        "the request carries headers AWS requires to be signed, unsigned: {unsigned:?}"
+    );
+    // And the list is not vacuously satisfied by the loop finding nothing: the
+    // four this operation signs are all present, and all covered.
+    for header in ["content-type", "host", "x-amz-content-sha256", "x-amz-date"] {
+        assert!(
+            request.header(header).is_some() && authorization_commits_to(request, header),
+            "{header} is not both sent and signed"
+        );
+    }
 }
 
 #[test]

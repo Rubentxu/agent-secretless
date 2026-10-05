@@ -36,6 +36,16 @@
 //! held the key. It is not `Clone`, has no `Debug`, and hands the signer over
 //! once and only once — after which the borrow is over and the key is gone.
 //!
+//! # One header list, signed and sent
+//!
+//! [`signed_headers`] exists because the two copies of the header list this
+//! module used to keep could drift, and a drift there is a signature over
+//! headers the request does not carry. AWS answers that with
+//! `SignatureDoesNotMatch`, which points an operator at their clock. The list is
+//! now built once and used for both, so "signed" and "sent" are the same fact —
+//! which is what the session path needs, since `x-amz-security-token` has to be
+//! inside `SignedHeaders` as well as on the wire.
+//!
 //! # What this is not
 //!
 //! Not reachable by an agent. There is no broker operation and no CLI verb
@@ -200,6 +210,71 @@ impl SignerSink {
     }
 }
 
+/// The headers one signed Query request carries, built once.
+///
+/// **One list, signed and sent.** The version this replaced wrote the four
+/// headers twice -- once for [`SignRequest`] and once for the request builder --
+/// with nothing keeping the two copies in step. A drift between them is a
+/// signature computed over headers the request does not carry, or a header sent
+/// that the signature does not cover, and AWS reports both as
+/// `SignatureDoesNotMatch`, which sends an operator to their clock.
+///
+/// It matters more than usual for the session path, where
+/// `x-amz-security-token` has to appear in **both** the signed list and the
+/// request: the AWS reference's temporary-credentials example signs with
+/// `SignedHeaders=host;user-agent;x-amz-date;x-amz-security-token`. With one
+/// list that is a fact about the shape instead of a thing to keep in step.
+///
+/// `extra` is how a caller adds a header that is part of the signature. It is
+/// a parameter rather than a second entry point so that "signed" and "sent"
+/// cannot diverge: there is nowhere to put a header that is only one of them.
+fn signed_headers(
+    host: &str,
+    payload_hash: &str,
+    amz_date: &str,
+    extra: &[(&str, &str)],
+) -> Vec<(String, String)> {
+    let mut headers = vec![
+        ("content-type".to_string(), CONTENT_TYPE.to_string()),
+        ("host".to_string(), host.to_string()),
+        ("x-amz-content-sha256".to_string(), payload_hash.to_string()),
+        ("x-amz-date".to_string(), amz_date.to_string()),
+    ];
+    headers.extend(
+        extra
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string())),
+    );
+    headers
+}
+
+/// Signs `payload` over exactly the headers that will be sent.
+///
+/// The borrowing is the whole point: the signer sees the same names and values
+/// the transport will put on the wire, so there is no second list to fall out
+/// of step with this one.
+fn sign_with(
+    signer: &SigV4Signer,
+    headers: &[(String, String)],
+    payload: &[u8],
+    amz_date: &str,
+) -> Result<super::sigv4::SignedRequest, StsClientError> {
+    let borrowed: Vec<Header<'_>> = headers
+        .iter()
+        .map(|(name, value)| Header::new(name, value))
+        .collect();
+    Ok(signer.sign(
+        &SignRequest {
+            method: "POST",
+            path: STS_PATH,
+            headers: &borrowed,
+            payload,
+            ..SignRequest::default()
+        },
+        amz_date,
+    )?)
+}
+
 /// The live client. Holds no secret: the key is borrowed per call.
 pub struct StsClient {
     transport: PinnedClient,
@@ -287,6 +362,10 @@ impl StsClient {
             "the instant is before the epoch or past the year a stamp can express",
         ))?;
 
+        // Built once, and then used twice: to sign and to send. See
+        // [`signed_headers`] for why that is one list rather than two.
+        let headers = signed_headers(&host, &payload_hash, &amz_date, &[]);
+
         // The one window in which the key is a value. `lend` calls `accept`,
         // `take` hands the signer over, and the signer is dropped -- zeroizing
         // the key -- at the end of the block below, before `send` is reached.
@@ -294,39 +373,32 @@ impl StsClient {
             let mut sink = SignerSink::new(&self.config.access_key_id, &self.config.region);
             secrets.lend(credential, &mut sink)?;
             let signer = sink.take()?;
-            signer.sign(
-                &SignRequest {
-                    method: "POST",
-                    path: STS_PATH,
-                    headers: &[
-                        Header::new("content-type", CONTENT_TYPE),
-                        Header::new("host", &host),
-                        Header::new("x-amz-content-sha256", &payload_hash),
-                        Header::new("x-amz-date", &amz_date),
-                    ],
-                    payload: body.as_bytes(),
-                    ..SignRequest::default()
-                },
-                &amz_date,
-            )?
             // The key is gone here. Nothing below can reach it, and the request
             // that follows is already signed.
+            sign_with(&signer, &headers, body.as_bytes(), &amz_date)?
         };
 
-        self.send(&signed, &payload_hash, &body, &request, now)
+        self.send(&signed, &headers, &body, now, |bytes, now| {
+            parse_assume_role(bytes, &request, now)
+        })
     }
 
-    fn send(
+    /// Sends a signed request and reads the answer with `parse`.
+    ///
+    /// Shared by every Query call rather than copied per operation: the
+    /// cross-origin policy, the two size bounds and the status-versus-refusal
+    /// decision are the properties worth having exactly once, and a second copy
+    /// of them is a second place for them to be subtly different.
+    fn send<T>(
         &self,
         signed: &super::sigv4::SignedRequest,
-        payload_hash: &str,
+        headers: &[(String, String)],
         body: &str,
-        request: &AssumeRole,
         now: SystemTime,
-    ) -> Result<AwsSession, StsClientError> {
+        parse: impl Fn(&[u8], SystemTime) -> Result<T, StsError>,
+    ) -> Result<T, StsClientError> {
         let url = self.transport.url(&self.audience, STS_PATH)?;
         let origin = url.clone();
-        let host = self.host_header();
         let authority = self.audience.authority.clone();
 
         // The closure's error type is spelled out because `#[from]` on three
@@ -337,24 +409,27 @@ impl StsClient {
             url,
             &origin,
             |target| -> Result<Redirect<reqwest::blocking::Response>, StsClientError> {
-            let sent = self
-                .transport
-                .client()
-                .post(target.clone())
-                .header("content-type", CONTENT_TYPE)
-                .header("host", host.clone())
-                .header("x-amz-content-sha256", payload_hash.to_string())
-                .header("x-amz-date", signed.amz_date.clone())
-                .header("authorization", signed.authorization.clone())
-                .body(body.to_string())
-                .send()
-                .map_err(|error| TransportError::from((authority.clone(), error)))?;
-            let status = sent.status();
-            let next = sent
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| target.join(value).ok());
+                let mut builder = self
+                    .transport
+                    .client()
+                    .post(target.clone())
+                    .body(body.to_string());
+                // The very list the signature was computed over. `Authorization`
+                // is the one header added here and not signed, because it *is*
+                // the signature.
+                for (name, value) in headers {
+                    builder = builder.header(name, value);
+                }
+                let sent = builder
+                    .header("authorization", signed.authorization.clone())
+                    .send()
+                    .map_err(|error| TransportError::from((authority.clone(), error)))?;
+                let status = sent.status();
+                let next = sent
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| target.join(value).ok());
                 match next {
                     Some(next) if status.is_redirection() => Ok(Redirect::Hop(next)),
                     _ => Ok(Redirect::Done(sent)),
@@ -377,8 +452,8 @@ impl StsClient {
             }));
         }
 
-        match parse_assume_role(&bytes, request, now) {
-            Ok(session) => Ok(session),
+        match parse(&bytes, now) {
+            Ok(value) => Ok(value),
             // A refusal that names its code is worth more than its status, and
             // the code is the part an operator acts on. A 5xx that happens to
             // carry an ErrorResponse is the same answer.
