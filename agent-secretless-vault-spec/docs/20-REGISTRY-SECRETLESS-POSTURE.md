@@ -327,6 +327,59 @@ did not go red" are different findings. Disambiguating the snippet also fixed a
 mutation that had been a *harness error* in the R2.F.2 phase all along: that
 phase was 5 red + 1 harness error, not 5 red + 1 red, and is now 6.
 
+## R2.F.3a, the resource the policy can reason about
+
+A connector is not a provider until the policy can say something about it. So
+the increment is two types and a decision, and the decision is the interesting
+part: **what is the resource a registry permission is about?**
+
+The obvious answer is `Api { audience }`, which is what GitHub and AWS use. It
+is the wrong answer here, and the reason is the registry's own grant shape: a
+registry authorizes **per repository**, in a scope of the form
+`repository:<name>:<actions>`. An audience cannot express that. A rule written
+against one either allows every repository on the host or none, and the
+question an operator actually has — *may this agent pull `library/alpine`* —
+has nowhere to live. So `Resource::Registry { authority, repository }` carries
+both halves, and the `repository` attribute is the whole reason it exists.
+
+Two decisions worth writing down, because both could reasonably have gone the
+other way and one of them nearly did:
+
+**The default policy permits neither action.** `registry_pull` is the read half
+of a provider whose read half looks harmless, and permitting it would mean every
+deployment that upgrades starts letting every session pull every image its
+credential reaches, with no operator having decided that. The house rule is
+already settled in the other direction — `aws_sts_caller_identity`,
+`oauth2_identity` and `connect_route` all landed with no permit, for the same
+reason. Both actions are in the Cedar **schema** so that an operator's rule
+*loads and then denies*, which is a failure they can read, rather than crashing
+at policy load.
+
+**`Authority` gives spelling, not approval, and the row that says so replaced a
+row that said otherwise.** The first version of
+`una_autoridad_de_registro_tiene_una_sola_ortografia_y_es_un_host` asserted that
+`registry-1.docker.io.evil.example` would not canonicalize. It does — it is a
+perfectly valid host and a *different* one. A suffix mirla is not a misspelling
+of an approved host; it is somebody else's host, and the thing that refuses it
+is the allowlist comparison, not the type. So the row now asserts the two
+guarantees that are actually true — one spelling per host, and nothing that is
+not a bare host gets in — and says plainly that approval lives elsewhere.
+
+That is the **fifth** time this repository has written a row that asserts a
+property the code under it does not have. It is also the first time the failure
+was caught by *running* the row against the real function rather than by a
+mutation, and the cure was the same as the other four: not a tighter assertion,
+a better question.
+
+**Six rows, six mutations, six red.** The one to read first maps a push onto a
+pull by editing one line of `action_name`. That match is exhaustive, so a
+copy-paste there compiles, validates against the schema, and silently makes
+`registry_push` evaluate as `registry_pull` — which, under any policy written
+for reading, turns a permitted read into a permitted write. Nothing else in the
+tree would notice: the schema still declares both actions, the entity is still
+a `Registry`, and the audit trail would record the push under the name of a
+read.
+
 ## What is still missing
 
 `get_blob` is the last piece the connector needs before it is a *pull*. What

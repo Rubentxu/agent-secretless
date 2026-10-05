@@ -185,6 +185,49 @@ permit (principal, action == Action::"postgres_read", resource is Database);
 // the scope-aware lend needs its own handle, and the token cache's key has to
 // become `(credential, scope)` or a narrow request would be served a wide cached
 // token.
+//
+// -- M11-R2.F.3: the OCI registry, and the shape of the rule an operator writes
+//
+// `registry_pull` and `registry_push` are in the *schema* and have **no permit
+// rule**, and that is the same decision as `aws_sts_caller_identity` and
+// `oauth2_identity` above rather than a new one: a surface that did not exist
+// when this text was written does not start answering on behalf of every session
+// because somebody upgraded. They are in the schema because without it a policy
+// naming them would fail strict validation at *load*, and a load-time crash for a
+// rule an operator wrote on purpose is the wrong failure mode — the correct one
+// is a denial at evaluation, which is what an operator can read and act on.
+//
+// The entity type is `Registry` and it carries **two** attributes, which is the
+// only part of this that is new:
+//
+//   permit (principal, action == Action::"registry_pull", resource is Registry)
+//   when { resource.authority == "registry-1.docker.io"
+//          && resource.repository == "library/alpine" };
+//
+// `repository` exists because a registry grants per repository, in a scope of
+// the form `repository:<name>:<actions>`. An `Api` — a bare audience — cannot
+// ask the question an operator actually has, which is "may this agent pull
+// *this* image", and pretending otherwise would have produced a rule that either
+// allowed every repository or none.
+//
+// **The `authority` attribute is safe to expose, and the reason is not that it
+// is validated — it is that nothing the agent sends can put a value in it.**
+// `audience_is_approved` does not gate `Registry`, and it does not need to,
+// because the broker builds this value from operator configuration and the
+// request only ever names a repository. A rule that compares `authority` is
+// therefore comparing a *declared* fact: naming `evil.example` there produces a
+// rule that never fires, not one that fires against an agent-chosen host.
+//
+// **And the same paragraph has to warn about the failure mode in the other
+// direction, because it is the one a reader is most likely to assume away.** If
+// the broker ever built this entity from a request-supplied host, the rule above
+// would become a *filter* over hosts the agent chose, and "deny everything
+// except `registry-1.docker.io`" would silently become "allow everything except
+// `registry-1.docker.io`" — the inversion, with the same policy text. The
+// allowlist property here is structural, and it lives in the broker's
+// configuration, not in this file. That is the same bargain `OAuth2Client`
+// struck, and it is worth knowing which file a property actually lives in before
+// trusting it here.
 //"#;
 
 /// Audiences a semantic HTTP action may ever target (D6; the design v2 open
@@ -254,6 +297,15 @@ const SCHEMA_JSON: &str = r#"{
               "type": "Set",
               "element": { "type": "String" }
             }
+          }
+        }
+      },
+      "Registry": {
+        "shape": {
+          "type": "Record",
+          "attributes": {
+            "authority": { "type": "String" },
+            "repository": { "type": "String" }
           }
         }
       }
@@ -432,6 +484,34 @@ const SCHEMA_JSON: &str = r#"{
         "appliesTo": {
           "principalTypes": ["AgentSession"],
           "resourceTypes": ["OAuth2Client"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
+      "registry_pull": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Registry"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
+      "registry_push": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Registry"],
           "context": {
             "type": "Record",
             "attributes": {
@@ -1126,6 +1206,8 @@ fn action_name(action: &Action) -> &'static str {
         Action::ConnectRoute => "connect_route",
         Action::AwsStsCallerIdentity => "aws_sts_caller_identity",
         Action::OAuth2Identity => "oauth2_identity",
+        Action::RegistryPull => "registry_pull",
+        Action::RegistryPush => "registry_push",
     }
 }
 
@@ -1141,6 +1223,7 @@ fn entity_type(resource: &Resource) -> &'static str {
         Resource::Host { .. } => "Host",
         Resource::Api { .. } => "Api",
         Resource::OAuth2Client { .. } => "OAuth2Client",
+        Resource::Registry { .. } => "Registry",
     }
 }
 
@@ -1156,6 +1239,18 @@ fn resource_name(resource: &Resource) -> String {
         // entity namespaces apart, and it is here rather than in the type name
         // because Cedar sees only a string.
         Resource::OAuth2Client { credential, .. } => format!("oauth2:{credential}"),
+        // `registry:` rather than the bare repository, for the same reason as
+        // `oauth2:` above. A repository name is attacker-supplied text in a
+        // system that also has `Repository { owner, name }`, and an entity uid
+        // of `library/alpine` from one namespace would be indistinguishable
+        // from one of the other. The prefix is the only thing keeping them
+        // apart, and Cedar sees only a string.
+        Resource::Registry {
+            authority,
+            repository,
+        } => {
+            format!("registry:{authority}/{repository}")
+        }
     }
 }
 
@@ -1199,6 +1294,24 @@ fn resource_attributes(resource: &Resource) -> Vec<(&'static str, ResourceAttrib
                 ResourceAttribute::Set(asv_domain::scope_set(scope)),
             )]
         }
+        // The repository is a policy input, and it is the *only* thing in this
+        // value the agent chose. It is exposed as an attribute rather than
+        // folded into the uid because a rule that wants to allow one
+        // repository and refuse another has to be able to ask, and
+        // `entity == Resource::"..."` can only ever name one of them.
+        //
+        // The authority is here too, and the reason is worth being explicit
+        // about: it is exposed so a policy *can* be written per registry, and
+        // it is safe to expose because it is not request-supplied. The broker
+        // builds this value from operator configuration, so a rule that reads
+        // `authority` is reading a declared fact, not an agent's suggestion.
+        Resource::Registry {
+            authority,
+            repository,
+        } => vec![
+            ("authority", ResourceAttribute::Text(authority.to_string())),
+            ("repository", ResourceAttribute::Text(repository.clone())),
+        ],
         Resource::Repository { .. } | Resource::Database { .. } | Resource::Host { .. } => {
             Vec::new()
         }
@@ -2218,4 +2331,267 @@ permit (principal, action == Action::"postgres_create_table", resource is Databa
         },
     };
     assert!(engine.authorize(&request, None, None).decision.is_allowed());
+}
+
+// ------------------------------------------------------------ M11-R2.F.3
+
+#[cfg(test)]
+/// A registry request against a declared authority and a named repository.
+///
+/// Both halves are parameters for the same reason the OAuth2 helper takes a
+/// scope: the authority is what an operator's rule compares against and the
+/// repository is what the agent chose, and a fixture that hardcoded either
+/// one would let every row below pass with a rule nobody wrote.
+fn registry_request(action: Action, authority: &str, repository: &str) -> AuthorizationRequest {
+    AuthorizationRequest {
+        session: AgentSessionId::new(),
+        action,
+        resource: Resource::Registry {
+            authority: Authority::canonicalize(authority).expect("valid authority"),
+            repository: repository.into(),
+        },
+        context: PolicyContext {
+            workspace: "/repo".into(),
+            protected_ref: None,
+            request_digest: Some("digest".into()),
+            peer_uid: 1000,
+        },
+    }
+}
+
+/// A stock broker refuses every registry operation, pull included.
+///
+/// This is the load-bearing row for the whole increment, and it is easier to
+/// get wrong than it looks. `registry_pull` is the *read* half of a provider
+/// whose read half looks harmless — and permitting it here would mean every
+/// deployment that upgrades to a version with an OCI connector starts letting
+/// every agent session pull every image its credential can reach, with no
+/// operator having decided that. The two actions are in the Cedar *schema* so
+/// that a rule naming them loads and then denies, which is a failure an
+/// operator can read, rather than failing at policy load.
+///
+/// Mutation: add `permit (principal, action == Action::"registry_pull",
+/// resource is Registry);` to `POLICY_TEXT`.
+#[test]
+fn la_policy_por_defecto_no_permite_nada_sobre_un_registro() {
+    let engine = PolicyEngine::default();
+    for (action, label) in [
+        (Action::RegistryPull, "pull"),
+        (Action::RegistryPush, "push"),
+    ] {
+        let verdict = engine.authorize(
+            &registry_request(action, "registry-1.docker.io", "library/alpine"),
+            None,
+            None,
+        );
+        assert!(
+            !verdict.decision.is_allowed(),
+            "a default policy permitted a registry {label}, so an operator who \
+             never wrote a rule would find their deployment pulling images"
+        );
+    }
+}
+
+/// The rule `POLICY_TEXT` tells an operator to write now matches, and matches
+/// only the registry and repository it names.
+///
+/// Both halves, for the reason the AWS row above says twice: the interesting
+/// failure is a condition that is satisfiable by *anything*, which looks
+/// identical to "it works" when only the positive half is asserted. A
+/// `when { resource.repository == ... }` against an attribute nothing supplies
+/// would deny always, and `when { true }` would allow always — and the first
+/// is the bug that shipped once already, in `Api::audience`.
+///
+/// Mutation: drop the `repository` arm from `resource_attributes`, or supply
+/// the authority under the repository's name.
+#[test]
+fn la_regla_documentada_de_un_registro_casa_y_solo_con_el_suyo() {
+    let engine = PolicyEngine::from_policy_text(
+        r#"permit (principal, action == Action::"registry_pull", resource is Registry)
+           when { resource.authority == "registry-1.docker.io"
+                  && resource.repository == "library/alpine" };"#,
+    )
+    .expect("the documented rule loads and is valid");
+
+    assert!(
+        engine
+            .authorize(
+                &registry_request(
+                    Action::RegistryPull,
+                    "registry-1.docker.io",
+                    "library/alpine"
+                ),
+                None,
+                None,
+            )
+            .decision
+            .is_allowed(),
+        "a rule naming the registry's own repository still denies"
+    );
+
+    // The same registry, another repository. This half has no analogue on any
+    // other provider here, and it is the whole reason `Registry` is not an
+    // `Api`: without a repository attribute there is nothing to write.
+    assert!(
+        !engine
+            .authorize(
+                &registry_request(Action::RegistryPull, "registry-1.docker.io", "acme/private"),
+                None,
+                None,
+            )
+            .decision
+            .is_allowed(),
+        "a pull of another repository on the same approved registry was allowed"
+    );
+
+    // Another registry, the repository the rule names.
+    assert!(
+        !engine
+            .authorize(
+                &registry_request(Action::RegistryPull, "ghcr.io", "library/alpine"),
+                None,
+                None,
+            )
+            .decision
+            .is_allowed(),
+        "the same repository on another registry was allowed"
+    );
+}
+
+/// A rule that permits only `registry_pull` does not also permit
+/// `registry_push`, and permitting the read is not a decision about the
+/// write.
+///
+/// The two actions exist separately because a pull reads content this side
+/// can verify and a push asserts content *to* someone else: after it, a
+/// repository that other agents, other CI and other humans pull from is no
+/// longer the one they were verifying. One `registry_access` action with a
+/// scope parameter would have collapsed exactly that, and the collapse would
+/// have looked like a simplification.
+///
+/// Mutation: put both actions in the `action in [...]` head of the rule.
+#[test]
+fn un_pull_permitido_no_arrastra_al_push() {
+    let engine = PolicyEngine::from_policy_text(
+        r#"permit (principal, action == Action::"registry_pull", resource is Registry)
+           when { resource.repository == "library/alpine" };"#,
+    )
+    .expect("the pull-only rule loads");
+
+    assert!(
+        engine
+            .authorize(
+                &registry_request(
+                    Action::RegistryPull,
+                    "registry-1.docker.io",
+                    "library/alpine"
+                ),
+                None,
+                None,
+            )
+            .decision
+            .is_allowed(),
+        "the pull the rule names is denied, so the row would prove nothing"
+    );
+    assert!(
+        !engine
+            .authorize(
+                &registry_request(
+                    Action::RegistryPush,
+                    "registry-1.docker.io",
+                    "library/alpine"
+                ),
+                None,
+                None,
+            )
+            .decision
+            .is_allowed(),
+        "a rule that permits a pull also permitted a push to the same repository"
+    );
+}
+
+/// The registry entity is not a repository entity, and the uid says so.
+///
+/// `Repository { owner, name }` renders `acme/app`; a `Registry` holding the
+/// repository `app` on `registry-1.docker.io` renders
+/// `registry:registry-1.docker.io/library/app`. Without the prefix the two
+/// are the same string, and a policy rule naming one would match whichever
+/// the entity store happened to hold — which is the D6 defect the comment on
+/// `entity_type` describes, in a different costume.
+///
+/// Mutation: drop the `registry:` prefix from `resource_name`.
+#[test]
+fn una_entidad_de_registro_no_se_puede_confundir_con_una_de_repositorio() {
+    let uid = registry_request(Action::RegistryPull, "registry-1.docker.io", "library/app")
+        .resource_name();
+
+    assert!(
+        uid.starts_with("registry:"),
+        "a registry entity has no namespace prefix: {uid:?}"
+    );
+    // The value is stable enough for an operator to write into a policy,
+    // which is the only reason to build it as a string at all.
+    assert_eq!(uid, "registry:registry-1.docker.io/library/app");
+}
+
+/// What `Authority` gives a registry resource, stated exactly.
+///
+/// This row replaced a stronger claim that was simply false, and the false
+/// claim is worth recording because it is the fifth time this repository has
+/// written it. The earlier version asserted that
+/// `registry-1.docker.io.evil.example` would not canonicalize. It does — it is
+/// a perfectly valid host, and a *different* one, and treating that as a forgery
+/// is the wrong model: a suffix mirla is not a misspelling of an approved host,
+/// it is somebody else's host.
+///
+/// The two guarantees below are the ones that are actually true, and both are
+/// needed:
+///
+/// 1. **One spelling per host.** `REGISTRY-1.DOCKER.IO` and
+///    `registry-1.docker.io` are the same value, so an operator writing one and
+///    a broker building the other compare equal. A case-sensitive `String` would
+///    make the allowlist a spelling lottery.
+/// 2. **Anything that is not a bare host is refused** — a scheme, a port, a
+///    path, an empty label. So the value inside a `Registry` is a host and
+///    cannot smuggle a URL, which is what keeps a policy rule comparing it from
+///    being about a different string than the one that gets dialled.
+///
+/// And what the type does **not** give is approval. `ALLOWED_AUDIENCES` does
+/// not list registries and does not need to, because the broker builds this
+/// value from operator configuration and the request only ever names a
+/// repository. A row claiming this layer enforced an allowlist would be the
+/// exact defect D6's own row warns about.
+///
+/// Mutation: stop lowercasing, or accept a scheme/port/path in
+/// `Authority::canonicalize`.
+#[test]
+fn una_autoridad_de_registro_tiene_una_sola_ortografia_y_es_un_host() {
+    // 1. One spelling per host.
+    assert_eq!(
+        Authority::canonicalize("REGISTRY-1.DOCKER.IO").expect("valid"),
+        Authority::canonicalize("registry-1.docker.io").expect("valid"),
+        "two spellings of one host are two values, so an operator's rule depends \
+         on how the broker typed it"
+    );
+    // And a suffix mirla is a *different* host, which is why an allowlist has to
+    // be an exact comparison rather than a suffix test.
+    assert_ne!(
+        Authority::canonicalize("registry-1.docker.io.evil.example").expect("valid"),
+        Authority::canonicalize("registry-1.docker.io").expect("valid"),
+    );
+    // 2. Not a bare host, refused.
+    for not_a_host in [
+        "https://registry-1.docker.io",
+        "registry-1.docker.io:443",
+        "evil.example/registry-1.docker.io",
+        "registry-1.docker.io/v2/",
+        "a..b",
+        "",
+    ] {
+        assert!(
+            Authority::canonicalize(not_a_host).is_err(),
+            "{not_a_host:?} became an authority, so a policy rule comparing it \
+             would be comparing a different string than the one dialled"
+        );
+    }
 }

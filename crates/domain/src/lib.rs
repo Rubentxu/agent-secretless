@@ -713,6 +713,32 @@ pub enum Action {
     /// broker compares the answer against the deployment and refuses a
     /// mismatch, rather than relaying whatever was granted.
     OAuth2Identity,
+    /// Reads an image out of an OCI registry (M11-R2.F.3).
+    ///
+    /// A *semantic* operation, for the reason every other one here is: the
+    /// registry protocol offers `GET /v2/<name>/manifests/<ref>` and
+    /// `GET /v2/<name>/blobs/<digest>`, and a generic `http_request` over one
+    /// of those paths would be unauthorizable in the way that matters — the
+    /// thing being granted is not "a request to a host", it is "the right to
+    /// read this repository", and only the repository-scoped form of the grant
+    /// says that.
+    ///
+    /// Read-only, which is why it is the action an operator's first rule is
+    /// about, and why [`Self::RegistryPush`] exists separately rather than as a
+    /// flag on this one. Neither is permitted by the default policy: a surface
+    /// that did not exist when that text was written does not start answering
+    /// because somebody upgraded.
+    RegistryPull,
+    /// Writes an image into an OCI registry (M11-R2.F.3).
+    ///
+    /// **A push is not a pull with a different method.** A pull reads content
+    /// this side can verify, because a manifest names digests and a blob
+    /// carries the one it was asked for. A push asserts content *to* someone
+    /// else: after it, a repository that other agents, other CI and other
+    /// humans pull from is no longer the one they were verifying. So the two
+    /// are separate actions, the policy default permits only the read, and an
+    /// operator who wants writes to a shared registry has to say so.
+    RegistryPush,
 }
 
 impl fmt::Display for Action {
@@ -734,6 +760,8 @@ impl fmt::Display for Action {
             Self::ConnectRoute => "connect.route",
             Self::AwsStsCallerIdentity => "aws.sts.caller_identity",
             Self::OAuth2Identity => "oauth2.identity",
+            Self::RegistryPull => "registry.pull",
+            Self::RegistryPush => "registry.push",
         };
         f.write_str(s)
     }
@@ -828,6 +856,46 @@ pub enum Resource {
         /// and `authorize_oauth2` passes the *deployment's* string. An agent
         /// cannot ask for a scope, so it cannot ask for a wider one.
         scope: String,
+    },
+    /// One OCI repository on one registry (M11-R2.F.3).
+    ///
+    /// **Both halves, and the second one is why this is not an `Api`.** An
+    /// `Api` is a bare audience, which is the right granularity for GitHub
+    /// because every issue and release in a repository is the same
+    /// authorization. It is the wrong granularity here: a registry grants
+    /// access *per repository*, in a scope string of the form
+    /// `repository:<name>:<actions>` (RFC 6749 §3.3, as Docker uses it), and a
+    /// resource that cannot name the repository cannot ask Cedar the question
+    /// an operator actually has, which is "may this agent pull
+    /// `library/alpine`".
+    ///
+    /// **The `authority` is an [`Authority`] and is never request-supplied.**
+    /// That is the same control D6 gives the other providers, and it is why
+    /// the field is a type that can only be built by canonicalizing: a
+    /// lookalike spelling of an approved registry cannot be *constructed*, so
+    /// no policy rule can name one and have it approved.
+    ///
+    /// ## What is deliberately NOT here
+    ///
+    /// No `host` field, no port, no scheme, and no credential. The credential
+    /// is a vault secret the agent never names, and the host is operator
+    /// configuration the broker resolves before building this value — because
+    /// `ALLOWED_AUDIENCES` is a two-entry first-party list and a registry set
+    /// is Docker Hub, GHCR, Quay and a per-region ECR host, so enumerating
+    /// them is a list nobody maintains. The reachability property is therefore
+    /// obtained the way [`Self::OAuth2Client`] obtains it, structurally: the
+    /// deployment declares, the request proposes a repository, and the broker
+    /// answers with the declared entry.
+    Registry {
+        /// The registry the repository lives on. Built by the broker from
+        /// operator configuration, never by the request.
+        authority: Authority,
+        /// The repository, as the OCI grammar spells it: lowercase
+        /// path components separated by `/`. Parsed and refused before it
+        /// becomes part of a URL, and refused again by the connector's own
+        /// `RepositoryName`, because the broker's check is a policy input and
+        /// the connector's is a path input and neither is the other's job.
+        repository: String,
     },
 }
 
@@ -1121,6 +1189,10 @@ mod tests {
             Action::GitHubIssueCreate,
             Action::GitHubIssueRead,
             Action::GitHubReleaseCreate,
+            Action::AwsStsCallerIdentity,
+            Action::OAuth2Identity,
+            Action::RegistryPull,
+            Action::RegistryPush,
         ] {
             let name = action.to_string();
             assert!(!name.is_empty(), "{action:?} has no action name");
@@ -1142,7 +1214,33 @@ mod tests {
         }
         assert_eq!(Action::GitHubIssueRead.to_string(), "github.issue.read");
         assert_eq!(Action::GitHubIssueCreate.to_string(), "github.issue.create");
+        // The spellings an operator writes into a policy file, pinned because a
+        // Cedar rule names the *snake* form and the audit trail names the dotted
+        // one, and the two are separate strings that have to agree.
+        assert_eq!(Action::RegistryPull.to_string(), "registry.pull");
+        assert_eq!(Action::RegistryPush.to_string(), "registry.push");
     }
+
+    // This row's list is a **sample, not an enumeration**, and saying so is the
+    // honest description of it.
+    //
+    // A new `Action` is *not* forced into the list above: nothing checks that
+    // the two agree, so a variant added today and not added there would compile
+    // and this row would stay green. What *is* enforced, and where, matters more
+    // than the list:
+    //
+    // - `Display` is an exhaustive `match`, so a variant with no name is a
+    // compile error right here in this crate.
+    // - `asv_policy::action_name` is an exhaustive `match` over `Action`, so a
+    // variant with no Cedar spelling is a compile error there. That is the
+    // guarantee that actually protects the policy engine, and it is a
+    // compiler rather than a list.
+    //
+    // The row therefore checks the *shape* of a name, which is a property of
+    // `Display` and not of any particular variant, plus the spellings that
+    // appear in documentation. Extending it is still the right thing to do when
+    // a variant lands — it is cheap and it pins the exact string — but the
+    // honest claim is "this is checked here", not "this is checked *only* here".
 
     /// M4-R9: an Api resource carries an already-canonical audience, so the
     /// uncanonical spelling can never be built at all.
