@@ -108,6 +108,21 @@ def check(condition: bool, message: str) -> None:
         print(f"  FAIL {message}")
 
 
+#: The count words `c5b` can read. A table rather than an int parser because the
+#: document writes Spanish and the alternatives are a brittle `int()` that would
+#: have to invent the same table anyway, or a digit the skill does not use.
+#: Anything outside it is reported by name, so adding a count the suite cannot
+#: read is a failure the author sees rather than a check that quietly stops.
+SPANISH_NUMERALS = {
+    "uno": 1, "dos": 2, "tres": 3, "cuatro": 4, "cinco": 5,
+    "seis": 6, "siete": 7, "ocho": 8, "nueve": 9, "diez": 10,
+    "once": 11, "doce": 12, "trece": 13, "catorce": 14, "quince": 15,
+    "dieciseis": 16, "dieciséis": 16, "diecisiete": 17,
+    "dieciocho": 18, "diecinueve": 19, "veinte": 20,
+    "veintiuno": 21, "veintidos": 22, "veintitrés": 23, "veintitres": 23,
+}
+
+
 def skill_dir() -> Path:
     override = os.environ.get("ASV_SKILL_DIR")
     if override:
@@ -285,6 +300,62 @@ def c5_every_published_rel_is_reachable(files: dict[str, str], truth: dict) -> N
         if not uri:
             continue
         check(uri in text, f"the skill documents the published relation {uri}")
+
+
+def c5b_the_stated_count_is_the_published_count(files: dict[str, str], truth: dict) -> None:
+    """The skill says how many relations the runtime publishes. That number has
+    to be the real one.
+
+    `c5` checks that every published relation is *named*, and `check_truth_is_
+    not_vacuous` checks that the product publishes thirteen. Neither looks at the
+    number the skill writes in prose, so a skill could name all thirteen and
+    still say "nine" and this suite would pass. Measured against the sibling
+    checkout on 2026-10-06: the skill said "nueve y sólo nueve" while
+    `operational()` had returned thirteen since R2.F.4 added the two registry
+    pushes, and every other check was green.
+
+    Two halves, and the first is the one that would have caught it. A number the
+    suite cannot find is a number it cannot hold: the phrase is required, so
+    deleting the count is red rather than vacuous. The second parses it and
+    compares. Spanish rather than a digit is what the document actually uses,
+    and the parser is a table rather than a guess -- "trece" next to
+    `len(operational)` is a comparison, and a number word it does not know is
+    reported as such instead of being silently skipped.
+    """
+    text = all_text(files)
+    # `nueve y sólo nueve` -- a numeral word, then the same word after `y sólo`.
+    # The repetition is what makes this a count rather than a stray word.
+    pattern = re.compile(
+        r"\b(veinti\w+|diec\w+|cien\w+|\w+)\s+y\s+s[oó]lo\s+\1\b",
+        re.IGNORECASE,
+    )
+    found = pattern.findall(text)
+    if not found:
+        check(False, "the skill states how many relations the runtime publishes")
+        return
+    if len(found) > 1:
+        # Two counts is not one count to compare, and picking the first would be
+        # the check deciding which sentence is the claim.
+        check(
+            False,
+            f"the skill states a published count {len(found)} times "
+            f"({sorted({w.lower() for w in found})}); one sentence, one number",
+        )
+        return
+    word = found[0].lower()
+    stated = SPANISH_NUMERALS.get(word)
+    if stated is None:
+        check(
+            False,
+            f"the skill states a count this suite cannot read: {word!r}. "
+            f"Add it to SPANISH_NUMERALS rather than removing the sentence",
+        )
+        return
+    actual = len(truth["operational"])
+    check(
+        stated == actual,
+        f"the skill says the runtime publishes {stated} relations, and it publishes {actual}",
+    )
 
 
 def c6_operations_are_real(files: dict[str, str], truth: dict) -> None:
@@ -720,6 +791,7 @@ def main() -> int:
     c3_no_invented_rel(files, truth)
     c4_withheld_rels_are_marked(files, truth)
     c5_every_published_rel_is_reachable(files, truth)
+    c5b_the_stated_count_is_the_published_count(files, truth)
     c6_operations_are_real(files, truth)
     c7_argv_arrays_are_real(files, truth)
     c8_codes(files, truth)
