@@ -314,7 +314,7 @@ impl NpmDiscovery {
         // Sorted by the canonical spelling rather than by `Ord` on the struct,
         // so the order in a report is one a reader can predict and does not
         // change if the struct gains a field.
-        out.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        out.sort_by_key(|audience| audience.to_string());
         out.dedup();
         out
     }

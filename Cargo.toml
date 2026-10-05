@@ -14,7 +14,7 @@ members = [
     "crates/ebpfd",
     "crates/tls-acceptor",
     "crates/operator-core",
-    "crates/integrations",
+      "crates/integrations",
 ]
 # `apps/desktop` is deliberately NOT a member. It is a separate workspace with
 # its own `[workspace]` table, because the GUI needs webkit2gtk-4.1 / gtk+-3.0
@@ -29,7 +29,7 @@ exclude = ["apps/desktop"]
 # pinning, the redirect policy and the audited send path.
 
 [workspace.package]
-version = "0.29.0"
+version = "0.30.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"

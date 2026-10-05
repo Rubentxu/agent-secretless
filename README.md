@@ -14,15 +14,15 @@ agent ──(surrogate / socket)──▶ broker ──(real credential)──�
         no secret material                the only holder
 ```
 
-> **Status: pre-1.0, at v0.29.0. Not certified, and the gates say so.**
+> **Status: pre-1.0, at v0.30.0. Not certified, and the gates say so.**
 >
-> The workspace compiles and **1656 tests are enumerated**. Under `cargo test`,
-> 1655 of them run and pass and 1 is gated out of debug builds by construction:
+> The workspace compiles and **1713 tests are enumerated**. Under `cargo test`,
+> 1712 of them run and pass and 1 is gated out of debug builds by construction:
 > the p95 latency budget carries `#[cfg_attr(debug_assertions, ignore)]`,
 > because a latency budget measured against debug ed25519 is a statement about
 > `debug_assertions` rather than about the product. It runs and passes under
 > `--release` — measured here at 1490us against a 6000us budget — so the release
-> run below executes all 1656. The count and the quick start's arithmetic are
+> run below executes 1711 of them. The count and the quick start's arithmetic are
 > re-derived every CI run by the `R11 README test count` gate, which subtracts
 > the `--skip` filters the quick start documents rather than checking a sum, so
 > a block that skips a test and then claims the full count fails instead of
@@ -187,7 +187,7 @@ Each item says where its detail lives, because none of it is a guess.
 # the verifier is required: the installer refuses to proceed without it
 cargo install rsign2          # or your distribution's package manager
 curl -LsSf https://raw.githubusercontent.com/Rubentxu/agent-secretless/main/scripts/install.sh \
-  | sh -s -- --version 0.29.0 --prefix "$HOME/.local"
+  | sh -s -- --version 0.30.0 --prefix "$HOME/.local"
 ```
 
 The installer requires `sha256.sum` to carry a valid minisign signature before
@@ -211,13 +211,13 @@ permissions alone. That is a recorded gap to close before 1.0.
 cargo build --release -p asv-broker
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# expected: passed=1654 failed=0 ignored=0
+# expected: passed=1711 failed=0 ignored=0
 ```
 
-1654 rather than 1656 because the command above skips two of them: `uat_028`
+1711 rather than 1713 because the command above skips two of them: `uat_028`
 starts a real `sshd` and needs a host to run it, and the p95 budget is asserted
 separately in `--release` so the quick start stays a quick start. The two
-skips are reported as filtered, not as ignored, so 1654 + 2 filtered is the 1656
+skips are reported as filtered, not as ignored, so 1711 + 2 filtered is the 1713
 enumerated.
 
 That number was `passed=692` in this file for several milestones, and nothing
@@ -331,7 +331,7 @@ to signing or proxying, because that is how "secretless" quietly becomes a lie.
 
 ## Specification
 
-`agent-secretless-vault-spec/` holds the full pack: 20 documents, 20 ADRs, and a
+`agent-secretless-vault-spec/` holds the full pack: 21 documents, 20 ADRs, and a
 `SHA256SUMS` manifest (verified intact). It is imported as research and is not
 edited in place except where a decision it records has since been made — each
 such edit carries its date and its reason.

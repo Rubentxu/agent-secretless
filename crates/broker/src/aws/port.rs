@@ -46,13 +46,13 @@ use asv_connector_http::{SecretError, SecretPort, SecretSink};
 use super::client::{StsClient, StsClientError};
 use super::sts::{AwsSecretSink, AwsSession};
 
+/// A client this port asks for a session.
+///
 /// One use of a session's three signing values is
 /// [`AwsSecretSink`], which R2.C.2.a already defines
 /// for exactly this: it is what `AwsSession::with_signing_values` takes, so
 /// declaring a second shape here would have been a second way for three values
 /// to leave a session.
-
-/// A client this port asks for a session.
 ///
 /// A trait rather than `StsClient` so the cache rows can count the mints without
 /// a socket, and so a second provider shape can be added without touching the

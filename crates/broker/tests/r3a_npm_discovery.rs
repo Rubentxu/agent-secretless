@@ -98,7 +98,11 @@ fn an_operator_types_the_command_and_gets_a_report_with_no_credential_in_it() {
     let project = Project::new();
 
     for rendering in [&["--json"][..], &[].as_slice()] {
-        let label = if rendering.is_empty() { "prose" } else { "json" };
+        let label = if rendering.is_empty() {
+            "prose"
+        } else {
+            "json"
+        };
         let (stdout, stderr, ok) = project.discover(rendering);
         assert!(ok, "{label}: the command failed: {stderr}");
         assert!(!stdout.is_empty(), "{label}: the command printed nothing");
@@ -152,9 +156,7 @@ fn the_report_names_both_configuration_files_in_the_order_npm_reads_them() {
     let (stdout, stderr, ok) = project.discover(&["--json"]);
     assert!(ok, "{stderr}");
 
-    let project_at = stdout
-        .find("project")
-        .expect("the project file is named");
+    let project_at = stdout.find("project").expect("the project file is named");
     let user_at = stdout
         .rfind("\"user\"")
         .or_else(|| stdout.rfind("user"))
@@ -164,7 +166,10 @@ fn the_report_names_both_configuration_files_in_the_order_npm_reads_them() {
         "the report does not list the project file before the user file, and npm's precedence \
          means the effective configuration is the one an operator has to read first: {stdout}"
     );
-    assert!(stdout.contains("sha256:"), "no file was fingerprinted: {stdout}");
+    assert!(
+        stdout.contains("sha256:"),
+        "no file was fingerprinted: {stdout}"
+    );
 }
 
 #[test]
@@ -262,6 +267,13 @@ fn an_unknown_family_is_refused_with_the_list_of_what_this_build_knows() {
         .expect("run");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "an unknown family exited zero");
-    assert!(stderr.contains("npm"), "the refusal does not say what exists: {stderr}");
-    assert!(out.stdout.is_empty(), "an unknown family still printed a report: {}", String::from_utf8_lossy(&out.stdout));
+    assert!(
+        stderr.contains("npm"),
+        "the refusal does not say what exists: {stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "an unknown family still printed a report: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 }

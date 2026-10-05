@@ -1048,7 +1048,7 @@ fn run_isolated(
         }
         Response::Error { message, .. } => Err(std::io::Error::other(format!(
             "asv run-isolated refused: {}: {message}",
-            response_kind(&response).to_string(),
+            response_kind(&response),
         ))),
         other => Err(std::io::Error::other(format!(
             "asv run-isolated got an unexpected answer: {other:?}"
@@ -1394,7 +1394,10 @@ fn run_integrations(command: &IntegrationsCommand) -> std::io::Result<()> {
                     "family": family,
                     "error": message,
                 });
-                println!("{}", serde_json::to_string_pretty(&failure).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&failure).unwrap_or_default()
+                );
             } else {
                 eprintln!("asv: {message}");
             }

@@ -14,16 +14,16 @@ agente ──(sustituto / socket)──▶ broker ──(credencial real)──�
         sin material secreto              único poseedor
 ```
 
-> **Estado: pre-1.0, en v0.29.0. Sin certificar, y los gates lo dicen.**
+> **Estado: pre-1.0, en v0.30.0. Sin certificar, y los gates lo dicen.**
 >
-> El workspace compila y hay **1656 tests enumerados**. Con `cargo test`, 1655
+> El workspace compila y hay **1713 tests enumerados**. Con `cargo test`, 1712
 > se ejecutan y pasan y 1 queda fuera de las compilaciones de depuración por
 > construcción: el presupuesto de latencia p95 lleva
 > `#[cfg_attr(debug_assertions, ignore)]`, porque un presupuesto de latencia
 > medido contra ed25519 en depuración es una afirmación sobre
 > `debug_assertions`, no sobre el producto. Ese test sí se ejecuta y pasa con
 > `--release` — medido aquí en 1490us contra un presupuesto de 6000us — así que
-> la corrida en release de abajo ejecuta los 1656. El conteo y la aritmética
+> la corrida en release de abajo ejecuta 1711 de ellos. El conteo y la aritmética
 > del inicio rápido los vuelve a derivar en cada corrida de CI el gate
 > `R11 README test count`, que resta los filtros `--skip` que documenta el propio
 > inicio rápido en vez de comprobar una suma, de modo que un bloque que se salta
@@ -198,7 +198,7 @@ es una suposición:
 # el verificador es obligatorio: el instalador no sigue sin él
 cargo install rsign2          # o el gestor de paquetes de tu distribución
 curl -LsSf https://raw.githubusercontent.com/Rubentxu/agent-secretless/main/scripts/install.sh \
-  | sh -s -- --version 0.29.0 --prefix "$HOME/.local"
+  | sh -s -- --version 0.30.0 --prefix "$HOME/.local"
 ```
 
 El instalador exige que `sha256.sum` lleve una firma minisign válida antes de
@@ -221,14 +221,14 @@ permisos de fichero. Es una carencia registrada para cerrar antes de 1.0.
 cargo build --release -p asv-broker
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# esperado: passed=1654 failed=0 ignored=0
+# esperado: passed=1711 failed=0 ignored=0
 ```
 
-1654 y no 1656 porque el comando de arriba se salta dos: `uat_028` levanta un
+1711 y no 1713 porque el comando de arriba se salta dos: `uat_028` levanta un
 `sshd` real y necesita un host donde correr, y el presupuesto p95 se afirma por
 separado en `--release` para que el inicio rápido siga siendo rápido. Los dos
-saltos se cuentan como filtrados, no como ignorados, así que 1654 + 2
-filtrados son los 1656 enumerados.
+saltos se cuentan como filtrados, no como ignorados, así que 1711 + 2
+filtrados son los 1713 enumerados.
 
 Ese número era `passed=692` en este fichero durante varios milestones, y nada
 lo comprobaba: un conteo viejo en un README es una afirmación como cualquier
@@ -348,7 +348,7 @@ convierte silenciosamente en una mentira.
 
 ## Especificación
 
-`agent-secretless-vault-spec/` contiene el pack completo: 20 documentos, 20
+`agent-secretless-vault-spec/` contiene el pack completo: 21 documentos, 20
 ADRs y un manifiesto `SHA256SUMS` (verificado intacto). Se importa como
 investigación y no se edita in situ salvo donde una decisión que registra ya se
 ha tomado — cada una de esas ediciones lleva su fecha y su motivo.
