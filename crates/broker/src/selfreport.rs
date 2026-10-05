@@ -113,73 +113,130 @@ impl SelfReport {
     }
 }
 
+/// The capabilities this build actually has a complete path for, each against
+/// the wire method that serves it.
+///
+/// **One list, not two.** This used to be a `vec![]` of names here and an
+/// exhaustive `match` on `Request` inside `#[cfg(test)]`. Two hand-maintained
+/// taxonomies of the same decision, kept in step by two rows, and the direction
+/// that bites had already bitten once: `aws.sts.caller_identity` was fully
+/// built — a domain action, a typed request, a broker operation, a CLI verb —
+/// and was not announced, so `asv capabilities` told an agent the product had
+/// no AWS path.
+///
+/// Keying by [`Request::method_name`] rather than by the variant is what makes
+/// one list possible. `method_name` is an exhaustive `match` over every
+/// variant, so adding a `Request` is a *compile error* there; this table is then
+/// the only place a variant can be classified, and
+/// `every_request_method_is_classified_exactly_once` is what says the two are
+/// the same set. That is a smaller thing to get wrong than a second list, and
+/// the failure it can still produce -- a new variant classified as `None`
+/// plumbing -- is visible rather than silent.
+///
+/// A `None` capability is a deliberate answer, not an omission: session
+/// lifecycle, authorisation, surrogate revocation, approval and audit are real
+/// operations, and none of them is something an agent selects *instead of*
+/// another capability. They are how the ones below are reached. Advertising
+/// them would put plumbing in the list a reader scans to decide what the
+/// product can do.
+const CAPABILITIES: &[(&str, Option<&str>)] = &[
+    // Health and metadata.
+    ("ping", Some("system.health")),
+    ("agent_info", Some("system.self")),
+    // Sessions and the SSH signer they carry.
+    ("run_isolated", Some("session.run")),
+    ("mint_surrogate", Some("session.ssh_sign")),
+    // Credential *metadata* only. There is no capability here that returns a
+    // secret, and the list is the place a reader looks to decide that.
+    ("list_credential_metadata", Some("credentials.metadata")),
+    ("create_credential", Some("credentials.create")),
+    ("delete_credential", Some("credentials.revoke")),
+    // Semantic connectors.
+    ("read_issue", Some("github.issue.read")),
+    ("create_issue", Some("github.issue.create")),
+    ("create_release", Some("github.release.create")),
+    ("postgres_connect", Some("postgres.connect")),
+    ("postgres_query", Some("postgres.query")),
+    // The AWS provider's first operation. Named for what the agent gets back,
+    // which is an identity, and deliberately *not* named after the API action it
+    // calls: a name that reads like a retrieval would tell an agent this
+    // returns content, and "get" is the word that does that.
+    //
+    // No secret crosses this boundary, and the response type has no field one
+    // could fit in -- so listing it costs an agent nothing to hold.
+    ("aws_caller_identity", Some("aws.sts.caller_identity")),
+    // The OAuth2 provider's first operation, and the same argument as the line
+    // above: named for what comes back (an identity, verified against the
+    // deployment), not after the HTTP method that fetches it.
+    //
+    // It is also the operation that turned M11's second provider from a library
+    // vertical into a surface. Before this, the daemon mounted
+    // `OAuth2SecretPort` and no request could name it.
+    ("oauth2_identity", Some("oauth2.identity")),
+    // R2.F.3 and R2.F.4: the four halves of an OCI exchange, read and write.
+    //
+    // **Four names, and the split is not cosmetic.** The broker answers each
+    // from different code, spends a surrogate on each, and a manifest names
+    // digests the agent then asks for by content address. Collapsing the reads
+    // into one capability would tell an agent that fetching a manifest fetches
+    // everything it names -- the belief that turns a policy permitting a read
+    // into a policy permitting a whole image. The writes carry the same
+    // warning: on a write, a mistake is published rather than merely leaked.
+    //
+    // All four resolve to two policy actions, and that is not a collapse.
+    // `registry_pull` covers both reads because reading a manifest and reading
+    // the blobs it names are one permission in the registry's own scope;
+    // `registry_push` covers both writes for the same reason. The advertisement
+    // is finer than the policy on purpose: an agent choosing an operation wants
+    // to know which one it is asking for, while an operator writing a rule does
+    // not.
+    ("registry_pull_manifest", Some("registry.manifest.read")),
+    ("registry_pull_blob", Some("registry.blob.read")),
+    ("registry_push_manifest", Some("registry.manifest.push")),
+    ("registry_push_blob", Some("registry.blob.push")),
+    // Plumbing: real, and how the rows above are reached rather than something
+    // an agent picks instead of one of them.
+    ("create_session", None),
+    ("end_session", None),
+    ("register_session_key", None),
+    ("postgres_revoke", None),
+    ("authorize", None),
+    ("explain_authorization", None),
+    ("revoke_surrogate", None),
+    ("submit_approval", None),
+    ("audit_query", None),
+];
+
 /// The capabilities this build actually has a complete path for.
 ///
-/// A `cfg` list, not a roadmap. R9 in `11-RISKS-OPEN-QUESTIONS.md` names the
-/// failure directly: discovery announcing a feature that has types but no
+/// A `cfg` list, not a roadmap: R9 in `11-RISKS-OPEN-QUESTIONS.md` names the
+/// failure directly, discovery announcing a feature that has types but no
 /// complete path teaches an agent to try it.
 ///
-/// The invariant is **bidirectional**, and both directions have bitten:
-///
-/// - Every name here is backed by a `Request` variant that is *handled* rather
-///   than refused as unknown.
-/// - Every handled `Request` variant that represents an operation is *named*
-///   here. This is the direction that was missing: `aws.sts.caller_identity`
-///   was fully built — a domain action, a typed request, a broker operation and
-///   a CLI verb — and was not announced, so `asv capabilities` told an agent the
-///   product had no AWS path. A feature nobody is told about is not reachable,
-///   which is R1's lesson applied to discovery rather than to execution.
-///
-/// `every_advertised_capability_is_handled` and
-/// `every_handled_operation_is_advertised` are what keep the two in step.
+/// Derived from [`CAPABILITIES`] rather than written out, so there is exactly
+/// one place a capability is named. Sorted and deduplicated as the previous
+/// hand-written list was, so the bytes `asv capabilities` prints are unchanged.
 pub fn compiled_capabilities() -> Vec<String> {
-    let mut out = vec![
-        // Health and metadata.
-        "system.health".to_string(),
-        "system.self".to_string(),
-        // Sessions and the SSH signer they carry.
-        "session.run".to_string(),
-        "session.ssh_sign".to_string(),
-        // Credential *metadata* only. There is no capability here that
-        // returns a secret, and the list is the place a reader looks to
-        // decide that.
-        "credentials.metadata".to_string(),
-        "credentials.create".to_string(),
-        "credentials.revoke".to_string(),
-        // Semantic connectors.
-        "github.issue.read".to_string(),
-        "github.issue.create".to_string(),
-        "github.release.create".to_string(),
-        "postgres.connect".to_string(),
-        "postgres.query".to_string(),
-        // The AWS provider's first operation. Named for what the agent gets
-        // back, which is an identity, and deliberately *not* named after the
-        // API action it calls: the module's own row below refuses a name that
-        // reads like a retrieval, and `aws.sts.get_caller_identity` contains
-        // "get".
-        //
-        // No secret crosses this boundary, and the response type has no field
-        // one could fit in — so listing it costs an agent nothing to hold.
-        "aws.sts.caller_identity".to_string(),
-        // The OAuth2 provider's first operation, and the same argument as the
-        // line above: named for what comes back (an identity, verified against
-        // the deployment), not after the HTTP method that fetches it.
-        //
-        // It is also the operation that turned M11's second provider from a
-        // library vertical into a surface. Before this, the daemon mounted
-        // `OAuth2SecretPort` and no request could name it.
-        "oauth2.identity".to_string(),
-        // R2.F.3: the two halves of an OCI pull. See `capability_of` for why
-        // these are two names and why the policy underneath evaluates a single
-        // `registry_pull`.
-        "registry.manifest.read".to_string(),
-        "registry.blob.read".to_string(),
-        "registry.manifest.push".to_string(),
-        "registry.blob.push".to_string(),
-    ];
+    let mut out: Vec<String> = CAPABILITIES
+        .iter()
+        .filter_map(|(_, capability)| capability.map(str::to_string))
+        .collect();
     out.sort();
     out.dedup();
     out
+}
+
+/// The capability the wire method `method` is served by.
+///
+/// Production, and the reason the table above could stop being a second list:
+/// this used to live inside `#[cfg(test)]`, which meant the classification an
+/// agent reads and the one a row checked were maintained separately and only
+/// met in a test build.
+pub fn capability_of_method(method: &str) -> Option<&'static str> {
+    CAPABILITIES
+        .iter()
+        .find(|(name, _)| *name == method)
+        .and_then(|(_, capability)| *capability)
 }
 
 #[cfg(test)]
@@ -188,73 +245,6 @@ mod tests {
     use asv_domain::{AgentSessionId, CredentialId, CredentialKind};
     use asv_ipc_protocol::{OpaqueSecret, Request, PROTOCOL_VERSION};
     use std::collections::{BTreeMap, BTreeSet};
-
-    /// The capability a request is served by, or `None` for the requests that
-    /// are plumbing rather than an operation an agent would name.
-    ///
-    /// **Exhaustive on purpose.** Adding a `Request` variant does not compile
-    /// until it has been classified here, so "which operations exist" is
-    /// answered in one place and the compiler refuses to let the two drift
-    /// apart silently — which is exactly how `aws.sts.caller_identity` ended up
-    /// built and unannounced.
-    fn capability_of(request: &Request) -> Option<&'static str> {
-        Some(match request {
-            Request::Ping { .. } => "system.health",
-            Request::AgentInfo { .. } => "system.self",
-            Request::RunIsolated { .. } => "session.run",
-            Request::MintSurrogate { .. } => "session.ssh_sign",
-            Request::ListCredentialMetadata => "credentials.metadata",
-            Request::CreateCredential { .. } => "credentials.create",
-            Request::DeleteCredential { .. } => "credentials.revoke",
-            Request::ReadIssue { .. } => "github.issue.read",
-            Request::CreateIssue { .. } => "github.issue.create",
-            Request::CreateRelease { .. } => "github.release.create",
-            Request::AwsCallerIdentity { .. } => "aws.sts.caller_identity",
-            Request::OAuth2Identity { .. } => "oauth2.identity",
-            // R2.F.3. Named for the two halves an OCI pull is made of rather
-            // than for the HTTP verb, for the same reason as the two lines
-            // above: the agent receives content, not a capability request.
-            //
-            // **Two names, not one, and the split is not cosmetic.** The
-            // broker answers a manifest read and a blob read from different
-            // code, spends a surrogate on each, and a manifest names digests
-            // that the agent then asks for by content address. Collapsing them
-            // into one capability would tell an agent that fetching a manifest
-            // fetches everything it names, which is the belief that turns a
-            // policy permitting a read into a policy permitting a whole image.
-            //
-            // Both still resolve to the single `Action::RegistryPull` the
-            // policy evaluates, because the registry's own scope treats them
-            // as one: `repository:<name>:pull` covers both halves. The
-            // advertisement is finer than the policy on purpose — an agent
-            // choosing an operation wants to know which one it is asking for,
-            // while an operator writing a rule does not.
-            Request::PullManifest { .. } => "registry.manifest.read",
-            Request::PullBlob { .. } => "registry.blob.read",
-            // R2.F.4. Four names, because a registry pull and a registry push
-            // are four different requests a caller chooses between, and the two
-            // push verbs carry the same warning the read ones do: on a write, a
-            // mistake is published.
-            //
-            // All four resolve to two policy actions. That is deliberate and is
-            // not a collapse: `registry_pull` covers both reads because reading
-            // a manifest and reading the blobs it names are one permission in
-            // the registry's own scope, and `registry_push` covers both writes
-            // for the same reason. The advertisement is finer because the
-            // *caller* is finer — someone choosing an operation wants to know
-            // which one they are asking for.
-            Request::PushManifest { .. } => "registry.manifest.push",
-            Request::PushBlob { .. } => "registry.blob.push",
-            Request::PostgresConnect { .. } => "postgres.connect",
-            Request::PostgresQuery { .. } => "postgres.query",
-            // Session lifecycle, authorisation, surrogate revocation, approval
-            // and audit. Real operations, and none of them something an agent
-            // selects *instead of* another capability — they are how the ones
-            // above are reached. Advertising them would put plumbing in the
-            // list a reader scans to decide what the product can do.
-            _ => return None,
-        })
-    }
 
     /// One value of every `Request` variant.
     ///
@@ -435,7 +425,7 @@ mod tests {
     fn two_operations_do_not_share_one_capability_name() {
         let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
         for request in one_of_every_variant() {
-            if let Some(capability) = capability_of(&request) {
+            if let Some(capability) = capability_of_method(request.method_name()) {
                 *seen.entry(capability).or_default() += 1;
             }
         }
@@ -452,13 +442,93 @@ mod tests {
 
     /// The direction that was already claimed and was not true.
     ///
+    /// Every wire method has exactly one row in the table.
+    ///
+    /// **This is the row the string key made necessary.** The table is keyed by
+    /// [`Request::method_name`] so that one list could replace two, and the cost
+    /// of that is that a method name is a string: a typo is not a compile error,
+    /// it is a capability nobody is classified as serving. That is not
+    /// hypothetical -- writing this table the first time, four of the registry
+    /// methods were keyed `pull_manifest` rather than `registry_pull_manifest`
+    /// and `every_advertised_capability_is_handled` is what caught it.
+    ///
+    /// So the exhaustiveness that used to come from a `match` inside
+    /// `#[cfg(test)]` is asserted here instead, against the *real* method names
+    /// rather than against a second hand-written list. A new `Request` variant
+    /// fails to compile in `method_name` and then fails this row.
+    #[test]
+    fn every_request_method_is_classified_exactly_once() {
+        let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+        for (method, _) in CAPABILITIES {
+            *seen.entry(method).or_default() += 1;
+        }
+        for (method, count) in &seen {
+            assert_eq!(*count, 1, "`{method}` is classified {count} times");
+        }
+
+        let advertised: BTreeSet<&str> = CAPABILITIES.iter().map(|(m, _)| *m).collect();
+        let known: BTreeSet<&str> = one_of_every_variant()
+            .iter()
+            .map(|request| request.method_name())
+            .collect();
+
+        // Direction one: a real variant with no row. This is the direction that
+        // bites -- a new operation that is served and unannounced, which is how
+        // `aws.sts.caller_identity` stayed invisible for so long.
+        for method in &known {
+            assert!(
+                advertised.contains(method),
+                "`{method}` is a real Request variant with no row in CAPABILITIES. \
+                 Add one -- with `None` if it is plumbing -- or a capability will \
+                 drift from what the broker serves."
+            );
+        }
+
+        // Direction two: a row naming something that is not a real method. The
+        // table is keyed by strings, so a typo lands here rather than in a
+        // compile error.
+        //
+        // **The comparison is against the sample, and the sample is smaller than
+        // the enum.** `Authorize`, `ExplainAuthorization` and `SubmitApproval`
+        // carry an `AuthorizationRequest` and are the one family
+        // `one_of_every_variant` leaves out, so they are named here rather than
+        // being quietly absent from the check. Each must be plumbing, and this
+        // says so in a place a reader looks, instead of letting the omission
+        // hide behind a count.
+        const OUTSIDE_THE_SAMPLE: &[&str] =
+            &["authorize", "explain_authorization", "submit_approval"];
+        for method in OUTSIDE_THE_SAMPLE.iter().copied() {
+            assert!(
+                advertised.contains(method),
+                "`{method}` is omitted from the sample and so is not checked above; \
+                 it still needs a row."
+            );
+            assert_eq!(
+                capability_of_method(method),
+                None,
+                "`{method}` is omitted from the sample, so nothing above can hold it \
+                 to the right answer. If it has become an operation, it needs a \
+                 capability and a row in the sample."
+            );
+        }
+        assert_eq!(
+            advertised.len(),
+            known.len() + OUTSIDE_THE_SAMPLE.len(),
+            "the table names {} methods and the enum {} plus the {} the sample \
+             omits, so a row is either duplicated or points at nothing",
+            advertised.len(),
+            known.len(),
+            OUTSIDE_THE_SAMPLE.len()
+        );
+    }
+
     /// A capability in the list with no request behind it is a promise the
     /// broker cannot keep, and an agent that trusts it will try it.
     #[test]
     fn every_advertised_capability_is_handled() {
         let served: BTreeSet<&str> = one_of_every_variant()
             .iter()
-            .filter_map(capability_of)
+            .filter_map(|request| capability_of_method(request.method_name()))
             .collect();
         for advertised in compiled_capabilities() {
             assert!(
@@ -479,7 +549,7 @@ mod tests {
     fn every_handled_operation_is_advertised() {
         let advertised: BTreeSet<String> = compiled_capabilities().into_iter().collect();
         for request in one_of_every_variant() {
-            if let Some(capability) = capability_of(&request) {
+            if let Some(capability) = capability_of_method(request.method_name()) {
                 assert!(
                     advertised.contains(capability),
                     "`{capability}` is served by {:?} but not advertised, so an agent \
