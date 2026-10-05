@@ -276,6 +276,16 @@ TEST_PREFIX = "aws::sts::tests::"
 # `--lib`, and pointing `--lib` at one measures nothing -- which the
 # `no-run` bucket reports rather than passing off as green.
 CARGO_TARGET = "--lib"
+# Which package holds them.
+#
+# This was hardcoded to `asv-broker` and every campaign inherited it, which
+# meant the first campaign written against another crate -- the CLI's two
+# secret-bearing buffers -- ran `cargo test -p asv-broker --bin asv`, matched
+# no test, and reported `unreadable` for all six of its mutations. A
+# hardcoded package is the same failure as the hardcoded `PATH` above: it
+# looks like a finding about the code under test rather than about the
+# harness. The four-bucket accounting is what made it visible.
+PACKAGE = "asv-broker"
 
 
 def run_test(short_name: str) -> tuple[str, str]:
@@ -297,7 +307,7 @@ def run_test(short_name: str) -> tuple[str, str]:
     """
     name = TEST_PREFIX + short_name
     proc = subprocess.run(
-        ["cargo", "test", "-p", "asv-broker", *CARGO_TARGET.split(), name, "--", "--exact"],
+        ["cargo", "test", "-p", PACKAGE, *CARGO_TARGET.split(), name, "--", "--exact"],
         cwd=REPO, env=ENV, capture_output=True, text=True, timeout=1200,
     )
     out = proc.stdout + proc.stderr

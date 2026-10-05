@@ -33,6 +33,12 @@ serde_json = "1"
 # `SecretString` for the passphrase `asv setup` writes and `asv doctor` reads.
 # Already in the lock via `asv-vault`; this makes an existing entry direct.
 secrecy.workspace = true
+# `Zeroizing` for the serialized request and the response buffer. `asv
+# add-credential` puts a credential on this process's heap, and a `Vec<u8>` that
+# is freed to the allocator still holds the bytes until something reuses the
+# page. Already in the lock via `asv-ipc-protocol` and `asv-domain`; this makes
+# an existing entry direct rather than adding anything new.
+zeroize.workspace = true
 tokio = { workspace = true }
 # `getuid()`, for deriving the default broker socket from the running user.
 # Already in the lock via `asv-identity` and `asv-broker`, so this adds nothing

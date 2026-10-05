@@ -407,15 +407,38 @@ async fn main() -> std::io::Result<()> {
             // the one byte stripped, because `echo secret |` is the obvious
             // way to use this and a stored trailing newline would be a
             // credential that silently never works.
-            let mut secret = String::new();
-            if let Err(error) =
-                std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut secret)
-            {
-                eprintln!("asv: cannot read the secret from stdin: {error}");
-                std::process::exit(2);
-            }
-            let secret = secret.strip_suffix('\n').unwrap_or(&secret).to_string();
-            if secret.is_empty() {
+            //
+            // **One buffer, and it is zeroized.** The first version read into a
+            // plain `String` and then made a second one:
+            //
+            // ```text
+            // let secret = String::new();
+            // let secret = secret.strip_suffix('\n').unwrap_or(&secret).to_string();
+            // ```
+            //
+            // The `to_string()` copies, the original is shadowed, and neither
+            // is zeroized — so the trailing-newline case, which is the *common*
+            // one because `echo secret |` is the obvious invocation, left two
+            // freed heap buffers holding the credential. `strip_suffix` cannot
+            // truncate in place through an immutable borrow, which is what
+            // pushed the first version toward copying rather than toward
+            // `Zeroizing`.
+            //
+            // `Zeroizing<String>` gives both: `pop()` truncates in place, and
+            // the final `mem::take` hands the one allocation to `OpaqueSecret`,
+            // which already zeroizes it. Nothing is ever duplicated, so there
+            // is no second copy for this to have missed.
+            let mut secret = {
+                let mut stdin = std::io::stdin().lock();
+                match read_credential(&mut stdin) {
+                    Ok(secret) => secret,
+                    Err(error) => {
+                        eprintln!("asv: cannot read the secret from stdin: {error}");
+                        std::process::exit(2);
+                    }
+                }
+            };
+            if secret.expose().is_empty() {
                 eprintln!("asv: no secret on stdin");
                 std::process::exit(2);
             }
@@ -424,7 +447,11 @@ async fn main() -> std::io::Result<()> {
                 kind,
                 provider,
                 account,
-                secret: OpaqueSecret::new(secret.into_bytes()),
+                // Moves the allocation rather than copying it. The `Zeroizing`
+                // is left holding an empty `String`, whose drop is a no-op, and
+                // the bytes end up owned by the type that was already written
+                // to zeroize them.
+                secret: std::mem::replace(&mut secret, OpaqueSecret::new(Vec::new())),
             }
         }
         Command::DeleteCredential { id } => {
@@ -1457,10 +1484,63 @@ fn run_command(socket: &std::path::Path, command: Vec<String>) -> std::io::Resul
     Err(std::io::Error::other("child terminated by signal"))
 }
 
+/// Reads the credential an operator typed, stripping exactly one newline.
+///
+/// Split out of the `add-credential` arm so the newline rule can be exercised
+/// without a process, a socket or a vault, and so the return type can be named
+/// by a row: the buffer is an [`OpaqueSecret`], which zeroizes on drop, and a
+/// caller that wanted a `String` back could not bind this.
+///
+/// The newline rule is the interesting part and it is not "strip trailing
+/// whitespace". `echo secret |` produces one `\n` and the obvious use of this
+/// command is `echo secret |`, so a stored trailing newline would be a
+/// credential that silently never works. Exactly one: a secret that genuinely
+/// ends in a newline keeps it, because a rule that strips them all is a rule
+/// that corrupts data.
+fn read_credential(input: &mut impl std::io::Read) -> std::io::Result<OpaqueSecret> {
+    let mut secret = zeroize::Zeroizing::new(String::new());
+    std::io::Read::read_to_string(input, &mut secret)?;
+    if secret.ends_with('\n') {
+        secret.pop();
+    }
+    Ok(OpaqueSecret::new(std::mem::take(&mut *secret).into_bytes()))
+}
+
+/// The serialized request, in a buffer that zeroizes when it is dropped.
+///
+/// The return type is the property, and it is why this is a function rather than
+/// an inline `serde_json::to_vec`. `asv add-credential` serializes an
+/// `OpaqueSecret`, whose `Serialize` impl writes the bytes verbatim because the
+/// protocol requires the secret on the wire. Every other buffer on this path is
+/// careful about that secret; this one held it in a plain `Vec<u8>` that went
+/// straight back to the allocator.
+fn encode(request: &Request) -> std::io::Result<zeroize::Zeroizing<Vec<u8>>> {
+    Ok(zeroize::Zeroizing::new(
+        serde_json::to_vec(request).map_err(|e| std::io::Error::other(e.to_string()))?,
+    ))
+}
+
 fn call(socket: &std::path::Path, request: &Request) -> std::io::Result<Response> {
     let mut stream = UnixStream::connect(socket)?;
 
-    let payload = serde_json::to_vec(request).map_err(|e| std::io::Error::other(e.to_string()))?;
+    // Both buffers are `Zeroizing`, and that is the whole of the fix.
+    //
+    // The request buffer holds a credential for exactly one command:
+    // `asv add-credential` serializes an `OpaqueSecret`, whose `Serialize` impl
+    // writes the bytes out verbatim, because the protocol requires the secret on
+    // the wire. Everything else about that type is careful — it is a
+    // `Zeroizing<Vec<u8>>` inside, and it redacts its own `Debug` — and the one
+    // buffer that actually carries the plaintext is this one, which was a plain
+    // `Vec<u8>` handed straight back to the allocator.
+    //
+    // The response buffer is zeroized on the way out even though no response is
+    // supposed to carry a secret, and the reason is that zeroing it *by hand* on
+    // the success path would be skipped by every `return` above. A defence
+    // wired to one exit path is a defence that quietly stops being one. The
+    // whole 64 KiB is cleared rather than just the `n` bytes read, because
+    // selecting the used region is exactly the kind of arithmetic that is right
+    // until it is not, and 64 KiB is not a cost worth optimising here.
+    let payload = encode(request)?;
     if payload.len() > asv_ipc_protocol::MAX_MESSAGE_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1470,7 +1550,7 @@ fn call(socket: &std::path::Path, request: &Request) -> std::io::Result<Response
     stream.write_all(&payload)?;
     stream.flush()?;
 
-    let mut buf = vec![0u8; asv_ipc_protocol::MAX_MESSAGE_BYTES];
+    let mut buf = zeroize::Zeroizing::new(vec![0u8; asv_ipc_protocol::MAX_MESSAGE_BYTES]);
     let n = stream.read(&mut buf)?;
     if n == 0 {
         return Err(std::io::Error::new(
@@ -1815,5 +1895,122 @@ mod tests {
                 "this spelling would miss in the vault: {wrong}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // The two buffers that actually hold a credential on this process.
+    //
+    // Every other secret path in the product is careful: `OpaqueSecret` is a
+    // `Zeroizing<Vec<u8>>` and redacts its own `Debug`, the AWS session token
+    // is documented as a plain `String` on the wire, and the broker's responses
+    // have no field one could occupy. These two are the client-side remainder,
+    // and they were not careful: `add-credential` made two unzeroized copies of
+    // what the operator typed, and the buffer the serialized request went into
+    // was a plain `Vec<u8>` handed straight back to the allocator.
+    //
+    // The exposure is bounded and the rows below should not oversell it: `asv`
+    // is a short-lived process, so the heap dies with it. What a long-running
+    // mode, a core dump or swap would inherit is the reason this is worth
+    // fixing now rather than when someone adds that mode.
+    // ---------------------------------------------------------------------
+
+    /// The serialized request comes back in a buffer that zeroizes itself.
+    ///
+    /// The type annotation is the assertion. `encode` is declared as returning
+    /// `zeroize::Zeroizing<Vec<u8>>`, so binding it to a plain `Vec<u8>` does
+    /// not compile — which is what makes this property structural rather than
+    /// a claim a future edit can quietly undo, and it is why `encode` is a
+    /// function instead of an inline `serde_json::to_vec`.
+    #[test]
+    fn the_serialized_request_lives_in_a_buffer_that_zeroizes() {
+        let request = Request::CreateCredential {
+            label: "example".into(),
+            kind: asv_domain::CredentialKind::ApiKey,
+            provider: "example".into(),
+            account: "example".into(),
+            secret: OpaqueSecret::new(b"the-secret-value".to_vec()),
+        };
+        let payload: zeroize::Zeroizing<Vec<u8>> = encode(&request).expect("encodes");
+        assert!(
+            payload.windows(6).any(|w| w == b"secret"),
+            "the wire form must carry the secret: this is the one request where \
+             the buffer below is the only copy of it on this process"
+        );
+    }
+
+    /// The credential the operator typed is read into a type that zeroizes.
+    ///
+    /// As above, the annotation is the assertion: a `read_credential` that
+    /// returned a `String` could not be bound here.
+    #[test]
+    fn the_typed_credential_is_read_into_a_buffer_that_zeroizes() {
+        let secret: OpaqueSecret = read_credential(&mut b"hunter2".as_slice()).expect("reads");
+        assert_eq!(secret.expose(), b"hunter2");
+    }
+
+    /// The newline a shell adds is not part of the credential.
+    ///
+    /// `echo secret | asv add-credential` is the obvious invocation, and
+    /// storing the trailing newline would be a credential that silently never
+    /// works against any provider.
+    #[test]
+    fn a_trailing_newline_is_not_part_of_the_credential() {
+        let secret = read_credential(&mut b"hunter2\n".as_slice()).expect("reads");
+        assert_eq!(secret.expose(), b"hunter2");
+    }
+
+    /// Exactly one. A secret that genuinely ends in a newline keeps it, because
+    /// a rule that strips them all is a rule that corrupts data.
+    #[test]
+    fn only_one_trailing_newline_is_stripped() {
+        let secret = read_credential(&mut b"hunter2\n\n".as_slice()).expect("reads");
+        assert_eq!(secret.expose(), b"hunter2\n");
+    }
+
+    /// A credential with no newline at all is stored whole — the stripping is
+    /// not a decode that assumes a shell was involved.
+    #[test]
+    fn a_credential_with_no_newline_is_stored_whole() {
+        let secret = read_credential(&mut b"hunter2".as_slice()).expect("reads");
+        assert_eq!(secret.expose(), b"hunter2");
+    }
+
+    /// Empty input is refused at the call site, and the refusal is about the
+    /// emptiness rather than about the read having failed.
+    #[test]
+    fn a_bare_newline_reads_as_empty() {
+        let secret = read_credential(&mut b"\n".as_slice()).expect("reads");
+        assert!(
+            secret.expose().is_empty(),
+            "a lone newline must leave nothing, or `echo | asv add-credential` \
+             would store an empty credential rather than refusing"
+        );
+    }
+
+    /// Leading whitespace is part of the credential.
+    ///
+    /// This row replaces one that could not fail. The first version here
+    /// asserted "the credential is held by a type that owns one allocation",
+    /// which read as if it held the *copy count* of the buffer — and it could
+    /// not: replacing the `mem::take` with a `to_string()` produces the same
+    /// bytes through the same type and the row stays green. A copy is invisible
+    /// at runtime, so a row cannot hold that property and pretending one does
+    /// is how an unfalsifiable assertion gets to look like evidence.
+    ///
+    /// The copy count is therefore a source property, held by there being one
+    /// `mem::take` between stdin and `OpaqueSecret`, and it is recorded as a
+    /// survivor in `cli_buffers_falsify.py` rather than dressed up as a test.
+    /// What *is* observable is the newline rule, and this row is the half of it
+    /// the first version missed: a `trim()` would pass every other row here,
+    /// because none of them begin with a space.
+    #[test]
+    fn a_leading_space_is_part_of_the_credential() {
+        let secret = read_credential(&mut b"  hunter2\n".as_slice()).expect("reads");
+        assert_eq!(
+            secret.expose(),
+            b"  hunter2",
+            "only the newline a shell appends is stripped; a credential may \
+             legitimately begin with whitespace and `trim()` would corrupt it"
+        );
     }
 }
