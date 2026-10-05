@@ -87,7 +87,32 @@ permit (principal, action == Action::"postgres_read", resource is Database);
 // and naming the audience there is the point: the broker evaluates against the
 // *deployment's* audience, so the rule is about one declared destination rather
 // than about AWS in general.
-"#;
+//
+// -- A correction to the rule above, and it is the reason this paragraph exists
+//
+// The AWS example says `resource.audience == "..."`, and that condition **cannot
+// ever be true**. `cedar_decision` builds the request with
+// `Request::new(principal, action, resource, context, None)` -- the last argument
+// is where a resource's attributes go, and nothing in this crate ever builds an
+// `Entity`, so `Api::audience` is declared in `SCHEMA_JSON` and never supplied.
+// An operator who followed the documentation above would get a permanent,
+// unexplained denial. The reachable-host guarantee is *not* affected, because
+// `audience_is_approved` runs in Rust before Cedar; only the attribute is
+// missing. Fixing it is its own change with its own evidence, and until then
+// **match the entity name**, which is real: `Api::"api:<audience>"`.
+//
+// `oauth2_identity` has no permit rule for the same reason as the other two, and
+// its entity type is `OAuth2Client` rather than `Api` -- see `ALLOWED_AUDIENCES`
+// for why widening that list to admit arbitrary IdPs would be a regression for
+// GitHub and AWS rather than a compromise. So the working rule is:
+//
+//   permit (principal, action == Action::"oauth2_identity",
+//           resource == OAuth2Client::"oauth2:<vault-credential-id>");
+//
+// which addresses one *registered client* rather than one host. That is the
+// right granularity anyway: the authority being delegated is the registration,
+// and two registrations may share an audience while differing in scope.
+//"#;
 
 /// Audiences a semantic HTTP action may ever target (D6; the design v2 open
 /// question resolved it as a compile-time constant, not configuration).
@@ -147,7 +172,8 @@ const SCHEMA_JSON: &str = r#"{
             "audience": { "type": "String" }
           }
         }
-      }
+      },
+      "OAuth2Client": {}
     },
     "actions": {
       "git_fetch": {
@@ -309,6 +335,20 @@ const SCHEMA_JSON: &str = r#"{
         "appliesTo": {
           "principalTypes": ["AgentSession"],
           "resourceTypes": ["Api"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
+      "oauth2_identity": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["OAuth2Client"],
           "context": {
             "type": "Record",
             "attributes": {
@@ -822,6 +862,29 @@ impl PolicyEngine {
         // denied without ever reaching the authorizer, so no policy text can
         // widen the reachable host set. The first layer (the `Authority` type)
         // already proved the spelling; this one proves approval.
+        //
+        // **The match is on `Api` and only on `Api`, and R2.B.2 added a second
+        // resource type that deliberately does not come through here.** Read
+        // that as a decision, not an oversight, because the natural reaction to
+        // "a new resource type skips the allowlist" is to add it to the list --
+        // and that would break the property this function exists to provide.
+        //
+        // `ALLOWED_AUDIENCES` enumerates first-party API hosts. OAuth2's purpose
+        // is reaching IdPs that are not on any enumerable list, so the two
+        // requirements are in direct conflict and *something* has to give.
+        // Widening the list gives the wrong thing: it would approve `evil.example`
+        // for **GitHub and AWS too**, because they share this resource type, and
+        // D6's guarantee is precisely that policy text cannot choose the host.
+        //
+        // What is given instead is the enumeration. `Resource::OAuth2Client`
+        // arrives here with an audience the *operator* declared in
+        // `--oauth2-clients` and the broker validated at startup, and it is the
+        // only audience the call can use. A policy can therefore allow or deny
+        // a set the policy did not choose, which is the same guarantee D6 buys
+        // for `Api` — reached structurally rather than by list membership.
+        // `OAuth2AudienceReachesCedar` is the row that holds this line, and if it
+        // ever goes red the correct repair is to make the audience
+        // non-request-supplied, never to add a host to the list.
         if let Resource::Api { audience } = &request.resource {
             if !audience_is_approved(audience) {
                 return Ok(false);
@@ -886,6 +949,7 @@ fn action_name(action: &Action) -> &'static str {
         Action::GitHubReleaseCreate => "github_release_create",
         Action::ConnectRoute => "connect_route",
         Action::AwsStsCallerIdentity => "aws_sts_caller_identity",
+        Action::OAuth2Identity => "oauth2_identity",
     }
 }
 
@@ -900,6 +964,7 @@ fn entity_type(resource: &Resource) -> &'static str {
         Resource::Database { .. } => "Database",
         Resource::Host { .. } => "Host",
         Resource::Api { .. } => "Api",
+        Resource::OAuth2Client { .. } => "OAuth2Client",
     }
 }
 
@@ -909,6 +974,12 @@ fn resource_name(resource: &Resource) -> String {
         Resource::Database { name, role } => format!("db:{name}/{role}"),
         Resource::Host { hostname } => format!("host:{hostname}"),
         Resource::Api { audience } => format!("api:{audience}"),
+        // `oauth2:` rather than the bare id, so a policy rule naming an OAuth2
+        // client can never be confused with one naming a repository that
+        // happens to share a name. The prefix is the only thing keeping the
+        // entity namespaces apart, and it is here rather than in the type name
+        // because Cedar sees only a string.
+        Resource::OAuth2Client { credential, .. } => format!("oauth2:{credential}"),
     }
 }
 

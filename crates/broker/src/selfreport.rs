@@ -161,6 +161,14 @@ pub fn compiled_capabilities() -> Vec<String> {
         // No secret crosses this boundary, and the response type has no field
         // one could fit in — so listing it costs an agent nothing to hold.
         "aws.sts.caller_identity".to_string(),
+        // The OAuth2 provider's first operation, and the same argument as the
+        // line above: named for what comes back (an identity, verified against
+        // the deployment), not after the HTTP method that fetches it.
+        //
+        // It is also the operation that turned M11's second provider from a
+        // library vertical into a surface. Before this, the daemon mounted
+        // `OAuth2SecretPort` and no request could name it.
+        "oauth2.identity".to_string(),
     ];
     out.sort();
     out.dedup();
@@ -195,6 +203,7 @@ mod tests {
             Request::CreateIssue { .. } => "github.issue.create",
             Request::CreateRelease { .. } => "github.release.create",
             Request::AwsCallerIdentity { .. } => "aws.sts.caller_identity",
+            Request::OAuth2Identity { .. } => "oauth2.identity",
             Request::PostgresConnect { .. } => "postgres.connect",
             Request::PostgresQuery { .. } => "postgres.query",
             // Session lifecycle, authorisation, surrogate revocation, approval
@@ -280,6 +289,10 @@ mod tests {
                 session,
                 credential: String::new(),
             },
+            Request::OAuth2Identity {
+                session,
+                credential: String::new(),
+            },
             Request::AuditQuery { since_secs: 0 },
             Request::PostgresConnect {
                 session,
@@ -311,7 +324,7 @@ mod tests {
         // makes that omission visible instead of assumed.
         assert_eq!(
             sample.len(),
-            19,
+            20,
             "a new Request variant must be added to one_of_every_variant(), \
              and one that represents an operation must also be classified"
         );

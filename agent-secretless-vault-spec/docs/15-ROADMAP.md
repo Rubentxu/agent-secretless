@@ -73,7 +73,7 @@ is not listed, and a block with a residual says so in its own row.
 | **R0** | closed | `tests/r0_gate.py` — 4 passed, 0 failed, 0 unavailable. Signature verification reachable from a clean install, 46 negative provenance checks, the official skill published outside this repository and cross-repo verified at 105 checks. |
 | **R1** | closed, and the caveat that qualified it is gone | `r1_isolated_reachability` 11/11 and `r1_isolated_e2e` 6/6, both from the product surface, and `uat_040_isolated_worker_runtime` 15/15. This row previously carried a caveat that 21 tests returned early when their substrate was missing and Cargo reported that as **passed**. The figure was right and the file count was wrong — it is three files, not five, and the split is 18 plus 3. All 18 now **refuse** with `UNAVAILABLE_SUBSTRATE` and are falsified by `tests/falsification/r1_substrate_falsify.py`: 18 red, 14 green, 0 unmeasured. The remaining 3 are the PostgreSQL rows, which already had the better shape (`ASV_UAT033_REQUIRE=1`) and are left alone. See *The rows that reported passing without running*. |
 | **R2.A** | closed, with one half `host-dependent` | `r2a_github_vertical` 11/11 in-process against a real TLS origin, and `r2a_cli_reachability` 4/4 against the real binaries. The live call against the real `api.github.com` is **not** measured and is not claimed; see *Status of item 1* below. |
-| **R2.B** | partial, and less reachable than the row used to say | `oauth2_vertical` 11/11 over a real vault, a real issuer and a real resource call, and `r2b_oauth2_revocation` 5/5 with four falsifications. The revocation gap is closed and the property is structural — `forget` is required on `SecretPort` with no default. **What no request reaches is the larger gap and it was not recorded here before:** the daemon constructs `OAuth2SecretPort` from an operator-written `--oauth2-clients` file and installs it in `state.secrets`, and there is no `Request` variant, no dispatch arm and no CLI verb that asks it for anything. The port is live in the process and inert. That is *why* the requested scope is operator-configured rather than policy-derived: no policy is evaluated on this path, because there is no path. Two further things stay open — compatibility with an operator's real IdP needs a host that has one, and making the scope policy-bound is R4's work. See *Status of item 4*. |
+| **R2.B** | surface delivered; scope-as-policy-resource still open | `oauth2_vertical` 11/11 over a real vault, a real issuer and a real resource call, `r2b_oauth2_revocation` 5/5 with four falsifications, and now `r2b2_oauth2_vertical` 22/22 through the broker's own `handle` — `asv oauth2 whoami` reaches the port. `ALLOWED_AUDIENCES` was **not** widened: `Resource::OAuth2Client` is a separate type, so admitting a generic IdP cannot reopen D6 for GitHub and AWS, and the schema refuses the dangerous rule at load rather than at evaluation. The answer is verified against the deployment, not relayed, and the issuer's own escalation check turns out to speak before the broker's. Falsified 15 mutations in five passes: 14 red, 1 documented survivor, 0 unmeasured. Still open: a live third-party IdP, scope as a policy resource, and the config-file-vs-policy intersection. See *Status of item 4*. |
 | **R2.C** | one operation reachable from the product surface; item 2 still not closed | `aws::sigv4` 16/16 against the AWS documentation's own vectors, `aws::sts` 34/34 and `aws::calendar` 9/9 against an oracle written from the specifications, `aws::port` 12/12 with no socket in it, `aws::identity` 12/12 against two documented AWS samples, `r2c2b_sts_vertical` 18/18 against a real TLS origin, and `r2c3_aws_vertical` 13/13 from the product surface — CLI verb, typed IPC, real vault, real policy, real origin, and the advertisement an agent reads to find the verb at all. **113 mutations** across seven harnesses, and the number is the sum of the harness files rather than an inherited figure: 25 `sigv4`, 25 `sts`, 13 `client`, 14 `calendar`, 13 `port`, 14 `identity`, 9 `r2c3`. Of those, **110 red, 1 refused by the compiler, 2 recorded survivors** (the post-read size bound, unexercised because the fake origin always declares a `content-length`; and the binding's `Debug`, which cannot leak because `AwsSecretPort`'s own `Debug` does not). All seven are in the repository at `tests/falsification/` and every one was re-run from there, so the figure is re-derivable rather than merely asserted. **One operation is not a catalogue** — `s3:GetObject`, the regional STS endpoints and the live call are open, so item 2 is not closed under M11's rule. See *Status of item 2*. |
 
 **The R1 row is the one worth reading twice.** `uat_040`'s file-injection row was
@@ -1112,6 +1112,176 @@ a scope for a request nobody can make.
 Until step 1 exists, the honest description of item 4 is a complete provider
 framework with no consumer — which is the failure mode the goal forbids under
 the name *code without a consumer*, and which this row now says outright.
+
+#### R2.B.2 — step 1, delivered: the surface, and the answer it produced
+
+`asv oauth2 whoami` now reaches the port. `Request::OAuth2Identity` names a
+session and a credential *reference* and nothing else; `Response::OAuth2Identity`
+carries three non-secret strings; `Action::OAuth2Identity` is the verb;
+`oauth2.identity` is the advertised capability; and `OAuth2Binding` in
+`crates/broker/src/oauth2_binding.rs` is the deployment the broker authorizes
+against. The client secret is spent inside the port on one token request and
+never reaches a sink, so the operation the agent names is an operation.
+
+**The four things a request cannot name are `token_url`, `resource_url`,
+`audience` and `scope`,** and the absence of those fields is the claim rather
+than an omission. All four come from `--oauth2-clients`, which the daemon reads
+and validates at startup; a request that could name its own scope would be a
+request that named its own authority.
+
+Three findings came out of building it, and each one changed the design.
+
+**One: the allowlist was not widened, and that is the load-bearing decision.**
+`ALLOWED_AUDIENCES` remains exactly `["api.github.com", "sts.amazonaws.com"]`.
+The obvious way to make a generic IdP reachable is to add its host, and doing so
+would have compiled and passed every row while silently reopening D6 for GitHub
+and AWS — they share the `Api` resource type, and `audience_is_approved` gates
+every one of them, so any policy text could then have named `evil.example` and
+been approved. Instead `Resource::OAuth2Client` is a **separate resource type**,
+keyed by credential wire id, and it does not reach `audience_is_approved` at
+all. The reachability guarantee is obtained structurally — the deployment
+declares, the request proposes, and a policy can only allow or deny one of the
+already-declared clients — instead of by enumeration, which is the weaker
+mechanism here because a list long enough to be a product is a list nobody
+maintains. Three type facts forced the new variant rather than making it a
+preference: an RFC 8707 audience is a **URI** and `Resource::Api.audience` is an
+`Authority`, which is a *host*; the audience is never request-supplied, so
+`Authority`'s "an uncanonical audience cannot be constructed" buys nothing; and
+the host the client secret is actually POSTed to is `token_url`, which
+`ALLOWED_AUDIENCES` never gated at all — `load_clients` checked only
+`starts_with("https://")`, a scheme check rather than an approval check, so
+treating the audience as the approval question would have been a category error
+about the wrong string.
+
+The control turned out **stronger than a runtime denial**, which was not
+anticipated. The Cedar schema declares `oauth2_identity` as applying to
+`OAuth2Client` only, so an operator cannot *write* the dangerous rule at all:
+`permit (…, action == Action::"oauth2_identity", resource is Api)` fails strict
+validation when the policy is compiled, naming the offending rule, before any
+request exists. The failure mode is unreachable by construction rather than by a
+check that might be forgotten.
+
+**Two: the answer is verified, not relayed — and the issuer speaks first.**
+The deployment declares the scope and audience it expects, and a disagreement
+with the resource's own answer is a refusal. The reason is that a resource
+server reports whatever it was given, honestly, *including more than the
+operator configured*; relaying that would leave `--oauth2-clients` describing an
+authority that is no longer the one in play, which is the escalation M11 exists
+to prevent arrived at through the provider rather than through a request.
+
+The first version of the widening row **failed**, and how it failed is the
+finding: `ClientCredentialsIssuer::issue` already refuses a widened grant —
+`credential scope escalated: asked for "read:pods", granted "read:pods
+write:pods"` — and it does so *before the broker holds a token*. That is the
+stronger control, and it means the broker's own comparison in
+`OAuth2Binding::identity` is unreachable through the production issuer. It was
+kept rather than deleted, because a provider that widens the grant *after*
+issuance is real and `OAuth2Issuer` is an extension point a deployment can
+supply — and a control nobody can reach is not a control, neither is one nobody
+can falsify. The two layers are now asserted separately, and each is reachable.
+
+**Three: the documented AWS policy rule cannot work, and R2.B.2 refused to
+repeat it.** `POLICY_TEXT` tells an operator to write
+`resource.audience == "sts.eu-west-1.amazonaws.com"`, and that condition can
+never be true: `cedar_decision` calls `Request::new(…, None)` and nothing in the
+policy crate ever builds an `Entity`, so `Api::audience` is declared in
+`SCHEMA_JSON` and never supplied. An operator following the documentation would
+get a permanent, unexplained denial. The reachable-host guarantee is *not*
+affected — `audience_is_approved` runs in Rust before Cedar, so only the
+attribute is missing — and the working form is to match the entity **name**,
+`Api::"api:<audience>"`. `OAuth2Client` therefore carries no attribute at all,
+and the correction is recorded in the policy text next to the rule it corrects.
+Fixing the attribute is its own change with its own evidence and is **not** part
+of this one.
+
+Measured: `r2b2_oauth2_vertical` 22 rows through the broker's own `handle`, with
+a real `VaultStore`, a real routing port, a real Cedar policy, a real RFC 6749
+server and a real RFC 8707 resource; `oauth2_port` loader rows 6 including three
+new ones. Falsified by `tests/falsification/r2b2_falsify.py` in five passes:
+**broker 5/5 red, binding 5/5 red, policy 2/2 red, selfreport 2/2 red, and one
+documented survivor** — 15 mutations, 14 red, 1 survivor, 0 measured-nothing.
+
+The survivor is the interesting one and it is not a defect.
+`INDEPENDENCE_MUTATIONS` widens `ALLOWED_AUDIENCES` by one host and asserts the
+OAuth2 happy path **still passes**, which is the measurement that the OAuth2
+surface does not depend on the allowlist at all — the design's central claim,
+stated as a number rather than as a paragraph. The first version of this campaign
+filed that mutation under a heading implying it should go red, and it did not;
+the cause was the campaign, not the code, because the harm of stretching the list
+falls on GitHub and AWS and no OAuth2 row can go red however far it is stretched.
+The two *dangerous* widenings were then re-aimed at the policy crate's own
+`unapproved_audience_is_denied_even_though_it_canonicalizes`, and both go red —
+so the harm is measured, and the independence is measured, and they are not the
+same measurement.
+
+The campaign found five defects in its own evidence and each was repaired rather
+than absorbed:
+
+- a missing ownership row (a survivor — nothing tested session ownership);
+- a mutation whose snippet was not the code it claimed to change, so it mutated
+  zero characters and reported a survivor;
+- a row measuring UTF-8 strictness on a path where the token is always valid, and
+  therefore incapable of failing;
+- a row accepting *any* refusal, which left the non-2xx check unfalsifiable
+  because a JSON parse failure is also a refusal;
+- a `--exact` invocation that passed a bare test name, so both policy mutations
+  reported `measured nothing` and the harness was reporting its own addressing
+  bug as a result.
+
+The last two are the reason a campaign is worth running even when the code is
+right: in both cases the code was fine and the *evidence* was not, and a summary
+that reported either as a pass would have been worse than no campaign.
+
+Steps 2 and 3 remain open and are unchanged: the scope as a policy *resource*,
+and the intersection where the operator's file proposes and the policy bounds.
+What exists now is the prerequisite for both — and note that step 2's "a new
+resource variant rather than a field added to `Resource::Api`" is now half-done
+for a different reason, since the variant exists for the approval argument above
+rather than for the scope, and it will carry the scope when step 2 arrives.
+
+Open, and not closed by any of the above: a live exchange against a real
+third-party IdP needs a host that has one; `IDENTITY_TIMEOUT` bounds the call but
+no row measures a hung resource, because a ten-second test is not a better test;
+and the registration file's `resource_url` path component is dropped at load
+(the broker dials `/resource` itself) without a row saying so out loud.
+
+#### A process incident, because it changed what a commit message can be trusted to mean
+
+While R2.B.2 was being written, a second agent session working in the same
+repository committed `bb710f5 feat(aws): the answer to "is this object there" that
+holds no object` — and that commit **contains R2.B.2's edits to
+`tests/falsification/README.md`**. The other session staged that file whole while
+these edits were uncommitted in the working tree, so three paragraphs about the
+OAuth2 campaign shipped under a message about `s3:HeadObject`.
+
+The content is correct and nothing was lost, which is the only reason this is
+recorded as an incident rather than as damage. The attribution is wrong, and
+attribution is load-bearing here: this project claims that a commit message
+states what a commit did, and a reader auditing `bb710f5` for what changed in the
+falsification coverage would find three OAuth2 paragraphs with no mention in the
+title or body.
+
+The cause is the one this file already warns about — two writers, one index — and
+the rule that prevents it is the one already written: **stage an explicit list of
+files, never a path or a directory, and re-check `git status` immediately before
+committing.** `git add tests/falsification/README.md` is a path; a file two
+writers both touch is the case where a path is not enough.
+
+What this does *not* justify is rewriting `bb710f5`. History is shared with a
+session that is still writing, and an amend or a rebase to fix a message would
+trade a documented misattribution for an undocumented one. The honest repair is
+the one available: say so here, where the authority is read.
+
+It also has a second-order consequence worth stating, because the campaign ran
+during the same window: the `policy` pass first reported three
+`compiler-refused` results that were **not measurements at all**. The other
+session's `aws/s3/object.rs` did not compile at that moment, so the whole
+workspace failed to build and the harness correctly reported the
+unreadable bucket — for a reason that had nothing to do with the mutations. Those
+three results were discarded and the pass re-run on a tree that compiled, which
+is the only reason the numbers above are trustworthy. **A campaign's result is
+only about the tree it ran on**, and a concurrent writer invalidates it without
+touching the file under mutation.
 
 Item 4 was the only one of the seven that had been built when R2.A started, and
 the difference between what it was and what it is took five increments, each of

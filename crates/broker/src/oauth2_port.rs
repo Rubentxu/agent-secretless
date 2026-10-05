@@ -320,6 +320,34 @@ struct RawClient {
     audience: String,
     #[serde(default)]
     scope: String,
+    /// Where the derived token is presented, and which host the broker vets
+    /// before presenting it there.
+    ///
+    /// **Required as of R2.B.2, and required rather than defaulted on purpose.**
+    /// A registration with no resource can still be traded for a token — that is
+    /// what the field meant before this increment — but it cannot answer "which
+    /// identity is this request acting as", which is the only reason a broker
+    /// would exchange a client secret at all. Defaulting it would produce a
+    /// configuration that loads cleanly and then refuses every call, which is the
+    /// worst of the two failure modes: an operator who sees a successful startup
+    /// has learned nothing about the thing that is broken.
+    resource_url: String,
+}
+
+/// One registration as loaded from disk: what the **port** needs, plus what the
+/// **broker** needs to reach the resource.
+///
+/// Kept as one struct rather than two parallel vectors because the pairing
+/// between a port registration and a deployment is the whole invariant — two
+/// `Vec`s that must stay index-aligned is a way to have the port trade
+/// credential A's secret while the broker presents A's token to B's resource.
+pub struct LoadedClient {
+    /// The registration the port trades. This is the type that existed before
+    /// R2.B.2 and it is unchanged: a client secret and the four strings needed
+    /// to spend it on one token request.
+    pub client: OAuth2Client,
+    /// The deployment the broker authorizes against and presents the token to.
+    pub deployment: crate::oauth2_binding::OAuth2Deployment,
 }
 
 /// Loads client registrations from a JSON file.
@@ -328,9 +356,14 @@ struct RawClient {
 /// whether the *name* resolves is not checked, because a provider that is down
 /// at startup is a normal thing and the broker must still start. What is
 /// checked is everything that can be known without the network — a credential
-/// with no name, a token URL that is not HTTPS, two registrations fighting over
-/// one credential.
-pub fn load_clients(path: &std::path::Path) -> Result<Vec<OAuth2Client>, ClientConfigError> {
+/// with no name, a token URL that is not HTTPS, a resource URL that does not
+/// parse or is not HTTPS, two registrations fighting over one credential.
+///
+/// **The resource URL is validated as strictly as the token URL, and the reason
+/// is that both are places a bearer or a client secret is written to.** An
+/// operator who fat-fingers `http://` on the resource gets a startup refusal
+/// rather than a token posted in the clear to the first agent that asks.
+pub fn load_clients(path: &std::path::Path) -> Result<Vec<LoadedClient>, ClientConfigError> {
     let text = std::fs::read_to_string(path).map_err(|error| ClientConfigError::Unreadable {
         path: path.display().to_string(),
         reason: error.to_string(),
@@ -367,16 +400,84 @@ pub fn load_clients(path: &std::path::Path) -> Result<Vec<OAuth2Client>, ClientC
                 ),
             });
         }
+        let credential_id = asv_domain::CredentialId::from_wire(&entry.credential).map_err(|error| {
+            ClientConfigError::Unusable {
+                credential: entry.credential.clone(),
+                reason: format!(
+                    "the credential is not a vault id, so no request could ever name it: {error}"
+                ),
+            }
+        })?;
+        // Split once, into the two halves the broker needs: a canonical host to
+        // vet and a port to dial. Both come from the operator's string, and
+        // neither is ever taken from a request.
+        let (token_endpoint, _) = split_https(&entry.credential, &entry.token_url)?;
+        let (resource, resource_port) = split_https(&entry.credential, &entry.resource_url)?;
+
         seen.push(entry.credential.clone());
-        clients.push(OAuth2Client {
-            credential: entry.credential,
-            client_id: entry.client_id,
-            token_url: entry.token_url,
-            audience: entry.audience,
-            scope: entry.scope,
+        clients.push(LoadedClient {
+            client: OAuth2Client {
+                credential: entry.credential,
+                client_id: entry.client_id,
+                token_url: entry.token_url,
+                audience: entry.audience.clone(),
+                scope: entry.scope.clone(),
+            },
+            deployment: crate::oauth2_binding::OAuth2Deployment {
+                credential: credential_id,
+                token_endpoint,
+                resource,
+                resource_port,
+                audience: entry.audience,
+                expected_scope: entry.scope,
+            },
         });
     }
     Ok(clients)
+}
+
+/// Splits an `https://host[:port]` URL into a canonical authority and a port.
+///
+/// Returns the token endpoint's port as `0` — "use the scheme default" — because
+/// the issuer builds that URL itself and only needs the host canonicalized. The
+/// resource's port is real and returned, because the broker dials it explicitly
+/// and a deployment must not be talked into a different port by a default.
+fn split_https(
+    credential: &str,
+    url: &str,
+) -> Result<(asv_domain::Authority, u16), ClientConfigError> {
+    let parsed = url::Url::parse(url).map_err(|error| ClientConfigError::Unusable {
+        credential: credential.to_string(),
+        reason: format!("{url} is not a URL: {error}"),
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(ClientConfigError::Unusable {
+            credential: credential.to_string(),
+            reason: format!("{url} is not https"),
+        });
+    }
+    let host = parsed.host_str().ok_or_else(|| ClientConfigError::Unusable {
+        credential: credential.to_string(),
+        reason: format!("{url} has no host"),
+    })?;
+    let authority = asv_domain::Authority::canonicalize(host).map_err(|error| {
+        ClientConfigError::Unusable {
+            credential: credential.to_string(),
+            reason: format!("{host} is not a canonical host: {error}"),
+        }
+    })?;
+    // `Url::port` is `None` for the default, which is 443 for https. The
+    // explicit `.port_or_known_default()` would give 443, and the issuer path
+    // wants the "unset" answer — so the branch is deliberate rather than a
+    // shortcut.
+    let port = parsed.port().unwrap_or(443);
+    if port == 0 {
+        return Err(ClientConfigError::Unusable {
+            credential: credential.to_string(),
+            reason: format!("{url} names port 0, which never connects"),
+        });
+    }
+    Ok((authority, port))
 }
 
 /// Answers from the OAuth2 port for registered credentials and from the vault
@@ -666,6 +767,13 @@ mod tests {
     /// A well-formed file loads, and `audience` and `scope` may be omitted
     /// because both have honest defaults: no audience means the issuer's own
     /// resource, and no scope means whatever the provider considers default.
+    ///
+    /// The credentials are canonical UUIDs rather than the readable labels this
+    /// test used to carry, and that is the point of R2.B.2's new validation: a
+    /// registration keyed on a name no request could ever send is the same
+    /// defect `AwsDeployment::credential` documents, and it used to load
+    /// cleanly and then refuse every call. So a label is now a *startup* refusal
+    /// with the file and line in reach, instead of a runtime one with neither.
     #[test]
     fn a_well_formed_file_loads() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -673,61 +781,193 @@ mod tests {
         std::fs::write(
             &path,
             r#"[
-                 {"credential":"cred-1","client_id":"asv-broker",
+                 {"credential":"11111111-1111-4111-8111-111111111111","client_id":"asv-broker",
                   "token_url":"https://idp.example.com/token",
+                  "resource_url":"https://api.example.com/resource",
                   "audience":"https://api.example.com","scope":"read"},
-                 {"credential":"cred-2","client_id":"other",
-                  "token_url":"https://idp2.example.com/token"}
+                 {"credential":"22222222-2222-4222-8222-222222222222","client_id":"other",
+                  "token_url":"https://idp2.example.com/token",
+                  "resource_url":"https://api2.example.com/resource"}
                ]"#,
         )
         .expect("write");
         let clients = load_clients(&path).expect("loads");
         assert_eq!(clients.len(), 2);
-        assert_eq!(clients[0].scope, "read");
-        assert_eq!(clients[1].audience, "", "omitted means the issuer's own");
-        assert_eq!(clients[1].scope, "", "omitted means the provider's default");
+        assert_eq!(clients[0].client.scope, "read");
+        assert_eq!(
+            clients[1].client.audience, "",
+            "omitted means the issuer's own"
+        );
+        assert_eq!(
+            clients[1].client.scope, "",
+            "omitted means the provider's default"
+        );
+    }
+
+    /// The deployment half carries what the broker needs to reach the resource,
+    /// and both halves came from the same entry — the pairing is what stops the
+    /// port trading one credential's secret while the broker presents the token
+    /// to another credential's resource.
+    #[test]
+    fn a_loaded_registration_yields_a_matching_deployment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clients.json");
+        std::fs::write(
+            &path,
+            r#"[{"credential":"11111111-1111-4111-8111-111111111111","client_id":"asv-broker",
+                 "token_url":"https://idp.example.com/token",
+                 "resource_url":"https://api.example.com:8443/anything",
+                 "audience":"https://api.example.com","scope":"pods:read"}]"#,
+        )
+        .expect("write");
+        let clients = load_clients(&path).expect("loads");
+        let loaded = &clients[0];
+        // The port registration and the deployment agree on the credential, in
+        // the two spellings each uses, and on the two strings they share.
+        assert_eq!(
+            loaded.deployment.credential.to_wire(),
+            loaded.client.credential,
+            "a request names the wire id and the port keys the record name"
+        );
+        assert_eq!(loaded.deployment.expected_scope, loaded.client.scope);
+        assert_eq!(loaded.deployment.audience, loaded.client.audience);
+        // The resource URL is split into a vetted host and an explicit port.
+        // The *path* is dropped on purpose: the broker dials `/resource` itself,
+        // so an operator cannot configure the broker into fetching a different
+        // endpoint by writing a longer URL here.
+        assert_eq!(loaded.deployment.resource.to_string(), "api.example.com");
+        assert_eq!(loaded.deployment.resource_port, 8443);
+        assert_eq!(loaded.deployment.token_endpoint.to_string(), "idp.example.com");
+    }
+
+    /// A port is defaulted rather than refused when the URL names no port,
+    /// because `https://…` means 443 and an operator should not have to spell
+    /// it. The port is *recorded* either way, so the broker dials one it chose
+    /// explicitly rather than one a default chose at dial time.
+    #[test]
+    fn a_resource_url_without_a_port_gets_the_https_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clients.json");
+        std::fs::write(
+            &path,
+            r#"[{"credential":"11111111-1111-4111-8111-111111111111","client_id":"a",
+                 "token_url":"https://idp.example.com/token",
+                 "resource_url":"https://api.example.com"}]"#,
+        )
+        .expect("write");
+        let clients = load_clients(&path).expect("loads");
+        assert_eq!(clients[0].deployment.resource_port, 443);
     }
 
     /// Every way the file can be wrong is a refusal, and none of them is a
     /// partial load. A registration that is half-understood is worse than none.
+    ///
+    /// The `String` cases rather than `&str` because most of these are *edits* of
+    /// one well-formed registration, and a literal per case would be six copies
+    /// of a fixture that has to change whenever the schema does.
     #[test]
     fn a_wrong_file_is_a_refusal_rather_than_a_partial_load() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cases: Vec<(&str, &str)> = vec![
+        const GOOD: &str = r#""credential":"11111111-1111-4111-8111-111111111111","client_id":"a","token_url":"https://x.example/t","resource_url":"https://r.example/x""#;
+        const ID: &str = "11111111-1111-4111-8111-111111111111";
+        let one = |edited: &str| format!("[{edited}]");
+        let cases: Vec<(&str, String)> = vec![
             (
                 "two registrations, one credential",
-                r#"[{"credential":"c1","client_id":"a","token_url":"https://x.example/t"},
-                    {"credential":"c1","client_id":"b","token_url":"https://y.example/t"}]"#,
+                format!(
+                    r#"[{{"credential":"{ID}","client_id":"a","token_url":"https://x.example/t","resource_url":"https://r.example/x"}},
+                       {{"credential":"{ID}","client_id":"b","token_url":"https://y.example/t","resource_url":"https://r.example/x"}}]"#
+                ),
             ),
             (
                 "a token endpoint that is not https",
-                r#"[{"credential":"c1","client_id":"a","token_url":"http://x.example/t"}]"#,
+                one(&GOOD.replace("https://x.example/t", "http://x.example/t")),
+            ),
+            (
+                "a resource endpoint that is not https",
+                one(&GOOD.replace("https://r.example/x", "http://r.example/x")),
+            ),
+            (
+                "a resource endpoint that is not a URL",
+                one(&GOOD.replace("https://r.example/x", "not a url")),
+            ),
+            (
+                "a resource endpoint with no host",
+                one(&GOOD.replace("https://r.example/x", "https:///x")),
+            ),
+            (
+                "a missing resource endpoint",
+                one(&GOOD.replace(
+                    r#","resource_url":"https://r.example/x""#,
+                    "",
+                )),
+            ),
+            (
+                "a credential that is not a uuid",
+                one(&GOOD.replace(ID, "cred-1")),
+            ),
+            (
+                "an upper-case uuid, which is not the canonical spelling",
+                one(&GOOD.replace(ID, "11111111-1111-4111-8111-11111111111A")),
             ),
             (
                 "an empty client id",
-                r#"[{"credential":"c1","client_id":"  ","token_url":"https://x.example/t"}]"#,
+                one(&GOOD.replace(r#""client_id":"a""#, r#""client_id":"  ""#)),
             ),
             (
                 "an empty credential",
-                r#"[{"credential":"","client_id":"a","token_url":"https://x.example/t"}]"#,
+                one(&GOOD.replace(
+                    &format!(r#""credential":"{ID}""#),
+                    r#""credential":"""#,
+                )),
             ),
             (
                 "a misspelled field name",
-                r#"[{"credential":"c1","client_id":"a","token_url":"https://x.example/t","scpoe":"read"}]"#,
+                one(&format!("{GOOD},\"scpoe\":\"read\"}}")),
             ),
-            ("not json at all", "clients = []"),
+            (
+                "a secret smuggled into the file",
+                one(&format!("{GOOD},\"client_secret\":\"leaked\"}}")),
+            ),
+            ("not json at all", "clients = []".to_string()),
         ];
         for (name, body) in cases {
             let path = dir.path().join("clients.json");
-            std::fs::write(&path, body).expect("write");
+            std::fs::write(&path, &body).expect("write");
             assert!(
                 load_clients(&path).is_err(),
-                "{name} must be refused rather than loaded"
+                "{name} must be refused rather than loaded:\n{body}"
             );
         }
         assert!(
             load_clients(&dir.path().join("absent.json")).is_err(),
             "a missing file is a refusal, not an empty list"
+        );
+    }
+
+    /// **An empty list is not a wrong file, and this row exists to stop somebody
+    /// deciding otherwise later.**
+    ///
+    /// It is the natural reading of `--oauth2-clients` pointed at a list with
+    /// nothing in it: no client is registered, so no OAuth2 request can be
+    /// served, and every such request is refused with a message that says
+    /// `configured: []`. That is self-describing, and it is the same state the
+    /// broker is in when the flag is absent — so refusing the file would turn a
+    /// working "none registered" into a startup crash for no gain.
+    ///
+    /// The distinction that matters is *empty* versus *malformed*, and it is
+    /// worth having a row for: an empty file is a decision, and a file of `[]`
+    /// is that decision written down. A truncated file, on the other hand, does
+    /// not parse, and that case is two rows above.
+    #[test]
+    fn an_empty_list_is_zero_clients_rather_than_a_refusal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clients.json");
+        std::fs::write(&path, "[]").expect("write");
+        let clients = load_clients(&path).expect("an empty list is a decision, not an error");
+        assert!(
+            clients.is_empty(),
+            "and it is the same state as passing no --oauth2-clients at all"
         );
     }
 
@@ -740,7 +980,7 @@ mod tests {
         let path = dir.path().join("clients.json");
         std::fs::write(
             &path,
-            r#"[{"credential":"c1","client_id":"a","token_url":"https://x.example/t"}]"#,
+            r#"[{"credential":"11111111-1111-4111-8111-111111111111","client_id":"a","token_url":"https://x.example/t","resource_url":"https://r.example/x"}]"#,
         )
         .expect("write");
         let text = std::fs::read_to_string(&path).expect("read");
@@ -754,7 +994,8 @@ mod tests {
         // `client_secret` key is a refusal, not a silently ignored field.
         std::fs::write(
             &path,
-            r#"[{"credential":"c1","client_id":"a","token_url":"https://x.example/t",
+            r#"[{"credential":"11111111-1111-4111-8111-111111111111","client_id":"a","token_url":"https://x.example/t",
+                 "resource_url":"https://r.example/x",
                  "client_secret":"leaked"}]"#,
         )
         .expect("write");

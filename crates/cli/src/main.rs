@@ -111,6 +111,15 @@ enum Command {
         #[command(subcommand)]
         command: AwsCommand,
     },
+    /// Act as a registered OAuth2 client, without ever holding a credential.
+    ///
+    /// The provider the broker trades a *client secret* for a *short-lived
+    /// token*, which is the shape GitHub and AWS do not have: neither of those
+    /// mints anything for the agent here, and this one does.
+    Oauth2 {
+        #[command(subcommand)]
+        command: Oauth2Command,
+    },
     /// List credential metadata. Never values.
     Credentials {
         /// Emit the `asv.agent/v1` envelope instead of prose.
@@ -251,6 +260,41 @@ enum AwsCommand {
     },
 }
 
+/// `asv oauth2` — the second M11 provider, and the first one where the broker
+/// trades one credential for another before doing anything.
+///
+/// **There is no `--scope`, no `--audience`, no `--resource` and no
+/// `--token-url`**, and their absence is the same design as the three the AWS
+/// verb lacks. All four come from the `--oauth2-clients` file the daemon was
+/// started with: the scope in particular, because a scope this process could
+/// name would be a scope the agent picked, and picking its own authority is the
+/// escalation the whole broker is built to refuse.
+#[derive(Subcommand)]
+enum Oauth2Command {
+    /// Report which derived OAuth2 identity the broker would act as.
+    ///
+    /// Asks the protected resource what token it actually accepted, and prints
+    /// what it said. Nothing printed here is a credential: no access token, and
+    /// no client secret — the secret never leaves the broker.
+    ///
+    /// The `scope` and `audience` printed are **verified against what the
+    /// operator configured**, not relayed. If the identity provider granted more
+    /// than `--oauth2-clients` declares, this command fails rather than reporting
+    /// authority the operator did not ask for. An exit 1 here means the
+    /// configuration and the provider have drifted apart, which is a thing to fix
+    /// at the IdP.
+    Whoami {
+        /// Vault id of the OAuth2 client secret, as `asv credentials` prints it.
+        /// A *reference*: the broker resolves it against the clients the daemon
+        /// was configured with, and the client secret never reaches here.
+        #[arg(long, value_name = "ID")]
+        credential: String,
+        /// Emit the `asv.agent/v1` envelope instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum GithubIssueCommand {
     /// Read one issue. Returns only its title, body and state.
@@ -364,6 +408,7 @@ async fn main() -> std::io::Result<()> {
         // across the single-request path below.
         Command::Github { command } => return run_github(&socket, command),
         Command::Aws { command } => return run_aws(&socket, command),
+        Command::Oauth2 { command } => return run_oauth2(&socket, command),
         Command::Setup { json } => return run_setup(*json),
         Command::Doctor { json } => return run_doctor(&socket, *json),
         Command::Agent {
@@ -492,6 +537,9 @@ async fn main() -> std::io::Result<()> {
         Command::Aws { .. } => {
             unreachable!("aws opens its own session and is handled before broker IPC")
         }
+        Command::Oauth2 { .. } => {
+            unreachable!("oauth2 opens its own session and is handled before broker IPC")
+        }
         Command::Setup { .. }
         | Command::Doctor { .. }
         | Command::Capabilities { .. }
@@ -585,6 +633,7 @@ pub fn response_kind(response: &Response) -> &'static str {
         Response::IssueCreated { .. } => "IssueCreated",
         Response::ReleaseCreated { .. } => "ReleaseCreated",
         Response::AwsCallerIdentity { .. } => "AwsCallerIdentity",
+        Response::OAuth2Identity { .. } => "OAuth2Identity",
         Response::AuditRecords { .. } => "AuditRecords",
         Response::PostgresConnected { .. } => "PostgresConnected",
         Response::PostgresResult { .. } => "PostgresResult",
@@ -1212,6 +1261,92 @@ fn run_aws(socket: &std::path::Path, command: &AwsCommand) -> std::io::Result<()
     }
 }
 
+/// Runs one OAuth2 verb.
+///
+/// **No surrogate and no token, and both absences are the design.** A surrogate
+/// would be a bearer token this process holds, and the whole point of M11 is
+/// that it does not: the client secret stays in the broker, is spent on one
+/// token request, and what the broker holds afterwards is an access token that
+/// expires on the *provider's* clock. So there is nothing to mint, nothing to
+/// redeem, and nothing to revoke on the way out — the broker borrows, asks, and
+/// answers with what the resource reported.
+fn run_oauth2(socket: &std::path::Path, command: &Oauth2Command) -> std::io::Result<()> {
+    let Oauth2Command::Whoami { credential, json } = command;
+
+    // Validated before a session exists, for the reason `run_aws` does it: a
+    // malformed id would be accepted here and then miss in the broker, and the
+    // operator would be told a credential does not exist.
+    if CredentialId::from_wire(credential).is_err() {
+        eprintln!("asv: the --credential value is not a vault id; copy it from `asv credentials`");
+        std::process::exit(2);
+    }
+
+    let session = match github_call(
+        socket,
+        &Request::CreateSession {
+            workspace: std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        },
+    ) {
+        Response::SessionCreated { session, .. } => session,
+        other => {
+            return Err(std::io::Error::other(format!(
+                "asv oauth2 could not open a session: {other:?}"
+            )))
+        }
+    };
+
+    let response = github_call(
+        socket,
+        &Request::OAuth2Identity {
+            session,
+            credential: credential.clone(),
+        },
+    );
+
+    // Ended before the answer is reported, for the reason `run_aws` gives: a
+    // report that never arrives is still bounded by the session's own lifetime.
+    let _ = call(socket, &Request::EndSession { session });
+
+    match &response {
+        Response::OAuth2Identity {
+            resource,
+            scope,
+            audience,
+        } => {
+            if *json {
+                let result = ipc::from_response(&response);
+                println!("{}", render::json::envelope(&render::json::for_result(&result)));
+            } else {
+                println!("resource: {resource}");
+                println!("scope:    {scope}");
+                println!("audience: {audience}");
+            }
+            Ok(())
+        }
+        Response::Error { code, message } => {
+            if *json {
+                let result = ipc::from_response(&response);
+                println!("{}", render::json::envelope(&render::json::for_result(&result)));
+            } else {
+                eprintln!("asv oauth2 refused ({code:?}): {message}");
+            }
+            // Exit 1, distinct from a connection failure (2), for the reason the
+            // AWS and GitHub verbs document it: "the broker said no" and "there
+            // was no broker" are different events and a script must not retry
+            // both alike. The scope-mismatch case lands here, and it is the one
+            // worth reading: it means the identity provider and
+            // `--oauth2-clients` have drifted apart.
+            std::process::exit(1);
+        }
+        other => Err(std::io::Error::other(format!(
+            "asv oauth2 got an unexpected answer: {other:?}"
+        ))),
+    }
+}
+
 /// Dials the broker, or reports the failure the way every other verb does.
 ///
 /// A connection failure is exit 2 and the `ASV_CONNECTION_FAILED` line, not a
@@ -1571,6 +1706,20 @@ fn print_response(response: &Response) {
             println!("arn:     {arn}");
             println!("user_id: {user_id}");
             println!("account: {account}");
+        }
+        // Not reached from `asv oauth2 whoami`, which renders these three itself
+        // for the same reason the AWS arm is above. Present because the match is
+        // exhaustive on purpose: an unhandled response must be a compile error,
+        // not a silent blank line to an operator who has just asked an identity
+        // provider a question.
+        Response::OAuth2Identity {
+            resource,
+            scope,
+            audience,
+        } => {
+            println!("resource: {resource}");
+            println!("scope:    {scope}");
+            println!("audience: {audience}");
         }
         Response::Pong { protocol } => {
             println!("broker reachable, protocol v{protocol}");

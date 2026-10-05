@@ -691,6 +691,28 @@ pub enum Action {
     /// permission being authorized here is the broker's own, and it is what
     /// stops an agent from naming a credential it was not granted.
     AwsStsCallerIdentity,
+    /// Asks an OAuth2-protected resource which derived identity a request is
+    /// actually acting as (M11-R2.B.2).
+    ///
+    /// The same shape as [`Self::AwsStsCallerIdentity`] and for the same
+    /// reason: it is the operation that answers *which identity is this request
+    /// acting as*, and it is read-only and parameterless so the whole question
+    /// is answerable without the agent addressing anything.
+    ///
+    /// **Named for what the agent gets back rather than after the HTTP method.**
+    /// The resource is reached with a `GET`, but a name containing "get" or
+    /// "introspect" reads like a retrieval and invites the reading that the
+    /// agent is being handed a token to use. It is not: the answer is three
+    /// non-secret strings the *resource* printed, and the client secret never
+    /// leaves the broker.
+    ///
+    /// Note what it is **not** evidence of, in the same way AWS is not. A
+    /// resource server that accepts a token and prints its scope has verified
+    /// the token is live and bound to that audience; it has not checked that
+    /// the scope is *narrower* than the operator configured. That is why the
+    /// broker compares the answer against the deployment and refuses a
+    /// mismatch, rather than relaying whatever was granted.
+    OAuth2Identity,
 }
 
 impl fmt::Display for Action {
@@ -711,6 +733,7 @@ impl fmt::Display for Action {
             Self::PostgresAlterTable => "postgres.alter_table",
             Self::ConnectRoute => "connect.route",
             Self::AwsStsCallerIdentity => "aws.sts.caller_identity",
+            Self::OAuth2Identity => "oauth2.identity",
         };
         f.write_str(s)
     }
@@ -735,6 +758,60 @@ pub enum Resource {
     /// uncanonical audience cannot be constructed (M4 design D5).
     Api {
         audience: Authority,
+    },
+    /// One registered OAuth2 client, addressed by the vault credential that
+    /// holds its client secret (M11-R2.B.2).
+    ///
+    /// **A distinct variant rather than an `Api`, and the distinction is the
+    /// control.** `Api` is gated by `ALLOWED_AUDIENCES`, a two-entry list of
+    /// first-party hosts. OAuth2's whole point is reaching IdPs that are not on
+    /// any list, so the two requirements genuinely conflict, and resolving it by
+    /// widening the list would be a real regression rather than a compromise:
+    /// `audience_is_approved` gates *every* `Api`, so admitting arbitrary IdP
+    /// hosts there would let any policy text name `evil.example` as an
+    /// audience and have it approved — reopening, for GitHub and AWS, the exact
+    /// hole D6 closes.
+    ///
+    /// ## Why the reachability property still holds without the list
+    ///
+    /// [`ALLOWED_AUDIENCES`](crate) exists to stop *policy text* from widening
+    /// the reachable host set. For OAuth2 the reachable set cannot be widened by
+    /// policy at all: the audience and the token endpoint both come from
+    /// `--oauth2-clients`, which is operator configuration read and validated at
+    /// startup. A policy can only allow or deny one of those already-declared
+    /// clients, so the guarantee is obtained *structurally* — the deployment
+    /// declares, the request proposes, and the broker answers with the declared
+    /// entry — instead of by enumeration. Enumeration is the weaker mechanism
+    /// here, because a list long enough to be a product is a list nobody
+    /// maintains.
+    ///
+    /// ## Why the audience is a `String` and not an `Authority`
+    ///
+    /// Because an RFC 8707 resource indicator is a **URI**, not a host:
+    /// `https://api.asv.test`, with a scheme and a path. `Authority` exists (D5)
+    /// so that an uncanonical audience cannot be constructed, and it does that
+    /// for a host. Reusing it for a URI would mean either a new canonicalization
+    /// rule inside `Authority` — widening a type whose entire value is that it
+    /// means one thing — or a mangled string. The audience is *not*
+    /// request-supplied, so it cannot be attacker-chosen here; it is operator
+    /// text that the broker compares against what the resource reports, and a
+    /// comparison needs no type that forbids construction.
+    ///
+    /// Keyed by the credential's wire id rather than by the audience, matching
+    /// [`Self::Database`], which is addressed by `(name, role)` rather than by
+    /// the address it connects to. The authority being delegated is the client
+    /// registration; two registrations may legitimately share one audience, and a
+    /// policy that cannot tell them apart cannot grant one without the other.
+    OAuth2Client {
+        /// The vault credential's wire id. The *reference* the request named,
+        /// resolved broker-side against the configured registrations — never a
+        /// secret and never a token.
+        credential: String,
+        /// The RFC 8707 resource indicator the operator declared, reported so a
+        /// policy author can see it. Carried for the audit trail and for `asv
+        /// explain`; it is **not** consulted by `audience_is_approved`, because
+        /// this variant is deliberately outside that list.
+        audience: String,
     },
 }
 

@@ -51,6 +51,7 @@ pub mod oauth2;
 /// The production consumer of M11: a `SecretPort` that lends a short-lived
 /// access token rather than the stored client secret.
 pub mod oauth2_port;
+pub mod oauth2_binding;
 /// The RFC 6749 authorization server the OAuth2 tests run against.
 ///
 /// Feature-gated rather than `#[cfg(test)]` because the assertions that matter
@@ -794,6 +795,20 @@ pub struct BrokerState {
     /// `AwsSecretPort` exists to prevent. The audience and role live on the
     /// deployment inside the binding, which is what keeps them out of a request.
     pub aws: Vec<crate::aws_binding::AwsBinding>,
+    /// R2.B.2: the OAuth2 clients this broker will broker a derived identity
+    /// for.
+    ///
+    /// **Empty is the default and refuses every OAuth2 request**, the same
+    /// fail-closed reading as [`Self::aws`]. A broker that was not told which
+    /// IdP a credential is traded with is not a broker that gets to trade it
+    /// with somewhere the request names.
+    ///
+    /// Held as bindings rather than configuration for the same reason as
+    /// `aws`: the *port* has to outlive a request. A binding built per call
+    /// would re-exchange the client secret and re-resolve the resource host on
+    /// every call, and the second of those is the DNS-rebinding hole the
+    /// pinned client exists to close.
+    pub oauth2: Vec<crate::oauth2_binding::OAuth2Binding>,
     /// R9: tamper-evident log of every handled request. One record per
     /// `handle` call, appended by the public wrapper (not by the inner
     /// dispatcher), so the audit cannot be bypassed by a new variant.
@@ -894,6 +909,7 @@ impl Default for BrokerState {
             // same reason `secrets` is None: a fabricated default here would be
             // a role nobody chose.
             aws: Vec::new(),
+            oauth2: Vec::new(),
             audit: Arc::new(Mutex::new(audit::AuditLog::default())),
             control_plane: admission::Enrolment::empty(),
             vault_writer: None,
@@ -2115,6 +2131,70 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                 },
             }
         }
+        Request::OAuth2Identity {
+            session,
+            credential,
+        } => {
+            // Parsed before the authorization for the reason the AWS arm gives:
+            // a string that is not a vault id cannot name a registration, and
+            // "you called me wrong" is a different answer from "not granted".
+            let credential = match CredentialId::from_wire(&credential) {
+                Ok(id) => id,
+                Err(_) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: "the credential is not a vault id".into(),
+                    }
+                }
+            };
+            let binding = match state.authorize_oauth2(session, peer, &credential) {
+                Ok(binding) => binding,
+                Err(denial) => return *denial,
+            };
+            // The client secret is spent inside here, on one token request, and
+            // the token exists for one call. The credential reference is
+            // re-serialised rather than passed as the parsed id because the
+            // port's key space is the *vault record name*, which is the spelling
+            // the registration declared, and there is only one of those.
+            match binding.identity(&credential.to_wire()) {
+                Ok(identity) => Response::OAuth2Identity {
+                    resource: identity.resource,
+                    scope: identity.scope,
+                    audience: identity.audience,
+                },
+                // A provider refusal and a configuration disagreement are
+                // different faults with different owners, and both are `Upstream`
+                // because in both cases the broker did its job — it decided the
+                // call was allowed — and something outside the process then did
+                // not. Naming the case in the message is what sends an operator
+                // to the right place; the code stays shared rather than growing a
+                // variant per provider behaviour.
+                Err(crate::oauth2_binding::IdentityError::ScopeWider { expected, granted }) => {
+                    Response::Error {
+                        code: ErrorCode::Upstream,
+                        message: format!(
+                            "the OAuth2 provider granted scope {granted:?} but the deployment \
+                             declares {expected:?}; the operator's configuration no longer \
+                             describes this credential's authority"
+                        ),
+                    }
+                }
+                Err(crate::oauth2_binding::IdentityError::AudienceMismatch {
+                    expected,
+                    reported,
+                }) => Response::Error {
+                    code: ErrorCode::Upstream,
+                    message: format!(
+                        "the token was issued for audience {reported:?} but the deployment \
+                         declares {expected:?}"
+                    ),
+                },
+                Err(error) => Response::Error {
+                    code: ErrorCode::Upstream,
+                    message: error.to_string(),
+                },
+            }
+        }
         Request::PostgresConnect {
             session,
             host,
@@ -2521,6 +2601,96 @@ impl BrokerState {
             peer,
             Action::AwsStsCallerIdentity,
             Resource::Api {
+                audience: binding.deployment.audience.clone(),
+            },
+        )?;
+        Ok(binding)
+    }
+
+    /// The OAuth2 registration a request's credential names, or a refusal.
+    ///
+    /// **Refusing an unknown credential is the point, not an edge case**, and it
+    /// is the same argument [`Self::aws_binding`] makes: falling back to a
+    /// default registration would be a grant nobody made, and the request is the
+    /// untrusted side of this socket. The message lists what *is* configured so
+    /// an agent that cannot find its credential can tell "not granted" from
+    /// "misspelled".
+    fn oauth2_binding(
+        &self,
+        credential: &CredentialId,
+    ) -> Result<&crate::oauth2_binding::OAuth2Binding, Box<Response>> {
+        match self
+            .oauth2
+            .iter()
+            .find(|binding| binding.deployment.serves(credential))
+        {
+            Some(binding) => Ok(binding),
+            None => {
+                let configured: Vec<String> = self
+                    .oauth2
+                    .iter()
+                    .map(|binding| binding.deployment.credential.to_wire())
+                    .collect();
+                Err(Box::new(Response::Error {
+                    code: ErrorCode::Denied,
+                    message: format!(
+                        "no OAuth2 client is configured for {}; configured: {configured:?}",
+                        credential.to_wire()
+                    ),
+                }))
+            }
+        }
+    }
+
+    /// Every check an OAuth2 identity request must pass **before any socket is
+    /// touched**.
+    ///
+    /// Ordered by how cheap the refusal is: session ownership, then whether a
+    /// vault is open at all, then whether the request named something, and only
+    /// then the policy decision. A request that fails any of them has not
+    /// reached the IdP, has not spent the client secret, and has not presented
+    /// a token anywhere.
+    ///
+    /// That last part is why the ordering is the argument rather than a detail:
+    /// the credential is spent inside `identity`, and a denied request must
+    /// arrive before that.
+    fn authorize_oauth2(
+        &self,
+        session: AgentSessionId,
+        peer: &WorkloadIdentity,
+        credential: &CredentialId,
+    ) -> Result<&crate::oauth2_binding::OAuth2Binding, Box<Response>> {
+        // Through `session_owned_by` so its guard is released before the policy
+        // is consulted. Holding it here would deadlock: `evaluate` locks this
+        // same store. See that method for the backtrace that found it in
+        // `authorize_aws`.
+        if !self.session_owned_by(session, peer)? {
+            return Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: "session is not owned by the authenticated peer".into(),
+            }));
+        }
+        if self.secrets.is_none() {
+            return Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: "no credential store is open, so no brokered operation can run".into(),
+            }));
+        }
+        let binding = self.oauth2_binding(credential)?;
+        // The resource is the *registration's*, never the request's, and the
+        // policy is evaluated against that. Note which resource type this is:
+        // `OAuth2Client`, addressed by credential id, and **not** `Api` — the
+        // `Api` type is gated by `ALLOWED_AUDIENCES`, a two-host list of
+        // first-party APIs, and putting a generic IdP through it would either
+        // break the product or, worse, widen that list for GitHub and AWS too.
+        // The audience travels in the resource for the audit trail and is
+        // deliberately not an approval input here.
+        self.authorize_verb(
+            session,
+            peer,
+            Action::OAuth2Identity,
+            Resource::OAuth2Client {
+                credential: credential.to_wire(),
                 audience: binding.deployment.audience.clone(),
             },
         )?;

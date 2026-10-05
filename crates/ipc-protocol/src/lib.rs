@@ -187,7 +187,7 @@ impl BrokerIdentity {
 /// the unisolated one; a peer speaking protocol 7 does not know this verb
 /// exists, and a broker that answered its absence with something else would be
 /// inventing an operation it does not have.
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 
 /// Hard ceiling on a single inbound message. Bounded allocation is required for
 /// any IPC that faces an untrusted peer (`docs/17-IMPLEMENTATION-BOOTSTRAP.md` §9).
@@ -409,6 +409,32 @@ pub enum Request {
         /// would be a credential the operator never granted.
         credential: String,
     },
+    /// Asks an OAuth2-protected resource which derived identity this request
+    /// acts as (M11-R2.B.2).
+    ///
+    /// **The agent names a credential and nothing else, and that is the whole
+    /// claim.** Four things are operator configuration read from
+    /// `--oauth2-clients` — the token endpoint, the RFC 8707 audience, the
+    /// scope and the resource's own URL — and *none of them has a field here*.
+    /// That is deliberate and it is the property, not an omission: a request
+    /// that could name its own scope would be a request that named its own
+    /// authority, and the escalation refusal in [`asv_domain::Action`] exists
+    /// precisely so the broker does not take the agent's word for what it needs.
+    ///
+    /// Compare `AwsCallerIdentity`, which is silent on all three of its own
+    /// un-nameable parameters for the same reason. The two operations are the
+    /// same shape because the problem is the same shape: a derived credential
+    /// the agent must not hold, and a provider identity it may ask about.
+    OAuth2Identity {
+        /// The session this call is charged to, for the reason every
+        /// session-bearing request carries one: a derived identity the broker
+        /// cannot revoke on `EndSession` would outlive the grant.
+        session: AgentSessionId,
+        /// A vault credential *reference*, resolved broker-side against the
+        /// registered clients. Naming one that was never registered is a
+        /// refusal, never a default — a default would be a grant nobody made.
+        credential: String,
+    },
     /// Operator audit query (R9). Refused for agent sessions: audit readers
     /// must not be audit writers, and the human control plane that will own
     /// this channel ships separately. The variant exists on the wire so the
@@ -606,6 +632,38 @@ pub enum Response {
         arn: String,
         user_id: String,
         account: String,
+    },
+    /// Which derived OAuth2 identity this request acted as (M11-R2.B.2).
+    ///
+    /// The exact analogue of the AWS answer above, and the analogy is the point:
+    /// both are the strings the *provider itself* prints, both are non-secret by
+    /// the provider's own account of them, and neither has a field a credential
+    /// could go in. There is no access token here and no client secret, and
+    /// there is no `OpaqueSecret` wrapper because there is nothing to wrap.
+    ///
+    /// ## Why these three fields are checked before they are returned
+    ///
+    /// `scope` and `audience` are what the *resource* reported, and a resource
+    /// will faithfully report whatever the IdP granted — including more than the
+    /// operator configured. Relaying that unchecked would mean the operator's
+    /// `--oauth2-clients` entry silently stops describing the authority the
+    /// broker is actually exercising, which is the escalation M11 exists to
+    /// prevent, arrived at through a provider rather than through a request. So
+    /// the broker compares both against the deployment and answers
+    /// [`ErrorCode::Upstream`] on a mismatch. These two fields are therefore a
+    /// *verified* claim about the deployment, not a transcript of the provider.
+    ///
+    /// A refusal never arrives as one of these with empty fields; it arrives as
+    /// [`ErrorCode::Denied`] or [`ErrorCode::Upstream`], so an agent cannot
+    /// mistake "I could not ask" for "I have no scopes".
+    OAuth2Identity {
+        /// The resource the token was accepted by, as the resource spells it.
+        resource: String,
+        /// The granted scope, verified equal to what the deployment declared.
+        scope: String,
+        /// The RFC 8707 resource indicator the token was bound to, verified
+        /// equal to what the deployment declared.
+        audience: String,
     },
     /// Answer to an audit query. Records are metadata-only by construction;
     /// `dropped` counts retention evictions so loss is never silent.
@@ -890,6 +948,7 @@ impl Request {
             Request::ReadIssue { .. } => "read_issue",
             Request::CreateIssue { .. } => "create_issue",
             Request::CreateRelease { .. } => "create_release",
+            Request::OAuth2Identity { .. } => "oauth2_identity",
             Request::AuditQuery { .. } => "audit_query",
             Request::PostgresConnect { .. } => "postgres_connect",
             Request::PostgresQuery { .. } => "postgres_query",

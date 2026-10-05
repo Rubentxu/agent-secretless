@@ -420,8 +420,10 @@ fn main() -> std::io::Result<()> {
                 eprintln!("                         authorizes nothing.");
                 eprintln!("  --oauth2-clients PATH  JSON list of credentials this broker");
                 eprintln!("                         trades for short-lived tokens, each with a");
-                eprintln!("                         credential, client_id, token_url and");
-                eprintln!("                         optional audience and scope.");
+                eprintln!("                         credential, client_id, token_url,");
+                eprintln!("                         resource_url and optional audience");
+                eprintln!("                         and scope. token_url and");
+                eprintln!("                         resource_url must both be https.");
                 eprintln!("                         Carries no secret: the client secret");
                 eprintln!("                         stays in the vault, and a file that");
                 eprintln!("                         names one is refused.");
@@ -783,18 +785,50 @@ fn main() -> std::io::Result<()> {
                     }
                 };
                 let registered = clients.len();
+                // Two passes over one `Vec<LoadedClient>`, and the pairing
+                // between a port registration and a binding is by index over the
+                // same list. It would be shorter to collect one `Vec` and build
+                // the other later, but the binding needs the routing port to
+                // exist first — and a binding built against a not-yet-real port
+                // is a window in which it could borrow from the *vault*, which
+                // for this provider means handing the client secret to the
+                // resource as if it were a token. That is the one failure in
+                // this file worth writing two loops to make impossible.
+                let port_clients: Vec<_> = clients.iter().map(|loaded| loaded.client.clone()).collect();
                 let oauth2: Arc<dyn asv_connector_http::SecretPort> =
                     Arc::new(asv_broker::oauth2_port::OAuth2SecretPort::new(
                         Arc::clone(&vault_port),
-                        clients,
+                        port_clients,
                     ));
                 // Only a credential that is *not registered* reaches the vault.
                 // A provider failure is a refusal, so a temporary outage cannot
                 // be answered by handing the operation the client secret.
+                let routing: Arc<dyn asv_connector_http::SecretPort> = Arc::new(
+                    asv_broker::oauth2_port::RoutingSecretPort::new(oauth2, vault_port),
+                );
+                for loaded in clients {
+                    // A resource host that cannot be vetted stops the broker
+                    // here, with a message about the configuration, rather than
+                    // at the first agent call where it would be blamed on a
+                    // credential the operator did not break.
+                    match asv_broker::oauth2_binding::OAuth2Binding::new(
+                        loaded.deployment,
+                        loaded.client.client_id.clone(),
+                        Arc::clone(&routing),
+                    ) {
+                        Ok(binding) => state.oauth2.push(binding),
+                        Err(error) => {
+                            eprintln!(
+                                "asv: --oauth2-clients {} cannot be used for {}: {error}",
+                                path.display(),
+                                loaded.client.credential
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                }
                 tracing::info!(registered, "OAuth2 clients registered");
-                Arc::new(asv_broker::oauth2_port::RoutingSecretPort::new(
-                    oauth2, vault_port,
-                ))
+                routing
             }
         });
         tracing::info!(
