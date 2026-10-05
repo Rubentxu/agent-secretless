@@ -2379,6 +2379,191 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             }
         }
 
+        Request::PushBlob {
+            session,
+            surrogate,
+            registry,
+            repository,
+            digest,
+            bytes,
+        } => {
+            // Same five checks as the pull, in the same order, and the write
+            // path is the one where a skipped check publishes rather than
+            // merely leaks: a push that went straight to the registry would put
+            // a layer in a repository the operator never declared.
+            let declaration = match state.authorize_registry_action(
+                session,
+                peer,
+                Action::RegistryPush,
+                &registry,
+                &repository,
+            ) {
+                Ok(declaration) => declaration,
+                Err(denial) => return *denial,
+            };
+            let credential = match surrogates!(state).redeem_for(
+                &surrogate,
+                session,
+                OperationFamily::Registry,
+                now_secs(),
+            ) {
+                Ok(credential) => credential,
+                Err(error) => return surrogate_failure(error),
+            };
+            // The equality the pull arms carry, for the same reason and with the
+            // same weight: on a write it is the difference between "this session
+            // may push to the registry the operator lent it a credential for" and
+            // "any session may push with whatever that registry is served by".
+            if credential != declaration.credential {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: format!(
+                        "this surrogate stands for {}, and the registry {} is served by {}",
+                        credential.to_wire(),
+                        declaration.authority,
+                        declaration.credential.to_wire()
+                    ),
+                };
+            }
+            let digest = match ContentDigest::parse(&digest) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("the digest is not a sha256 content address: {error}"),
+                    }
+                }
+            };
+            let repository = match RepositoryName::parse(&repository) {
+                Ok(repository) => repository,
+                Err(error) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("the repository is not an OCI name: {error}"),
+                    };
+                }
+            };
+            let client = match state.registry_client(&declaration) {
+                Ok(client) => client,
+                Err(failure) => return *failure,
+            };
+            let audience = match state.connectors.resolve_registry(&declaration.authority) {
+                Ok(audience) => audience,
+                Err(error) => {
+                    return Response::Error {
+                        code: registry_code(&error),
+                        message: format!("{} is not reachable: {error}", declaration.authority),
+                    }
+                }
+            };
+            // `put_blob` re-hashes the bytes and refuses a mismatch *before*
+            // opening a socket, so the digest this answers with is the content's
+            // own rather than the caller's claim echoed back.
+            match client.put_blob(&audience, &repository, &digest, &bytes) {
+                Ok(()) => Response::BlobPushed {
+                    digest: digest.to_string(),
+                    bytes: bytes.len(),
+                },
+                Err(error) => Response::Error {
+                    code: registry_code(&error),
+                    message: format!("the blob write failed: {error}"),
+                },
+            }
+        }
+
+        Request::PushManifest {
+            session,
+            surrogate,
+            registry,
+            repository,
+            reference,
+            manifest,
+        } => {
+            // The five checks again, deliberately not folded into the arm
+            // above: `Action::RegistryPush` is the same for both, and the
+            // *content* is not. A policy that permits pushing blobs has not
+            // thereby permitted publishing an index that names them.
+            let declaration = match state.authorize_registry_action(
+                session,
+                peer,
+                Action::RegistryPush,
+                &registry,
+                &repository,
+            ) {
+                Ok(declaration) => declaration,
+                Err(denial) => return *denial,
+            };
+            let credential = match surrogates!(state).redeem_for(
+                &surrogate,
+                session,
+                OperationFamily::Registry,
+                now_secs(),
+            ) {
+                Ok(credential) => credential,
+                Err(error) => return surrogate_failure(error),
+            };
+            if credential != declaration.credential {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: format!(
+                        "this surrogate stands for {}, and the registry {} is served by {}",
+                        credential.to_wire(),
+                        declaration.authority,
+                        declaration.credential.to_wire()
+                    ),
+                };
+            }
+            let reference = match ImageReference::parse(&reference) {
+                Ok(reference) => reference,
+                Err(error) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("the reference is not an image reference: {error}"),
+                    }
+                }
+            };
+            let repository = match RepositoryName::parse(&repository) {
+                Ok(repository) => repository,
+                Err(error) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("the repository is not an OCI name: {error}"),
+                    };
+                }
+            };
+            let client = match state.registry_client(&declaration) {
+                Ok(client) => client,
+                Err(failure) => return *failure,
+            };
+            let audience = match state.connectors.resolve_registry(&declaration.authority) {
+                Ok(audience) => audience,
+                Err(error) => {
+                    return Response::Error {
+                        code: registry_code(&error),
+                        message: format!("{} is not reachable: {error}", declaration.authority),
+                    }
+                }
+            };
+            match client.put_manifest(&audience, &repository, &reference, &manifest) {
+                Ok(()) => {
+                    // Content-addressed here for the same reason the pull arm
+                    // does it: an agent that pushed by tag needs to learn what
+                    // it just published, and the only answer that can be checked
+                    // is one computed from the bytes.
+                    let digest = ContentDigest::of(&manifest);
+                    Response::ManifestPushed {
+                        reference: reference.to_string(),
+                        digest: digest.to_string(),
+                        bytes: manifest.len(),
+                    }
+                }
+                Err(error) => Response::Error {
+                    code: registry_code(&error),
+                    message: format!("the manifest write failed: {error}"),
+                },
+            }
+        }
+
         Request::AwsCallerIdentity {
             session,
             credential,
@@ -2975,6 +3160,39 @@ impl BrokerState {
         registry: &str,
         repository: &str,
     ) -> Result<crate::registry_declaration::RegistryDeclaration, Box<Response>> {
+        self.authorize_registry_action(
+            session,
+            peer,
+            Action::RegistryPull,
+            registry,
+            repository,
+        )
+    }
+
+    /// The registry path with the action decided by the caller (R2.F.4).
+    ///
+    /// **The action is a parameter rather than a second copy of this
+    /// function**, for the reason [`Self::authorize_github_write`] takes one:
+    /// every check *before* the policy — session ownership, an open vault, the
+    /// repository grammar, the declaration lookup — is identical for a read and
+    /// a write, and a second function would be a place for one of those checks
+    /// to be quietly left out of the write path. That is not a hypothetical
+    /// concern here: it is exactly what the declaration lookup is for, and a
+    /// push that skipped it would let a session write to a registry the
+    /// operator never declared.
+    ///
+    /// Passing the action at the call site also keeps the distinction visible
+    /// where it is made. A handler that wrote `Action::RegistryPull` and a
+    /// handler that wrote `Action::RegistryPush` read differently at the line,
+    /// and the second one can be checked against the request by eye.
+    fn authorize_registry_action(
+        &self,
+        session: AgentSessionId,
+        peer: &WorkloadIdentity,
+        action: Action,
+        registry: &str,
+        repository: &str,
+    ) -> Result<crate::registry_declaration::RegistryDeclaration, Box<Response>> {
         if !self.session_owned_by(session, peer)? {
             return Err(Box::new(Response::Error {
                 code: ErrorCode::Denied,
@@ -3023,7 +3241,7 @@ impl BrokerState {
         self.authorize_verb(
             session,
             peer,
-            Action::RegistryPull,
+            action,
             Resource::Registry {
                 authority: requested.clone(),
                 repository: repository.as_str().to_string(),

@@ -110,6 +110,12 @@ pub enum AgentRel {
     // failure this module's own header is about.
     RegistryManifestRead,
     RegistryBlobRead,
+    /// R2.F.4. A registry write is two more relations for the reason the reads
+    /// are two: a push of a manifest and a push of a blob are two requests, and
+    /// they are not interchangeable — one is addressed by a tag, the other by a
+    /// content address computed from the bytes.
+    RegistryManifestPush,
+    RegistryBlobPush,
     // Declared, not yet published. See `operational()` for why each is
     // waiting; the comment is the reason so that adding the capability later
     // is a one-line change with the reasoning still attached.
@@ -149,6 +155,8 @@ impl AgentRel {
             AgentRel::GithubReleaseCreate => "asv://rels/github/release/create",
             AgentRel::RegistryManifestRead => "asv://rels/registry/manifest/read",
             AgentRel::RegistryBlobRead => "asv://rels/registry/blob/read",
+            AgentRel::RegistryManifestPush => "asv://rels/registry/manifest/push",
+            AgentRel::RegistryBlobPush => "asv://rels/registry/blob/push",
             AgentRel::PostgresConnect => "asv://rels/postgres/connect",
             AgentRel::PostgresQuery => "asv://rels/postgres/query",
             AgentRel::SshSign => "asv://rels/ssh/sign",
@@ -171,6 +179,8 @@ impl AgentRel {
             AgentRel::GithubReleaseCreate => "github.release.create",
             AgentRel::RegistryManifestRead => "registry.manifest.read",
             AgentRel::RegistryBlobRead => "registry.blob.read",
+            AgentRel::RegistryManifestPush => "registry.manifest.push",
+            AgentRel::RegistryBlobPush => "registry.blob.push",
             AgentRel::PostgresConnect => "postgres.connect",
             AgentRel::PostgresQuery => "postgres.query",
             AgentRel::SshSign => "ssh.sign",
@@ -270,6 +280,27 @@ impl AgentRel {
                 true,
                 "Read an OCI blob, verified against its content address",
             ),
+            // Published together with the `push` verbs in the same change, for
+            // the reason `every_operational_relation_parses_as_a_real_command`
+            // exists: a link is a promise about a command, and the argv below
+            // is checked against the real parser by that row rather than by
+            // reading this file.
+            AgentRel::RegistryManifestPush => AgentLink::new(
+                self.uri(),
+                self.operation(),
+                &["registry", "manifest", "push"],
+                Safety::BoundedExecution,
+                true,
+                "Publish an OCI manifest through a broker-leased credential",
+            ),
+            AgentRel::RegistryBlobPush => AgentLink::new(
+                self.uri(),
+                self.operation(),
+                &["registry", "blob", "push"],
+                Safety::BoundedExecution,
+                true,
+                "Publish an OCI blob, addressed by the digest of its own bytes",
+            ),
             AgentRel::PostgresConnect => AgentLink::new(
                 self.uri(),
                 self.operation(),
@@ -353,6 +384,8 @@ impl AgentRel {
             AgentRel::GithubReleaseCreate,
             AgentRel::RegistryManifestRead,
             AgentRel::RegistryBlobRead,
+            AgentRel::RegistryManifestPush,
+            AgentRel::RegistryBlobPush,
         ]
     }
 
@@ -502,6 +535,32 @@ mod tests {
                 "--credential",
                 "00000000-0000-4000-8000-000000000000",
             ],
+            // The writes carry `--file`, not a digest the caller supplies. The
+            // blob completion has no `--digest` on purpose: the CLI computes the
+            // address from the bytes, so a consumer completing one would be
+            // making a claim about content nothing has checked.
+            "asv://rels/registry/manifest/push" => &[
+                "--registry",
+                "registry-1.docker.io",
+                "--repository",
+                "library/alpine",
+                "--reference",
+                "latest",
+                "--file",
+                "/dev/null",
+                "--credential",
+                "00000000-0000-4000-8000-000000000000",
+            ],
+            "asv://rels/registry/blob/push" => &[
+                "--registry",
+                "registry-1.docker.io",
+                "--repository",
+                "library/alpine",
+                "--file",
+                "/dev/null",
+                "--credential",
+                "00000000-0000-4000-8000-000000000000",
+            ],
             _ => return None,
         })
     }
@@ -565,6 +624,11 @@ mod tests {
                 // which one it is asking for.
                 "asv://rels/registry/manifest/read",
                 "asv://rels/registry/blob/read",
+                // R2.F.4. The writes are two more for the same reason, and
+                // publishing them next to the reads is what keeps a caller
+                // from completing one noun for both directions.
+                "asv://rels/registry/manifest/push",
+                "asv://rels/registry/blob/push",
             ]
         );
     }

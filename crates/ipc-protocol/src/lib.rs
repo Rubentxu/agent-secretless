@@ -440,6 +440,53 @@ pub enum Request {
         /// different content address.
         digest: String,
     },
+    /// Semantic OCI registry write, continued (M11-R2.F.4).
+    ///
+    /// **Every field on a write is agent-supplied and that is the point.** The
+    /// body, the reference and the digest all come from the caller, so this is
+    /// the request where a mistake is *published* rather than read: a manifest
+    /// that goes to `library/alpine:latest` overwrites what an operator's users
+    /// will pull next. It is therefore the request that most needs the declared
+    /// authority rather than the request's, and the one where
+    /// `Action::RegistryPush` earns its existence separately from
+    /// `RegistryPull`.
+    ///
+    /// A separate request from `PushBlob` for the same reason `PullBlob` is
+    /// separate from `PullManifest`: the policy resource is the same shape but
+    /// the operation is not, and a rule that permits one must not permit the
+    /// other.
+    PushManifest {
+        session: AgentSessionId,
+        surrogate: String,
+        /// Selects a declared registry by equality. Never dialed.
+        registry: String,
+        repository: String,
+        /// A tag or a digest. **Writing by tag is a choice with consequences**,
+        /// and the broker does not soften it: the bytes are refused as
+        /// unverifiable, but what a tag now points at is the registry's answer,
+        /// and an operator who does not want that writes by digest.
+        reference: String,
+        /// The manifest bytes, verbatim. Not parsed here on purpose: this
+        /// protocol carries bytes, and a broker that re-serialised an image
+        /// manifest would be publishing something the caller never signed.
+        manifest: Vec<u8>,
+    },
+    /// Semantic OCI registry blob write (M11-R2.F.4).
+    ///
+    /// The `digest` is not decorative and not redundant with `bytes`: it is the
+    /// address the caller claims for the content, the broker recomputes the
+    /// content's address from the bytes and refuses a mismatch, and the registry
+    /// is asked to store the bytes *under the caller's address*. A push where
+    /// those three can disagree is a push that publishes content under an
+    /// address it does not have.
+    PushBlob {
+        session: AgentSessionId,
+        surrogate: String,
+        registry: String,
+        repository: String,
+        digest: String,
+        bytes: Vec<u8>,
+    },
     /// Asks AWS which identity the request would act as (M11-R2.C.3).
     ///
     /// **This request has no surrogate, and that is the whole difference from
@@ -702,6 +749,27 @@ pub enum Response {
     BlobRead {
         bytes: Vec<u8>,
         digest: String,
+    },
+    /// A blob the registry accepted, under the address it was sent to.
+    ///
+    /// **The digest is recomputed from the bytes this side sent**, so the
+    /// address in this answer is one the broker checked rather than one it
+    /// forwarded. It says what was published, not what the registry confirmed
+    /// it kept — a registry answering `201` having stored something else is
+    /// outside what this protocol can observe without reading it back, and
+    /// pretending otherwise would be a stronger claim than the wire supports.
+    BlobPushed {
+        digest: String,
+        bytes: usize,
+    },
+    /// A manifest the registry accepted.
+    ///
+    /// `reference` echoes what was written to, because a tag is a mutable name
+    /// and the caller should not have to remember which one it sent.
+    ManifestPushed {
+        reference: String,
+        digest: String,
+        bytes: usize,
     },
     /// What AWS says the request is acting as, and nothing else (M11-R2.C.3).
     ///
@@ -1042,6 +1110,8 @@ impl Request {
             // being read is a different one.
             Request::PullManifest { .. } => "registry_pull_manifest",
             Request::PullBlob { .. } => "registry_pull_blob",
+            Request::PushManifest { .. } => "registry_push_manifest",
+            Request::PushBlob { .. } => "registry_push_blob",
             Request::OAuth2Identity { .. } => "oauth2_identity",
             Request::AuditQuery { .. } => "audit_query",
             Request::PostgresConnect { .. } => "postgres_connect",

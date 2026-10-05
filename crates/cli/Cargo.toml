@@ -43,6 +43,13 @@ secrecy.workspace = true
 # page. Already in the lock via `asv-ipc-protocol` and `asv-domain`; this makes
 # an existing entry direct rather than adding anything new.
 zeroize.workspace = true
+# `asv registry blob push` computes the content address of the bytes it is
+# about to publish. That is the client's claim about the content; the broker
+# recomputes it independently in `RegistryClient::put_blob` and refuses a
+# mismatch *before* opening a socket, so the two checks constrain each other
+# instead of one trusting the other. Already in the lock via `asv-vault` and
+# `asv-ssh-agent`; this makes an existing entry direct.
+sha2.workspace = true
 tokio = { workspace = true }
 # `getuid()`, for deriving the default broker socket from the running user.
 # Already in the lock via `asv-identity` and `asv-broker`, so this adds nothing

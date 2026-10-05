@@ -174,6 +174,8 @@ pub fn compiled_capabilities() -> Vec<String> {
         // `registry_pull`.
         "registry.manifest.read".to_string(),
         "registry.blob.read".to_string(),
+        "registry.manifest.push".to_string(),
+        "registry.blob.push".to_string(),
     ];
     out.sort();
     out.dedup();
@@ -229,6 +231,20 @@ mod tests {
             // while an operator writing a rule does not.
             Request::PullManifest { .. } => "registry.manifest.read",
             Request::PullBlob { .. } => "registry.blob.read",
+            // R2.F.4. Four names, because a registry pull and a registry push
+            // are four different requests a caller chooses between, and the two
+            // push verbs carry the same warning the read ones do: on a write, a
+            // mistake is published.
+            //
+            // All four resolve to two policy actions. That is deliberate and is
+            // not a collapse: `registry_pull` covers both reads because reading
+            // a manifest and reading the blobs it names are one permission in
+            // the registry's own scope, and `registry_push` covers both writes
+            // for the same reason. The advertisement is finer because the
+            // *caller* is finer — someone choosing an operation wants to know
+            // which one they are asking for.
+            Request::PushManifest { .. } => "registry.manifest.push",
+            Request::PushBlob { .. } => "registry.blob.push",
             Request::PostgresConnect { .. } => "postgres.connect",
             Request::PostgresQuery { .. } => "postgres.query",
             // Session lifecycle, authorisation, surrogate revocation, approval
@@ -348,6 +364,22 @@ mod tests {
                 repository: String::new(),
                 digest: String::new(),
             },
+            Request::PushManifest {
+                session,
+                surrogate: surrogate.clone(),
+                registry: String::new(),
+                repository: String::new(),
+                reference: String::new(),
+                manifest: Vec::new(),
+            },
+            Request::PushBlob {
+                session,
+                surrogate: surrogate.clone(),
+                registry: String::new(),
+                repository: String::new(),
+                digest: String::new(),
+                bytes: Vec::new(),
+            },
         ]
     }
 
@@ -387,7 +419,7 @@ mod tests {
         // makes that omission visible instead of assumed.
         assert_eq!(
             sample.len(),
-            22,
+            24,
             "a new Request variant must be added to one_of_every_variant(), \
              and one that represents an operation must also be classified"
         );

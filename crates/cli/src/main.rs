@@ -467,8 +467,34 @@ enum RegistryManifestCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Write a manifest. Prints the content address the registry stored.
+    Push {
+        /// Vault id of the credential the deployment lent this registry. A
+        /// *reference*: the broker resolves it and refuses if it is not the
+        /// credential this registry is served by. Mandatory for the same
+        /// reason as on `read` — deriving it here would leave the surrogate
+        /// with nothing to be compared against.
+        #[arg(long, value_name = "ID")]
+        credential: String,
+        /// Registry host. Selects a declaration; never a destination.
+        #[arg(long, value_name = "HOST")]
+        registry: String,
+        /// Repository path, e.g. `library/alpine`.
+        #[arg(long, value_name = "NAME")]
+        repository: String,
+        /// Tag or digest to write. A tag is mutable: whatever it points at
+        /// afterwards is the registry's answer, and this verb does not soften
+        /// that. Write by digest when that is not what you mean.
+        #[arg(long, value_name = "REF")]
+        reference: String,
+        /// The manifest to publish. Read verbatim; never re-serialised.
+        #[arg(long, value_name = "PATH")]
+        file: std::path::PathBuf,
+        /// Emit the `asv.agent/v1` envelope instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
 }
-
 /// The blob nouns.
 #[derive(Subcommand)]
 enum RegistryBlobCommand {
@@ -492,6 +518,30 @@ enum RegistryBlobCommand {
         /// Write the blob here instead of stdout.
         #[arg(long, value_name = "PATH")]
         out: Option<std::path::PathBuf>,
+        /// Emit the `asv.agent/v1` envelope instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a blob. The content address is computed from the bytes, never asked
+    /// for.
+    Push {
+        /// Vault id of the credential the deployment lent this registry. See
+        /// `manifest read` for why this is a *reference* and not redundant with
+        /// `--registry`.
+        #[arg(long, value_name = "ID")]
+        credential: String,
+        /// Registry host. Selects a declaration; never a destination.
+        #[arg(long, value_name = "HOST")]
+        registry: String,
+        /// Repository path, e.g. `library/alpine`.
+        #[arg(long, value_name = "NAME")]
+        repository: String,
+        /// The blob to publish. Its content address is computed here from the
+        /// bytes rather than taken from the operator: a `--digest` flag would
+        /// be a claim about bytes nothing has checked, and the broker recomputes
+        /// it anyway.
+        #[arg(long, value_name = "PATH")]
+        file: std::path::PathBuf,
         /// Emit the `asv.agent/v1` envelope instead of prose.
         #[arg(long)]
         json: bool,
@@ -647,7 +697,7 @@ async fn main() -> std::io::Result<()> {
         Command::Github { command } => return run_github(&socket, command),
         Command::Aws { command } => return run_aws(&socket, command),
         Command::Oauth2 { command } => return run_oauth2(&socket, command),
-        Command::Registry { command } => return run_registry(&socket, command),
+        Command::Registry { command } => return run_registry_dispatch(&socket, command),
         // `plan` opens a session and `discover` does not, so the whole
         // subcommand tree is dispatched here rather than in the single-request
         // path below: the two halves differ in whether they have a reason to
@@ -897,6 +947,8 @@ pub fn response_kind(response: &Response) -> &'static str {
         // arms, not a review of the feature they belong to.
         Response::ManifestRead { .. } => "ManifestRead",
         Response::BlobRead { .. } => "BlobRead",
+        Response::ManifestPushed { .. } => "ManifestPushed",
+        Response::BlobPushed { .. } => "BlobPushed",
         Response::Error { .. } => "Error",
     }
 }
@@ -1980,6 +2032,23 @@ fn print_discovery_prose(discovery: &asv_integrations::Discovery) {
 /// address, the media type and the length, which is enough to check a file that
 /// is already on disk; embedding megabytes of layer in an envelope would make
 /// the envelope a thing with a size limit nobody wrote down.
+/// Routes a registry verb by direction.
+///
+/// One place decides read-or-write, so adding a verb to either enum and
+/// forgetting this match is a compile error naming the verb, not a silent
+/// no-op. The direction is not guessed from the fields: it comes from which
+/// enum the verb is in.
+fn run_registry_dispatch(socket: &std::path::Path, command: &RegistryCommand) -> std::io::Result<()> {
+    match command {
+        RegistryCommand::Manifest(RegistryManifestCommand::Read { .. })
+        | RegistryCommand::Blob(RegistryBlobCommand::Read { .. }) => run_registry(socket, command),
+        RegistryCommand::Manifest(RegistryManifestCommand::Push { .. })
+        | RegistryCommand::Blob(RegistryBlobCommand::Push { .. }) => {
+            run_registry_push(socket, command)
+        }
+    }
+}
+
 fn run_registry(socket: &std::path::Path, command: &RegistryCommand) -> std::io::Result<()> {
     let (credential_arg, registry, repository, selector, out, json) = match command {
         RegistryCommand::Manifest(RegistryManifestCommand::Read {
@@ -1998,6 +2067,17 @@ fn run_registry(socket: &std::path::Path, command: &RegistryCommand) -> std::io:
             out,
             json,
         }) => (credential, registry, repository, Selector::Digest(digest), out, json),
+        // Unreachable through `run_registry_dispatch`, which routes a push here
+        // only by mistake. Present so that adding a verb to either enum cannot
+        // leave this function silently unhandled: a write reaching a reader
+        // that has no `--out` and no reference-to-fetch is a bug worth naming
+        // rather than an empty tuple.
+        RegistryCommand::Manifest(RegistryManifestCommand::Push { .. })
+        | RegistryCommand::Blob(RegistryBlobCommand::Push { .. }) => {
+            return Err(std::io::Error::other(
+                "asv: a push verb reached the read path; that is a dispatch bug",
+            ))
+        }
     };
 
     // Validated before a session exists, for the reason `run_github` does it: a
@@ -2200,6 +2280,206 @@ fn report_registry_refusal(response: &Response, json: bool) -> std::io::Result<(
             "asv registry got an unexpected answer: {other:?}"
         ))),
     }
+}
+
+/// `asv registry … push` — the two write verbs of M11-R2.F.4.
+///
+/// Separate from `run_registry` rather than a branch inside it, because the two
+/// directions do not share a shape: a read is addressed by a name and yields
+/// bytes with a media type, and a write is addressed by a file and yields an
+/// address. Folding them into one function would need a sum type spanning both,
+/// and the shared part — validate, open a session, mint a surrogate — is three
+/// statements, not three hundred.
+fn run_registry_push(socket: &std::path::Path, command: &RegistryCommand) -> std::io::Result<()> {
+    let (credential_arg, registry, repository, file, reference, json) = match command {
+        RegistryCommand::Manifest(RegistryManifestCommand::Push {
+            credential,
+            registry,
+            repository,
+            reference,
+            file,
+            json,
+        }) => (
+            credential, registry, repository, file, Some(reference), json,
+        ),
+        RegistryCommand::Blob(RegistryBlobCommand::Push {
+            credential,
+            registry,
+            repository,
+            file,
+            json,
+        }) => (credential, registry, repository, file, None, json),
+        // `run_registry` already claimed the reads; reaching here means a new
+        // noun was added to `RegistryCommand` and this match was not updated,
+        // which is what the compiler's exhaustiveness is for.
+        RegistryCommand::Manifest(RegistryManifestCommand::Read { .. })
+        | RegistryCommand::Blob(RegistryBlobCommand::Read { .. }) => {
+            return Err(std::io::Error::other(
+                "asv: that registry verb is a read; it is dispatched by run_registry",
+            ))
+        }
+    };
+
+    // Same reason, and the same message, as on `run_registry`: a malformed id
+    // accepted here would miss in the vault later and be reported as a missing
+    // credential.
+    let credential = match CredentialId::from_wire(credential_arg) {
+        Ok(id) => id,
+        Err(_) => {
+            eprintln!(
+                "asv: the --credential value is not a vault id; copy it from `asv credentials`"
+            );
+            std::process::exit(2);
+        }
+    };
+
+    let bytes = std::fs::read(file).map_err(|error| {
+        std::io::Error::other(format!(
+            "asv registry could not read {}: {error}",
+            file.display()
+        ))
+    })?;
+
+    // Refused here, by name, rather than discovered by the broker's decoder.
+    // `MAX_MESSAGE_BYTES` bounds the whole encoded request, so the payload that
+    // provably fits is smaller than the limit, and naming the number is more
+    // use to an operator than a `MessageTooLarge` from three layers down.
+    //
+    // The honest limit of this verb is therefore a few kilobytes under 64 KiB,
+    // and this says so: a monolithic PUT cannot publish a layer that weighs
+    // megabytes. That is a known boundary of the transport, not a tuning knob.
+    if bytes.len() >= asv_ipc_protocol::MAX_MESSAGE_BYTES {
+        return Err(std::io::Error::other(format!(
+            "asv registry: {} is {} bytes, and this transport publishes at most \
+             {} bytes in one request. A layer of this size needs a chunked \
+             upload session, which this verb does not implement.",
+            file.display(),
+            bytes.len(),
+            asv_ipc_protocol::MAX_MESSAGE_BYTES
+        )));
+    }
+
+    let session = match github_call(
+        socket,
+        &Request::CreateSession {
+            workspace: std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        },
+    ) {
+        Response::SessionCreated { session, .. } => session,
+        other => {
+            return Err(std::io::Error::other(format!(
+                "asv registry could not open a session: {other:?}"
+            )))
+        }
+    };
+
+    let outcome = github_call(
+        socket,
+        &Request::MintSurrogate {
+            session,
+            credential,
+            max_uses: 1,
+            ttl_secs: REGISTRY_SURROGATE_TTL_SECS,
+        },
+    );
+
+    // One request, built from the direction. The digest is computed here from
+    // the bytes rather than asked for, and the broker recomputes it again: two
+    // independent derivations of one claim, either of which can catch the other.
+    let request = match &outcome {
+        Response::SurrogateMinted { surrogate, .. } => match reference {
+            Some(reference) => Request::PushManifest {
+                session,
+                surrogate: surrogate.clone(),
+                registry: registry.clone(),
+                repository: repository.clone(),
+                reference: reference.clone(),
+                manifest: bytes.clone(),
+            },
+            None => Request::PushBlob {
+                session,
+                surrogate: surrogate.clone(),
+                registry: registry.clone(),
+                repository: repository.clone(),
+                digest: content_digest(&bytes),
+                bytes: bytes.clone(),
+            },
+        },
+        other => {
+            // The mint was refused, or answered something else. Reporting that
+            // answer *is* the outcome: there is no push without a surrogate.
+            return report_registry_refusal(other, *json);
+        }
+    };
+
+    let response = github_call(socket, &request);
+
+    // Ended before the answer is reported, for the reason `run_registry` gives.
+    let _ = call(socket, &Request::EndSession { session });
+
+    match &response {
+        Response::ManifestPushed {
+            reference,
+            digest,
+            bytes,
+        } => {
+            if *json {
+                print_registry_push_json(&response, digest, *bytes);
+            } else {
+                println!("manifest {reference} pushed as {digest} ({bytes} bytes)");
+            }
+            Ok(())
+        }
+        Response::BlobPushed { digest, bytes } => {
+            if *json {
+                print_registry_push_json(&response, digest, *bytes);
+            } else {
+                println!("blob {digest} pushed ({bytes} bytes)");
+            }
+            Ok(())
+        }
+        // Every refusal and every unexpected answer goes here, which is what
+        // keeps "the registry said no" distinguishable from "I did not
+        // understand the answer".
+        other => report_registry_refusal(other, *json),
+    }
+}
+
+/// The `asv.agent/v1` envelope for a write. The address is the whole answer and
+/// the bytes are already at the registry, so the envelope carries the count and
+/// not the content — the same shape `run_registry` uses for a read, mirrored.
+fn print_registry_push_json(response: &Response, digest: &str, bytes: usize) {
+    let mut data = match ipc::from_response(response) {
+        ipc::ApplicationResult::Ok { data, .. } => data,
+        _ => serde_json::json!({}),
+    };
+    data["digest"] = serde_json::json!(digest);
+    data["bytes"] = serde_json::json!(bytes);
+    println!(
+        "{}",
+        render::json::envelope(&render::json::for_result(
+            &ipc::ApplicationResult::Ok {
+                summary: format!("{bytes} byte(s) pushed as {digest}"),
+                data,
+            }
+        ))
+    );
+}
+
+/// The content address of `bytes`, in the `sha256:<hex>` spelling the registry
+/// protocol uses.
+///
+/// Written out rather than reused from `asv-connector-http`, which the CLI
+/// deliberately does not depend on: the CLI is a client, and pulling a transport
+/// crate in to hash a file would invert the dependency the whole broker is
+/// built around. The two spellings are the same convention, and the broker
+/// parses what this produces with `ContentDigest::parse`.
+fn content_digest(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("sha256:{:x}", sha2::Sha256::digest(bytes))
 }
 
 fn run_oauth2(socket: &std::path::Path, command: &Oauth2Command) -> std::io::Result<()> {
@@ -2653,6 +2933,20 @@ fn print_response(response: &Response) {
         }
         Response::BlobRead { bytes, digest } => {
             println!("blob {digest} ({} bytes)", bytes.len());
+        }
+        // Registry pushes report the address and the count. The bytes are
+        // already at the registry and already on disk here; what an operator
+        // needs back is the digest to pin, not the content echoed a second
+        // time. Same reason as the read arms above.
+        Response::ManifestPushed {
+            reference,
+            digest,
+            bytes,
+        } => {
+            println!("manifest {reference} pushed as {digest} ({bytes} bytes)");
+        }
+        Response::BlobPushed { digest, bytes } => {
+            println!("blob {digest} pushed ({bytes} bytes)");
         }
         // Not reached from `asv aws whoami`, which renders these three itself so
         // it can label them. Present because the match is exhaustive on purpose:

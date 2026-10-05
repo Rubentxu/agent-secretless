@@ -530,6 +530,60 @@ impl RegistryClient {
         })
     }
 
+    /// Writes a blob, under a content address the caller computed.
+    ///
+    /// **The monolithic form, not the two-step session**, and the choice is
+    /// deliberate rather than convenient. The specification's session upload is
+    /// `POST /v2/<name>/blobs/uploads/` followed by a `PUT` to whatever the
+    /// registry puts in the `Location` header — and that header is a URL the
+    /// *registry* chose. Following it is the same shape as following a `realm`,
+    /// so it would need the same vetting, and the vetting is real work: a
+    /// broker that PUTs a layer to an address it did not resolve itself would be
+    /// sending a registry credential somewhere it was never pointed.
+    ///
+    /// The monolithic `PUT /v2/<name>/blobs/uploads/?digest=<digest>` sends the
+    /// whole blob to the authority the caller already resolved and pinned, so
+    /// there is no registry-chosen URL in the loop at all. It is what the
+    /// registries that support it accept for a small blob, and the two-step form
+    /// is the follow-up when a deployment needs large layers.
+    ///
+    /// ## What this verifies, and what it cannot
+    ///
+    /// It verifies the bytes against the digest **before** sending, so the
+    /// caller cannot upload content under an address it does not have. It does
+    /// **not** verify that the registry stored those bytes: a registry that
+    /// answers `201` having discarded the body would be believed, and finding
+    /// out is the next pull's problem. That is a property of the protocol's
+    /// write path rather than a check this client declines to make — the
+    /// registry does not hand back the content it stored, so there is nothing
+    /// to compare against without a second round trip that reads it back.
+    pub fn put_blob(
+        &self,
+        registry: &ResolvedAudience,
+        repository: &RepositoryName,
+        digest: &ContentDigest,
+        body: &[u8],
+    ) -> Result<(), RegistryError> {
+        // Before the socket, not after. A caller that computed the wrong digest
+        // should never see a connection opened to find out.
+        let found = ContentDigest::of(body);
+        if &found != digest {
+            return Err(RegistryError::Blob(BlobError::DigestMismatch {
+                expected: digest.to_string(),
+                found: found.to_string(),
+            }));
+        }
+        self.attempt(
+            registry,
+            reqwest::Method::PUT,
+            &blob_upload_path(repository, digest),
+            RegistryOperation::Push,
+            repository,
+            Some(body),
+        )?;
+        Ok(())
+    }
+
     /// Writes a manifest. This is the whole of a push's first half.
     pub fn put_manifest(
         &self,
@@ -744,6 +798,20 @@ impl RegistryClient {
 /// `/v2/<repository>/blobs/<digest>`.
 fn blob_path(repository: &RepositoryName, digest: &ContentDigest) -> String {
     format!("/v2/{}/blobs/{}", repository.as_str(), digest.as_str())
+}
+
+/// Where a blob is *written*, which is a different path from where it is read.
+///
+/// `blobs/<digest>` is the address the content has once it is there;
+/// `blobs/uploads/?digest=` is the address it is sent to in one piece. Keeping
+/// them as two functions rather than one with a flag is what makes the read and
+/// the write of the same digest impossible to confuse at a call site.
+fn blob_upload_path(repository: &RepositoryName, digest: &ContentDigest) -> String {
+    format!(
+        "/v2/{}/blobs/uploads/?digest={}",
+        repository.as_str(),
+        digest.as_str()
+    )
 }
 
 /// How a realm is written down in a cache key.

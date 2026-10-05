@@ -128,6 +128,16 @@ permit (
 when { resource.repository == "library/alpine" };
 "#;
 
+/// Permits a push from any declared registry, and nothing else.
+///
+/// **Not the same as [`PULL_ANY`] and never combined with it.** A push row that
+/// ran under a policy permitting both could not say which permission produced
+/// the outcome, and the whole question a write row asks is whether the *push*
+/// permission is what let it through.
+const PUSH_ANY: &str = r#"
+permit (principal, action == Action::"registry_push", resource is Registry);
+"#;
+
 /// Permits pushes, which every pull row below must still be refused against.
 ///
 /// Without this row the negatives would have a simpler explanation — "pulls
@@ -367,19 +377,23 @@ impl Vertical {
                     .headers
                     .iter()
                     .any(|(name, value)| name == "authorization" && value.starts_with("Bearer "));
-                if has_bearer {
-                    if observed.request_line.contains("/blobs/") {
-                        OriginResponse::new(200, String::from_utf8_lossy(BLOB).to_string())
-                            .with_header("content-type", "application/octet-stream")
-                    } else {
-                        OriginResponse::new(200, String::from_utf8_lossy(MANIFEST).to_string())
-                            .with_header(
-                                "content-type",
-                                "application/vnd.oci.image.manifest.v1+json",
-                            )
-                    }
+                if !has_bearer {
+                    return OriginResponse::new(401, "").with_header("www-authenticate", &challenge);
+                }
+                // The write is answered before the read branch, and the order is
+                // load-bearing rather than tidy: the upload path
+                // `/blobs/uploads/?digest=` *contains* `/blobs/`, so a handler
+                // that tested for the read path first would answer a push with
+                // the bytes of a pull -- and the rows would go green against a
+                // broker that had sent the wrong body to the registry.
+                if observed.request_line.starts_with("PUT ") {
+                    OriginResponse::new(201, "")
+                } else if observed.request_line.contains("/blobs/") {
+                    OriginResponse::new(200, String::from_utf8_lossy(BLOB).to_string())
+                        .with_header("content-type", "application/octet-stream")
                 } else {
-                    OriginResponse::new(401, "").with_header("www-authenticate", &challenge)
+                    OriginResponse::new(200, String::from_utf8_lossy(MANIFEST).to_string())
+                        .with_header("content-type", "application/vnd.oci.image.manifest.v1+json")
                 }
             }),
         );
@@ -507,6 +521,61 @@ impl Vertical {
     /// The common case: a pull from the declared registry and repository.
     fn read(&mut self, surrogate: &str) -> Response {
         self.pull_manifest(surrogate, NAME, REPOSITORY, "latest")
+    }
+
+    fn push_blob(
+        &mut self,
+        surrogate: &str,
+        registry: &str,
+        repository: &str,
+        digest: &str,
+        bytes: &[u8],
+    ) -> Response {
+        handle(
+            &mut self.state,
+            &self.peer,
+            Request::PushBlob {
+                session: self.session,
+                surrogate: surrogate.to_string(),
+                registry: registry.to_string(),
+                repository: repository.to_string(),
+                digest: digest.to_string(),
+                bytes: bytes.to_vec(),
+            },
+        )
+    }
+
+    fn push_manifest(
+        &mut self,
+        surrogate: &str,
+        registry: &str,
+        repository: &str,
+        reference: &str,
+        manifest: &[u8],
+    ) -> Response {
+        handle(
+            &mut self.state,
+            &self.peer,
+            Request::PushManifest {
+                session: self.session,
+                surrogate: surrogate.to_string(),
+                registry: registry.to_string(),
+                repository: repository.to_string(),
+                reference: reference.to_string(),
+                manifest: manifest.to_vec(),
+            },
+        )
+    }
+
+    /// A body whose content address is computed here, the way the CLI does it.
+    ///
+    /// Deliberately computed by the row rather than copied from the broker's
+    /// answer: a test that asks the broker for the digest and then asserts the
+    /// broker published that digest is asserting that the broker agrees with
+    /// itself.
+    fn digest_of(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        format!("sha256:{:x}", sha2::Sha256::digest(bytes))
     }
 
     fn connections(&self) -> usize {
@@ -1313,10 +1382,219 @@ fn a_manifest_and_a_blob_are_advertised_as_two_operations() {
         .iter()
         .filter(|c| c.starts_with("registry."))
         .collect();
+    // Scoped to the reads, deliberately, rather than counting every registry
+    // name. The property this row protects is that a pull is **two** requests
+    // and one name would hide which is being served. Counting all of them made
+    // the row a tripwire for an unrelated feature: adding push turned it red
+    // without either read having been folded onto one name. The push names are
+    // pinned by `a_push_is_advertised_as_two_more_operations` below.
+    let reads: Vec<&&String> = registry
+        .iter()
+        .filter(|c| c.ends_with(".read"))
+        .collect();
+    let pushes: Vec<&&String> = registry
+        .iter()
+        .filter(|c| c.ends_with(".push"))
+        .collect();
     assert_eq!(
-        registry.len(),
+        reads.len(),
         2,
         "a registry pull is two requests and one name would hide which is \
-         being served: {registry:?}"
+         being served: {reads:?}"
+    );
+    assert_eq!(
+        pushes.len(),
+        2,
+        "a registry push is two requests for the same reason: {pushes:?}"
+    );
+    // Every registry name is a read or a push. A third kind would land here
+    // without either row noticing, so the split is checked rather than assumed.
+    assert_eq!(
+        reads.len() + pushes.len(),
+        registry.len(),
+        "a registry capability that is neither a read nor a push: {registry:?}"
+    );
+}
+
+/// The push names, on their own.
+///
+/// The mutation that puts this red is dropping `registry.manifest.push` or
+/// `registry.blob.push` from `selfreport::compiled_capabilities`. Without a
+/// row of its own, the two names would be checked only by the count above,
+/// which cannot tell "both present" from "one present and one stranger".
+#[test]
+fn a_push_is_advertised_as_two_more_operations() {
+    let mut v = Vertical::declared();
+    let response = handle(
+        &mut v.state,
+        &v.peer,
+        Request::AgentInfo {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+        },
+    );
+    let capabilities = match response {
+        Response::BrokerInfo { capabilities, .. } => capabilities,
+        other => panic!("expected a self-description, got {other:?}"),
+    };
+    for name in ["registry.manifest.push", "registry.blob.push"] {
+        assert!(
+            capabilities.iter().any(|c| c == name),
+            "an agent asking what the broker can do is not told about {name}: \
+             {capabilities:?}"
+        );
+    }
+}
+
+/// A blob push reaches the declared registry and the registry's own answer is
+/// what comes back.
+///
+/// This is the row the write path did not have. `the_written_digest_is_the_
+/// digest_of_the_written_bytes` and `the_manifest_digest_is_computed_and_a_lying_
+/// header_is_ignored` both stop before the socket, and
+/// `a_policy_that_permits_push_only_refuses_the_pull` proves the *refusal*,
+/// so nothing here was exercising the success: an arm that authorized correctly
+/// and then handed the connector something unusable would have been green.
+///
+/// The mutation that puts it red is either (a) writing the blob body under the
+/// manifest's path in `blob_upload_path`, or (b) dropping the `201` arm from
+/// `put_blob`'s accept list so a genuine success is read as a refusal. Both turn
+/// this row red and neither is visible from the rows above.
+#[test]
+fn a_declared_registry_serves_a_blob_push_and_the_answer_is_the_registrys() {
+    let mut v = Vertical::declared();
+    v.policy(&format!("{}{PUSH_ANY}", composed("")));
+
+    let bytes = b"a layer".to_vec();
+    let digest = Vertical::digest_of(&bytes);
+    let surrogate = v.mint();
+
+    let response = v.push_blob(&surrogate, NAME, REPOSITORY, &digest, &bytes);
+    let (pushed, count) = match &response {
+        Response::BlobPushed { digest: d, bytes } => (d.clone(), *bytes),
+        other => panic!("a declared push must be served, got {other:?}"),
+    };
+
+    assert_eq!(pushed, digest, "the registry answered a different address");
+    assert_eq!(count, bytes.len(), "the count must be the bytes sent");
+
+    // The origin actually saw a `PUT` carrying those bytes. Without this the
+    // row would pass on a broker that answered `BlobPushed` from its own
+    // bookkeeping without dialling anything.
+    let seen = v.seen();
+    let puts: Vec<&Observed> = seen
+        .iter()
+        .filter(|o| o.request_line.starts_with("PUT "))
+        .collect();
+    assert!(
+        !puts.is_empty(),
+        "nothing was uploaded: the registry origin saw {:?}",
+        seen.iter().map(|o| &o.request_line).collect::<Vec<_>>()
+    );
+    let path = puts[0].request_line.split_whitespace().nth(1).unwrap_or("");
+    assert!(
+        path.contains("/blobs/uploads/"),
+        "a monolithic blob upload PUTs to /blobs/uploads/?digest=, not a \
+         manifest path: {path}"
+    );
+    assert!(
+        path.contains(&digest),
+        "the upload path must carry the content address as its query: {path}"
+    );
+}
+
+/// A manifest push reaches the declared registry under the reference it was
+/// asked for.
+///
+/// Separate from the blob row because a manifest write is the one an operator
+/// reasons about by tag: what `latest` points at afterwards is the registry's
+/// answer, and the row pins that the reference travelled rather than being
+/// derived.
+///
+/// The mutation that puts it red is resolving the manifest path from the
+/// manifest *digest* instead of the reference, which is the plausible mistake
+/// and which this row is the only one to catch.
+#[test]
+fn a_declared_registry_serves_a_manifest_push_under_the_reference() {
+    let mut v = Vertical::declared();
+    v.policy(&format!("{}{PUSH_ANY}", composed("")));
+
+    let manifest = br#"{"schemaVersion":2}"#.to_vec();
+    let surrogate = v.mint();
+
+    let response = v.push_manifest(&surrogate, NAME, REPOSITORY, "latest", &manifest);
+    let (reference, pushed) = match &response {
+        Response::ManifestPushed {
+            reference,
+            digest,
+            bytes: _,
+        } => (reference.clone(), digest.clone()),
+        other => panic!("a declared manifest push must be served, got {other:?}"),
+    };
+
+    assert_eq!(
+        reference, "latest",
+        "the registry is told the reference it was given, not one derived from \
+         the content"
+    );
+    assert_eq!(
+        pushed,
+        Vertical::digest_of(&manifest),
+        "the digest the registry stored must be the one recomputed from the \
+         bytes, not one the caller supplied"
+    );
+
+    let seen = v.seen();
+    let puts: Vec<&Observed> = seen
+        .iter()
+        .filter(|o| o.request_line.starts_with("PUT "))
+        .collect();
+    assert!(
+        !puts.is_empty(),
+        "nothing was uploaded: the registry origin saw {:?}",
+        seen.iter().map(|o| &o.request_line).collect::<Vec<_>>()
+    );
+    let path = puts[0].request_line.split_whitespace().nth(1).unwrap_or("");
+    assert!(
+        path.contains("/manifests/latest"),
+        "a manifest is written at the reference it was asked for: {path}"
+    );
+}
+
+/// A push whose claimed address is not the address of the bytes never opens a
+/// socket.
+///
+/// The row that distinguishes "the registry rejected it" from "this broker
+/// never dialed", which is the difference between a transport failure and a
+/// refusal the operator caused. `a_blob_is_verified_against_the_digest_it_was_
+/// asked_for` covers the read direction; this is the write direction, where a
+/// wrong digest is an operator mistake rather than a corruption to detect.
+///
+/// The mutation that puts it red is moving `ContentDigest::of(body)` after the
+/// `attempt(...)` call in `put_blob`, so the mismatch is discovered by the
+/// registry instead of by this broker.
+#[test]
+fn a_push_that_lies_about_the_content_address_is_refused_before_the_socket() {
+    let mut v = Vertical::declared();
+    v.policy(&format!("{}{PUSH_ANY}", composed("")));
+
+    let bytes = b"a layer".to_vec();
+    let liar = format!(
+        "sha256:{}",
+        "0".repeat(64) // a well-formed address of nothing
+    );
+    let surrogate = v.mint();
+    let before = v.connections();
+
+    let response = v.push_blob(&surrogate, NAME, REPOSITORY, &liar, &bytes);
+
+    assert!(
+        !matches!(response, Response::BlobPushed { .. }),
+        "a digest that is not the digest of the bytes must not be published, \
+         got {response:?}"
+    );
+    assert_eq!(
+        v.connections(),
+        before,
+        "the mismatch must be found before the registry is dialed"
     );
 }
