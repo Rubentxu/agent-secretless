@@ -538,3 +538,89 @@ fn forget_deja_solo_lo_que_no_venia_de_esa_credencial() {
         "another credential's token was dropped"
     );
 }
+
+// ---------------------------------------------------------------------- blobs
+
+/// A digest is a check, not a name, so anything that is not one is refused
+/// before it can become a path.
+///
+/// Mutation: accept any `sha256:` prefix, or allow uppercase hex.
+#[test]
+fn un_digest_que_no_es_un_digest_se_rechaza() {
+    let good = format!("sha256:{}", "a".repeat(64));
+    assert!(ContentDigest::parse(&good).is_ok());
+    for hostile in [
+        "sha256:".to_string(),
+        "sha256:abc".to_string(),
+        format!("sha256:{}", "A".repeat(64)),
+        format!("sha256:{}", "g".repeat(64)),
+        format!("sha512:{}", "a".repeat(64)),
+        format!("latest:{}", "a".repeat(64)),
+        "latest".to_string(),
+    ] {
+        assert!(
+            ContentDigest::parse(&hostile).is_err(),
+            "{hostile:?} must not become a content address"
+        );
+    }
+}
+
+/// The bytes have the digest they are said to have, and the check is the
+/// sha256 of the bytes rather than a string of them.
+///
+/// Mutation: hash the text form of the bytes, which is the same class of
+/// mistake R2.F.2's body row made.
+#[test]
+fn un_digest_es_el_sha256_de_los_bytes() {
+    // The empty content has a well-known digest; getting it wrong here would
+    // mean the comparison is not sha256 at all.
+    assert_eq!(
+        ContentDigest::of(b"").as_str(),
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(
+        ContentDigest::of(b"hello").as_str(),
+        "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    );
+    // Bytes that are not text at all, which is the case a `String` round trip
+    // would quietly change. The expected value is spelled out rather than
+    // recomputed by the row, because a row that recomputes the digest with the
+    // same helper it is testing cannot tell a correct hash from a lossy one:
+    // `from_utf8_lossy` on these bytes yields different characters, so a
+    // row written that way would agree with the bug it is meant to catch.
+    let binary = vec![0xffu8, 0x00, 0xfe];
+    let digest = ContentDigest::of(&binary);
+    assert_eq!(
+        digest.as_str(),
+        "sha256:af9ceddc9d8b08ac09e1994bfd20459b5e377425df7354dfce3501992828a5b7",
+        "the hash is not of the bytes, or not of these bytes"
+    );
+    assert_eq!(digest.as_str().len(), 71);
+    assert!(ContentDigest::parse(digest.as_str()).is_ok());
+}
+
+/// Two blobs with the same bytes have the same digest, and two without do not.
+/// A "verification" that passed for both would be checking nothing.
+///
+/// Mutation: return a constant digest.
+#[test]
+fn dos_blobs_distintos_no_comparten_digest() {
+    let a = ContentDigest::of(b"layer-one");
+    let b = ContentDigest::of(b"layer-two");
+    assert_ne!(a, b);
+    assert_eq!(a, ContentDigest::of(b"layer-one"));
+}
+
+/// The path is built from the repository and the digest, and the digest is
+/// already a checked value so there is nothing left to escape.
+///
+/// Mutation: interpolate a caller-supplied string instead of the digest.
+#[test]
+fn la_ruta_de_un_blob_viene_de_las_dos_mitades_comprobadas() {
+    let repository = repository();
+    let digest = ContentDigest::of(b"layer");
+    assert_eq!(
+        blob_path(&repository, &digest),
+        format!("/v2/library/alpine/blobs/{}", digest.as_str())
+    );
+}

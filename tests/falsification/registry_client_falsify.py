@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Falsification for R2.F.2 (the registry request loop) and R2.F.4 (its token
-cache).
+"""Falsification for R2.F.2 (the registry request loop), R2.F.4 (its token
+cache) and R2.F.5 (the content address and the check that the bytes have it).
 
-Five phases over one file: the reference grammar, the token query, the loop
-that spends what the query asked for, and then the cache key, the cache clock,
-and the cache as the wire sees it. The phases are named in the output and
-tallied separately, because "which half survived" is the first question to ask
-of a survivor.
+Seven phases over one file: the reference grammar, the token query, the loop
+that spends what the query asked for, the cache key, the cache clock, the cache
+as the wire sees it, and then the two halves of the blob -- the digest as a
+parsed value, and the comparison as the wire exercises it. The phases are named
+in the output and tallied separately, because "which half survived" is the
+first question to ask of a survivor.
 
 Same five-bucket accounting as `registry_falsify.py` -- red, compiler-refused,
 green survivor, measured nothing, and a snippet this harness could not find,
 which is a defect in the harness rather than a result about the code.
 
-**Twenty-nine mutations, twenty-nine red, and four rows with no mutation of
+**Thirty-seven mutations, thirty-seven red, and four rows with no mutation of
 their own. The reasons are worth stating.**
 
 `the_stored_credential_reaches_the_realm_and_nothing_else` is the row a
@@ -35,6 +36,12 @@ the request rather than during it.
 module. It is here because a `401` without `WWW-Authenticate` is not a `401`,
 and every row in the loop phase depends on that variant existing.
 
+`la_ruta_de_un_blob_viene_de_las_dos_mitades_comprobadas` is the fourth. It
+pins a path, and a path is a formatting detail rather than a security property;
+what makes it worth keeping is that it is the one row that would go red the day
+someone routed the path through a caller-supplied string, which is the change
+that would turn a checked digest into an unchecked one.
+
 **The mutation to read first is the one that forwards the challenge's scope.**
 `token_query` is four lines and the whole argument of R2.F is in them: the
 challenge is the sender's request, and what reaches the token endpoint is what
@@ -51,8 +58,29 @@ passes, and a grant of `repository:someone/else:pull,push` is spent against
 `library/alpine`. That is the confused deputy, and one character is the
 difference between refusing it and doing it.
 
-**Three rows were green for a reason that was not the code they named, and all
-three were found by this campaign.**
+**The third is believing the registry's own digest header.** A registry may
+answer a blob request with `Docker-Content-Digest` set to whatever it likes, and
+a client that reads it is checking the registry against itself: the header
+agrees with the request, the request agrees with the manifest, and the manifest
+was never checked against the layer. Nothing in the protocol stops the
+assertion, so the row serves bytes that do not carry the digest asked for while
+asserting in a header that they do. Only hashing the body is not circular.
+
+**Four rows were green for a reason that was not the code they named, and all
+four were found by this campaign.**
+
+`la_comprobacion_del_digest_no_es_una_advertencia_al_lado_del_exito` is the
+fourth, and it is the one worth reading twice, because the survivor it produced
+was the campaign's own fault rather than the code's. The row asserted only that
+a mismatched blob is refused, so a mutation that made the comparison
+unconditionally *true* still refused it and came back green. A row that asks
+"is this an error?" cannot tell a correct refusal from an indiscriminate one.
+The row was not strengthened -- it was replaced, by
+`el_digest_que_el_registry_afirma_en_una_cabecera_no_sustituye_al_hash`, which
+asks a question the indiscriminate version cannot answer: would this client
+still refuse a registry that *agrees with the request*? The lesson is the
+strongest form of the one below: a row has to be able to fail for a reason that
+is not the reason it was written for.
 
 `la_clave_de_cache_no_olvida_ninguna_parte_de_la_decision` spelled `TokenKey`
 out by hand in the test file, and came back green under all four of its
@@ -68,7 +96,12 @@ the fake origin recorded, and the fixture reads bodies as text. A mutation that
 re-encodes the body through `String::from_utf8_lossy` therefore agreed with the
 row, because both were lossy in the same way. The row is now
 `a_push_body_reaches_the_request_byte_for_byte` and reads the bytes out of the
-built request, where they are still bytes.
+built request, where they are still bytes. The same class of bug was then found
+a second time in R2.F.5 -- hashing the text form of a blob instead of its bytes
+-- and the fix is the same in both places: the *fixture* has to carry bytes, not
+text, or it cannot tell a correct hash from a lossy one. `OriginResponse::body`
+is a `Vec<u8>` now for that reason, and `OriginResponse::bytes` exists so a blob
+row has a way to say so.
 
 `a_refusal_without_a_challenge_is_not_a_puzzle` came back green with the
 `BearerChallenge::parse` line replaced, because a `401` carrying no challenge
@@ -113,8 +146,8 @@ REFERENCE_MUTATIONS = [
         # two cache keys for one blob, and a comparison that treats them as
         # different.
         "accept an uppercase digest",
-        ".all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())",
-        ".all(|b| b.is_ascii_hexdigit())",
+        "        if let Some(digest) = raw.strip_prefix(\"sha256:\") {\n            if digest.len() != 64\n                || !digest\n                    .bytes()\n                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())",
+        "        if let Some(digest) = raw.strip_prefix(\"sha256:\") {\n            if digest.len() != 64\n                || !digest\n                    .bytes()\n                    .all(|b| b.is_ascii_hexdigit())",
         "a_digest_reference_is_a_real_sha256_and_nothing_else",
     ),
     (
@@ -354,6 +387,87 @@ CACHE_WIRING_MUTATIONS = [
     ),
 ]
 
+# R2.F.5 -- the content address, and the check that the bytes have it.
+#
+# The digest is the only reference in the surface that cannot lie, because it
+# is checked. Everything about R2.F.5's security rests on two things staying
+# true: a string that is not a digest never becomes one, and the bytes are
+# compared as bytes. A mutation that weakens either is the whole finding.
+DIGEST_MUTATIONS = [
+    (
+        "accept any sha256: prefix as a content address",
+        "        if hex.len() != 64\n            || !hex\n                .bytes()\n                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())\n        {\n            return Err(ReferenceError::MalformedDigest);\n        }",
+        "        if false {\n            return Err(ReferenceError::MalformedDigest);\n        }",
+        "un_digest_que_no_es_un_digest_se_rechaza",
+    ),
+    (
+        # `A` and `a` are the same hex digit to a case-insensitive reader, and
+        # a digest is content-addressed by the lowercase spelling every
+        # implementation agrees on. Accepting both is accepting two spellings
+        # for one address, which is a second name for the same content.
+        "accept uppercase hex in a digest",
+        "        if hex.len() != 64\n            || !hex\n                .bytes()\n                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())",
+        "        if hex.len() != 64\n            || !hex\n                .bytes()\n                .all(|b| b.is_ascii_hexdigit())",
+        "un_digest_que_no_es_un_digest_se_rechaza",
+    ),
+    (
+        # The same mistake the push-body row made, in a new place: hashing the
+        # *text form* of the bytes. `from_utf8_lossy` rewrites every invalid
+        # byte to U+FFFD, so any layer that is not text would get a digest
+        # that no registry computes, and the check would pass on the same
+        # wrong value on both sides.
+        "hash the text form of the bytes rather than the bytes",
+        "        let hash = Sha256::digest(bytes);",
+        "        let hash = Sha256::digest(String::from_utf8_lossy(bytes).as_bytes());",
+        "un_digest_es_el_sha256_de_los_bytes",
+    ),
+    (
+        "content-address every blob the same way",
+        "        let hash = Sha256::digest(bytes);",
+        "        let hash = Sha256::digest(b\"constant\");",
+        "dos_blobs_distintos_no_comparten_digest",
+    ),
+    (
+        "build the blob path from the tag rather than the digest",
+        "    format!(\"/v2/{}/blobs/{}\", repository.as_str(), digest.as_str())",
+        "    format!(\"/v2/{}/blobs/latest\", repository.as_str())",
+        "la_ruta_de_un_blob_viene_de_las_dos_mitades_comprobadas",
+    ),
+]
+
+# R2.F.5 on the wire. A unit row can show that a comparison is written; only a
+# socket can show that the comparison is reached before the caller can install
+# anything, and that the bytes that were refused really did arrive.
+BLOB_WIRE_MUTATIONS = [
+    (
+        "hand the caller the lossy text form of the blob",
+        "            bytes: outcome.body,",
+        "            bytes: String::from_utf8_lossy(&outcome.body).into_owned().into_bytes(),",
+        "un_blob_que_cumple_su_digest_llega_como_sono_sus_bytes",
+    ),
+    (
+        # The whole method's purpose, deleted in one line. Everything else
+        # still works: the request goes out, the token is spent, the 200 is
+        # read. A registry that answers with different bytes is believed.
+        "return the blob without comparing it to the digest asked for",
+        "        let found = ContentDigest::of(&outcome.body);\n        if found != *digest {",
+        "        let found = ContentDigest::of(&outcome.body);\n        if false {",
+        "un_blob_que_no_cumple_su_digest_no_se_instala",
+    ),
+    (
+        # The one a client that has read the Docker Registry spec is tempted to
+        # write. `Docker-Content-Digest` is the registry's *claim* about what it
+        # sent, and taking it is a closed loop: a registry that answers with the
+        # wrong bytes and asserts the digest that was asked for agrees with
+        # itself, with the request and with the manifest. Only hashing the body
+        # is not circular.
+        "believe the registry's own digest header instead of hashing the body",
+        "        let found = ContentDigest::of(&outcome.body);",
+        "        let found = outcome\n            .headers\n            .get(reqwest::header::HeaderName::from_static(\"docker-content-digest\"))\n            .and_then(|v| v.to_str().ok())\n            .and_then(|v| ContentDigest::parse(v).ok())\n            .unwrap_or_else(|| ContentDigest::of(&outcome.body));",
+        "el_digest_que_el_registry_afirma_en_una_cabecera_no_sustituye_al_hash",
+    ),
+]
+
 
 def run_phase(path: Path, prefix: str, mutations: list, title: str) -> tuple[int, dict, list]:
     """Apply `mutations` to one file and return the five-bucket tally.
@@ -416,6 +530,8 @@ PHASES = [
     (WIRE, LOOP_MUTATIONS, "R2.F.2 the loop"),
     (UNIT, KEY_MUTATIONS, "R2.F.4 cache key and clock"),
     (WIRE, CACHE_WIRING_MUTATIONS, "R2.F.4 cache on the wire"),
+    (UNIT, DIGEST_MUTATIONS, "R2.F.5 the content address"),
+    (WIRE, BLOB_WIRE_MUTATIONS, "R2.F.5 the check on the wire"),
 ]
 
 
@@ -426,7 +542,7 @@ def main() -> int:
     f.STS = CLIENT
 
     total = sum(len(m) for _, m, _ in PHASES)
-    print(f"# falsifying R2.F.2 with {total} mutations across {len(PHASES)} phases\n")
+    print(f"# falsifying R2.F.2, R2.F.4 and R2.F.5 with {total} mutations across {len(PHASES)} phases\n")
 
     tally = {}
     problems = []

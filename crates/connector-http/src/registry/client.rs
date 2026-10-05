@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
 use asv_domain::Authority;
@@ -207,6 +208,8 @@ pub enum RegistryError {
     NoTokenInResponse,
     #[error("the registry answered {status} rather than the {expected} the operation expected")]
     UnexpectedStatus { status: u16, expected: u16 },
+    #[error(transparent)]
+    Blob(#[from] BlobError),
 }
 
 /// What a successful read produced.
@@ -216,6 +219,81 @@ pub struct ManifestRead {
     /// `application/vnd.oci.image.manifest.v1+json`.
     pub content_type: Option<String>,
     pub body: Vec<u8>,
+}
+
+/// Why a blob was refused after it had already been fetched.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BlobError {
+    #[error("the blob arrived carrying {found}, and {expected} was asked for")]
+    DigestMismatch { expected: String, found: String },
+}
+
+/// A `sha256:<64 lowercase hex>` content address.
+///
+/// A separate type from [`ImageReference`] because the two mean opposite
+/// things: a reference may be a mutable tag, and a tag names whatever the
+/// registry currently holds. A digest is the opposite -- it *is* the content,
+/// and the only reason to accept it is that the bytes can be checked against
+/// it. Letting a tag name a blob would be letting a name stand in for a check.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ContentDigest(String);
+
+impl ContentDigest {
+    /// Reads a digest, refusing anything that is not one.
+    pub fn parse(raw: &str) -> Result<Self, ReferenceError> {
+        let hex = raw
+            .strip_prefix("sha256:")
+            .ok_or(ReferenceError::MalformedDigest)?;
+        if hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(ReferenceError::MalformedDigest);
+        }
+        Ok(Self(raw.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Content-addresses `bytes`.
+    ///
+    /// Hashes the bytes as bytes. A `String` round trip first would be the same
+    /// mistake the manifest body row made, and it is invisible until the first
+    /// layer that is not valid UTF-8.
+    pub fn of(bytes: &[u8]) -> Self {
+        let hash = Sha256::digest(bytes);
+        let mut rendered = String::with_capacity(7 + 64);
+        rendered.push_str("sha256:");
+        for byte in hash {
+            rendered.push(char::from_digit((byte >> 4) as u32, 16).expect("a nibble"));
+            rendered.push(char::from_digit((byte & 0x0f) as u32, 16).expect("a nibble"));
+        }
+        Self(rendered)
+    }
+}
+
+impl std::fmt::Display for ContentDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The bytes of a blob, and the digest they were checked against.
+///
+/// The digest is a field and not a return value because "which bytes are
+/// these" is not a question a caller should be able to leave unanswered, and a
+/// `Vec<u8>` on its own is a `Vec<u8>` anybody can quote from anywhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobRead {
+    pub media_type: Option<String>,
+    pub bytes: Vec<u8>,
+    /// The digest this content was verified to have. The only one a caller can
+    /// name, because [`ContentDigest`] is the only kind of reference that
+    /// takes one.
+    pub digest: ContentDigest,
 }
 
 /// A client that talks to one registry family, using one stored credential.
@@ -382,6 +460,48 @@ impl RegistryClient {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string),
             body: outcome.body,
+        })
+    }
+
+    /// Reads a blob, and refuses bytes that do not carry the digest asked for.
+    ///
+    /// The check is the point of the method, not a nicety at the end of it. A
+    /// registry answers a blob request with whatever it holds, and "whatever it
+    /// holds" under a content address is a claim about bytes this side has not
+    /// seen. A pull that skipped the check would install an image whose layers
+    /// are not the ones the manifest names, and every later verification would
+    /// agree, because the manifest would name the digests of the bytes that
+    /// arrived.
+    pub fn get_blob(
+        &self,
+        registry: &ResolvedAudience,
+        repository: &RepositoryName,
+        digest: &ContentDigest,
+    ) -> Result<BlobRead, RegistryError> {
+        let outcome = self.attempt(
+            registry,
+            reqwest::Method::GET,
+            &blob_path(repository, digest),
+            RegistryOperation::Pull,
+            repository,
+            None,
+        )?;
+
+        let found = ContentDigest::of(&outcome.body);
+        if found != *digest {
+            return Err(RegistryError::Blob(BlobError::DigestMismatch {
+                expected: digest.to_string(),
+                found: found.to_string(),
+            }));
+        }
+        Ok(BlobRead {
+            media_type: outcome
+                .headers
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            bytes: outcome.body,
+            digest: found,
         })
     }
 
@@ -594,6 +714,11 @@ impl RegistryClient {
             },
         );
     }
+}
+
+/// `/v2/<repository>/blobs/<digest>`.
+fn blob_path(repository: &RepositoryName, digest: &ContentDigest) -> String {
+    format!("/v2/{}/blobs/{}", repository.as_str(), digest.as_str())
 }
 
 /// How a realm is written down in a cache key.

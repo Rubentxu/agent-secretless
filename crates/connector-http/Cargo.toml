@@ -27,6 +27,10 @@ zeroize.workspace = true
 # inside a `Basic` header. Already in the tree for the OAuth2 client-secret
 # case, so this is a move rather than a new dependency.
 base64.workspace = true
+# R2.F: a blob is only handed back after its bytes are hashed and found to
+# carry the digest that was asked for. Already in the workspace for the vault
+# and the SSH agent, so this is a move rather than a new dependency.
+sha2.workspace = true
 # Only ever reached through `test-support`. Declared optional so the default
 # build carries neither of them.
 rcgen = { version = "0.13", optional = true }

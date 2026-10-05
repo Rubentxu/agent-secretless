@@ -95,13 +95,29 @@ pub struct OriginResponse {
     /// Headers to send, in order. A name repeated here is sent twice, which is
     /// what a caller asking for that wants.
     pub headers: Vec<(String, String)>,
-    /// The body. Its length is what `content-length` says, always.
-    pub body: String,
+    /// The body, as bytes. Its length is what `content-length` says, always.
+    ///
+    /// Bytes and not a `String` because a registry blob is not text, and a
+    /// fixture that could only carry text would have to mangle the very thing a
+    /// blob test is about.
+    pub body: Vec<u8>,
 }
 
 impl OriginResponse {
     /// A response with no content type declared.
     pub fn new(status: u16, body: impl Into<String>) -> Self {
+        Self {
+            status,
+            headers: Vec::new(),
+            body: body.into().into_bytes(),
+        }
+    }
+
+    /// A response whose body is bytes rather than text.
+    ///
+    /// Takes no content type, because a blob's type is metadata the registry
+    /// asserts about the content and this fixture has no opinion about it.
+    pub fn bytes(status: u16, body: impl Into<Vec<u8>>) -> Self {
         Self {
             status,
             headers: Vec::new(),
@@ -547,13 +563,18 @@ fn render(response: &OriginResponse) -> Vec<u8> {
         .iter()
         .map(|(name, value)| format!("{name}: {value}\r\n"))
         .collect::<String>();
-    format!(
-        "HTTP/1.1 {}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n{}",
+    let mut wire = format!(
+        "HTTP/1.1 {}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n",
         status_line(response.status),
         response.body.len(),
-        response.body
     )
-    .into_bytes()
+    .into_bytes();
+    // Appended rather than interpolated: a body is bytes, and formatting one
+    // into a `String` would fail on -- or worse, mangle -- anything that is
+    // not valid UTF-8. A fixture that could not carry a non-text body could not
+    // prove that the client under test keeps non-text bodies intact.
+    wire.extend_from_slice(&response.body);
+    wire
 }
 
 /// The status line for a status this harness can produce.

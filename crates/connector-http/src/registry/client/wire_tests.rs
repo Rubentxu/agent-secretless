@@ -878,3 +878,178 @@ fn un_token_sin_expires_in_no_se_cachea() {
         "a token with no stated end was served more than once"
     );
 }
+
+// -------------------------------------------------------------------- blobs
+
+/// A registry that answers the challenge, and then serves one fixed blob body
+/// for anything under `/blobs/`.
+///
+/// The body is a parameter rather than a constant because the rows below differ
+/// only in which bytes the registry claims, and a fixture that could only serve
+/// one of them would make the disagreement the one case untested.
+fn blob_origin(realm_url: &str, layer: Vec<u8>) -> TlsOrigin {
+    let challenge = format!(
+        r#"Bearer realm="{realm_url}",service="registry.docker.io",scope="repository:library/alpine:pull""#
+    );
+    TlsOrigin::start(
+        NAME,
+        Arc::new(move |observed: &Observed| {
+            let has_bearer = observed
+                .headers
+                .iter()
+                .any(|(name, value)| name == "authorization" && value.starts_with("Bearer "));
+            if !has_bearer {
+                return OriginResponse::new(401, "").with_header("www-authenticate", &challenge);
+            }
+            OriginResponse::bytes(200, layer.clone()).with_header(
+                "content-type",
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+            )
+        }),
+    )
+}
+
+/// A registry that answers the challenge, serves one fixed blob body, and
+/// *asserts in a header* a digest that is not the one those bytes have.
+///
+/// The header is the whole point, so it is not optional: a fixture that only
+/// served mismatched bytes would let a client that reads
+/// `Docker-Content-Digest` pass this row by accident.
+fn lying_origin(realm_url: &str, layer: Vec<u8>, claimed: String) -> TlsOrigin {
+    let challenge = format!(
+        r#"Bearer realm="{realm_url}",service="registry.docker.io",scope="repository:library/alpine:pull""#
+    );
+    TlsOrigin::start(
+        NAME,
+        Arc::new(move |observed: &Observed| {
+            let has_bearer = observed
+                .headers
+                .iter()
+                .any(|(name, value)| name == "authorization" && value.starts_with("Bearer "));
+            if !has_bearer {
+                return OriginResponse::new(401, "").with_header("www-authenticate", &challenge);
+            }
+            OriginResponse::bytes(200, layer.clone()).with_header("docker-content-digest", &claimed)
+        }),
+    )
+}
+
+/// A blob arrives and the bytes are the bytes, over a real socket, with the
+/// digest they actually have.
+///
+/// This is the positive half. Without it, a `get_blob` that always returned
+/// `Err` would satisfy every refusal row in this section.
+///
+/// Mutation: return the bytes as a `String`, which silently replaces anything
+/// that is not valid UTF-8 and is the mistake the next row exists to catch.
+#[test]
+fn un_blob_que_cumple_su_digest_llega_como_sono_sus_bytes() {
+    // A gzip layer starts 0x1f 0x8b and is otherwise not text at all.
+    let layer: Vec<u8> = vec![0x1f, 0x8b, 0x08, 0x00, 0xff, 0xfe, 0x00, 0x41, 0x0a];
+    let realm = exact_token_origin();
+    let registry = blob_origin(&realm.url("/token"), layer.clone());
+    let client = client_for(
+        &[&registry, &realm],
+        RecordingPort::new() as Arc<dyn SecretPort>,
+    );
+
+    let read = client
+        .get_blob(
+            &pinned_to(&registry),
+            &repository(),
+            &ContentDigest::of(&layer),
+        )
+        .expect("a blob that carries its digest is not a failure");
+
+    assert_eq!(read.bytes, layer, "the bytes were altered in transit");
+    assert_eq!(
+        read.digest,
+        ContentDigest::of(&layer),
+        "the returned digest is not the one the bytes have"
+    );
+    assert_eq!(
+        read.media_type.as_deref(),
+        Some("application/vnd.oci.image.layer.v1.tar+gzip"),
+        "the registry's own type for the layer was dropped"
+    );
+}
+
+/// A registry that answers a blob request with bytes it does not have is
+/// refused, and the refusal says which bytes arrived.
+///
+/// This is the row the whole method exists for. A registry is the party that
+/// names the digest; if its claim is not checked against the bytes, a hostile
+/// or broken registry can hand over different layers and every later
+/// verification will agree, because the manifest will name the digests of
+/// whatever arrived.
+///
+/// Mutation: return the body without comparing it, or compare the request
+/// digest against itself.
+#[test]
+fn un_blob_que_no_cumple_su_digest_no_se_instala() {
+    let asked_for = ContentDigest::of(b"the-layer-the-manifest-named");
+    let served = b"a-completely-different-layer".to_vec();
+    let realm = exact_token_origin();
+    let registry = blob_origin(&realm.url("/token"), served.clone());
+    let client = client_for(
+        &[&registry, &realm],
+        RecordingPort::new() as Arc<dyn SecretPort>,
+    );
+
+    let error = client
+        .get_blob(&pinned_to(&registry), &repository(), &asked_for)
+        .expect_err("bytes that do not carry the digest asked for must not be returned");
+
+    // The refusal has to name *both* digests. A message that only says
+    // "mismatch" is a message that leaves the operator to work out which side
+    // lied, and a corrupt mirror and a tampered layer want opposite responses.
+    assert!(
+        matches!(&error, RegistryError::Blob(BlobError::DigestMismatch { expected, found })
+            if expected == &asked_for.to_string()
+                && found == &ContentDigest::of(&served).to_string()),
+        "the refusal did not name the digest asked for and the digest arrived: {error:?}"
+    );
+}
+
+/// A digest the registry *claims* in a header does not stand in for the hash
+/// of the bytes it sent.
+///
+/// This is the row that the previous third row should have been. It is not a
+/// rephrasing of "the mismatch is refused" -- it is the one shape that refusal
+/// alone would not catch. A registry that answers with bytes the caller did not
+/// ask for can simply assert the digest it was asked for in
+/// `Docker-Content-Digest`, and a client that believes the header agrees with
+/// itself: the claim matches the request, the request matches the manifest, and
+/// the manifest was never checked against the layer either. Nothing in the
+/// protocol stops the assertion, so only hashing the body closes it.
+///
+/// The header is therefore a claim to be ignored, not a second source of truth.
+///
+/// Mutation: take the digest from the response header instead of hashing the
+/// body.
+#[test]
+fn el_digest_que_el_registry_afirma_en_una_cabecera_no_sustituye_al_hash() {
+    let asked_for = ContentDigest::of(b"the-layer-the-manifest-named");
+    let served = b"an-entirely-different-layer".to_vec();
+    let realm = exact_token_origin();
+    let registry = lying_origin(&realm.url("/token"), served, asked_for.to_string());
+    let client = client_for(
+        &[&registry, &realm],
+        RecordingPort::new() as Arc<dyn SecretPort>,
+    );
+
+    let error = client
+        .get_blob(&pinned_to(&registry), &repository(), &asked_for)
+        .expect_err("a header saying the right digest is not a reason to install the wrong bytes");
+
+    // And the error has to name the bytes that actually arrived, not the ones
+    // the registry said it sent. A `found` that echoes the header would pass a
+    // `matches!` on the variant while telling the operator nothing.
+    assert!(
+        matches!(&error, RegistryError::Blob(BlobError::DigestMismatch { expected, found })
+            if expected == &asked_for.to_string()
+                && found == &ContentDigest::of(b"an-entirely-different-layer").to_string()
+                && found != expected),
+        "the refusal repeated the registry's own claim instead of naming the bytes: {error:?}"
+    );
+}

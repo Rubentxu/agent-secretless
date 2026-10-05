@@ -212,14 +212,16 @@ for reasons that were not the code they named:
   header is refused one line earlier. The mutation was measuring the wrong
   line, and moving it one line up is what turned the row red.
 
-## What is still missing
+## What R2.F.2 did not include
 
-The loop is not yet reachable from a session. A real request has to arrive from
-a brokered session, a `Request` has to name a registry operation, and the broker
+The loop was not reachable from a session. A real request has to arrive from a
+brokered session, a `Request` has to name a registry operation, and the broker
 has to decide which repository an agent may touch — which means `Action` in the
-domain, dispatch in the policy engine, and a verb in the CLI. Those are
-R2.F.3, and they are the same three files every remaining roadmap row needs, so
-they are the next thing to unblock rather than the next thing to start.
+domain, dispatch in the policy engine, and a verb in the CLI. Those are R2.F.3,
+and they are the same three files every remaining roadmap row needs, so they
+are the next thing to unblock rather than the next thing to start. R2.F.4 and
+R2.F.5 went the other way round, because a connector that redeems a token per
+request and installs a blob it never checked is not worth surfacing.
 
 ## R2.F.4, the token cache
 
@@ -258,3 +260,79 @@ A duplicate spelling of the code under test is a row that passes no matter what
 the code does — which is the same lesson as R2.F.1's `is_err()` row and
 R2.F.2's text-reading body row, and it is the third time this repository has
 paid for it.
+
+## R2.F.5, the blob
+
+A pull is not a manifest. It is a manifest, a config, and a layer per blob —
+and the layer is the part that gets installed. So `get_blob` takes a
+`ContentDigest` and returns a `BlobRead` that carries the digest the bytes were
+*verified* to have, and the difference is the whole increment.
+
+`ContentDigest` is a separate type from `ImageReference` because the two mean
+opposite things. A reference may be a mutable tag, and a tag names whatever the
+registry currently holds. A digest *is* the content, and the only reason to
+accept one is that the bytes can be checked against it. Letting a tag name a
+blob would be letting a name stand in for a check — which is why
+`ContentDigest::parse` is the only constructor, it refuses anything that is not
+`sha256:` plus 64 lowercase hex digits, and it refuses *before* the value can
+become a path.
+
+The check is the method's purpose rather than a nicety at the end of it. A
+registry answers a blob request with whatever it holds, and "whatever it holds"
+under a content address is a claim about bytes this side has not seen. A pull
+that skipped the check would install an image whose layers are not the ones the
+manifest names, and **every later verification would agree**, because the
+manifest would name the digests of the bytes that arrived. The compromise is
+self-consistent, which is what makes it worth spelling out.
+
+Three rules, each of which exists because the obvious implementation is wrong:
+
+- The digest is the sha256 **of the bytes**. A `String` round trip first — the
+  mistake R2.F.2's push-body row made — is invisible until the first layer that
+  is not valid UTF-8, and it is a *gzip* layer, so it is the first thing anyone
+  pulls.
+- The digest is not read from `Docker-Content-Digest`. That header is the
+  registry's own claim about what it sent, and a client that believes it is
+  checking the registry against itself: the header agrees with the request, the
+  request agrees with the manifest, and the manifest was never checked against
+  the layer either. Nothing in the protocol stops the assertion.
+- The bytes are `Vec<u8>` all the way out, and the fixture that serves them is
+  too. `OriginResponse::body` was a `String`, which meant the fake origin could
+  not carry a non-text body without mangling it — so a row asserting that blob
+  bytes survive intact would have been asserting that the *fixture* survives
+  intact. It is a `Vec<u8>` now, with `OriginResponse::bytes`, for the same
+  reason the push-body row reads the built request rather than the recorded one.
+
+**Seven rows, eight mutations, eight red, and one row replaced rather than
+strengthened.**
+
+The replaced row is the finding worth reading twice. `la_comprobacion_del_
+digest_no_es_una_advertencia_al_lado_del_exito` asserted that a mismatched blob
+is refused. A mutation that made the comparison unconditionally *true* still
+refused it, and came back green — because a row that asks only "is this an
+error?" cannot tell a correct refusal from an indiscriminate one. It was not
+fixed by finding a better mutation. It was replaced by
+`el_digest_que_el_registry_afirma_en_una_cabecera_no_sustituye_al_hash`, which
+asks a question the indiscriminate version cannot answer: *would this client
+still refuse a registry that agrees with the request?* That is the fourth time
+this repository has paid for a row that could not fail for the reason it was
+written for, and the third time the cure was a stronger question rather than a
+tighter assertion.
+
+The campaign also repaired a latent defect of its own. Adding a second digest
+parser to `client.rs` made the `is_ascii_hexdigit && !is_ascii_uppercase`
+snippet ambiguous, and the harness reported the mutation as unrunnable rather
+than as green — correctly, since "the harness could not find this" and "the row
+did not go red" are different findings. Disambiguating the snippet also fixed a
+mutation that had been a *harness error* in the R2.F.2 phase all along: that
+phase was 5 red + 1 harness error, not 5 red + 1 red, and is now 6.
+
+## What is still missing
+
+`get_blob` is the last piece the connector needs before it is a *pull*. What
+is still absent is everything above it: the loop is not reachable from a
+session. A real request has to arrive from a brokered session, a `Request` has
+to name a registry operation, and the broker has to decide which repository an
+agent may touch — which means `Action` in the domain, dispatch in the policy
+engine, and a verb in the CLI. Those are R2.F.3, and they are the same files
+every remaining roadmap row needs.
