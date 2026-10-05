@@ -70,6 +70,8 @@ has: no source edits while a campaign or a suite is in flight.
 | `k8s_metadata_falsify.py` | `crates/broker/src/k8s/metadata.rs` | 7 red + 2 compiler-refused, against 13 rows |
 | `k8s_binding_falsify.py` | `crates/broker/src/k8s/binding.rs` | 12, one-for-one against 20 rows |
 | `s3_falsify.py` | `crates/broker/src/aws/s3.rs` | 13, one-for-one against 23 rows |
+| `s3_object_falsify.py` | `crates/broker/src/aws/s3/object.rs` | 9, against 15 rows |
+| `r2b2_falsify.py` | `lib.rs`, `oauth2_binding.rs`, `policy/src/lib.rs`, `selfreport.rs` | 15, in five passes |
 
 `sts_falsify.py` is also the base harness the others import, which is why its
 mutation list is a module-level `MUTATIONS` that callers replace. That has a
@@ -80,7 +82,7 @@ harness therefore names its target file in the first line of its own output.
 
 ## Known survivors
 
-Two, both recorded in `15-ROADMAP.md` and both kept rather than deleted — a
+Three, all recorded in `15-ROADMAP.md` and all kept rather than deleted — a
 deleted survivor hides that a branch has no row.
 
 - The post-read size bound in `client_falsify.py`, unexercised because the fake
@@ -89,6 +91,25 @@ deleted survivor hides that a branch has no row.
   `AwsSecretPort` has a hand-written `Debug` that prints the margin and the
   credential ids and nothing else. The defence is two layers down, so the row is
   a regression net and not the evidence.
+- **`r2b2_falsify.py`'s `independence` pass — and this one is a result rather
+  than a gap.** It widens `ALLOWED_AUDIENCES` by one host and asserts the OAuth2
+  happy path *still passes*, which is the measurement that the generic-IdP
+  surface does not depend on the allowlist at all. `Resource::OAuth2Client` is a
+  separate type that never reaches `audience_is_approved`, so stretching the list
+  cannot reach it in either direction. The design claim is stated here as a
+  survivor rather than as a paragraph, which is the only form of it that cannot
+  quietly stop being true.
+
+That third survivor is also the sharpest thing this file has to say about
+**where a mutation is filed**. The same campaign's first pass aimed the two
+*dangerous* widenings at OAuth2 rows, and all three survived — which reads as a
+finding and was an artefact. The harm of stretching the list falls on GitHub and
+AWS, which share the `Api` resource type, so an OAuth2 row cannot go red however
+far it is stretched. Re-aimed at the policy crate's own
+`unapproved_audience_is_denied_even_though_it_canonicalizes`, both go red. The
+harm is measured and the independence is measured, and they are not the same
+measurement; a campaign that reported the first three survivors as a gap in the
+test would have been wrong about which arrow to move.
 
 `k8s_request_falsify.py` has **none**, and that is a result rather than an
 absence of trying: 24 mutations, all red, none refused by the compiler, none
@@ -103,6 +124,25 @@ narrowing of `Verb::takes_name` to `Verb::Get` was filed against a row that
 still passes under it, and would have been reported as a survivor — which reads
 as a gap in the test rather than a gap in the filing. What it actually breaks is
 `delete` ceasing to require a name, so that is the row it is filed against now.
+
+`r2b2_falsify.py` is the second campaign to file something wrongly, and it did
+so twice, so the pattern is worth having in one place:
+
+- a survivor that was **a missing row** — nothing tested session ownership, and
+  the mutation deleting the ownership check passed because the fixture's session
+  *was* owned. Adding the row turned it red.
+- a **row that could not fail** — one measured UTF-8 strictness on a path where
+  the token is always valid UTF-8, and another accepted *any* refusal, which left
+  the non-2xx check unfalsifiable because a JSON parse failure is also a refusal.
+  A row that cannot go red is worse than no row, because it reads as coverage.
+- a `measured nothing` from passing a **bare test name** to a `--exact`
+  invocation. The bucket was honest — nothing *was* measured — but the cause was
+  the harness's own addressing, and reporting a harness typo as a result about
+  the code is how a campaign starts being believed for the wrong reason.
+
+Both times the code was fine and the *evidence* was not. That is the recurring
+finding of this file: the falsifier finds defects in the tests more often than in
+the code, and the tests are the part that is assumed.
 
 ## Rows that no single-site mutation can reach
 
@@ -308,3 +348,49 @@ mutations would each take a second row for the other half of their rule. They
 do not — the harness credits one row per mutation, and a second attribution
 would be a claim nothing checked. The number in the file is the one that was
 measured.
+
+`s3_object_falsify.py` is 9 mutations against 15 rows, and six of the rows are
+unreachable by design rather than by omission. Two of them are the module's
+whole claim: `no_field_of_the_answer_can_hold_the_object` and
+`the_response_type_has_nowhere_to_put_a_body` are destructuring rows, so adding
+a field that could carry the object breaks the crate instead of failing an
+assertion. That is the strongest form this repository has for a "there is
+nowhere for it to go" property, and the campaign cannot turn it red — which is
+the point, not a gap.
+
+**This module does not read the response body, and that is forced rather than
+chosen.** S3 answers a failure with an XML `<Error>` document, and this
+workspace has no XML parser by decision: a parser brings a DTD, a DTD is an
+XXE surface, and `aws::sts` says so at the top of its own file. So the status
+line is the signal, the body is discarded unread, and the refusal says so —
+because an operator who sees a bare `403` goes looking for an IAM decision that
+is not there. The mutation that reads a body is possible to write and is the
+most damaging edit available in the file, because it would smuggle a parser
+past a decision made deliberately.
+
+**The campaign found a real log-injection hole.** `ObjectResponse::header`
+returned the *first* matching value. The row checking an optional header for a
+control character came back green under an injected second
+`x-amz-version-id` — because the first, clean one is what a lookup returns. A
+duplicated header is exactly the injection vector, and the reader was blind to
+the half of it that carries the payload. It is now `values`, returning every
+match, and `header` refuses a duplicate outright rather than resolving it by
+arrival order — two `content-length` values are two answers to "how big is it",
+and picking one would make the answer depend on the order the origin happened to
+serialise them in.
+
+Two more findings are about filing rather than about code, and both are the kind
+a harness exists to surface.
+
+`the_response_type_has_nowhere_to_put_a_body` was first written as two
+`ObjectResponse` values, one "with a body" and one without, asserting they read
+the same. It cannot be written that way — the type has no body field, so the
+fixtures differed in their headers and the row failed for an unrelated reason.
+The claim was true and the row was measuring something else.
+
+And the mutation for `is_populated` had its direction backwards. The row
+asserts an empty object is *not* populated, so making the method always return
+`false` satisfies it perfectly and reports a survivor that means nothing. A
+property like that is two-sided and each side needs its own mutation; the other
+side was already covered by the happy-path row, and the pair now pins the method
+from both ends.

@@ -262,3 +262,5 @@ fn check_key(key: &str) -> Result<(), S3Error> {
 
 #[cfg(test)]
 mod tests;
+
+pub mod object;
