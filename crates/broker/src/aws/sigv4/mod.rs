@@ -255,7 +255,7 @@ impl SigV4Signer {
         );
         let string_to_sign = format!(
             "{ALGORITHM}\n{amz_date}\n{scope}\n{}",
-            sha256_hex(canonical_request.as_bytes())
+            sha256_hex_of(canonical_request.as_bytes())
         );
 
         let signature = hex(&hmac_sha256(
@@ -311,7 +311,14 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// The SHA-256 of `bytes`, lowercase hex.
+///
+/// Public because [`super::sts`] hashes a request body with it before handing
+/// that body to this module to sign. Exposing the existing function is the
+/// point: a second hex-SHA-256 elsewhere in the tree is a second thing to keep
+/// correct, and a payload hash computed by a different function from the one
+/// the signer uses is a `SignatureDoesNotMatch` nobody can find.
+pub fn sha256_hex_of(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
@@ -390,7 +397,7 @@ fn canonical_request(
     let payload_hash = if request.payload.is_empty() {
         EMPTY_PAYLOAD_SHA256.to_string()
     } else {
-        sha256_hex(request.payload)
+        sha256_hex_of(request.payload)
     };
 
     Ok(format!(

@@ -74,7 +74,7 @@ is not listed, and a block with a residual says so in its own row.
 | **R1** | closed | `r1_isolated_reachability` 11/11 and `r1_isolated_e2e` 6/6, both from the product surface. One caveat, recorded because it changes how the evidence should be read: 21 tests across three files return early when unprivileged user namespaces are unavailable, and Cargo reports that as **passed**, not as skipped. The R1 full-suite result was therefore re-opened and is being corrected (`bl-bl-01M44FDFNF0003888YSWEGPXM0`). |
 | **R2.A** | closed, with one half `host-dependent` | `r2a_github_vertical` 11/11 in-process against a real TLS origin, and `r2a_cli_reachability` 4/4 against the real binaries. The live call against the real `api.github.com` is **not** measured and is not claimed; see *Status of item 1* below. |
 | **R2.B** | partial, with the strong form `host-dependent` | `r2b_oauth2_revocation` 5/5 with four falsifications run. The revocation gap is closed and the property is structural — `forget` is required on `SecretPort` with no default. Two things are **not** closed: compatibility with an operator's real IdP needs a host that has one, and the requested scope is still operator-configured rather than policy-derived, which is R4's work. |
-| **R2.C** | foundation only | `aws::sigv4` 16/16 against the AWS documentation's own vectors, with five falsifications run and two real bugs caught by the oracle. **No STS call, no broker operation, no CLI verb, and no product surface yet**, so item 2 is not closed under M11's rule. See *Status of item 2*. |
+| **R2.C** | foundation only, one layer deeper | `aws::sigv4` 16/16 against the AWS documentation's own vectors and `aws::sts` 34/34, both against an oracle written from the specifications. 25 mutations run: 24 falsified the row they name, 1 was refused by the compiler, 0 survived, 0 measured nothing. Three real defects in the reader were found this way. **Still no STS call, no broker operation, no CLI verb, and no product surface**, so item 2 is still not closed under M11's rule. See *Status of item 2*. |
 
 **The R1 row is the one worth reading twice.** `uat_040`'s file-injection row was
 asserting that the staged secret reached the redacted channel in cleartext — a
@@ -1108,17 +1108,19 @@ stub, not a test. So item 2 is construction rather than repair, and the failure
 mode is different from item 1's: there was no existing path to inherit a
 property from, so a subtly wrong signing primitive would be the whole problem.
 
-**R2.C.1 is the signing core, and it is the only part done.** Canonicalisation,
-the four-step key derivation, the `Authorization` header, and the refusals.
-There is no STS call, no broker operation and no CLI verb, so no agent can ask
-for an AWS credential, and **per M11's rule a provider does not count as closed
-on a signing core alone.**
+**R2.C.1 was the signing core. R2.C.2.a is the `AssumeRole` protocol in both
+directions, and it is still not a provider.** There is no socket, no
+`SecretPort` and no broker operation, so no agent can ask for an AWS credential,
+and **per M11's rule a provider does not count as closed on an encoding plus a
+signing core.**
 
 What is left, in order:
 
-- **R2.C.2.** `sts:AssumeRole` over real HTTPS, a short-lived session, cached
-  and revocable — reusing the `forget` machinery from R2.B.1 rather than
-  inventing a second invalidation path.
+- **R2.C.2.b.** The live HTTPS client, the `SecretPort` and a short-lived
+  session that is cached and revocable — reusing the `forget` machinery from
+  R2.B.1 rather than inventing a second invalidation path. The split from
+  `.a` is deliberate: a block that mixes a socket with a parser has twice the
+  surface to be wrong in and half the attention to give each.
 - **R2.C.3.** A broker operation and a CLI verb, so the agent names an
   *operation* and never sees an AWS secret. That is what satisfies "the agent
   must never need to know the secret key" in its strongest form; handing the
@@ -1127,12 +1129,74 @@ What is left, in order:
   item 1's is: it needs a real account and real credentials on a machine with
   network, and no repository check asserts it.
 
-**The oracle, and why the vectors mattered more than the tests.** Every
-expected value comes from the AWS documentation and none was copied from this
-implementation's output: they were computed first by a separate implementation
-written from the specification, and the two compared. That caught two bugs no
-test written afterwards would have found. The first put the date stamp in the
-credential scope **twice**, and the signature was still correct — the extra text
+#### The XML reader, and why there is no parser
+
+`Cargo.lock` still has no XML parser in it and none was added. A general parser
+brings a DTD, and a DTD is an XXE surface. The reader implements no entity
+mechanism at all: the five predefined entities and numeric references are
+decoded, and **every other entity is a refusal** — as is a bare `&`, and as is a
+document declaring a DTD. There is no code path in the file that turns a name
+into a fetch, so `&xxe;` has nothing to attack.
+
+That leniency was removed on purpose, and the reason is the one the whole file
+is built on: everywhere else — a duplicated element, an unclosed tag, a body
+that is not UTF-8, an instant that is not the documented shape — a document the
+reader does not understand is **refused rather than guessed at**. Preserving
+`&xxe;` as five literal characters was the single place it guessed. It is also
+not a real loss: a credential cannot contain `&name;`, so its presence is
+evidence the document is not what it claims.
+
+#### Three defects the evidence found, and one it did not
+
+- **A panic on a two-byte character beside a tag.** The duplicate-element check
+  indexed one byte past the opening tag, which lands inside a multibyte
+  character. A reader pointed at a socket must not take the process down, and
+  the row that measures it is
+  `a_multibyte_character_beside_a_tag_is_read_whole_and_does_not_bring_the_reader_down`.
+  The fix is `match_indices`, so every index sliced at is one the string library
+  already proved to be a character boundary.
+- **A leap second was accepted and silently clamped to 59**, while the
+  function's own doc comment said leap seconds were "refused rather than
+  approximated". The oracle disagreed with the code and the code was wrong: a
+  timestamp read wrongly is a credential believed valid after it is not.
+- **A credential field containing whitespace was accepted.** The AWS reference
+  page prints the sample `SessionToken` across five indented lines. That folding
+  cannot arrive on a socket — the token becomes an HTTP header value, and a
+  header value cannot contain a newline — but a reader that trimmed or un-folded
+  would mint a session wrong by exactly the whitespace it chose to remove, and
+  report success. The reader now refuses, which says *this document is not a
+  credential*.
+- **The one that was not a defect in the code: the first run of the
+  falsification harness reported all 24 mutations as falsified when it had run
+  zero tests.** It passed a short test name to `cargo test --exact`, cargo
+  matched nothing, printed `running 0 tests` and `test result: ok. 0 passed`,
+  and the harness read that as green. It is the same class of failure as
+  `uat_040`: a row that never ran is indistinguishable from a row that passed
+  unless the harness is built so it cannot say so. The harness now refuses to
+  report green unless the named row ran, and separately refuses to read a
+  failure as anything but a failure.
+
+**The arithmetic in the falsification summary was wrong too**, and in the
+direction that flatters: it computed "falsified" as everything that was not a
+survivor, which swept the compiler-refused mutations into the count while the
+line beneath said they were not counted. The 25 mutations partition into **24
+red, 1 refused by the compiler, 0 survivors, 0 unmeasured**, and the harness now
+asserts that the four buckets sum to the number of mutations run.
+
+**No new supply-chain surface.** `sha2` was already a direct broker dependency
+and `hmac` was already resolved through the vault; `Cargo.lock` gains one line
+and no package. `aws-sigv4` was not used: a new name in a signed SBOM to avoid
+a four-step HMAC chain is the wrong trade. The XML reader added no dependency at
+all, which is the point of it.
+
+#### The oracle, and why the vectors mattered more than the tests
+
+Every expected value comes from the AWS documentation and none was copied from
+this implementation's output: they were computed first by a separate
+implementation written from the specification, and the two compared. That caught
+two bugs no test written afterwards would have found. The first put the date
+stamp in the credential scope **twice**, and the signature was still correct —
+the extra text
 is not hashed — so nothing local noticed and every provider would have rejected
 the request with a scope no reader could reconcile against the signature beside
 it. The second was a parameter that could not do what its name promised: the
