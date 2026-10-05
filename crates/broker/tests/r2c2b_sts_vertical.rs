@@ -60,6 +60,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use asv_broker::aws::client::{AwsCredentialConfig, StsClient, StsClientError};
+use asv_broker::aws::identity::get_caller_identity;
+use asv_broker::aws::port::{AwsSecretPort, ClientExchange};
 use asv_broker::aws::sts::StsError;
 use asv_connector_http::fake_origin::{Observed, OriginResponse, Reply, TlsOrigin};
 use asv_connector_http::transport::{PinnedClient, ResolvedAudience};
@@ -75,6 +77,20 @@ const ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
 const CREDENTIAL: &str = "aws-prod";
 const ROLE: &str = "arn:aws:iam::123456789012:role/demo";
 const SESSION_NAME: &str = "asv-session";
+
+/// The two values `AssumeRole` hands back, and the ones a session-signed request
+/// is built from.
+///
+/// **Deliberately distinct from `LONG_LIVED_KEY` *and* from each other.** The
+/// long-lived key differs from the session's by a single character, which is
+/// enough for a human reading a failure and nowhere near enough for an
+/// assertion: a row that cannot tell the session's secret key from the
+/// long-lived one cannot prove that *neither* left, because it would pass
+/// whichever of the two actually did. Three separate strings, so "the session
+/// key did not reach the wire" is a statement about a value nothing else in the
+/// fixture contains.
+const SESSION_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCSESSIONKEY";
+const SESSION_TOKEN: &str = "FQoGZXIvYXdzEBYaCSESSIONTOKENXX";
 
 /// 2019-11-09T13:33:20Z, from the calendar oracle. The fixture response expires
 /// at 13:34:41Z, so a session minted here has 81 seconds left: a deliberately
@@ -148,13 +164,60 @@ fn assume_role_response() -> String {
   <AssumeRoleResult>
     <Credentials>
       <AccessKeyId>ASIAIOSFODNN7EXAMPLE</AccessKeyId>
-      <SecretAccessKey>wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY</SecretAccessKey>
-      <SessionToken>FQoGZXIvYXdzEBYaDEXAMPLE</SessionToken>
+      <SecretAccessKey>{SESSION_SECRET_KEY}</SecretAccessKey>
+      <SessionToken>{SESSION_TOKEN}</SessionToken>
       <Expiration>2019-11-09T13:34:41Z</Expiration>
     </Credentials>
   </AssumeRoleResult>
 </AssumeRoleResponse>"#
     )
+}
+
+/// AWS's own Example 2 shape, for the identity answer.
+fn caller_identity_response() -> String {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<GetCallerIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <GetCallerIdentityResult>
+    <Arn>arn:aws:sts::123456789012:assumed-role/demo/asv-session</Arn>
+    <UserId>ARO123EXAMPLE123:asv-session</UserId>
+    <Account>123456789012</Account>
+  </GetCallerIdentityResult>
+  <ResponseMetadata>
+    <RequestId>01234567-89ab-cdef-0123-456789abcdef</RequestId>
+  </ResponseMetadata>
+</GetCallerIdentityResponse>"#
+    .to_string()
+}
+
+/// An origin that answers the two calls differently, the way a real STS does.
+///
+/// A fixture answering both with one body would be a fixture measuring the wrong
+/// thing: the session-signed rows need a session minted *and* an identity read,
+/// and the whole subject is the second request.
+fn origin_for_session(identity_reply: Option<(u16, String)>) -> TlsOrigin {
+    TlsOrigin::start("sts.amazonaws.com", Arc::new(move |observed: &Observed| {
+        if observed.body.contains("Action=GetCallerIdentity") {
+            match &identity_reply {
+                Some((status, body)) => OriginResponse::new(*status, body.clone()),
+                None => OriginResponse::new(200, caller_identity_response()),
+            }
+        } else {
+            OriginResponse::new(200, assume_role_response())
+        }
+    }))
+}
+
+/// The port a session-signed call goes through, wired the way the broker wires
+/// it: an exchange over the real client, borrowing the long-lived key from a
+/// real `SecretPort`.
+fn session_port(origin: &TlsOrigin) -> (AwsSecretPort, Arc<std::sync::atomic::AtomicUsize>) {
+    let (long_lived, grants) = CountingPort::new(LONG_LIVED_KEY.as_bytes());
+    let client = Arc::new(client_for(origin));
+    let port = AwsSecretPort::new(Arc::new(ClientExchange::new(
+        client,
+        Arc::new(long_lived),
+    )));
+    (port, grants)
 }
 
 /// Starts a real TLS origin answering every request the way `reply` says.
@@ -576,4 +639,194 @@ fn a_same_origin_redirect_is_followed_and_the_signature_is_recomputed_for_the_ho
             "a hop went out unsigned"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// R2.C.3 — the request signed with a *session* rather than with the long-lived
+// key. This is the first code path in the tree where a credential is on the
+// wire, and the whole reason it needs its own rows is that it is different.
+// ---------------------------------------------------------------------------
+
+/// The row the AWS documentation dictates: a session-signed request puts
+/// `x-amz-security-token` **inside** the signature as well as on the request.
+///
+/// Example 2 of the `GetCallerIdentity` reference signs with
+/// `SignedHeaders=host;user-agent;x-amz-date;x-amz-security-token`. A request
+/// that sent the token without signing it is a request AWS rejects, and the
+/// rejection names the signature rather than the token — so without this row
+/// the failure would look like a clock problem.
+#[test]
+fn a_session_signed_request_signs_the_session_token_and_sends_it() {
+    let origin = origin_for_session(None);
+    let (port, _grants) = session_port(&origin);
+    let client = client_for(&origin);
+
+    let identity = get_caller_identity(&client, &port, CREDENTIAL, at(NOW))
+        .expect("a documented answer is an identity");
+    assert_eq!(identity.account, "123456789012");
+
+    let observed = origin.observed();
+    assert_eq!(observed.len(), 2, "a mint and a call, in that order");
+    let call = &observed[1];
+    assert!(
+        call.body.contains("Action=GetCallerIdentity"),
+        "the second request is not the identity call: {}",
+        call.body
+    );
+
+    // On the wire.
+    assert_eq!(
+        call.header("x-amz-security-token"),
+        Some(SESSION_TOKEN),
+        "the session token is not on the request it signs"
+    );
+    // And inside the signature, which is the part the documentation requires and
+    // the part a client that only chains a header onto the request would miss.
+    assert!(
+        authorization_commits_to(call, "x-amz-security-token"),
+        "the session token is sent but not signed: {}",
+        call.header("authorization").unwrap_or("<unsigned>")
+    );
+    // And the generic rule holds for this request too, token included.
+    for header in ["host", "x-amz-date", "x-amz-content-sha256", "x-amz-security-token"] {
+        assert!(
+            call.header(header).is_some() && authorization_commits_to(call, header),
+            "{header} is not both sent and signed"
+        );
+    }
+    // Signed for the service that will read it. A scope naming another service
+    // is a signature that is arithmetically perfect and about the wrong thing,
+    // and it is the one mistake a shared signer makes most easily.
+    let authorization = call.header("authorization").expect("the call is signed");
+    assert!(
+        authorization.contains("/us-east-1/sts/aws4_request"),
+        "the identity call is not signed for the sts service in the client's region: {authorization}"
+    );
+}
+
+/// Neither the long-lived key nor the session's own secret key reaches the wire.
+///
+/// The session's secret access key is *derived into* the signature and the
+/// signer is dropped before the send, exactly as in the long-lived path — so
+/// unlike the token, this value does not have to survive the call and does not.
+#[test]
+fn neither_the_long_lived_nor_the_session_secret_reaches_the_wire() {
+    let origin = origin_for_session(None);
+    let (port, _grants) = session_port(&origin);
+    let client = client_for(&origin);
+    get_caller_identity(&client, &port, CREDENTIAL, at(NOW)).expect("the fixture answers");
+
+    for request in origin.observed() {
+        for secret in [LONG_LIVED_KEY, SESSION_SECRET_KEY] {
+            assert!(
+                !request.request_line.contains(secret),
+                "a secret reached the request line: {}",
+                request.request_line
+            );
+            for (name, value) in &request.headers {
+                assert!(
+                    !value.contains(secret),
+                    "a secret reached the {name} header of {}",
+                    request.request_line
+                );
+            }
+        }
+    }
+}
+
+/// The identity that comes back is the provider's own answer, and the type
+/// carrying it has nowhere to put a credential.
+///
+/// The second half is the property R2.C.3 exists for: `CallerIdentity` has three
+/// string fields and all three are things AWS prints in CloudTrail. A caller
+/// holding one cannot be holding a secret, so there is no check to bypass.
+#[test]
+fn the_identity_that_comes_back_is_the_providers_own_words() {
+    let origin = origin_for_session(None);
+    let (port, _grants) = session_port(&origin);
+    let client = client_for(&origin);
+
+    let identity = get_caller_identity(&client, &port, CREDENTIAL, at(NOW)).expect("the fixture answers");
+    assert_eq!(
+        identity.arn,
+        "arn:aws:sts::123456789012:assumed-role/demo/asv-session",
+        "the ARN is not the one the provider sent"
+    );
+    assert_eq!(identity.user_id, "ARO123EXAMPLE123:asv-session");
+
+    // Printed whole, and it contains neither secret — the same check, and the
+    // reason the struct can derive `Debug` at all.
+    let printed = format!("{identity:?}");
+    for secret in [SESSION_SECRET_KEY, SESSION_TOKEN, LONG_LIVED_KEY] {
+        assert!(!printed.contains(secret), "a credential is in the identity's Debug");
+    }
+}
+
+/// A refusal on the identity call is named, and it is not a missing field.
+///
+/// `GetCallerIdentity` needs no permissions, so this is the shape a
+/// misconfigured or revoked role actually produces, and the operator needs the
+/// code rather than a status.
+#[test]
+fn a_refusal_on_the_identity_call_is_named() {
+    let body = r#"<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <Error><Type>Sender</Type><Code>ExpiredToken</Code>
+  <Message>The security token included in the request is expired</Message></Error>
+</ErrorResponse>"#;
+    let origin = origin_for_session(Some((403, body.to_string())));
+    let (port, _grants) = session_port(&origin);
+    let client = client_for(&origin);
+
+    match get_caller_identity(&client, &port, CREDENTIAL, at(NOW)) {
+        Err(StsClientError::Request(StsError::Provider { code, .. })) => {
+            assert_eq!(code, "ExpiredToken");
+        }
+        other => panic!("a refusal was not named: {other:?}"),
+    }
+}
+
+/// A credential the vault will not lend must not reach the socket for the
+/// session path either.
+///
+/// The `AssumeRole` rows cover this for the mint. It is repeated because the
+/// session path has a second, different borrow — the session's own three values
+/// — and "the first borrow is guarded" is not a statement about the second.
+#[test]
+fn a_credential_the_vault_will_not_lend_never_reaches_the_socket_for_the_session() {
+    let origin = origin_for_session(None);
+    let client = client_for(&origin);
+    let port = AwsSecretPort::new(Arc::new(ClientExchange::new(
+        Arc::new(client_for(&origin)),
+        Arc::new(RefusingPort),
+    )));
+
+    assert!(get_caller_identity(&client, &port, CREDENTIAL, at(NOW)).is_err());
+    assert!(
+        origin.observed().is_empty(),
+        "a request reached the origin with a credential the vault refused"
+    );
+}
+
+/// A second call inside the margin is served from the cache, so the identity
+/// path does not re-mint on every request.
+///
+/// This is the port's cache doing its job one layer up, and it is here because
+/// the session path is where re-minting would actually hurt: the `AssumeRole`
+/// call borrows the long-lived key, and a credential operation that hit AWS twice
+/// per call would borrow it twice.
+#[test]
+fn two_identity_calls_cost_one_mint() {
+    let origin = origin_for_session(None);
+    let (port, _grants) = session_port(&origin);
+    let client = client_for(&origin);
+
+    for _ in 0..3 {
+        get_caller_identity(&client, &port, CREDENTIAL, at(NOW)).expect("the fixture answers");
+    }
+    let observed = origin.observed();
+    assert_eq!(
+        observed.len(),
+        4,
+        "three identity calls must cost one mint and three calls, not three of each"
+    );
 }

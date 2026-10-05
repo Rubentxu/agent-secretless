@@ -21,6 +21,7 @@
 
 pub mod calendar;
 pub mod client;
+pub mod identity;
 pub mod port;
 pub mod sigv4;
 pub mod sts;

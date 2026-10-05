@@ -228,7 +228,7 @@ impl SignerSink {
 /// `extra` is how a caller adds a header that is part of the signature. It is
 /// a parameter rather than a second entry point so that "signed" and "sent"
 /// cannot diverge: there is nowhere to put a header that is only one of them.
-fn signed_headers(
+pub(crate) fn signed_headers(
     host: &str,
     payload_hash: &str,
     amz_date: &str,
@@ -253,7 +253,7 @@ fn signed_headers(
 /// The borrowing is the whole point: the signer sees the same names and values
 /// the transport will put on the wire, so there is no second list to fall out
 /// of step with this one.
-fn sign_with(
+pub(crate) fn sign_with(
     signer: &SigV4Signer,
     headers: &[(String, String)],
     payload: &[u8],
@@ -325,6 +325,12 @@ impl StsClient {
             .eq_ignore_ascii_case(authority)
     }
 
+    /// The operator's configuration, for a caller that signs with a session
+    /// and needs the same region the client was built for.
+    pub(crate) fn config(&self) -> &AwsCredentialConfig {
+        &self.config
+    }
+
     /// The pinned audience, for a receipt.
     pub fn audience(&self) -> &ResolvedAudience {
         &self.audience
@@ -335,7 +341,7 @@ impl StsClient {
     ///
     /// A `Host` carrying the port when the URL does not is a header that
     /// disagrees with the request line, and SigV4 signs what it sends.
-    fn host_header(&self) -> String {
+    pub(crate) fn host_header(&self) -> String {
         match self.audience.port {
             443 => self.audience.authority.to_string(),
             port => format!("{}:{port}", self.audience.authority),
@@ -389,7 +395,7 @@ impl StsClient {
     /// cross-origin policy, the two size bounds and the status-versus-refusal
     /// decision are the properties worth having exactly once, and a second copy
     /// of them is a second place for them to be subtly different.
-    fn send<T>(
+    pub(crate) fn send<T>(
         &self,
         signed: &super::sigv4::SignedRequest,
         headers: &[(String, String)],

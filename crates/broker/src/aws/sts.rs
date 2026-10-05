@@ -463,7 +463,7 @@ fn credential(text: &str, name: &'static str) -> Result<String, StsError> {
 /// error document this reader cannot read properly is a document it should not be
 /// quoting a code from: `AccessDenied` and "Unknown" send an operator to
 /// different places in the same morning.
-fn read_error_response(text: &str) -> Result<Option<(String, String)>, StsError> {
+pub(crate) fn read_error_response(text: &str) -> Result<Option<(String, String)>, StsError> {
     if !text.contains("<Error") {
         return Ok(None);
     }
@@ -503,7 +503,7 @@ fn read_error_response(text: &str) -> Result<Option<(String, String)>, StsError>
 /// proved to be a character boundary. The version this replaced indexed one byte
 /// past the opening tag, which lands inside a two-byte character — how a reader
 /// pointed at a socket panics on something a socket can perfectly well send.
-fn element<'a>(text: &'a str, name: &'a str) -> Result<&'a str, StsError> {
+pub(crate) fn element<'a>(text: &'a str, name: &'a str) -> Result<&'a str, StsError> {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
     let mut occurrences = text.match_indices(&open);
@@ -536,7 +536,7 @@ fn element<'a>(text: &'a str, name: &'a str) -> Result<&'a str, StsError> {
 /// the first place, so its presence is evidence the document is not what it
 /// claims — and a probe that gets a hard refusal learns more about this reader
 /// than a 200 carrying a mangled token ever would.
-fn decode_predefined(raw: &str, name: &'static str) -> Result<String, StsError> {
+pub(crate) fn decode_predefined(raw: &str, name: &'static str) -> Result<String, StsError> {
     if !raw.contains('&') {
         return Ok(raw.to_string());
     }
@@ -594,6 +594,33 @@ fn field_name(name: &str) -> &'static str {
         "Message" => "an error Message",
         _ => "a credential field",
     }
+}
+
+/// Reads one text field, naming a missing one with the name the caller used.
+///
+/// [`element`] reports a missing field through [`field_name`], which knows the
+/// four credential fields and falls back to "a credential field" for anything
+/// else. That fallback is right inside `parse_assume_role` and **wrong** outside
+/// it: a `GetCallerIdentity` document contains no credential at all, so an
+/// operator told a credential field is missing goes looking for one that cannot
+/// be there.
+///
+/// Reusing one reader across operations is the right call, and it is what made
+/// this visible — the first version of the caller-identity reader reported every
+/// missing field as a missing credential and both of its rows caught it. The
+/// caller knows which field it asked for, so this takes the name back rather than
+/// inheriting a stand-in written for a different operation.
+pub(crate) fn text_field(text: &str, name: &'static str) -> Result<String, StsError> {
+    let named = |error: StsError| match error {
+        StsError::Missing(_) => StsError::Missing(name),
+        other => other,
+    };
+    let raw = element(text, name).map_err(named)?;
+    let decoded = decode_predefined(raw, name).map_err(named)?;
+    if decoded.is_empty() {
+        return Err(StsError::Missing(name));
+    }
+    Ok(decoded)
 }
 
 /// RFC 3339, to the second, as AWS writes it: `2015-08-04T06:51:37Z`.
