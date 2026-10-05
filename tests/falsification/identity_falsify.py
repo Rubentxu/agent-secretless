@@ -112,9 +112,12 @@ SOCKET = [
                 "        let _ = session_token;\n        let headers = signed_headers(\n",
             ),
             (
-                "            &[(SESSION_TOKEN_HEADER, std::str::from_utf8(session_token).map_err(\n"
-                "                |_| StsError::IncompleteRequest(\"a session token that is not UTF-8\"),\n"
-                "            )?)],\n",
+                "            &[(\n"
+                "                SESSION_TOKEN_HEADER,\n"
+                "                std::str::from_utf8(session_token).map_err(|_| {\n"
+                "                    StsError::IncompleteRequest(\"a session token that is not UTF-8\")\n"
+                "                })?,\n"
+                "            )],\n",
                 "            &[],\n",
             ),
         ],
@@ -124,9 +127,12 @@ SOCKET = [
                 "        let _ = session_token;\n        let headers = signed_headers(\n",
             ),
             (
-                "            &[(SESSION_TOKEN_HEADER, std::str::from_utf8(session_token).map_err(\n"
-                "                |_| StsError::IncompleteRequest(\"a session token that is not UTF-8\"),\n"
-                "            )?)],\n",
+                "            &[(\n"
+                "                SESSION_TOKEN_HEADER,\n"
+                "                std::str::from_utf8(session_token).map_err(|_| {\n"
+                "                    StsError::IncompleteRequest(\"a session token that is not UTF-8\")\n"
+                "                })?,\n"
+                "            )],\n",
                 "            &[],\n",
             ),
         ],
@@ -150,8 +156,9 @@ SOCKET = [
         # so it never has to be on the wire -- and putting it there is exactly
         # the leak the row exists to catch.
         "put the session's secret key in a request header",
-        "            )?)],\n        );",
-        "            )?), (\"x-amz-debug\", std::str::from_utf8(secret_access_key)\n"
+        "                })?,\n"
+        "            )],\n        );",
+        "                })?, (\"x-amz-debug\", std::str::from_utf8(secret_access_key)\n"
         "                .map_err(|_| StsError::IncompleteRequest(\"a key that is not UTF-8\"))?)],\n"
         "        );",
         "neither_the_long_lived_nor_the_session_secret_reaches_the_wire",
