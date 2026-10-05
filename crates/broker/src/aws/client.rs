@@ -4,10 +4,10 @@
 //!
 //! [`StsClient`] does three things itself and borrows the fourth:
 //!
-//! 1. builds the body — [`AssumeRole::form_body`](super::AssumeRole::form_body);
+//! 1. builds the body — `AssumeRole::form_body`;
 //! 2. signs it with the **long-lived** key, borrowed from a `SecretPort`;
 //! 3. stamps the date — [`amz_date`](super::calendar::amz_date);
-//! 4. reads the answer — [`parse_assume_role`](super::parse_assume_role).
+//! 4. reads the answer — [`parse_assume_role`].
 //!
 //! The transport between 2 and 4 is `asv-connector-http`'s pinned client, and it
 //! needed no work to get here: `PinnedClient::client`, `url` and
@@ -38,7 +38,7 @@
 //!
 //! # One header list, signed and sent
 //!
-//! [`signed_headers`] exists because the two copies of the header list this
+//! `signed_headers` exists because the two copies of the header list this
 //! module used to keep could drift, and a drift there is a signature over
 //! headers the request does not carry. AWS answers that with
 //! `SignatureDoesNotMatch`, which points an operator at their clock. The list is
@@ -101,7 +101,7 @@ pub struct AwsCredentialConfig {
     pub role_session_name: String,
     pub duration_seconds: u32,
     /// Often a shared secret. See the field on
-    /// [`AssumeRole`](super::AssumeRole::external_id).
+    /// `AssumeRole::external_id`.
     pub external_id: Option<String>,
 }
 

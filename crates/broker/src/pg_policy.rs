@@ -10,7 +10,7 @@
 //!
 //! [`classify`] returns [`DbAction`] or a refusal, and there is no third
 //! answer. It never returns "unknown, allow it": a statement this module
-//! cannot place is [`Unclassified::RefuseUnknown`], which denies it. A
+//! cannot place is [`Classified::RefuseUnknown`], which denies it. A
 //! classifier that guessed would be an authorization bypass with a SQL
 //! parser's confidence attached, and `CREATE TABLE` hidden inside a
 //! `WITH ... INSERT` or a `DO` block is exactly the case where guessing is

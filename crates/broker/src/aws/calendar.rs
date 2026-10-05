@@ -11,7 +11,7 @@
 //! from one computed over the right day, and the provider answers
 //! `SignatureDoesNotMatch` with nothing a caller can reconcile against it.
 //!
-//! So the two directions live together, and [`tests`] checks them against an
+//! So the two directions live together, and `tests` checks them against an
 //! oracle *and* against each other. The round trip is not the whole check — a
 //! round trip through one implementation proves only that it agrees with
 //! itself — which is why the boundaries below are absolute values, not

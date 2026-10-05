@@ -1091,7 +1091,7 @@ pub trait UpstreamTransportPolicy: std::fmt::Debug + Send + Sync {
 
 /// Answers `Cleartext` for every destination.
 ///
-/// Exists for the same reason [`NEVER_CANCELLED`] does: a bridge that can only
+/// Exists for the same reason `NEVER_CANCELLED` does: a bridge that can only
 /// be configured one way is a bridge whose tests have to reach for a file format
 /// to vary anything, and the tests here point at loopback origins that speak
 /// plain HTTP by construction.

@@ -45,7 +45,7 @@
 //!
 //! # Why the sink sends
 //!
-//! [`SessionCall`] is an `AwsSecretSink` that performs the entire call inside
+//! `SessionCall` is an `AwsSecretSink` that performs the entire call inside
 //! `accept`, which is not what the name suggests and is deliberate. If `accept`
 //! only signed and returned, something downstream would have to carry the token
 //! — and whatever carries it is a field on a type that outlives the call. Doing

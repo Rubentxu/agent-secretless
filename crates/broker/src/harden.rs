@@ -188,7 +188,7 @@ pub fn broker_install_paths(
 
 /// True when `path` is already covered by a static system hierarchy.
 ///
-/// This is the same predicate [`install_landlock`] uses to drop a
+/// This is the same predicate `install_landlock` uses to drop a
 /// declared path that a system rule already grants, exposed so a caller
 /// — in particular a test — can tell whether a rule it declares is
 /// redundant *before* relying on it.

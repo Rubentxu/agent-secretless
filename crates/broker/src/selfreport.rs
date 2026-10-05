@@ -2,7 +2,7 @@
 //!
 //! # Why this is a record rather than a query
 //!
-//! `harden::install` returns a [`harden::HardenConfig`] describing the
+//! `harden::install` returns a [`crate::harden::HardenConfig`] describing the
 //! protections it actually established. `main` had that value, logged it, and
 //! dropped it — so the answer to "is the running broker undumpable?" existed
 //! for the length of one log line and was gone afterwards. `asv doctor`, on

@@ -1,15 +1,15 @@
 //! M10-runtime — the isolated-worker spawn primitive.
 //!
 //! Turns the prototype's data types ([`WorkerTemplate`],
-//! [`EgressPolicy`], [`SecretInjectionPlan`], [`LandlockProfile`],
-//! [`SeccompProfile`], [`Redactor`]) into a real process: the worker
+//! [`EgressPolicy`], [`SecretInjectionPlan`], [`LandlockProfile`](crate::isolated_exec::LandlockProfile),
+//! [`SeccompProfile`](crate::isolated_exec::SeccompProfile), [`Redactor`](crate::isolated_exec::Redactor)) into a real process: the worker
 //! runs in a fresh user + network namespace, with a per-template
 //! Landlock ruleset and the M7 seccomp deny-list applied in-child
 //! BEFORE exec (a hook failure aborts the child pre-exec — the worker
 //! can never run unprotected), receives its secret through a
 //! child-only env var or a 0600 file removed after the run, is killed
 //! at the caller's timeout, and has its output redacted through the
-//! template's [`Redactor`].
+//! template's [`Redactor`](crate::isolated_exec::Redactor).
 //!
 //! Posture honesty: a template with `EgressPolicy::Allow(_)` is
 //! REFUSED (`SpawnError::EgressAllowUnsupported`) until the M8/M9
@@ -117,7 +117,7 @@ const fn run_outcome_contract_is_exhaustive() -> usize {
 }
 
 /// What the run produced. stdout/stderr have ALREADY passed through
-/// the template's [`Redactor`] — the raw bytes are not reachable
+/// the template's [`Redactor`](crate::isolated_exec::Redactor) — the raw bytes are not reachable
 /// through this type (drop-order guarantees the redacted copies are
 /// all a caller ever sees).
 #[derive(Debug, Clone)]

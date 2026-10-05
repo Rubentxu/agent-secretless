@@ -128,7 +128,7 @@ pub struct WorkerTemplate {
     pub name: String,
     /// Absolute path of the binary.
     pub binary: PathBuf,
-    /// Arguments to pass (excluding argv[0]).
+    /// Arguments to pass (excluding `argv[0]`).
     pub arguments: Vec<String>,
     /// Secret injection plan.
     pub secret_injection: SecretInjectionPlan,

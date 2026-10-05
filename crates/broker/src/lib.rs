@@ -687,7 +687,7 @@ impl ConnectorFactory for LiveConnectorFactory {
     ///
     /// The returned [`PostgresClient`] carries the authority and the pair the
     /// broker authorised. It does not open a socket: the socket is opened in
-    /// [`BrokerState::postgres_connect`], after the session and the pair have
+    /// `BrokerState::postgres_connect`, after the session and the pair have
     /// both been checked, so a refused request never reaches a server.
     fn postgres(
         &self,

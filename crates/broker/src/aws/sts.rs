@@ -56,7 +56,7 @@
 //! window is inside `SecretPort::lend`.** The vault holds one secret: the secret
 //! access key. The access key id is the `AKIA…` identifier AWS itself prints in
 //! CloudTrail, so it travels as ordinary config, as do the role ARN, the region
-//! and the session name. The key is borrowed, the [`SigV4Signer`] is built
+//! and the session name. The key is borrowed, the [`SigV4Signer`](super::sigv4::SigV4Signer) is built
 //! **inside the sink**, the request is signed, and the signer is dropped — which
 //! zeroizes the key — *before a byte goes on the socket*. The tempting
 //! alternative, building the signer from a `&str` a caller already holds, is
@@ -67,8 +67,8 @@
 //!
 //! **A forward timestamp does not exist in this tree yet, and it is a new
 //! primitive, not a detail.** Signing needs an `X-Amz-Date` of the shape
-//! `20150830T123600Z`; [`parse_rfc3339`] reads the *other* direction, and the
-//! civil-date arithmetic underneath it ([`days_from_civil`]) has an inverse that
+//! `20150830T123600Z`; `parse_rfc3339` reads the *other* direction, and the
+//! civil-date arithmetic underneath it ([`days_from_civil`](super::calendar::days_from_civil)) has an inverse that
 //! is not written anywhere in the repository. An off-by-one in that inverse is
 //! invisible locally and fatal at the provider: the signature is computed
 //! perfectly over the wrong day, and the answer is `SignatureDoesNotMatch` with
