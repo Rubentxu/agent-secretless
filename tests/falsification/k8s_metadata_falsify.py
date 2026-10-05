@@ -137,10 +137,11 @@ MUTATIONS = [
         # name the moment the kind check is relaxed. A parse failure is a fact
         # about the origin and is worth keeping as one.
         "treat an unreadable body as an empty document",
-        "        serde_json::from_slice(&reply.body).map_err(|error| MetadataError::Unreadable(error.to_string()))?;",
-        "        serde_json::from_slice(&reply.body).unwrap_or_else(|_| {\n"
-        "            serde_json::from_str(r#\"{\"kind\":\"Secret\"}\"#).expect(\"a literal parses\")\n"
-        "        });",
+        "    let view: SecretView = serde_json::from_slice(&reply.body)\n"
+        "        .map_err(|error| MetadataError::Unreadable(error.to_string()))?;",
+        "    let view: SecretView = serde_json::from_slice(&reply.body).unwrap_or_else(|_| {\n"
+        "        serde_json::from_str(r#\"{\"kind\":\"Secret\"}\"#).expect(\"a literal parses\")\n"
+        "    });",
         "a_body_that_is_not_json_is_refused_rather_than_half_read",
     ),
     (
@@ -153,8 +154,8 @@ MUTATIONS = [
         # removes the `default` instead, which is the only edit that touches
         # the path that row exercises.
         "refuse a Secret whose data member is absent",
-        '    #[serde(\n        rename = "data",\n        default,\n        deserialize_with = "count_entries"\n    )]',
-        '    #[serde(\n        rename = "data",\n        deserialize_with = "count_entries"\n    )]',
+        '    #[serde(rename = "data", default, deserialize_with = "count_entries")]',
+        '    #[serde(rename = "data", deserialize_with = "count_entries")]',
         "a_secret_with_no_data_member_at_all_answers_with_a_zero_count",
     ),
     # ---- the two the type refuses -----------------------------------------

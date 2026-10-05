@@ -136,10 +136,14 @@ PARSE = [
         # still borrows, and does not run.
         "follow an include directive",
         '''        if key == "include" || key.starts_with("include:") {
-            return Err(ParseError::IncludeRefused { at_line: line_number });
+            return Err(ParseError::IncludeRefused {
+                at_line: line_number,
+            });
         }''',
         '''        if false {
-            return Err(ParseError::IncludeRefused { at_line: line_number });
+            return Err(ParseError::IncludeRefused {
+                at_line: line_number,
+            });
         }''',
         "an_include_directive_refuses_the_whole_file",
     ),
@@ -166,7 +170,9 @@ PARSE = [
         # complete.
         "skip a line that is not a key=value pair",
         '''        let Some((key, value)) = trimmed.split_once('=') else {
-            return Err(ParseError::NotAKeyValue { at_line: line_number });
+            return Err(ParseError::NotAKeyValue {
+                at_line: line_number,
+            });
         };''',
         '''        let Some((key, value)) = trimmed.split_once('=') else {
             continue;
@@ -212,10 +218,14 @@ PARSE = [
                 .strip_prefix('[')
                 .and_then(|rest| rest.strip_suffix(']'))
             else {
-                return Err(ParseError::NotAKeyValue { at_line: line_number });
+                return Err(ParseError::NotAKeyValue {
+                    at_line: line_number,
+                });
             };''',
         '''            let Some(inner) = trimmed.strip_suffix(']') else {
-                return Err(ParseError::NotAKeyValue { at_line: line_number });
+                return Err(ParseError::NotAKeyValue {
+                    at_line: line_number,
+                });
             };''',
         "comments_blank_lines_and_sections_are_handled",
     ),

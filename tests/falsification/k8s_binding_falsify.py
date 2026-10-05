@@ -69,7 +69,7 @@ MUTATIONS = [
         # service on the same private network and reasons that the declaration
         # already said "private is fine".
         "let any declared private audience through",
-        "            Some(_) if !InCluster::matches(&self.audience) => Err(DeploymentError::NotAClusterName {\n                audience: self.audience.clone(),\n            }),\n",
+        "            Some(_) if !InCluster::matches(&self.audience) => {\n                Err(DeploymentError::NotAClusterName {\n                    audience: self.audience.clone(),\n                })\n            }\n",
         "",
         "an_ip_literal_may_not_declare_itself_in_cluster",
     ),

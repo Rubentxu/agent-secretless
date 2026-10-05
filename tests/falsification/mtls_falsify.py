@@ -272,15 +272,15 @@ MUTATIONS = [
         # which is exactly why the row pins the variant rather than the
         # outcome.
         "report every request failure as unreadable",
-        "            if matches!(e, rcgen::Error::RingUnspecified) {",
-        "            if false {",
+        "        if matches!(e, rcgen::Error::RingUnspecified) {",
+        "        if false {",
         "una_peticion_con_la_firma_rota_se_rechaza",
     ),
     (
         # And the inverse, which is what keeps the row above honest.
         "report every request failure as a broken signature",
-        "            if matches!(e, rcgen::Error::RingUnspecified) {",
-        "            if true {",
+        "        if matches!(e, rcgen::Error::RingUnspecified) {",
+        "        if true {",
         "basura_no_se_confunde_con_una_firma_rota",
     ),
     # ---- the PEM path ------------------------------------------------------
@@ -298,8 +298,8 @@ MUTATIONS = [
         # failure now surfaces much later as a parse error about bytes that
         # were never a request.
         "never fail to read a PEM",
-        "            CertificateSigningRequestDer::from_pem_slice(pem.as_bytes()).map_err(|e| {",
-        "            Ok(CertificateSigningRequestDer::from(Vec::new())).map_err(|e: std::convert::Infallible| {",
+        "        let der = CertificateSigningRequestDer::from_pem_slice(pem.as_bytes()).map_err(|e| {",
+        "        let der = Ok(CertificateSigningRequestDer::from(Vec::new())).map_err(|e: std::convert::Infallible| {",
         "un_pem_sin_peticion_se_rechaza_al_leerlo",
     ),
     # ---- the answer's shape -----------------------------------------------

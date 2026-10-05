@@ -200,10 +200,12 @@ IDENTITY = [
         # the worst of the three outcomes: the plan survives the configuration
         # disappearing.
         "skip the files that cannot be read",
-        """            let now = policy.fingerprint(&entry.file).map_err(|source| PlanError::Unreadable {
-                path: entry.file.clone(),
-                message: source.to_string(),
-            })?;""",
+        """            let now = policy
+                .fingerprint(&entry.file)
+                .map_err(|source| PlanError::Unreadable {
+                    path: entry.file.clone(),
+                    message: source.to_string(),
+                })?;""",
         """            let Ok(now) = policy.fingerprint(&entry.file) else { continue };""",
         "an_unreadable_file_refuses_the_plan",
     ),

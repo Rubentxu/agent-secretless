@@ -49,6 +49,7 @@ BROKER = [
         "            Resource::OAuth2Client {\n"
         '                credential: credential.to_wire(),\n'
         "                audience: binding.deployment.audience.clone(),\n"
+        "                scope: binding.deployment.registered_scope.clone(),\n"
         "            },\n"
         "        )?;",
         "        let _ = (session, peer, &binding.deployment.audience);",
@@ -176,9 +177,11 @@ BINDING_MUTATIONS = [
         # describing the authority in play, and nothing downstream would notice
         # because the answer would look exactly like a correct one.
         "relay the granted scope instead of comparing it",
-        "        if reported.scope != self.deployment.expected_scope {\n"
+        "        if asv_domain::scope_set(&reported.scope)\n"
+        "            != asv_domain::scope_set(&self.deployment.registered_scope)\n"
+        "        {\n"
         "            return Err(IdentityError::ScopeWider {\n"
-        "                expected: self.deployment.expected_scope.clone(),\n"
+        "                expected: self.deployment.registered_scope.clone(),\n"
         "                granted: reported.scope,\n"
         "            });\n"
         "        }",
@@ -210,9 +213,11 @@ BINDING_MUTATIONS = [
         # is the one taken.
         "present a token that is not valid utf-8",
         "        let token = std::str::from_utf8(token.expose())\n"
-        "            .map_err(|_| IdentityError::Port(\n"
-        '                "the OAuth2 port returned a token that is not valid UTF-8".into(),\n'
-        "            ))?\n"
+        "            .map_err(|_| {\n"
+        "                IdentityError::Port(\n"
+        '                    "the OAuth2 port returned a token that is not valid UTF-8".into(),\n'
+        "                )\n"
+        "            })?\n"
         "            .to_string();",
         "        let token = String::from_utf8_lossy(token.expose()).to_string();",
         "a_token_that_is_not_a_bearer_token_is_refused_rather_than_substituted",
@@ -303,7 +308,7 @@ INDEPENDENCE_MUTATIONS = [
 SELFREPORT_MUTATIONS = [
     (
         "build the operation and never announce it",
-        '        "oauth2.identity".to_string(),\n',
+        '    ("oauth2_identity", Some("oauth2.identity")),\n',
         "",
         "the_advertised_capability_is_the_one_this_file_calls",
     ),
@@ -314,8 +319,8 @@ SELFREPORT_MUTATIONS = [
         # surface, and it is here so the substring check is not the only thing
         # standing between the two.
         "announce it under a name that reads like a retrieval",
-        '        "oauth2.identity".to_string(),\n',
-        '        "oauth2.get_identity".to_string(),\n',
+        '    ("oauth2_identity", Some("oauth2.identity")),\n',
+        '    ("oauth2_identity", Some("oauth2.get_identity")),\n',
         "the_advertised_capability_is_the_one_this_file_calls",
     ),
 ]

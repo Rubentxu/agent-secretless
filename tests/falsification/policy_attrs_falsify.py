@@ -42,11 +42,20 @@ ATTRIBUTES = [
         # it is invisible without this row because the decision is still a
         # denial -- a quiet one.
         "parse the attribute value as a cedar expression",
-        "            resource_attrs.insert(name.to_string(), RestrictedExpression::new_string(value));",
-        "            resource_attrs.insert(\n"
-        "                name.to_string(),\n"
-        "                RestrictedExpression::from_str(&value).expect(\"a literal\"),\n"
-        "            );",
+        "            let value = match value {\n"
+        "                ResourceAttribute::Text(text) => RestrictedExpression::new_string(text),\n"
+        "                ResourceAttribute::Set(members) => RestrictedExpression::new_set(\n"
+        "                    members.into_iter().map(RestrictedExpression::new_string),\n"
+        "                ),\n"
+        "            };\n"
+        "            resource_attrs.insert(name.to_string(), value);",
+        "            let value = match value {\n"
+        "                ResourceAttribute::Text(text) => RestrictedExpression::from_str(&text).expect(\"a literal\"),\n"
+        "                ResourceAttribute::Set(members) => RestrictedExpression::new_set(\n"
+        "                    members.into_iter().map(RestrictedExpression::new_string),\n"
+        "                ),\n"
+        "            };\n"
+        "            resource_attrs.insert(name.to_string(), value);",
         "the_documented_audience_rule_now_matches_and_only_its_own_audience",
     ),
     (
@@ -65,14 +74,20 @@ ATTRIBUTES = [
         # from the policy's point of view, and it is the mutation that looks
         # most like a working fix.
         "supply the audience but blank it",
-        '        Resource::Api { audience } => vec![("audience", audience.to_string())],',
-        '        Resource::Api { .. } => vec![("audience", String::new())],',
+        '        Resource::Api { audience } => {\n'
+        '            vec![("audience", ResourceAttribute::Text(audience.to_string()))]\n'
+        '        }',
+        '        Resource::Api { .. } => {\n'
+        '            vec![("audience", ResourceAttribute::Text(String::new()))]\n'
+        '        }',
         "the_documented_audience_rule_now_matches_and_only_its_own_audience",
     ),
     (
         # Supplying nothing, i.e. reverting to the declared-but-absent field.
         "supply no attribute at all",
-        '        Resource::Api { audience } => vec![("audience", audience.to_string())],',
+        '        Resource::Api { audience } => {\n'
+        '            vec![("audience", ResourceAttribute::Text(audience.to_string()))]\n'
+        '        }',
         "        Resource::Api { .. } => Vec::new(),",
         "a_resource_entity_carries_exactly_what_its_schema_declares",
     ),

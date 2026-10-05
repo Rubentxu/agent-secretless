@@ -49,10 +49,12 @@ BROKER = [
         # not a convenience -- it is a grant nobody made.
         "use the first configured deployment when the request names none",
         "            None => {\n"
-        '                let configured: Vec<String> = self',
+        '                let configured: Vec<String> = self\n'
+        "                    .aws",
         "            None if !self.aws.is_empty() => Ok(&self.aws[0]),\n"
         "            None => {\n"
-        '                let configured: Vec<String> = self',
+        '                let configured: Vec<String> = self\n'
+        "                    .aws",
         "a_credential_no_deployment_names_is_refused_before_any_socket",
     ),
     (
@@ -172,7 +174,7 @@ BINDINGS = [
 SELFREPORT = [
     (
         "build the operation and never announce it",
-        '        "aws.sts.caller_identity".to_string(),\n',
+        '    ("aws_caller_identity", Some("aws.sts.caller_identity")),\n',
         "",
         "an_agent_asking_what_the_broker_can_do_is_told_about_aws",
     ),
@@ -183,8 +185,8 @@ SELFREPORT = [
         # surface, and it is here so the substring check is not the only thing
         # standing between the two.
         "announce it under a name that reads like a retrieval",
-        '        "aws.sts.caller_identity".to_string(),\n',
-        '        "aws.sts.get_caller_identity".to_string(),\n',
+        '    ("aws_caller_identity", Some("aws.sts.caller_identity")),\n',
+        '    ("aws_caller_identity", Some("aws.sts.get_caller_identity")),\n',
         "the_advertised_aws_capability_does_not_name_a_retrieval",
     ),
 ]

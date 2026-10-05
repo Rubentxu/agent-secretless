@@ -149,7 +149,7 @@ MUTATIONS = [
     ),
     (
         "accept a bucket name that starts or ends with a separator",
-        "    if bucket.starts_with('.') || bucket.ends_with('.') || bucket.starts_with('-') || bucket.ends_with('-')\n    {",
+        "    if bucket.starts_with('.')\n        || bucket.ends_with('.')\n        || bucket.starts_with('-')\n        || bucket.ends_with('-')\n    {",
         "    if false {",
         "a_bucket_name_that_starts_or_ends_with_a_separator_is_refused",
     ),
@@ -158,7 +158,7 @@ MUTATIONS = [
         # one message and the operator has to bisect a 63-character name by
         # hand, which is the outcome the error is a struct to avoid.
         "say nothing about which rule was broken",
-        '        return Err(invalid("a bucket name is lowercase letters, digits, dots and hyphens"));',
+        '        return Err(invalid(\n            "a bucket name is lowercase letters, digits, dots and hyphens",\n        ));',
         '        return Err(invalid("invalid"));',
         "the_refusal_names_the_rule_that_was_broken",
     ),
@@ -181,7 +181,7 @@ MUTATIONS = [
         # computed over the resolved path while the operator's key is what the
         # request claims to name.
         "normalise a traversing key instead of refusing it",
-        "    if key.split('/').any(|segment| segment == \"..\" || segment == \".\") {",
+        "    if key\n        .split('/')\n        .any(|segment| segment == \"..\" || segment == \".\")\n    {",
         "    if false {",
         "a_key_containing_a_dot_dot_segment_is_refused_rather_than_rewritten",
     ),
@@ -191,7 +191,7 @@ MUTATIONS = [
         # campaign and breaks a legitimate key — and a check that is wrong
         # often enough gets disabled by whoever hits it first.
         "refuse any key with two dots in a row",
-        "    if key.split('/').any(|segment| segment == \"..\" || segment == \".\") {",
+        "    if key\n        .split('/')\n        .any(|segment| segment == \"..\" || segment == \".\")\n    {",
         "    if key.contains(\"..\") || key.contains(\"./\") {",
         "a_key_containing_dots_that_are_not_a_segment_is_fine",
     ),

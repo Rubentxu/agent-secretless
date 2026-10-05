@@ -119,7 +119,7 @@ MUTATIONS = [
     ),
     (
         "default a content-length that is not a number to zero",
-        "    let content_length: u64 = length\n        .parse()\n        .map_err(|_| ObjectError::NotANumber {\n            header: \"content-length\",\n            value: length.to_string(),\n        })?;",
+        "    let content_length: u64 = length.parse().map_err(|_| ObjectError::NotANumber {\n        header: \"content-length\",\n        value: length.to_string(),\n    })?;",
         "    let content_length: u64 = length.parse().unwrap_or(0);",
         "a_content_length_that_is_not_a_number_is_refused_rather_than_defaulted",
     ),
