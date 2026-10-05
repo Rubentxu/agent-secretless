@@ -241,6 +241,57 @@ enum IntegrationsCommand {
         #[arg(long, value_name = "DIR")]
         allow_symlink_root: Option<String>,
     },
+
+    /// Say what could be done about each credential the tool is configured to
+    /// use — R3's second stage.
+    ///
+    /// Reads the same configuration `discover` reads, asks the broker what
+    /// credentials exist, and for every auth selector it found reports the
+    /// strategies available for it **strongest posture first**. A posture ASV
+    /// cannot deliver is not offered: a non-exportable credential is never
+    /// offered `raw_process_exposure`, because there is no way to write its
+    /// value into a file for the tool.
+    ///
+    /// The report names credential, audience and operations together, because a
+    /// binding recorded as `npm-token` is the thing this step exists to stop.
+    ///
+    /// **This reads the broker's credential *inventory* — labels, kinds and
+    /// exportability — and nothing else.** It never receives a secret, and the
+    /// plan's types have nowhere to put one.
+    Plan {
+        /// The tool family to plan for.
+        ///
+        /// **Positional and required, unlike `discover`'s `--family`.**
+        /// `discover` describes whatever is on disk, so defaulting it to `npm`
+        /// is a harmless convenience. `plan` computes bindings for one family,
+        /// and defaulting it would be a silent choice of *whose* credentials
+        /// this invocation is about — which is exactly the decision §7 says must
+        /// be named rather than inferred.
+        #[arg(value_name = "FAMILY")]
+        family: String,
+        /// Emit the `asv.integrations.plan/v1` envelope instead of prose.
+        #[arg(long)]
+        json: bool,
+        /// Directory holding the project-level configuration.
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        cwd: String,
+        /// Home directory holding the user- and global-level configuration.
+        #[arg(long, value_name = "DIR")]
+        home: Option<String>,
+        /// Follow a configuration symlink whose target resolves inside this
+        /// directory. Refused by default, for the reason `discover` refuses it.
+        #[arg(long, value_name = "DIR")]
+        allow_symlink_root: Option<String>,
+        /// Plan against an empty inventory instead of asking the broker.
+        ///
+        /// The answer it produces is the first-run answer — *these are the
+        /// credentials you would need to adopt* — and it is a real plan rather
+        /// than a degraded one. It also makes this command runnable with no
+        /// broker up, which is how an operator finds out what to adopt before
+        /// deciding to adopt anything.
+        #[arg(long)]
+        no_vault: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -450,7 +501,11 @@ async fn main() -> std::io::Result<()> {
         Command::Github { command } => return run_github(&socket, command),
         Command::Aws { command } => return run_aws(&socket, command),
         Command::Oauth2 { command } => return run_oauth2(&socket, command),
-        Command::Integrations { command } => return run_integrations(command),
+        // `plan` opens a session and `discover` does not, so the whole
+        // subcommand tree is dispatched here rather than in the single-request
+        // path below: the two halves differ in whether they have a reason to
+        // reach the broker, and that difference belongs in one visible place.
+        Command::Integrations { command } => return run_integrations(&socket, command),
         Command::Setup { json } => return run_setup(*json),
         Command::Doctor { json } => return run_doctor(&socket, *json),
         Command::Agent {
@@ -1327,25 +1382,69 @@ fn run_aws(socket: &std::path::Path, command: &AwsCommand) -> std::io::Result<()
 /// expires on the *provider's* clock. So there is nothing to mint, nothing to
 /// redeem, and nothing to revoke on the way out — the broker borrows, asks, and
 /// answers with what the resource reported.
-/// R3's `discover`: describe a tool's configuration without its secrets.
+/// R3's `discover` and `plan`.
 ///
-/// No session, no socket, no broker. That is not a shortcut — `discover` reads
-/// files the caller can already read, so a broker round trip would authorise
-/// nothing and would create a dependency from the reporting surface to the
-/// credential plane for no gain. `plan` and `adopt` do need the broker, and they
-/// are the stages where a secret is actually moved.
-fn run_integrations(command: &IntegrationsCommand) -> std::io::Result<()> {
-    // The trait, for `Npm::discover`.
-    use asv_integrations::Adapter as _;
+/// `discover` takes no socket and that is not a shortcut — it reads files the
+/// caller can already read, so a broker round trip would authorise nothing and
+/// would create a dependency from the reporting surface to the credential plane
+/// for no gain. `plan` does open one, because it cannot answer "what could be
+/// done here" without knowing what credentials exist, and only the broker knows
+/// that. What it asks for is the credential *inventory* — label, kind,
+/// exportability — and never a value.
+///
+/// The split is the reason this function takes the socket and `discover` does
+/// not use it: `plan` is the first stage where a credential is *named*, and
+/// naming one is what makes the broker relevant.
+fn run_integrations(
+    socket: &std::path::Path,
+    command: &IntegrationsCommand,
+) -> std::io::Result<()> {
+    match command {
+        IntegrationsCommand::Discover {
+            family,
+            json,
+            cwd,
+            home,
+            allow_symlink_root,
+        } => run_integrations_discover(
+            family,
+            *json,
+            cwd,
+            home.as_deref(),
+            allow_symlink_root.as_deref(),
+        ),
+        IntegrationsCommand::Plan {
+            family,
+            json,
+            cwd,
+            home,
+            allow_symlink_root,
+            no_vault,
+        } => run_integrations_plan(
+            socket,
+            family,
+            *json,
+            cwd,
+            home.as_deref(),
+            allow_symlink_root.as_deref(),
+            *no_vault,
+        ),
+    }
+}
 
-    let IntegrationsCommand::Discover {
-        family,
-        json,
-        cwd,
-        home,
-        allow_symlink_root,
-    } = command;
-
+/// The shared half of both stages: locate the caller's configuration and read
+/// it. One implementation rather than two, because the two commands must agree
+/// about which files they are talking about — a `plan` built from a different
+/// set of files than the `discover` it follows would be a plan about something
+/// the operator was never shown.
+fn integrations_home_and_policy(
+    home: Option<&str>,
+    allow_symlink_root: Option<&str>,
+) -> std::io::Result<(
+    std::path::PathBuf,
+    std::path::PathBuf,
+    asv_integrations::FingerprintPolicy,
+)> {
     let home = match home {
         Some(home) => std::path::PathBuf::from(home),
         // `HOME` rather than a passwd lookup: this is the *caller's* home, and
@@ -1363,14 +1462,26 @@ fn run_integrations(command: &IntegrationsCommand) -> std::io::Result<()> {
             }
         },
     };
-    let cwd = std::path::PathBuf::from(cwd);
-
     let mut policy = asv_integrations::FingerprintPolicy::strict();
     if let Some(root) = allow_symlink_root {
         policy = policy.allowing_symlink_root(root);
     }
+    Ok((home, std::path::PathBuf::from("."), policy))
+}
 
-    let discovery = match family.as_str() {
+fn run_integrations_discover(
+    family: &str,
+    json: bool,
+    cwd: &str,
+    home: Option<&str>,
+    allow_symlink_root: Option<&str>,
+) -> std::io::Result<()> {
+    use asv_integrations::Adapter as _;
+
+    let (home, _, policy) = integrations_home_and_policy(home, allow_symlink_root)?;
+    let cwd = std::path::PathBuf::from(cwd);
+
+    let discovery = match family {
         "npm" => asv_integrations::Npm
             .discover(&policy, &home, &cwd)
             .map(asv_integrations::NpmDiscovery::into_discovery)
@@ -1384,7 +1495,7 @@ fn run_integrations(command: &IntegrationsCommand) -> std::io::Result<()> {
     let discovery = match discovery {
         Ok(discovery) => discovery,
         Err(message) => {
-            if *json {
+            if json {
                 // A failure in the `asv.discovery/v1` shape, so a consumer
                 // parsing this command's output has one shape to handle rather
                 // than two: prose on the happy path, JSON on the sad one, is a
@@ -1405,7 +1516,7 @@ fn run_integrations(command: &IntegrationsCommand) -> std::io::Result<()> {
         }
     };
 
-    if *json {
+    if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&discovery).expect("the report serialises")
@@ -1414,6 +1525,195 @@ fn run_integrations(command: &IntegrationsCommand) -> std::io::Result<()> {
     }
     print_discovery_prose(&discovery);
     Ok(())
+}
+
+/// R3's `plan`: the strategies available for each credential the tool is
+/// configured to use.
+///
+/// The broker is asked **one** question, and it is the metadata question:
+/// `ListCredentialMetadata`. The answer is a list of labels, kinds and
+/// exportabilities — no audience, no scope, and by construction no value — and
+/// that is enough to decide a posture, because a posture is a function of what
+/// kind of credential it is and whether it may leave the vault at all.
+///
+/// It is *not* enough to say which credential serves which registry, which is
+/// why two usable credentials come back `ambiguous` rather than resolved. That
+/// is a real gap in the input, reported rather than papered over.
+fn run_integrations_plan(
+    socket: &std::path::Path,
+    family: &str,
+    json: bool,
+    cwd: &str,
+    home: Option<&str>,
+    allow_symlink_root: Option<&str>,
+    no_vault: bool,
+) -> std::io::Result<()> {
+    use asv_integrations::Adapter as _;
+
+    let (home, _, policy) = integrations_home_and_policy(home, allow_symlink_root)?;
+    let cwd = std::path::PathBuf::from(cwd);
+
+    let inventory = if no_vault {
+        Vec::new()
+    } else {
+        match call(socket, &Request::ListCredentialMetadata)? {
+            Response::CredentialMetadata { entries } => entries
+                .into_iter()
+                .map(|entry| asv_domain::CredentialMetadata {
+                    id: asv_domain::CredentialId::from_uuid(entry.id),
+                    label: entry.label,
+                    kind: entry.kind,
+                    exportability: entry.exportability,
+                })
+                .collect(),
+            other => {
+                // A protocol that answered something else has not told us what
+                // credentials exist, and a plan built on "we did not ask" would
+                // be a plan about an invented inventory.
+                eprintln!(
+                    "asv: the broker answered {} to a credential-inventory request; \
+                     this command cannot plan against that",
+                    response_kind(&other)
+                );
+                std::process::exit(1);
+            }
+        }
+    };
+
+    let plan = match family {
+        "npm" => {
+            let discovery = match asv_integrations::Npm.discover(&policy, &home, &cwd) {
+                Ok(discovery) => discovery,
+                Err(error) => {
+                    if json {
+                        let failure = serde_json::json!({
+                            "schema": asv_integrations::PLAN_SCHEMA,
+                            "family": family,
+                            "error": error.to_string(),
+                        });
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&failure).unwrap_or_default()
+                        );
+                    } else {
+                        eprintln!("asv: {error}");
+                    }
+                    std::process::exit(1);
+                }
+            };
+            asv_integrations::plan_npm(&discovery, &inventory)
+        }
+        other => {
+            eprintln!(
+                "asv: no adapter for {other:?}; this build knows `npm`. Adding one is a module in \
+                 asv-integrations and one match arm here."
+            );
+            std::process::exit(1);
+        }
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&plan).expect("the plan serialises")
+        );
+        return Ok(());
+    }
+    print_plan_prose(&plan);
+    Ok(())
+}
+
+/// The human form of a plan.
+fn print_plan_prose(plan: &asv_integrations::IntegrationPlan) {
+    if plan.entries.is_empty() {
+        println!(
+            "npm: no auth selectors found in any configuration file, so there is nothing to plan."
+        );
+        return;
+    }
+    println!(
+        "npm plan — {} selector(s), against {} stored credential(s)",
+        plan.entries.len(),
+        plan.inventory_size
+    );
+    for entry in &plan.entries {
+        println!();
+        println!(
+            "{} ({:?}) -> {}",
+            entry.file.display(),
+            entry.origin,
+            entry.audience
+        );
+        println!("  field: {}", entry.field);
+        match &entry.binding {
+            asv_integrations::Binding::Bound {
+                credential,
+                label,
+                kind,
+                ..
+            } => println!("  would bind: {label} ({credential}, {kind:?})"),
+            asv_integrations::Binding::Ambiguous { candidates } => {
+                println!(
+                    "  would bind: {} candidates, and this build cannot tell them apart:",
+                    candidates.len()
+                );
+                for candidate in candidates {
+                    println!(
+                        "    - {} ({}, {:?})",
+                        candidate.label, candidate.credential, candidate.kind
+                    );
+                }
+                println!("    name one with `asv integrations adopt` to disambiguate.");
+            }
+            asv_integrations::Binding::NotACredential { field } => {
+                println!("  not a credential npm will authenticate with: {field}");
+            }
+            asv_integrations::Binding::Unbound { reason } => match reason {
+                asv_integrations::UnboundReason::NoUsableCredential { inventory_size } => println!(
+                    "  no credential to bind: the vault holds {inventory_size}, and none is a \
+                     shape that could serve a registry"
+                ),
+                asv_integrations::UnboundReason::EveryCandidateExcluded { excluded } => {
+                    println!("  no credential to bind; every candidate was excluded:");
+                    for exclusion in excluded {
+                        match exclusion {
+                            asv_integrations::Exclusion::DatabaseShaped { kind } => println!(
+                                "    - {kind:?} is database-shaped and can only ever authenticate \
+                                 against a database"
+                            ),
+                        }
+                    }
+                }
+            },
+        }
+        if entry.strategies.is_empty() {
+            println!("  strategies: none — nothing is bound, so nothing is on offer.");
+            continue;
+        }
+        println!("  strategies, strongest first:");
+        for strategy in &entry.strategies {
+            println!(
+                "    {}  ({})",
+                strategy.posture.wire_name(),
+                describe(strategy)
+            );
+        }
+    }
+}
+
+fn describe(strategy: &asv_integrations::Strategy) -> String {
+    use asv_integrations::Why as W;
+    match &strategy.why {
+        W::Brokered { kind } => {
+            format!("the broker substitutes a {kind:?}, so the tool never holds the value")
+        }
+        W::Minted { kind } => {
+            format!("a {kind:?} is minted per use, so what lands on disk expires")
+        }
+        W::Exported { exportability } => {
+            format!("the value is written out for the tool, permitted by {exportability:?}")
+        }
+    }
 }
 
 /// The human form of a discovery report.

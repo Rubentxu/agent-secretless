@@ -2257,6 +2257,107 @@ rule is untouched — but the distinction is worth writing down rather than
 discovering later. And `discover` reaches no broker, which is correct for this
 step and will have to change at `plan`.
 
+### R3.A.2 — the strategies available, and the one that says nothing can be done
+
+`asv integrations plan npm --json`. The design doc
+(`docs/asv-agent-first-security-evolution-v2-2026-10-02/04-CREDENTIAL-WORKFLOW-ADAPTERS.md`
+§2) defines this step as *"produce estrategias disponibles ordenadas por
+postura"*, so a plan is **advice**, and advice has a failure mode code does not:
+it can be *confidently wrong*.
+
+Measured: **20 rows** in `asv-integrations` (60 in the crate), **7 rows** in the
+product vertical `crates/broker/tests/r3a2_npm_plan.rs` — a real `VaultStore`, a
+real `asv-brokerd`, a real socket, a real `asv` client and a real `.npmrc`
+holding a real token — and **18 mutations across four passes**: 18 red, 0
+survivors, 0 compiler-refused, 0 unmeasured.
+
+**The dependency is inverted, and that is the whole design.** `plan` cannot
+answer without knowing what credentials exist, and only the broker knows that,
+so the naive shape is for the crate to ask — which would put the credential
+plane one dependency away from the crate whose entire justification is holding
+none. So `plan_npm(&NpmDiscovery, &[CredentialMetadata]) -> IntegrationPlan` is
+a **pure function**, and the CLI supplies the inventory. The day the broker
+reports a credential's audience and scope, the CLI's index changes and *this
+file does not* — which is R3's exit criterion demonstrated rather than asserted.
+
+**The three postures have independent preconditions, and each refusal is a
+control rather than a gap.**
+
+- `STRONG_SECRETLESS` — the broker substitutes the value, so the tool never
+  holds it. Available for anything not database-shaped.
+- `SHORT_LIVED_EXPOSURE` — only for `OAuth2`, because only OAuth2 has something
+  to *mint*. A static bearer token written to a file and deleted afterwards is
+  not a short-lived credential; it is a static credential that briefly existed,
+  and offering the posture **renames the risk instead of reducing it**.
+- `RAW_PROCESS_EXPOSURE` — refused when `Exportability::NonExportable`, which is
+  the **default**, so this is the common path. The value cannot leave the vault,
+  so writing it out is not something ASV can do, and offering it would send an
+  operator to `adopt` for a step that fails.
+
+**Two credentials come back `ambiguous`, and that is the interesting result.**
+The broker reports a credential's `kind` and **not** the audience it is
+registered for — `Request::ListCredentialMetadata` returns `{id, label, kind,
+exportability}` and no wire surface reports more — so when a vault holds two
+bearer tokens, nothing in `plan`'s inputs distinguishes the registry one from
+the CI one. Choosing the first would be a coin flip presented as a decision, so
+`plan` names both and `adopt` disambiguates. **This is a real gap in the input,
+reported rather than papered over**, and closing it means a protocol change that
+R2.F.3 owns, not a planner that guesses.
+
+**§7 is honoured structurally.** `PlanEntry` names credential, audience and
+operations together, because a binding recorded as `npm-token` is the thing the
+step exists to stop, and §8's posture order *is* the declaration order of
+`Posture` — one ranking, written once, so the order in the JSON cannot drift
+from the order the code produces.
+
+**§6 is a promise about bytes, and `revalidate` is what keeps it.** A plan that
+survived a changed file is worse than no plan, because it looks like an answer.
+Drift is refused as `CONFIG_CHANGED`; a comparison by digest alone would let a
+file swapped for an *identical* copy pass, so the inode is compared too; and a
+vanished file is `Unreadable`, not `Ok`.
+
+**Two defects found, one of them in the verification itself.**
+
+- The design doc that defines `CredentialBinding` **was cited earlier in this
+  file as non-existent**. It exists, committed in `0ea4881`, and R3.A.1's
+  `RegistryAudience` argument would have read differently against it. The error
+  was a working note, never a committed claim; recorded because the same
+  "I could not find it" reasoning is how a referenced authority gets invented
+  around.
+- **An orphaned module compiles and passes.** R3.A.2's first run reported
+  **40 tests green** while `plan.rs` and `plan/tests.rs` were compiled by
+  nobody: the other session's release work restored the *tracked* `lib.rs` to
+  HEAD, `pub mod plan;` went with it, and the two *untracked* files it named
+  nothing about were simply not part of the crate. No warning, no error, no
+  failing row — the only signal was that the count did not move. A deliberate
+  compile error appended to `plan/tests.rs` did not fail the build, which is
+  what proved it. **The defence is the product surface**: `asv integrations plan`
+  cannot exist if `plan` is unreachable, so the CLI wiring is the structural
+  guarantee and the crate count is only a smoke signal.
+
+**The campaign found that this stage's headline property is not falsifiable
+here, and that is the finding.** The first `leak` mutation carried a credential
+value into `PlanEntry` and the row stayed green — because **no mutation of this
+crate can make the plan leak one**: its two inputs carry no secret, since the
+parse result records a value's *length* and the inventory a label, a kind and an
+exportability. The property is **structural, not behavioural**, so it is not
+mutation-falsifiable at this layer, and a mutation that cannot be written is not
+evidence either way. The claim is therefore split where it can be measured: the
+input half by `npm_discover_falsify.py`'s `leak` bucket, which does turn red when
+a value is added to the parse result, and the output half by a row run against a
+real token in a real fixture. What replaced the bucket is the risk that *is*
+reachable here, and it is a plan's real failure: **saying something it was not
+told** — naming an audience its selector did not carry, or a length its file did
+not have.
+
+**Not started, and not simulated.** `adopt` — the step that actually moves a
+credential — is untouched; this stage names what *could* be moved and refuses
+what could not. `OperationFamily` has **no `Registry` variant**, so the shape
+rule is asked directly against `CredentialClass` rather than through
+`CredentialClass::backs`; that gap belongs to `asv-domain` and to R2.F.3, and is
+recorded here rather than taken unilaterally in a crate another session is
+editing.
+
 ---
 
 ## v1.0 — Certified product line

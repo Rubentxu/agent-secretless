@@ -19,8 +19,15 @@
 //!  config       the report can read      itself
 //! ```
 //!
-//! **This crate is `discover` and `safe parse`.** `plan` and `adopt` are not
-//! here yet, and saying so is the point of the paragraph below.
+//! **This crate is `discover` and `safe parse`, and `plan` as a pure
+//! function.** `adopt` is not here yet, and saying so is the point of the
+//! paragraph below.
+//!
+//! `plan` is here as a **function**, not as a step that reaches the vault: it
+//! takes a discovery and a credential inventory and returns an
+//! [`plan::IntegrationPlan`]. The CLI supplies the inventory, so a second
+//! adapter adds a planner to this crate and nothing anywhere else. See
+//! [`plan`] for why the dependency is inverted that way.
 //!
 //! # The laws this crate obeys
 //!
@@ -28,7 +35,9 @@
 //! crate is where that lives. It does not depend on the broker, the vault, the
 //! policy engine or the connectors — a discovery step that could reach a vault
 //! would be a step that could be *made* to, and `discover` has no reason to
-//! hold authority. Its only dependency is `asv-domain`, for `Authority`.
+//! hold authority. Its only dependency is `asv-domain`, for the credential
+//! and authority vocabulary. `plan` keeps the same law by taking its input
+//! rather than fetching it.
 //!
 //! **A report that cannot be wrong.** Every field in a report is either derived
 //! from the file or an explicit absence. Nothing is defaulted, nothing is
@@ -53,10 +62,15 @@
 
 pub mod fingerprint;
 pub mod npm;
+pub mod plan;
 pub mod registry_audience;
 
 pub use fingerprint::{Drift, FileFingerprint, FingerprintError, FingerprintPolicy};
 pub use npm::{Npm, NpmDiscovery, NpmError};
+pub use plan::{
+    plan_npm, Binding, BindingCandidate, Exclusion, IntegrationPlan, Operation, PlanEntry,
+    PlanError, Posture, Strategy, UnboundReason, Why, PLAN_SCHEMA,
+};
 pub use registry_audience::{RegistryAudience, RegistryAudienceError};
 
 use std::path::{Path, PathBuf};
