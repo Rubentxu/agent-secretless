@@ -13,6 +13,7 @@
 //! reachable by an agent yet. That half is [`sts`]'s last paragraph, and
 //! R2.C.2.b is the one that has to earn it.
 
+pub mod calendar;
 pub mod sigv4;
 pub mod sts;
 

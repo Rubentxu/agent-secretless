@@ -628,24 +628,12 @@ fn parse_rfc3339(raw: &str) -> Result<SystemTime, StsError> {
     }
     // Days since the epoch, by the civil-from-days inverse, so no date library
     // and no 32-bit-second overflow on a date after 2038.
-    let days = days_from_civil(year, month, day);
+    let days = super::calendar::days_from_civil(year as i64, month, day);
     let seconds = days as i64 * 86_400 + (hour * 3600 + minute * 60 + second) as i64;
     if seconds < 0 {
         return Err(malformed());
     }
     Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds as u64))
-}
-
-/// Days since 1970-01-01. Howard Hinnant's `days_from_civil`.
-fn days_from_civil(year: u32, month: u32, day: u32) -> i64 {
-    let y = year as i64 - if month <= 2 { 1 } else { 0 };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let m = month as i64;
-    let d = day as i64;
-    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }
 
 #[cfg(test)]
