@@ -40,6 +40,7 @@ python3 tests/falsification/calendar_falsify.py
 python3 tests/falsification/port_falsify.py
 python3 tests/falsification/identity_falsify.py lib      # and: reader, socket
 python3 tests/falsification/r2c3_falsify.py broker      # and: binding, selfreport
+python3 tests/falsification/k8s_request_falsify.py       # the Kubernetes request core
 ```
 
 They need a built workspace (`cargo build --workspace`) and they take a while:
@@ -63,6 +64,7 @@ has: no source edits while a campaign or a suite is in flight.
 | `port_falsify.py` | `crates/broker/src/aws/port.rs` | 13 |
 | `identity_falsify.py` | `crates/broker/src/aws/identity.rs` | 14, in three passes |
 | `r2c3_falsify.py` | `lib.rs`, `aws_binding.rs`, `selfreport.rs` | 9, in three passes |
+| `k8s_request_falsify.py` | `crates/broker/src/k8s/request.rs` | 24 |
 
 `sts_falsify.py` is also the base harness the others import, which is why its
 mutation list is a module-level `MUTATIONS` that callers replace. That has a
@@ -82,3 +84,17 @@ deleted survivor hides that a branch has no row.
   `AwsSecretPort` has a hand-written `Debug` that prints the margin and the
   credential ids and nothing else. The defence is two layers down, so the row is
   a regression net and not the evidence.
+
+`k8s_request_falsify.py` has **none**, and that is a result rather than an
+absence of trying: 24 mutations, all red, none refused by the compiler, none
+measured nothing. Writing it found two things that were removed from the module
+rather than kept — an `ApiError` arm nothing could construct, and three
+traversal checks the per-label loop already covered. Both were claims the code
+could not keep, and a campaign that had found neither would have left them in
+place looking handled.
+
+One mutation here is worth naming because it was **misfiled**, not missing. The
+narrowing of `Verb::takes_name` to `Verb::Get` was filed against a row that
+still passes under it, and would have been reported as a survivor — which reads
+as a gap in the test rather than a gap in the filing. What it actually breaks is
+`delete` ceasing to require a name, so that is the row it is filed against now.
