@@ -45,6 +45,7 @@ fn completion_opts() -> SpawnOptions {
     SpawnOptions {
         secret: None,
         timeout: Some(COMPLETION_BUDGET),
+        ..Default::default()
     }
 }
 
@@ -53,6 +54,7 @@ fn completion_opts_with_secret(secret: SecretProvider) -> SpawnOptions {
     SpawnOptions {
         secret: Some(secret),
         timeout: Some(COMPLETION_BUDGET),
+        ..Default::default()
     }
 }
 
@@ -292,64 +294,76 @@ fn uat_040_env_injection_reaches_child_only() {
 }
 
 #[test]
-fn uat_040_file_injection_is_0600_and_cleaned_up() {
-    require_userns("uat_040_file_injection_is_0600_and_cleaned_up");
+fn uat_040_file_injection_is_refused_and_leaves_nothing_on_the_host() {
+    // AAT-RUNTIME-06. A `File` plan is refused, and refusing it is only worth
+    // something if it is observable in two directions: the caller is told, and
+    // the host is left untouched.
+    //
+    // The previous row asserted the opposite and passed for as long as the
+    // defect was real. It staged the secret at an absolute host path, let the
+    // worker read it, and then checked the file was gone — which is the
+    // strongest possible way to certify a cleanup path, and the weakest way to
+    // certify a security boundary. The bytes existed in the parent filesystem
+    // for the whole life of the worker, and the cleanup it verified was a
+    // `Drop`, which a SIGKILL skips.
+    //
+    // Note there is no `require_userns` here. The refusal happens before any
+    // fork, so the property is provable on a kernel that cannot isolate
+    // anything — which is the point: nothing about refusing depends on the
+    // kernel cooperating.
     let dir = std::env::temp_dir().join(format!("asv-uat040-{}", std::process::id()));
     let path = dir.join("secret.bin");
-    let mut t = deny_template(
-        "file-worker",
-        "/bin/sh",
-        &[
-            "-c",
-            // The length, never the value. This row used to `cat` the staged
-            // file and assert on the plaintext, which meant it was asserting
-            // that the file-injection path **leaks into the redacted channel** —
-            // and it passed for exactly as long as that was true. R1 seeded the
-            // redactor from the secret the runtime resolved, so the value is now
-            // correctly replaced by `[REDACTED]` and the row went red.
-            //
-            // The fix is not to weaken the row but to ask a question the
-            // redacted channel can still answer: did the child receive the real
-            // bytes? `wc -c` is unforgeable here — `[REDACTED]` is a different
-            // length — and it keeps the secret off the wire and out of this
-            // file's failure messages, which is the same reason R1's own
-            // delivery row asserts a length rather than a value.
-            "stat -c '%a' \"$ASV_SECRET_FILE\"; wc -c < \"$ASV_SECRET_FILE\"",
-        ],
-    );
+    let mut t = deny_template("file-worker", "/bin/sh", &["-c", "echo should-never-run"]);
     t.secret_injection = SecretInjectionPlan::File {
         path: path.clone(),
         mode: 0o600,
     };
-    // The staged file lives outside the auto-allowed binary chain: the
-    // template's landlock profile must name its directory (exactly what
-    // a production template declares for its own secret staging dir).
+    // The old staging path called `create_dir_all` on the parent, so an empty
+    // staging directory survived the unlink. The row below checks the
+    // directory too, which is what makes it falsifiable against that code.
     t.landlock_profile = LandlockProfile {
         allowed_read: vec![std::env::temp_dir()],
         allowed_write: vec![],
     };
     let r = WorkerRegistry::new(vec![t]);
     let mut audit = AuditLog::new(16);
-    let run = spawn(
+
+    let err = spawn(
         &r,
         "file-worker",
         completion_opts_with_secret(Box::new(|| b"file-secret".to_vec())),
         &mut audit,
     )
-    .expect("run");
-    let out = String::from_utf8_lossy(&run.stdout_redacted);
-    assert_eq!(run.exit_code, Some(0), "{out}");
-    assert_eq!(out.lines().next().map(str::trim), Some("600"), "{out}");
-    assert_eq!(
-        out.lines().nth(1).map(str::trim),
-        Some("11"),
-        "the child must have read all {} bytes of the staged secret; the redacted \
-         channel is expected to hide the value, not the length: {out}",
-        "file-secret".len()
+    .expect_err("a File plan must be refused, not served");
+
+    assert!(
+        matches!(err, SpawnError::FileInjectionUnsupported),
+        "expected the named refusal, got {err:?}"
     );
-    // Automatic destruction (§7): the file is gone after the run.
-    assert!(!path.exists(), "the staged secret file must be removed");
-    let _ = std::fs::remove_dir(dir);
+
+    // AAT-RUNTIME-06: nothing on the host, neither the file nor the directory
+    // the old code created to hold it.
+    assert!(
+        !path.exists(),
+        "the declared path must not exist: refusing must not create it"
+    );
+    assert!(
+        !dir.exists(),
+        "the staging directory must not exist either; the removed implementation \
+         called create_dir_all on the parent and left it behind after unlinking"
+    );
+
+    // And the refusal is on the record, naming the plan it refused.
+    let recs = audit.query(0);
+    match &recs[0].event {
+        asv_ipc_protocol::AuditEventDto::WorkerSpawned {
+            outcome, injection, ..
+        } => {
+            assert_eq!(outcome, "refused");
+            assert_eq!(injection, "file", "the record must name the plan refused");
+        }
+        other => panic!("unexpected audit variant: {other:?}"),
+    }
 }
 
 // ----- M10R-R4: landlock + seccomp in-child ---------------------------------
@@ -504,6 +518,7 @@ fn uat_040_runaway_worker_is_killed_at_timeout() {
         SpawnOptions {
             secret: None,
             timeout: Some(std::time::Duration::from_millis(700)),
+            ..Default::default()
         },
         &mut audit,
     )

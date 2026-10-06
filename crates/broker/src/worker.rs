@@ -62,6 +62,15 @@ pub enum SpawnError {
     /// was supplied (or the reverse): a mismatch the caller must fix.
     #[error("secret injection plan mismatch: {0}")]
     InjectionMismatch(&'static str),
+    /// The template asks for its credential as a file.
+    ///
+    /// M10-R3 requires those bytes to exist only inside the worker's mount
+    /// namespace. That needs a mount point contract this build does not
+    /// have, and the alternative -- writing the secret to a host path and
+    /// removing it afterwards -- is the exposure M10-R3 exists to forbid.
+    /// Refused rather than approximated (M10R-R3).
+    #[error("secret file injection is refused: materialising it inside the worker's mount namespace needs a mount point contract this build does not have; use EnvVar")]
+    FileInjectionUnsupported,
     /// The child outlived the timeout and was killed (M10R-R5).
     #[error("worker exceeded the {0:?} timeout and was killed")]
     Timeout(Duration),
@@ -312,27 +321,52 @@ pub fn spawn(
         return Err(SpawnError::BinaryMissing(template.binary.clone()));
     }
 
-    // M10R-R3: resolve the secret exactly once.
-    let plan_matches = match (&template.secret_injection, &opts.secret) {
-        (SecretInjectionPlan::None, None) => Ok(()),
-        (SecretInjectionPlan::None, Some(_)) => Err(SpawnError::InjectionMismatch(
-            "template injects nothing but a secret provider was supplied",
-        )),
-        (SecretInjectionPlan::EnvVar { .. }, None) => Err(SpawnError::InjectionMismatch(
-            "template expects an env var but no secret provider was supplied",
-        )),
-        (SecretInjectionPlan::File { .. }, None) => Err(SpawnError::InjectionMismatch(
-            "template expects a secret file but no secret provider was supplied",
-        )),
-        (SecretInjectionPlan::EnvVar { .. } | SecretInjectionPlan::File { .. }, Some(_)) => Ok(()),
+    // M10R-R3: resolve the secret exactly once, and refuse a `File` plan on the
+    // template's own content.
+    //
+    // It used to be served instead: the parent resolved the secret and wrote
+    // it to an absolute host path, then a `Drop` guard unlinked it when the
+    // run ended. That is the exposure M10-R3 exists to forbid. The secret
+    // lived in the parent filesystem for the entire life of the worker,
+    // readable by anything running as the broker's uid -- which is the same
+    // uid as every tool the operator runs -- and the guard is a `Drop`, so a
+    // SIGKILL or a power loss skipped it and left the credential on disk.
+    //
+    // Refusing costs a capability the product cannot reach anyway: the
+    // workers file has no key that produces this variant, so the only caller
+    // of the staging path was a test, and that test was asserting the
+    // behaviour this arm removes.
+    //
+    // The refusal is keyed on the plan alone, not on the plan/provider pair.
+    // A missing provider is the caller's mistake and can be fixed by
+    // supplying one; an unmaterialisable plan is a property of the registry
+    // and no caller can talk the broker out of it. Reporting the pair's
+    // mismatch would invite a retry that can never succeed.
+    let plan_matches = match &template.secret_injection {
+        SecretInjectionPlan::File { .. } => Err(SpawnError::FileInjectionUnsupported),
+        SecretInjectionPlan::None => match &opts.secret {
+            None => Ok(()),
+            Some(_) => Err(SpawnError::InjectionMismatch(
+                "template injects nothing but a secret provider was supplied",
+            )),
+        },
+        SecretInjectionPlan::EnvVar { .. } => match &opts.secret {
+            None => Err(SpawnError::InjectionMismatch(
+                "template expects an env var but no secret provider was supplied",
+            )),
+            Some(_) => Ok(()),
+        },
     };
     if let Err(e) = plan_matches {
+        // `None` for the plan, like every other refusal here: `audit_worker`
+        // falls back to the template's own injection plan, which is the one
+        // that was just refused.
         audit_worker(audit, name, Some(template), None, "refused", None, None);
         return Err(e);
     }
 
-    // Create the hook-status channel before staging any secret file, so
-    // an OS resource failure cannot leave staged secret material behind.
+    // Create the hook-status channel before resolving the secret, so an OS
+    // resource failure cannot leave resolved secret material in scope.
     let (mut hook_status_reader, hook_status_writer) = match std::os::unix::net::UnixStream::pair()
     {
         Ok(pair) => pair,
@@ -342,24 +376,9 @@ pub fn spawn(
         }
     };
 
-    // File-plan staging: written pre-spawn, removed by the guard.
-    let mut file_guard: Option<SecretFileGuard> = None;
     let mut secret_bytes: Vec<u8> = Vec::new();
     let mut secret_provider = opts.secret;
-    if let SecretInjectionPlan::File { path, mode } = &template.secret_injection {
-        let provider = secret_provider
-            .take()
-            .expect("plan/provider match checked above");
-        secret_bytes = provider();
-        match write_secret_file(path, &secret_bytes, *mode) {
-            Ok(()) => file_guard = Some(SecretFileGuard { path: path.clone() }),
-            Err(e) => {
-                zeroize_buf(&mut secret_bytes);
-                audit_worker(audit, name, Some(template), None, "error", None, None);
-                return Err(e.into());
-            }
-        }
-    } else if matches!(
+    if matches!(
         template.secret_injection,
         SecretInjectionPlan::EnvVar { .. }
     ) {
@@ -404,12 +423,6 @@ pub fn spawn(
             std::ffi::OsString::from_vec(std::mem::take(&mut secret_bytes)),
         );
     }
-    if let SecretInjectionPlan::File { path, .. } = &plan {
-        // Surface the staged path to the child through the template's
-        // conventional variable so a tool can find it without the
-        // broker reading env (the value is a path, not a secret).
-        cmd.env("ASV_SECRET_FILE", path);
-    }
 
     // std normalizes pre_exec hook failures to InvalidInput/EINVAL,
     // which is ambiguous with exec-time errors. This close-on-exec
@@ -453,12 +466,10 @@ pub fn spawn(
         Err(_error) if pre_exec_hook_failed(&mut hook_status_reader) => {
             // The private marker proves the pre-exec hook failed; no
             // guess based on std's generic EINVAL is necessary.
-            cleanup_guard(file_guard);
             audit_worker(audit, name, Some(template), Some(&plan), "error", None, None);
             return Err(SpawnError::IsolationUnavailable);
         }
         Err(e) => {
-            cleanup_guard(file_guard);
             audit_worker(audit, name, Some(template), Some(&plan), "error", None, None);
             return Err(e.into());
         }
@@ -492,7 +503,6 @@ pub fn spawn(
         WaitResult::TimedOut => (RunOutcome::TimedOut, None, true),
     };
 
-    cleanup_guard(file_guard);
 
     let read_pipe = |reader: Option<std::thread::JoinHandle<std::io::Result<Captured>>>| {
         reader
@@ -779,54 +789,6 @@ fn is_executable_file(path: &Path) -> bool {
         Ok(m) => m.is_file() && m.permissions().mode() & 0o111 != 0,
         Err(_) => false,
     }
-}
-
-fn write_secret_file(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // Create exclusively, without following an attacker-controlled
-    // symlink, and request the restrictive mode at creation time. Apply
-    // the exact mode before writing so umask cannot broaden the exposure
-    // window while secret bytes are being staged.
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    f.set_permissions(std::fs::Permissions::from_mode(mode))?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    Ok(())
-}
-
-/// Removes the staged secret file when the run finishes (D5). The
-/// worker may have re-opened it; unlink is best-effort by contract.
-struct SecretFileGuard {
-    path: PathBuf,
-}
-
-impl Drop for SecretFileGuard {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(&self.path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    path = %self.path.display(),
-                    error = %e,
-                    "secret file cleanup failed; the operator should inspect the path"
-                );
-            }
-        }
-    }
-}
-
-fn cleanup_guard(guard: Option<SecretFileGuard>) {
-    // Moving the guard into this function triggers Drop (the unlink);
-    // the call site reads as a lifecycle step.
-    drop(guard);
 }
 
 fn zeroize_buf(buf: &mut [u8]) {

@@ -79,6 +79,27 @@ pub enum SecretInjectionPlan {
 The broker MUST materialise the secret bytes ONLY inside the worker's
 mount namespace; the parent process tree MUST NEVER observe the bytes.
 
+> **Status of `File`: modelled, refused, pending a mount point contract.**
+>
+> The requirement above is not met for `File` and the enum above is not
+> amended, because the gap is in the contract rather than in the enum. Materialising
+> the bytes inside a mount namespace means mounting a private tmpfs somewhere, and
+> *where* is policy this document does not state: whatever directory is mounted over
+> stops being visible to the worker. Mounting over `/run` costs a tool almost
+> nothing; mounting over `/etc` costs it `passwd` and its TLS roots. A worker file
+> cannot express that choice yet (`worker_file.rs` has no `secret_file` key), so no
+> template can reach this variant from the product.
+>
+> Until the contract exists the runtime **refuses** the plan, naming it in the audit
+> record and returning `SpawnError::FileInjectionUnsupported` → `ErrorCode::Denied`.
+> The previous behaviour — writing the bytes to an absolute host path and unlinking
+> them in a `Drop` — violated the requirement above directly: the credential was in
+> the parent filesystem for the whole life of the worker, readable by anything
+> running as the broker's uid, and a `SIGKILL` skipped the unlink.
+>
+> Closing this row requires a mount point contract, then a `secret_file` key in the
+> worker file, then AAT-RUNTIME-06 against a worker that is killed rather than reaped.
+
 #### Scenario: EnvVar plan is honoured
 
 > A worker template with `SecretInjectionPlan::EnvVar { name: "KUBE_TOKEN" }`

@@ -25,9 +25,21 @@ pub enum SecretInjectionPlan {
         /// The variable name (e.g. `"AWS_ACCESS_KEY_ID"`).
         name: String,
     },
-    /// Write a file at `path` inside the worker's mount namespace.
+    /// A file the worker reads its credential from.
+    ///
+    /// Modelled, not materialised. M10-R3 requires these bytes to exist ONLY
+    /// inside the worker's mount namespace, and honouring that needs a mount
+    /// point contract no spec states yet: whatever directory the private
+    /// tmpfs is mounted over stops being visible to the worker, and `/run`
+    /// costs a tool almost nothing while `/etc` costs it the world. Guessing
+    /// that here would be inventing policy rather than implementing a spec.
+    ///
+    /// Until a contract exists, `spawn` refuses this plan. The previous
+    /// implementation served it by writing the secret to an absolute host
+    /// path and unlinking it afterwards -- the exposure M10-R3 forbids, and
+    /// the thing this product exists to prevent.
     File {
-        /// Absolute path inside the worker's namespace.
+        /// Absolute path the worker would read the credential from.
         path: PathBuf,
         /// File mode (e.g. `0o600`).
         mode: u32,

@@ -1342,9 +1342,10 @@ fn spawn_error_code(error: &crate::worker::SpawnError) -> ErrorCode {
     use crate::worker::SpawnError::*;
     match error {
         UnknownWorker(_) | BinaryMissing(_) | InjectionMismatch(_) => ErrorCode::InvalidRequest,
-        EgressAllowUnsupported | SeccompProfileNotProduction | IsolationUnavailable => {
-            ErrorCode::Denied
-        }
+        EgressAllowUnsupported
+        | SeccompProfileNotProduction
+        | IsolationUnavailable
+        | FileInjectionUnsupported => ErrorCode::Denied,
         Timeout(_) => ErrorCode::Upstream,
         Io(_) => ErrorCode::Upstream,
     }
