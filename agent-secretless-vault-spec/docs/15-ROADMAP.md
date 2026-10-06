@@ -2472,6 +2472,90 @@ the vault does not report what audience a credential is registered for, so
 that makes `plan` report two bearer tokens as ambiguous. Recorded rather than
 guessed at.
 
+### R3.B.1 — Maven, and the first measurement of R3's exit criterion
+
+`asv integrations discover --family maven`. The second family, and the one that
+had to *earn* the criterion rather than assert it.
+
+**The exit criterion is "a new adapter addable without touching broker or
+domain", which is a statement about the shape of the tree and not a statement
+about how many adapters exist.** With one family it was untested, and untested
+criteria are aspirations. What adding Maven actually touched:
+
+```text
+crates/integrations/**      the family itself
+crates/cli/src/main.rs      one match arm, one prose printer
+── nothing else ──
+crates/broker/src/  crates/domain/src/  crates/ipc-protocol/src/  crates/connector-http/src/
+```
+
+**It cost one shared type to get there, and that is the finding.** `Candidate::origin`
+was typed `npm::Origin`, so a second family's precedence could not be expressed
+without either borrowing npm's three levels or changing it. Lifted to the crate
+root with a fourth level — `Tool`, where the tool and the operating system
+disagree about the name for the same directory, which is Maven's
+`$MAVEN_HOME/conf` and is not a "global". The lift immediately broke the CLI's
+npm printer on a non-exhaustive `match`, which is the closed enum doing its job.
+
+Measured: **30 rows** in `asv-integrations` for Maven (105 in the crate),
+**6 rows** in the vertical `crates/broker/tests/r3b1_maven_discovery.rs` against
+the real `asv` binary and a real `settings.xml`, and **21 mutations across four
+buckets**: 21 red, 0 survivors, 0 compiler-refused, 0 unmeasured.
+
+**§5's four XML requirements, and three of the four are the parser's.** DTD
+disabled and external entities disabled are structural (`roxmltree` refuses a
+DOCTYPE with `DtdDetected` before reading it, and an undeclared entity reference
+is an error rather than a fetch); network resolution is structural (no
+dependencies, `#![forbid(unsafe_code)]`, no `std::net`); **size and depth limits
+are ours, and the depth one was a documented lie until a row proved it.**
+
+The module first documented `nodes_limit` as "the ceiling on nesting". It is not.
+`roxmltree` appends an element's node when it reaches that element's **closing**
+tag (`parse.rs:781`, in the `Close` arm), so a document nested `N` deep recurses
+`N` deep before a single node exists to count — the ceiling is consulted on the
+way back out, by which time the stack is spent. Measured: a document nested 2049
+deep **aborted the process**, and `nodes_limit` was never read. So there is now a
+`MAX_DEPTH` of 64, enforced by a quote-aware pre-scan on the text before the
+parser is handed anything, and three separate ceilings with three rows each —
+because a ceiling that refuses everything is not a ceiling.
+
+**`<server><configuration>` is where Artifactory and Nexus keep an API key**, and
+an adapter written to the obvious shape models only `<username>`/`<password>`: it
+reports one credential and silently omits the second. An element the adapter does
+not model is therefore *named and measured* (`undescribed: [{element, len}]`),
+never read — present-and-not-described is a different claim from absent. The same
+reasoning strips `user:password@` from a mirror URL, which is a credential more
+often than anyone expects and which no one greps for.
+
+**Two report decisions that a first reading would have got wrong.** A
+`${env.ACME_TOKEN}` password is reported with `password_len: null` and the
+variable's name — the 19 characters in the file are text standing in for a
+credential, not the credential, and a report that offers both numbers is offering
+one plausible-looking wrong answer. And a `<proxy>` with no `<active>` is
+inactive, because the opposite default tells an operator a credential path is
+live that Maven will not take.
+
+**The policy this family has and npm does not: refuse the file, keep the report.**
+A world-writable or foreign-owned `settings.xml` becomes a finding and the run
+still succeeds. Absence is not a finding — most machines have no `settings.xml`
+— and the prose does not say "none was found" when a refusal is pending, because
+that is a claim about a file that exists.
+
+**A row of R3.A.1 broke, correctly.** `an_unknown_family_is_refused_with_the_list
+_of_what_this_build_knows` used `maven` as its example of an unknown family. It
+was right until Maven existed. Replaced with a sentinel that cannot become a real
+family, so the row points at the refusal path rather than at the current contents
+of the enum — a row wired to a *future* family has a shelf life, and its
+expiry looks like a defect somewhere else.
+
+**Not started, and not simulated.** `plan` and `adopt` for Maven do not exist:
+this family is `discover` and safe parse, which is what R3.B specifies. Mirrors,
+`<profiles>` and the repository `<id>` chain are read but not yet bound. The §6
+TOCTOU revalidation is not reachable because there is no plan to revalidate.
+`env_reference` names a variable and never resolves it — the environment is the
+caller's, not the file's. The `registry_audience`/`asv-domain` audience gap that
+blocks a Maven binding is unchanged and still belongs to R2.F.3.
+
 ---
 
 ## v1.0 — Certified product line

@@ -1,4 +1,5 @@
-//! Credential workflow adapters — R3, the first adapter family.
+//! Credential workflow adapters — R3: npm, and the first proof that a second
+//! family needs nothing outside this crate.
 //!
 //! # What this crate is for
 //!
@@ -19,9 +20,13 @@
 //!  config       the report can read      itself
 //! ```
 //!
-//! **This crate is `discover` and `safe parse`, and `plan` as a pure
-//! function.** `adopt` is not here yet, and saying so is the point of the
-//! paragraph below.
+//! **This crate is `discover`, `safe parse`, `plan` and `adopt`.** What it is
+//! not is anything that *fetches*: `plan` takes its inventory as an argument
+//! rather than reaching the broker, and the one place here that holds a
+//! credential — [`adopt`]'s extraction — is the step whose entire job is to
+//! produce one, and which therefore cannot ask a vault to send it a secret
+//! first. See [`adopt`] for why the order of the stages is what makes that
+//! safe.
 //!
 //! `plan` is here as a **function**, not as a step that reaches the vault: it
 //! takes a discovery and a credential inventory and returns an
@@ -52,16 +57,18 @@
 //!
 //! # What `discover` is not
 //!
-//! It is not a check that your npm setup is good. It cannot tell you a token is
-//! about to expire, that a scope is writable, or that a registry is the one you
-//! meant — those are `plan`'s questions, and `plan` is not written. It reports
-//! what is on disk, and every claim it makes is one a re-read would either
-//! confirm or contradict.
+//! It is not a check that your tooling setup is good. It cannot tell you a token
+//! is about to expire, that a scope is writable, or that a registry is the one
+//! you meant — those are `plan`'s questions, and `plan` answers them from the
+//! *inventory you hand it*, which is metadata and never a value. `discover`
+//! reports what is on disk, and every claim it makes is one a re-read would
+//! either confirm or contradict.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod adopt;
 pub mod fingerprint;
+pub mod maven;
 pub mod npm;
 pub mod plan;
 pub mod registry_audience;
@@ -70,6 +77,7 @@ pub use adopt::{
     selector_for, AdoptError, AdoptReceipt, AdoptSelector, NpmAdoption, PendingStep, ADOPT_SCHEMA,
 };
 pub use fingerprint::{Drift, FileFingerprint, FingerprintError, FingerprintPolicy};
+pub use maven::{Maven, MavenDiscovery, MavenError};
 pub use npm::{Npm, NpmDiscovery, NpmError};
 pub use plan::{
     plan_npm, Binding, BindingCandidate, Exclusion, IntegrationPlan, Operation, PlanEntry,
@@ -134,7 +142,40 @@ pub struct Candidate {
     /// Which of the tool's precedence levels this is. Carried so a report can
     /// say *which* file won, which is the question an operator actually has
     /// when a project config and a user config disagree.
-    pub origin: npm::Origin,
+    ///
+    /// **This was `npm::Origin`, and that was a real block on R3's exit
+    /// criterion.** The exit criterion says a new adapter must be addable
+    /// without touching the broker, the domain -- or, as it turned out, without
+    /// touching *this crate's shared types*. A second family could only have
+    /// borrowed npm's three levels or forced a change here, and the honest
+    /// reading is that the criterion was untested with one family.
+    ///
+    /// Lifted to the crate because the levels are genuinely shared -- a project
+    /// config, a user config, and something the tool installation brought --
+    /// and a family whose vocabulary does not fit adds a case rather than
+    /// bending this one.
+    pub origin: Origin,
+}
+
+/// Where a configuration file sits in a tool's own precedence.
+///
+/// Shared across families because the *shape* is shared: every tool on this
+/// list reads a project-level file, a user-level file, and possibly one its own
+/// installation carries. A family with a different shape gets its own level
+/// here rather than borrowing another's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    /// In the working directory, overriding the others.
+    Project,
+    /// In the user's home directory.
+    User,
+    /// In the tool installation's own configuration.
+    Global,
+    /// In the tool installation's configuration, where the tool and the
+    /// operating system disagree about the name for it. Maven reads
+    /// `$MAVEN_HOME/conf/settings.xml` and does not call it "global".
+    Tool,
 }
 
 /// A discovery report, in the one shape the CLI prints.
@@ -183,6 +224,7 @@ impl Discovery {
 #[serde(rename_all = "snake_case")]
 pub enum AnyReport {
     Npm(NpmDiscovery),
+    Maven(MavenDiscovery),
 }
 
 /// Something discovery noticed that the operator should see.

@@ -1726,9 +1726,13 @@ fn run_integrations_discover(
             .discover(&policy, &home, &cwd)
             .map(asv_integrations::NpmDiscovery::into_discovery)
             .map_err(|error| error.to_string()),
+        "maven" => asv_integrations::Maven
+            .discover(&policy, &home, &cwd)
+            .map(asv_integrations::MavenDiscovery::into_discovery)
+            .map_err(|error| error.to_string()),
         other => Err(format!(
-            "no adapter for {other:?}; this build knows `npm`. Adding one is a module in \
-             asv-integrations and one match arm here."
+            "no adapter for {other:?}; this build knows `npm` and `maven`. Adding one is a \
+             module in asv-integrations, a variant in `AnyReport`, and one match arm here."
         )),
     };
 
@@ -1963,16 +1967,34 @@ fn describe(strategy: &asv_integrations::Strategy) -> String {
 /// there is no line here that could be a credential, because the report has none
 /// to print.
 fn print_discovery_prose(discovery: &asv_integrations::Discovery) {
-    let asv_integrations::AnyReport::Npm(report) = &discovery.report;
+    // A `match` rather than the irrefutable `let` this used to be. That form
+    // was only possible while `AnyReport` had exactly one variant, and writing
+    // the dispatch out means a family added later has to be *described* here —
+    // an unreachable arm is a compiler error rather than prose that quietly
+    // prints nothing.
+    match &discovery.report {
+        asv_integrations::AnyReport::Npm(report) => print_npm_discovery(report),
+        asv_integrations::AnyReport::Maven(report) => print_maven_discovery(report),
+    }
+}
+
+fn print_npm_discovery(report: &asv_integrations::NpmDiscovery) {
     if report.files.is_empty() {
         println!("no .npmrc was found for this project or this account");
         return;
     }
     for file in &report.files {
+        // `Origin` has four levels and npm uses three. `Tool` — where the tool
+        // and the operating system disagree about the name for the same place,
+        // which is Maven's `$MAVEN_HOME/conf` rather than a "global" — has no
+        // npm candidate, so this arm cannot be reached from a report. It is
+        // written out rather than papered with `_` because a wildcard here is
+        // exactly how a fourth origin would start printing as "user".
         let origin = match file.origin {
-            asv_integrations::npm::Origin::Project => "project",
-            asv_integrations::npm::Origin::User => "user",
-            asv_integrations::npm::Origin::Global => "global",
+            asv_integrations::Origin::Project => "project",
+            asv_integrations::Origin::User => "user",
+            asv_integrations::Origin::Global => "global",
+            asv_integrations::Origin::Tool => "tool",
         };
         let readable = if file.fingerprint.is_untrusted_readable() {
             "  (readable by group or other — a token in here is exposed)"
@@ -1999,6 +2021,103 @@ fn print_discovery_prose(discovery: &asv_integrations::Discovery) {
                 selector.registry.audience, selector.field
             );
         }
+    }
+}
+
+/// Maven's prose, and the same law: a `<id>` and a byte count, never a value.
+///
+/// The `<id>` is printed verbatim on purpose. It is the handle a `pom.xml`
+/// refers to — Maven's audience, and the one field in the report that is not a
+/// secret *because* it is a name the tool already had to carry in the clear.
+fn print_maven_discovery(report: &asv_integrations::MavenDiscovery) {
+    // Silence is not an answer here. With a finding pending, "no settings.xml
+    // was found" is a claim about a file that exists, and printing it makes a
+    // refusal read as an absence — the one confusion this report cannot have.
+    if report.files.is_empty() {
+        if report.findings.is_empty() {
+            println!("no settings.xml was found for this account");
+        }
+        print_findings(&report.findings);
+        return;
+    }
+    for file in &report.files {
+        let origin = match file.origin {
+            asv_integrations::Origin::Project => "project",
+            asv_integrations::Origin::User => "user",
+            asv_integrations::Origin::Global => "global",
+            asv_integrations::Origin::Tool => "tool",
+        };
+        let readable = if file.fingerprint.is_untrusted_readable() {
+            "  (readable by group or other — a password in here is exposed)"
+        } else {
+            ""
+        };
+        println!("{origin} {}", file.fingerprint.path.display());
+        println!("  {}{readable}", file.fingerprint.digest);
+        if let Some(local) = &file.local_repository {
+            println!("  localRepository  {local}");
+        }
+        for mirror in &file.mirrors {
+            let url = mirror.url.as_deref().unwrap_or("(no url)");
+            let of = mirror.mirror_of.as_deref().unwrap_or("(no mirrorOf)");
+            println!("  mirror  {}  {url}  <- {of}", mirror.id);
+        }
+        for server in &file.servers {
+            println!("  server  {}", server.id);
+            match (&server.env_reference, server.password_len) {
+                // The variable is *named*, never resolved: the environment is
+                // the caller's, not the file's, and resolving it here would be
+                // this process reading a secret it was not asked to read.
+                (Some(name), _) => println!("    password  from ${{env.{name}}}"),
+                (None, Some(len)) => println!("    password  {len} bytes"),
+                (None, None) => println!("    password  (none set)"),
+            }
+            match server.username_len {
+                Some(len) => println!("    username  {len} bytes"),
+                None => println!("    username  (none set)"),
+            }
+            // **Printed, not left to the JSON.** A `<configuration>` this
+            // adapter does not model is where Artifactory and Nexus keep an API
+            // key, and a prose report that listed only the password would be
+            // quietly omitting a second credential. The element is named and
+            // measured — never read.
+            for undescribed in &server.undescribed {
+                println!(
+                    "    <{}>  not described by this adapter, {} bytes — check it by hand",
+                    undescribed.element, undescribed.len
+                );
+            }
+        }
+        for proxy in &file.proxies {
+            let host = proxy.host.as_deref().unwrap_or("(no host)");
+            let port = proxy
+                .port
+                .map(|port| port.to_string())
+                .unwrap_or_else(|| "(no port)".to_string());
+            let state = if proxy.active { "active" } else { "inactive" };
+            println!("  proxy  {}  {host}:{port}  ({state})", proxy.id);
+            match (&proxy.env_reference, proxy.password_len) {
+                (Some(name), _) => println!("    password  from ${{env.{name}}}"),
+                (None, Some(len)) => println!("    password  {len} bytes"),
+                (None, None) => println!("    password  (none set)"),
+            }
+        }
+    }
+    print_findings(&report.findings);
+}
+
+/// What discovery declined to read, and why.
+///
+/// Written for the second family rather than the first, which is worth saying:
+/// [`asv_integrations::NpmDiscovery`] has no findings because npm's `discover`
+/// refuses the whole run when a file will not parse, and this module was written
+/// and closed before the second family existed to show that the other policy —
+/// refuse the *file*, keep the report — is the one an operator can act on. The
+/// two are not merged here: doing so would change npm's committed behaviour, and
+/// a report that grew a field is a contract change, not a tidy-up.
+fn print_findings(findings: &[asv_integrations::Finding]) {
+    for finding in findings {
+        eprintln!("asv: {}: {}", finding.subject, finding.message);
     }
 }
 

@@ -38,6 +38,19 @@ libc = "0.2"
 # already paying rather than adding one.
 secrecy.workspace = true
 zeroize.workspace = true
+# R3.B: the Maven family. Chosen over `quick-xml` for one reason that is a
+# property rather than a preference: `roxmltree` declares **no dependencies at
+# all** and is `#![forbid(unsafe_code)]`, so it cannot fetch anything and cannot
+# reach the filesystem on its own. `quick-xml` at the version available offline
+# also wants rustc 1.86, above the workspace's 1.85.
+#
+# What it does NOT provide is a nesting limit, and its element parsing recurses
+# once per level. `nodes_limit` is therefore not optional here -- and it is not
+# sufficient either: `MAX_NODES` in `maven.rs` bounds breadth, while depth is
+# bounded separately by `MAX_DEPTH`, checked on the raw text, because the limit
+# `roxmltree` offers is consulted only once the recursion has already gone as
+# deep as the document goes.
+roxmltree = "0.20"
 
 [dev-dependencies]
 tempfile = "3"

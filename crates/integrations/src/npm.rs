@@ -159,17 +159,13 @@ fn read_refused(path: &Path, _fingerprint: &FileFingerprint) -> Result<String, N
     })
 }
 
-/// Which of npm's three files this is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Origin {
-    /// `./.npmrc`, which overrides the others.
-    Project,
-    /// `~/.npmrc`.
-    User,
-    /// The npm installation's own config, at `~/.npm/npmrc` on a default prefix.
-    Global,
-}
+/// Which of npm's files this is.
+///
+/// The levels are documented once, on the crate-level [`Origin`], because the
+/// second family's precedence had to fit the same vocabulary -- which is the
+/// point R3's exit criterion asks for. A re-export rather than a type alias so
+/// `npm::Origin` keeps naming what npm's own report contains.
+pub use crate::Origin;
 
 /// One file, described.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

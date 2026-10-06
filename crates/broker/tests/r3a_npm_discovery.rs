@@ -256,9 +256,17 @@ fn an_unknown_family_is_refused_with_the_list_of_what_this_build_knows() {
     // A wrong `--family` must not print an empty report. An empty report is
     // indistinguishable from "there is nothing configured", and an agent
     // reading one would plan against it.
+    //
+    // **The family name here was `maven`, and that had a shelf life.** The row
+    // was correct when only npm existed and it broke the moment R3.B.1 landed,
+    // because Maven stopped being an unknown family — the row failed, and the
+    // failure said nothing about what it was about. A sentinel that cannot
+    // become a real family keeps the row pointed at the refusal path instead of
+    // at the current contents of the enum.
+    let unknown = "not-a-family-this-build-knows";
     let project = Project::new();
     let out = Command::new(asv_broker::binary::locate("asv"))
-        .args(["integrations", "discover", "--family", "maven"])
+        .args(["integrations", "discover", "--family", unknown])
         .arg("--cwd")
         .arg(project.project_dir())
         .arg("--home")
@@ -267,6 +275,10 @@ fn an_unknown_family_is_refused_with_the_list_of_what_this_build_knows() {
         .expect("run");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "an unknown family exited zero");
+    assert!(
+        stderr.contains(unknown),
+        "the refusal does not name what was asked for: {stderr}"
+    );
     assert!(
         stderr.contains("npm"),
         "the refusal does not say what exists: {stderr}"

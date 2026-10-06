@@ -16,14 +16,14 @@ agente ──(sustituto / socket)──▶ broker ──(credencial real)──�
 
 > **Estado: pre-1.0, en v0.30.0. Sin certificar, y los gates lo dicen.**
 >
-> El workspace compila y hay **1805 tests enumerados**. Con `cargo test`, 1804
+> El workspace compila y hay **1843 tests enumerados**. Con `cargo test`, 1842
 > se ejecutan y pasan y 1 queda fuera de las compilaciones de depuración por
 > construcción: el presupuesto de latencia p95 lleva
 > `#[cfg_attr(debug_assertions, ignore)]`, porque un presupuesto de latencia
 > medido contra ed25519 en depuración es una afirmación sobre
 > `debug_assertions`, no sobre el producto. Ese test sí se ejecuta y pasa con
 > `--release` — medido aquí en 1490us contra un presupuesto de 6000us — así que
-> la corrida en release de abajo ejecuta 1803 de ellos. El conteo y la aritmética
+> la corrida en release de abajo ejecuta 1841 de ellos. El conteo y la aritmética
 > del inicio rápido los vuelve a derivar en cada corrida de CI el gate
 > `R11 README test count`, que resta los filtros `--skip` que documenta el propio
 > inicio rápido en vez de comprobar una suma, de modo que un bloque que se salta
@@ -218,17 +218,25 @@ permisos de fichero. Es una carencia registrada para cerrar antes de 1.0.
 ## Inicio rápido
 
 ```bash
-cargo build --release -p asv-broker
+cargo build --release --workspace
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# esperado: passed=1803 failed=0 ignored=0
+# esperado: passed=1841 failed=0 ignored=0
 ```
 
-1803 y no 1805 porque el comando de arriba se salta dos: `uat_028` levanta un
+1841 y no 1843 porque el comando de arriba se salta dos: `uat_028` levanta un
 `sshd` real y necesita un host donde correr, y el presupuesto p95 se afirma por
 separado en `--release` para que el inicio rápido siga siendo rápido. Los dos
-saltos se cuentan como filtrados, no como ignorados, así que 1803 + 2
-filtrados son los 1805 enumerados.
+saltos se cuentan como filtrados, no como ignorados, así que 1841 + 2
+filtrados son los 1843 enumerados.
+
+El paso de build es `--workspace` y no `-p asv-broker` porque las filas
+verticales invocan el binario `asv`, que es del crate del CLI, y
+`crates/broker/src/binary.rs` **se niega a correr un test contra un binario más
+antiguo que sus propias fuentes** — entra en pánico en vez de dejar que un test
+mida un programa que no contiene el cambio que se está midiendo. Construir solo
+el broker deja ese binario obsoleto y convierte nueve filas que pasaban en nueve
+pánicos que todos apuntan al túnel en vez de a la build.
 
 Ese número era `passed=692` en este fichero durante varios milestones, y nada
 lo comprobaba: un conteo viejo en un README es una afirmación como cualquier
