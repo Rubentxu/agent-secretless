@@ -14,7 +14,7 @@ agente ──(sustituto / socket)──▶ broker ──(credencial real)──�
         sin material secreto              único poseedor
 ```
 
-> **Estado: pre-1.0, en v0.33.0. Sin certificar, y los gates lo dicen.**
+> **Estado: pre-1.0, en v0.34.0. Sin certificar, y los gates lo dicen.**
 >
 > El workspace compila y hay **2029 tests enumerados**. Con `cargo test`, 2028
 > se ejecutan y pasan y 1 queda fuera de las compilaciones de depuración por
@@ -198,7 +198,7 @@ es una suposición:
 # el verificador es obligatorio: el instalador no sigue sin él
 cargo install rsign2          # o el gestor de paquetes de tu distribución
 curl -LsSf https://raw.githubusercontent.com/Rubentxu/agent-secretless/main/scripts/install.sh \
-  | sh -s -- --version 0.33.0 --prefix "$HOME/.local"
+  | sh -s -- --version 0.34.0 --prefix "$HOME/.local"
 ```
 
 El instalador exige que `sha256.sum` lleve una firma minisign válida antes de
