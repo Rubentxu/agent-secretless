@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 """Falsification harness for the CONNECT audit chain (V1-C2).
 
-Every mutation here asks one of two questions:
+Every mutation here asks one of three questions:
 
-* does the record still land, and does the class still say why; or
-* does a client-controlled string reach a durable, exported, hashed artefact.
+* does the record still land, and does the class still say why;
+* does a client-controlled string reach a durable, exported, hashed artefact; or
+* does one reach the operator's log, which is where the measured injection was.
 
-The second is the one this cycle nearly shipped. `parse_connect_target` builds
+The leak this design exists to prevent arrived twice, and the two guards that
+close it are independent on purpose. `parse_connect_target` builds
 `BridgeError::Protocol(format!("{authority} has no port"))` from the request
-line, so `ConnectionResult::Refused` carries bytes the client chose. Writing
-that into the chain would have been a leak created by the change meant to
-close an observability gap, and a canary test that only checked "something was
-recorded" would have passed.
+line *before* the session proof is looked at, so that text is whatever an
+unauthenticated peer wrote. `refusal_detail` is the guard that keeps it out of
+the operator's line; `ChainReport::record` is the guard that keeps a detail out
+of the chain whichever way it arrived. Falsifying only one of them proves only
+that one, which is why `the-refusal-detail-rides-into-the-chain` and
+`the-operator-log-quotes-the-client-after-all` are separate mutations rather
+than one mutation checked twice.
+
+A canary test that only asserted "something was recorded" would have passed for
+every leak below, and two of these are re-expressions of code that really was
+written and really did pass.
 """
 
 from __future__ import annotations
@@ -41,38 +50,47 @@ class Mutation:
 
 MUTATIONS = [
     Mutation(
-        name="the-refusal-reason-is-written-into-the-chain",
+        name="the-refusal-detail-rides-into-the-chain",
         edits=[
             (
                 RUNTIME,
-                '            ConnectionResult::Refused(reason) => refusal_class_from_text(reason).to_string(),',
-                '            // MUTANT: the rendered reason goes into the chain\n'
-                '            ConnectionResult::Refused(reason) => reason.clone(),',
+                "            ConnectionResult::Refused { class, .. } => (*class).to_string(),",
+                "            // MUTANT: the detail rides into the chain beside the class\n"
+                "            ConnectionResult::Refused { class, detail: why } => format!(\n"
+                '                "{class}: {}",\n'
+                "                why.as_deref().unwrap_or_default()\n"
+                "            ),",
             )
         ],
-        expect_red="a_refusal_is_recorded_as_a_class_and_never_quotes_the_reason",
+        expect_red="a_refusal_is_recorded_as_a_class_and_never_quotes_the_detail",
         why=(
-            "the leak this whole design exists to prevent. A hostile client puts "
-            "bytes of their choosing — a secret-shaped string included — into a "
-            "file that is hashed, exported and shipped. The canary is the client: "
-            "it chooses where the bytes go"
+            "the leak this whole design exists to prevent, on the surface that is "
+            "hashed, exported and shipped. Note what the mutation keeps: the class "
+            "still lands, so every assertion about the record still being "
+            "readable holds, and the chain keeps verifying. A guard that checked "
+            "'a refusal was recorded and the class says why' would be green while a "
+            "client chose the bytes"
         ),
     ),
     Mutation(
-        name="the-relay-failure-reason-is-written-into-the-chain",
+        name="the-operator-log-quotes-the-client-after-all",
         edits=[
             (
                 RUNTIME,
-                '            ConnectionResult::Refused(reason) => refusal_class_from_text(reason).to_string(),',
-                '            ConnectionResult::Refused(reason) => reason.clone(), // MUTANT',
+                "        BridgeError::Protocol(_) => None,\n        other => Some(other.to_string()),",
+                "        // MUTANT: the provenance rule is gone — every error offers its text\n"
+                "        other => Some(other.to_string()),",
             )
         ],
-        expect_red="a_relay_failure_reason_does_not_reach_the_chain_either",
+        expect_red="the_detail_is_dropped_for_exactly_the_errors_that_quote_the_client",
         why=(
-            "the same leak by the other path. `read_inner_head` and the "
-            "substitution port also render into `BridgeError::Protocol` and "
-            "`SubstitutionError`, so a guard covering only the CONNECT head "
-            "would be green while the relay still wrote one"
+            "the same bytes, on the surface the measured injection actually landed "
+            "on. `refusal_detail` is the *upstream* guard: it decides what text the "
+            "listener is willing to hand the reporter at all. Deleting the "
+            "provenance rule leaves the chain fine and every other test green, "
+            "because the chain test builds its outcomes by hand and never asks "
+            "where the detail came from. That is the argument for the two guards "
+            "being falsified separately"
         ),
     ),
     Mutation(
@@ -80,19 +98,21 @@ MUTATIONS = [
         edits=[
             (
                 RUNTIME,
-                "fn refusal_class_from_text(reason: &str) -> &'static str {",
-                """fn refusal_class_from_text(reason: &str) -> &'static str {
+                "pub fn refusal_class(error: &BridgeError) -> &'static str {\n    match error {",
+                """pub fn refusal_class(error: &BridgeError) -> &'static str {
     if true { // MUTANT: one class for every refusal
         return "refused";
-    }""",
+    }
+    match error {""",
             )
         ],
-        expect_red="cancellation_and_refusal_are_distinguishable_in_the_chain",
+        expect_red="distinct_bridge_errors_classify_distinctly",
         why=(
             "an operator who revoked a session and then reads one undifferentiated "
             "class goes looking for a client that misbehaved rather than for the "
             "policy that worked. Recording something is not the same as recording "
-            "why"
+            "why. The class is derived from the error's *kind* rather than from its "
+            "text precisely so that one arm cannot swallow the rest"
         ),
     ),
     Mutation(
@@ -108,10 +128,10 @@ MUTATIONS = [
         expect_red="a_connection_with_no_destination_is_still_recorded",
         why=(
             "the shape this mutation models already happened once, by hand: the "
-            "classifier searched `CancelReason`'s Display text, a caller worded "
-            "the reason differently, and the chain recorded `other` without "
-            "anything failing. A class derived from a human-readable message is a "
-            "class that changes when somebody improves the message"
+            "classifier searched `CancelReason`'s Display text, a caller worded the "
+            "reason differently, and the chain recorded `other` without anything "
+            "failing. The arm is exhaustive now, so the plausible way back is a new "
+            "arm folded into a catch-all rather than a match on rendered text"
         ),
     ),
     Mutation(
