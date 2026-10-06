@@ -126,14 +126,23 @@ fn answered_within(sock: &Path, patience: Duration) -> bool {
     let _ = stream.flush();
 
     let mut buf = vec![0u8; 64 * 1024];
-    while Instant::now() < deadline {
-        match stream.read(&mut buf) {
-            Ok(0) => return false,
-            Ok(n) => return serde_json::from_slice::<serde_json::Value>(&buf[..n]).is_ok(),
-            Err(_) => return false,
-        }
+    // One read, not a loop. All three arms of that match returned, so the
+    // `while` around it could only ever run once -- `clippy::never_loop` is
+    // right, and it is the deny lint rather than a warning that says so. The
+    // deadline guard survives the loop's removal because the guard was the
+    // part that was doing something: `patience` can elapse between setting the
+    // timeout above and reaching the read, and refusing the read then is
+    // exactly what the loop did. The read itself is already bounded by
+    // `set_read_timeout(Some(patience))`, so a second attempt would only ever
+    // re-arm the same deadline against the same stream.
+    if Instant::now() >= deadline {
+        return false;
     }
-    false
+    match stream.read(&mut buf) {
+        Ok(0) => false,
+        Ok(n) => serde_json::from_slice::<serde_json::Value>(&buf[..n]).is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// A peer that connects and never writes must not stop the next peer being
