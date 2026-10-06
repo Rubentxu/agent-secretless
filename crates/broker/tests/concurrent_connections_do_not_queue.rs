@@ -188,8 +188,57 @@ fn an_honest_client_is_answered_while_a_silent_peer_is_still_open() {
     );
 }
 
-/// **The row for the cap.** Past `MAX_IN_FLIGHT_CONNECTIONS` the broker refuses
-/// instead of queueing, and the refusal is visible and prompt.
+/// **The row that the cap is not a one-way ratchet.** A slot has to come back.
+///
+/// Rows one and two are both satisfiable by a counter that only ever counts
+/// up: fill the cap once and every later connection is refused, and both rows
+/// pass. Only a row that releases a slot and then expects the next peer to be
+/// admitted can see a missing `fetch_sub`, which is the failure that turns a
+/// broker into one that refuses every agent for the rest of the process's
+/// life after a single busy minute.
+///
+/// Bounded by retry rather than by a sleep: the slot comes back when the
+/// broker's read on the closed peer returns, and how long that takes is not
+/// something this test should assert. What it asserts is that the slot comes
+/// back *at all*, inside a window far longer than a loopback close needs.
+#[test]
+fn a_slot_comes_back_when_a_peer_finishes() {
+    let sandbox = Sandbox::new("release");
+    let _broker = sandbox.start();
+
+    let mut silent = silent_connections(&sandbox.sock, MAX_IN_FLIGHT_CONNECTIONS);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // The over-limit peer is refused while the cap is full. This is row two,
+    // and it is repeated here so that a broker which refuses unconditionally
+    // cannot pass by never giving a slot back.
+    assert!(
+        !ask_and_time(&sandbox.sock).1,
+        "the cap admitted a peer while all {MAX_IN_FLIGHT_CONNECTIONS} were still open; \
+         nothing to release in this row"
+    );
+
+    // Close one of the held sockets. The broker's read returns 0 and its worker
+    // finishes, which is where the slot comes back.
+    drop(silent.pop());
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut admitted = false;
+    while Instant::now() < deadline {
+        if ask_and_time(&sandbox.sock).1 {
+            admitted = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        admitted,
+        "after a held peer closed, no new peer was admitted within 10s. The cap is \
+         counting up and never counting down: a counter that never releases its slots \
+         refuses every agent for the rest of the process's life once it is full."
+    );
+}
 ///
 /// Falsifiable in two directions: a broker with no cap would answer the
 /// over-limit peer (or hold it until the deadline), and a broker that queued

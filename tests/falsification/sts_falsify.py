@@ -287,6 +287,14 @@ CARGO_TARGET = "--lib"
 # harness. The four-bucket accounting is what made it visible.
 PACKAGE = "asv-broker"
 
+# How many named bucket lists the calling harness partitions its mutations
+# across. Every harness that existed when this was a hardcoded word said four,
+# which is why it read as fact rather than as a claim — and `broker_accept_loop`
+# has three, so the line would have been false the moment a new harness landed.
+# Overridable rather than derived: the framework runs one bucket per invocation
+# and cannot see the others, so only the caller knows the count.
+BUCKET_COUNT_LABEL = "four"
+
 
 def run_test(short_name: str) -> tuple[str, str]:
     """Run exactly one row and report what actually happened.
@@ -400,7 +408,7 @@ def main() -> int:
     }
     assert sum(buckets.values()) == len(MUTATIONS), (buckets, len(MUTATIONS))
     print()
-    print(f"mutations: {len(MUTATIONS)}  (the four buckets partition the run)")
+    print(f"mutations: {len(MUTATIONS)}  (the {BUCKET_COUNT_LABEL} buckets partition the run)")
     for name, count in buckets.items():
         print(f"  {name:<22}: {count}")
     if refused:

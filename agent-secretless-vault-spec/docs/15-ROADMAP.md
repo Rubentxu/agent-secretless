@@ -2580,22 +2580,43 @@ arriving faster than it is served cannot race past the cap. Unbounded threads
 would be the same denial of service the sequential loop had, moved somewhere
 less visible: a peer opening thousands of sockets costs thousands of stacks.
 
-**Measured now, measured before in neither.** Two rows in
+**Measured now, measured before in neither.** Three rows in
 `crates/broker/tests/concurrent_connections_do_not_queue.rs`, against the real
 `asv-brokerd` binary and a real socket:
 
 | Row | Measured | Bound |
 |---|---|---|
-| `an_honest_client_is_answered_while_a_silent_peer_is_still_open` | **604µs** | 2s |
-| `a_burst_past_the_in_flight_cap_is_refused_rather_than_queued` | **149µs**, after 64 in flight | 5s socket deadline |
+| `an_honest_client_is_answered_while_a_silent_peer_is_still_open` | **448µs** | 2s |
+| `a_burst_past_the_in_flight_cap_is_refused_rather_than_queued` | **117µs**, after 64 in flight | 5s socket deadline |
+| `a_slot_comes_back_when_a_peer_finishes` | admitted on retry | 10s |
 
 Both numbers are printed by the rows rather than only asserted, because a bound
 nothing approaches is indistinguishable from a bound that is simply far away.
 The first row is falsifiable rather than decorative because a serialised loop
-cannot answer before the silent peer's 5s deadline expires — so 604µs is not
+cannot answer before the silent peer's 5s deadline expires — so 448µs is not
 "fast", it is a statement about concurrency. The second separates *refused*
-from *waited its turn*: 149µs is three orders of magnitude inside the deadline,
+from *waited its turn*: 117µs is four orders of magnitude inside the deadline,
 so nothing was served and then abandoned.
+
+**The third row is the one the first two cannot see.** Both of them are
+satisfiable by a counter that only ever counts up: fill the cap once, refuse
+from then on, and they pass forever. A broker that leaked its slots would
+refuse every agent for the rest of the process's life after a single busy
+minute, and neither row would ever notice. So the third closes a held peer and
+then waits for the next one to be admitted, bounded by retry rather than by a
+sleep — the slot comes back when the broker's read on the closed peer returns,
+and *when* that is not this test's claim; that it comes back at all is.
+
+**And the three rows are falsified, not merely passing.**
+`tests/falsification/broker_accept_loop_falsify.py`, three buckets run one per
+invocation: **4 mutations, 4 red, 0 survivors, 0 compiler-refused, 0
+unmeasured.** The ceiling admits every peer (2 mutations, both reds on the
+burst row: one deletes the admission decision, the other raises the ceiling to
+`usize::MAX` — the subtler one, because the constant is still there and a
+reader of `main.rs` still sees a limit). Releasing counts a connection in and
+never out, which only the third row catches. Concurrency serves the connection
+on the accept thread again, and the honest-client row reds it for the reason
+the surviving idle-connection row could not.
 
 **The row that claimed this coverage did not have it.**
 `idle_connection_does_not_block_the_broker.rs` bounds its honest client at 20s
@@ -2612,11 +2633,9 @@ including an honest agent: a flood is indistinguishable from a busy install at
 the accept loop, so a peer that opens 65 sockets can lock out the 65th honest
 agent for up to 5s. That is the deliberate trade named in `main.rs` — a visible
 refusal beats an invisible stall — and it is a policy question this cycle does
-not settle. Separately, the TCP tunnel listener carries its own `InFlight`
-gauge with its own accounting, and no row here covers that path either. And
-`main.rs` still has no falsification harness at all: the two rows above are
-integration rows against a spawned binary, which is a weaker kind of evidence
-than the campaign the connector and registry crates carry.
+not settle, though the harness above now at least keeps the refusal honest.
+Separately, the TCP tunnel listener carries its own `InFlight` gauge with its
+own accounting, and no row here covers that path either.
 
 ---
 
