@@ -4806,3 +4806,103 @@ can change in between.
   process, through the same `decide` the CLI calls — but a mid-invocation swap
   is covered by neither, and inventing a test hook that mutates the tool
   between the two resolutions would prove the hook.
+
+### R4.B.2 — execute against a real credential inventory
+
+R4.B.1 closed with a sentence it had earned by choosing not to overreach:
+
+> `execute` carries an **empty credential inventory** on purpose … So a receipt
+> today records an authority decision over a plan that bound nothing, which is
+> honest but is not yet the whole story.
+
+That was true, and this block is the rest of the story. `execute` now asks the
+broker what credentials exist, exactly as `plan` already did, and the receipt
+carries the **whole plan** rather than a summary of it — so "nothing was bound"
+becomes a fact with a number in it (`plan.inventory_size`) instead of an absence
+a reader has to infer from a field that is not there.
+
+**Why the plan and not a rendering of it.** A receipt carrying a rendered plan
+would be re-checkable only against the renderer. Carrying the `IntegrationPlan`
+the command printed and `bind_to` was called with means the document can be
+re-derived from itself, and one row now does exactly that: it takes the receipt,
+takes the plan out of it, re-computes `config_digest()` from the document alone,
+and compares it with what the binding claims was promised. An earlier draft of
+that row compared the plan's *per-file* fingerprint against the intent's
+`config_fingerprint` and passed for the wrong reason — the second is the
+aggregate over every entry with the family and a length prefix folded in, so
+they are different digests by construction.
+
+**Four accessors, each answering a question a reader would otherwise answer by
+counting `Binding` arms by hand.** `bound_anything`, `bound_count`,
+`unbound_count` and `credentials_at_stake`. `ambiguous` is not a binding, so a
+plan that refused to choose between two bearer tokens reports **zero** bound and
+still names the selector — a receipt claiming a spend that cannot happen is
+worse than reporting none, because it looks like an answer.
+
+**`--no-vault` is honest rather than silent.** It keeps the meaning `plan` gives
+it, and the receipt says `inventory_size: 0` with the selector still reported
+and bound to nothing. "One selector, nothing bound" is not "nothing to do".
+
+### What a live broker found that no unit test could
+
+The rows above are in `crates/integrations` and they pass. Then a fixture was
+written that starts a real `asv-brokerd` over a real `VaultStore` — the pattern
+R3.A.2 already had for `plan` — and three things turned up that no amount of
+library testing would have:
+
+1. **`--session` was mandatory, and nothing an operator could type had ever
+   authorized anything.** The broker records the PID that opened a session and
+   refuses to evaluate a request from any other PID. Every session id an
+   operator could paste belonged to a different process, so the answer was
+   always *"session is not owned by the authenticated peer"*. The command was
+   unreachable in the one way that mattered, and **every row in R4.B.1 passed
+   anyway** — a refusal nobody reads is not a failing row. `execute` now opens
+   its own session when the caller does not bring one, which is what
+   `run_isolated`, `registry` and `github` already did, and it does so *before*
+   the intent is hashed so the workload in the digest is the workload the broker
+   evaluates.
+2. **The refusal was summarised into uselessness.** `Response::Error` carries
+   the broker's own sentence and the CLI folded it into *"the broker answered
+   Error to an authorization request"* — true, protocol-shaped, and with the
+   reason removed. It is now carried verbatim, with its own reason code.
+3. **The prose named the credential by UUID alone.** An operator reading
+   `would spend: 8eced6c9-…` cannot recognise which vault entry that is. It now
+   prints `npm-registry (8eced6c9-…)`: the label is what a person recognises and
+   the id is what they can act on, so both go in.
+
+And fixing (1) produced a fourth: the step that opens the session used to
+`exit(1)`, which meant a machine with **no broker at all** wrote no receipt —
+even with `--no-vault`, which exists precisely so an operator can look before
+they have adopted anything. A broker that cannot be reached is now a
+`BrokerUnreachable` verdict the receipt carries, with the intent's workload
+naming the absent session rather than an empty string.
+
+| Vertical | What it is | Rows |
+|---|---|---|
+| `r4b2_bound_execute.rs` | npm and curl against a live broker and a stored credential | 7 |
+| `r4b1_intent_chain.rs` | the same command with no broker, and the `--no-vault` pair | 14 |
+
+**Falsified.** Seven buckets, twenty-four mutations, zero survivors — eight of
+them new. The two new buckets are also why the bug in (1) is dead rather than
+merely fixed: `inventory` points at the vertical that *starts a broker*, because
+the existing `chain` bucket mutates the same file and points at a fixture that
+runs with `--no-vault` and therefore never reaches the code it mutates. A row can
+only falsify a mutation when the fixture gets there.
+
+**Still not done, and named rather than left for an operator to discover:**
+
+- The policy has no rule for `registry.push` or `http.request` in these
+  fixtures, so the live path ends in `NoMatchingPolicy`. That is an honest
+  answer and it is not the same as a permit: **no vertical in this block has
+  watched a `PERMITTED` execution name a credential.** Everything asserted above
+  holds either way, which is why the rows assert the binding and not the
+  outcome — but the pair is unproven.
+- `plan` and `adopt` still do not exist for Maven or Gradle.
+- The action and the resource still come from `action_for(family)` and
+  `resource_for(family)`, one hard-coded pair per family.
+- No vertical can make a real binary swap land between the two resolutions
+  inside one invocation.
+- Two bearer tokens in one vault bind `ambiguous` for **both** families, so a
+  realistic two-token CI setup produces no binding at all. The broker reports a
+  credential's kind and not its audience over IPC, and closing that gap is a
+  protocol change rather than a plan change.
