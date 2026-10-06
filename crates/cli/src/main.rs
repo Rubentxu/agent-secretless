@@ -255,9 +255,20 @@ enum IntegrationsCommand {
         /// deadline is a session wearing a different hat.
         #[arg(long, value_name = "SECONDS", default_value_t = 300)]
         ttl: u64,
-        /// The session the broker authorizes under.
+        /// A session another process opened.
+        ///
+        /// **Almost never what you want, and the reason is structural rather
+        /// than a policy choice.** The broker records the PID that opened a
+        /// session and refuses to evaluate an authorization request from any
+        /// other PID, so a session id typed here by an operator can never
+        /// authorize the very command carrying it. Left out — the default — this
+        /// command opens its own session, which is what every other verb that
+        /// reaches the broker already does.
+        ///
+        /// The flag is for the caller that genuinely has one: a worker launched
+        /// inside `asv run` under an already-open session.
         #[arg(long, value_name = "UUID")]
-        session: String,
+        session: Option<String>,
         /// The workspace the authorization is scoped to.
         #[arg(long, value_name = "DIR")]
         workspace: String,
@@ -271,6 +282,16 @@ enum IntegrationsCommand {
         /// directory. Refused by default, for the reason `discover` refuses.
         #[arg(long, value_name = "DIR")]
         allow_symlink_root: Option<String>,
+        /// Do not ask the broker what credentials exist, and plan against an
+        /// empty inventory.
+        ///
+        /// **The receipt then says so.** A plan built on "we did not ask" would
+        /// be a plan about an invented inventory, and an execution authorized
+        /// over one would look identical to an execution that had asked and
+        /// found nothing. Same flag and same meaning as `plan`'s, deliberately:
+        /// an operator who learned it in one place learned it in both.
+        #[arg(long)]
+        no_vault: bool,
     },
     /// Describe what a tool's configuration file declares — R3's first stage.
     ///
@@ -1387,6 +1408,17 @@ fn run_isolated(
 /// "one operation" claim depend on a timer rather than on `max_uses`.
 const GITHUB_SURROGATE_TTL_SECS: u64 = 60;
 
+/// The `workload` an intent carries when no session was ever opened.
+///
+/// **A literal that says so, rather than an empty string.** The intent names
+/// the session it will be authorized under, and that name goes into the intent
+/// digest, so a receipt whose workload is blank would be a receipt claiming an
+/// operation with no session at all — which is both false (this process asked
+/// and failed to get one) and unreadable (a reader cannot tell it from a bug).
+/// This string is the difference between "there was no session" and "the
+/// session was the empty string".
+const UNOPENED_SESSION: &str = "(no session could be opened)";
+
 /// The lifetime of a registry pull's surrogate.
 ///
 /// Same minute as the GitHub verbs and for the same reason: the grant covers
@@ -1718,6 +1750,7 @@ fn run_integrations(
             cwd,
             home,
             allow_symlink_root,
+            no_vault,
         } => run_integrations_execute(
             socket,
             family,
@@ -1728,11 +1761,12 @@ fn run_integrations(
             actor,
             origin,
             *ttl,
-            session,
+            session.as_deref(),
             workspace,
             cwd,
             home.as_deref(),
             allow_symlink_root.as_deref(),
+            *no_vault,
         ),
         IntegrationsCommand::Adopt {
             family,
@@ -4189,16 +4223,55 @@ fn run_integrations_execute(
     actor: &str,
     origin: &str,
     ttl: u64,
-    session: &str,
+    session: Option<&str>,
     workspace: &str,
     cwd: &str,
     home: Option<&str>,
     allow_symlink_root: Option<&str>,
+    no_vault: bool,
 ) -> std::io::Result<()> {
     use asv_integrations::Adapter as _;
 
     let (home, _, policy) = integrations_home_and_policy(home, allow_symlink_root)?;
     let cwd_dir = std::path::PathBuf::from(cwd);
+
+    // --- 0. what credentials exist ------------------------------------------
+    // Before discovery, because the plan consumes it and the receipt has to
+    // carry the plan. R4.B.1 shipped this as `Vec::new()`, which made every
+    // receipt an authorization over a plan that named no credential — and
+    // because the receipt did not carry the plan, nothing in the document said
+    // so.
+    let inventory: Vec<asv_domain::CredentialMetadata> = if no_vault {
+        Vec::new()
+    } else {
+        match call(socket, &Request::ListCredentialMetadata) {
+            Ok(Response::CredentialMetadata { entries }) => entries
+                .into_iter()
+                .map(|entry| asv_domain::CredentialMetadata {
+                    id: asv_domain::CredentialId::from_uuid(entry.id),
+                    label: entry.label,
+                    kind: entry.kind,
+                    exportability: entry.exportability,
+                })
+                .collect(),
+            Ok(other) => {
+                // Same reasoning as `plan`: a protocol that answered something
+                // else has not told us what credentials exist, and executing
+                // against "we did not ask" is executing against an invention.
+                eprintln!(
+                    "asv: the broker answered {} to a credential-inventory request; \
+                     this command cannot execute against that",
+                    response_kind(&other)
+                );
+                std::process::exit(1);
+            }
+            Err(error) => {
+                eprintln!("asv: could not reach the broker for the credential inventory: {error}");
+                eprintln!("    pass --no-vault to execute against an empty inventory and say so.");
+                std::process::exit(1);
+            }
+        }
+    };
 
     // --- 1. discover -------------------------------------------------------
     // The typed discovery, kept typed. Routing it through `into_discovery`
@@ -4257,16 +4330,63 @@ fn run_integrations_execute(
     }
 
     // --- 3. plan -------------------------------------------------------------
-    // The inventory is empty on purpose: `execute` is about the authority
-    // chain, and reaching the vault for it would make a step that holds no
-    // secret into one that could. A plan that binds nothing is still a plan,
-    // and the receipt says so.
-    let inventory: Vec<asv_domain::CredentialMetadata> = Vec::new();
     let plan = match &discovered {
         Discovered::Npm(discovery) => asv_integrations::plan_npm(discovery, &inventory),
         Discovered::Curl(discovery) => asv_integrations::plan_curl(discovery, &inventory),
     }
     .with_tool(planned_tool.resolved.clone().expect("checked above"));
+
+    // --- 3b. the session this attempt will be authorized under ----------------
+    //
+    // **Opened here, by this process, unless the caller brought one it already
+    // owns — and here rather than at the authorization step because the intent
+    // names the session as its workload.** A session resolved after the intent
+    // was hashed would put a different workload in the receipt from the one the
+    // broker evaluated, which is the exact class of disagreement this block
+    // exists to make impossible.
+    //
+    // The broker records the PID that opened a session and refuses to evaluate
+    // an authorization request from any other PID, so R4.B.1's mandatory
+    // `--session` meant this command could never be authorised by anything an
+    // operator could type: any id they pasted belonged to another process, and
+    // the answer was always "session is not owned by the authenticated peer".
+    // Found by running the chain against a live broker rather than by reading
+    // the policy.
+    //
+    // Opening our own is what `run_isolated`, `registry` and `github` already
+    // do. A session brought from outside is still honoured, because a worker
+    // inside `asv run` genuinely has one — and when the broker refuses it, the
+    // reason it gives is carried into the receipt rather than summarised away.
+    //
+    // **A broker that cannot be reached is not a reason to write nothing.**
+    // This step used to exit, which meant a machine with no broker produced no
+    // receipt at all and `--no-vault` stopped being usable before an operator
+    // had decided to adopt anything — the same first-run property `plan` has.
+    // The failure now becomes a verdict the receipt carries, so the document
+    // still answers the only two questions anybody has: what would this have
+    // spent, and what stopped it.
+    let session: Option<String> = match session {
+        Some(borrowed) => Some(borrowed.to_string()),
+        None => match call(
+            socket,
+            &Request::CreateSession {
+                workspace: workspace.to_string(),
+            },
+        ) {
+            Ok(Response::SessionCreated { session, .. }) => Some(session.to_string()),
+            Ok(other) => {
+                eprintln!(
+                    "asv: could not open a session to authorize under: the broker answered {}",
+                    response_kind(&other)
+                );
+                None
+            }
+            Err(error) => {
+                eprintln!("asv: could not reach the broker to open a session: {error}");
+                None
+            }
+        },
+    };
 
     // --- 4. build the intent ------------------------------------------------
     let origin = match origin {
@@ -4293,7 +4413,7 @@ fn run_integrations_execute(
         transaction: transaction.to_string(),
         principal: principal.to_string(),
         actor: actor.to_string(),
-        workload: session.to_string(),
+        workload: session.clone().unwrap_or_else(|| UNOPENED_SESSION.into()),
         action: action_for(family),
         resource: resource_for(family),
         tool: plan.tool.clone(),
@@ -4330,7 +4450,7 @@ fn run_integrations_execute(
     };
 
     // --- 6. authorize, through the broker ------------------------------------
-    let verdict = authorize_over_ipc(socket, &intent, session, workspace, json);
+    let verdict = authorize_over_ipc(socket, &intent, session.as_deref(), workspace, json);
 
     // --- 7. check the world again --------------------------------------------
     // Re-resolved, never reused. Reusing the plan's resolution would compare
@@ -4416,13 +4536,25 @@ fn resource_for(family: &str) -> asv_domain::Resource {
 /// **The broker is the only authority here.** A failure to reach it is a
 /// `Deny`, not an `Executed` and not a panic: "we could not ask" and "we asked
 /// and were told no" must not look the same to a caller.
+///
+/// `None` means no session was ever opened — the broker was unreachable when
+/// this process went looking — so there is nobody to ask. That is a `Deny` on
+/// the same grounds as the IPC failure below it, and it is answered here rather
+/// than at the call site so that every route into "could not ask" produces one
+/// reason code instead of two.
 fn authorize_over_ipc(
     socket: &std::path::Path,
     intent: &asv_domain::ActionIntent,
-    session: &str,
+    session: Option<&str>,
     workspace: &str,
     _json: bool,
 ) -> asv_integrations::AuthorizationVerdict {
+    let Some(session) = session else {
+        return asv_integrations::AuthorizationVerdict::Deny {
+            reason: "no session could be opened, so no authority could be asked for".into(),
+            reason_code: "BrokerUnreachable".into(),
+        };
+    };
     let session_id: asv_domain::AgentSessionId = match session.parse() {
         Ok(id) => id,
         Err(error) => {
@@ -4469,6 +4601,19 @@ fn authorize_over_ipc(
                 }
             }
         }
+        // **The broker's own refusal is carried, not summarised.**
+        //
+        // `Response::Error` is the shape a session check rejects with — "the
+        // session is not owned by the authenticated peer", "the workspace is
+        // outside the grant" — and every one of those messages is the exact
+        // thing an operator needs and cannot guess. Folding them into "the
+        // broker answered Error" would be true and useless: it names the
+        // protocol shape and drops the reason. Found by running the chain
+        // against a live broker with a session that was never created.
+        Ok(Response::Error { message, .. }) => asv_integrations::AuthorizationVerdict::Deny {
+            reason: format!("the broker refused the authorization: {message}"),
+            reason_code: "Refused".into(),
+        },
         Ok(other) => asv_integrations::AuthorizationVerdict::Deny {
             reason: format!(
                 "the broker answered {} to an authorization request",
@@ -4527,6 +4672,41 @@ fn print_execute_prose(receipt: &asv_integrations::ExecuteReceipt) {
             reason,
             reason_code,
         } => println!("  DENIED ({reason_code}): {reason}"),
+    }
+    println!();
+    // The credentials section comes before the outcome on purpose. "Executed"
+    // and "executed, spending nothing" are different facts, and a reader who
+    // meets the verdict first has no reason to go looking for the difference.
+    println!("at stake:");
+    let stake = receipt.credentials_at_stake();
+    if stake.is_empty() {
+        println!(
+            "  nothing: {} credential(s) were offered, {} selector(s) in the plan, \
+             and none bound.",
+            receipt.plan.inventory_size,
+            receipt.plan.entries.len()
+        );
+    } else {
+        println!(
+            "  {} credential(s) offered, {} selector(s) in the plan",
+            receipt.plan.inventory_size,
+            receipt.plan.entries.len()
+        );
+        for (label, id) in receipt.credentials_named() {
+            // Both halves: `deploy-token` is what the operator typed into
+            // `add-credential`, and the id is what they can paste into
+            // `asv credentials delete`. Printing only the first makes the
+            // credential un-actionable; printing only the second makes it
+            // un-recognisable.
+            println!("  would spend: {label} ({id})");
+        }
+        if receipt.unbound_count() > 0 {
+            println!(
+                "  and {} selector(s) bound to nothing, which is a different \
+                 outcome from binding everything.",
+                receipt.unbound_count()
+            );
+        }
     }
     println!();
     println!("outcome:");
