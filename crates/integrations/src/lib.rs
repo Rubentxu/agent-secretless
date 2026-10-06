@@ -74,6 +74,7 @@ pub mod maven;
 pub mod npm;
 pub mod plan;
 pub mod registry_audience;
+pub mod tool;
 
 pub use adopt::{
     selector_for, AdoptError, AdoptReceipt, AdoptSelector, NpmAdoption, PendingStep, ADOPT_SCHEMA,
@@ -90,6 +91,7 @@ pub use plan::{
     PlanError, Posture, Strategy, UnboundReason, Why, PLAN_SCHEMA,
 };
 pub use registry_audience::{RegistryAudience, RegistryAudienceError};
+pub use tool::{resolve_tool, CandidateOutcome, PathCandidate, ToolResolution, MAX_TOOL_BYTES};
 
 // `adopt` names a vault credential in its receipt, so the handle type belongs
 // at this crate's root rather than making every consumer reach into
