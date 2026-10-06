@@ -313,11 +313,19 @@ fn the_whole_family_is_reachable_without_a_broker_or_a_vault() {
 
     // And an unknown family is still refused rather than falling through to a
     // default, so "this build knows maven" is a checked claim.
+    //
+    // **The example is a sentinel, and it was not always one.** This row used to
+    // pass `gradle`, which was right until Gradle existed — and it expired the
+    // moment R3.B.2 landed, with a failure that reads as a bug in the Gradle
+    // family rather than as an expired shelf life. R3.A.1's unit row had the
+    // same defect and was already given a sentinel; this vertical row had not.
+    // A row wired to a *future* family has a shelf life, and its expiry always
+    // looks like a defect somewhere else.
     let out = Command::new(asv_broker::binary::locate("asv"))
         .arg("integrations")
         .arg("discover")
         .arg("--family")
-        .arg("gradle")
+        .arg("a-family-this-build-does-not-have")
         .arg("--cwd")
         .arg(account.root.path())
         .arg("--home")
