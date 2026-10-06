@@ -71,6 +71,32 @@ if [[ ! -f "${DISTRIB}/dist-manifest.json" ]]; then
   exit 1
 fi
 
+# The product boundary must be present **before** any asset is collected, and
+# this check is in the shell rather than inside the collector on purpose.
+#
+# It used to live in the python that builds ASSETS, calling `sys.exit` when
+# `manifest.toml` was absent. That never stopped a publish: the python runs
+# inside a `$( )` feeding `mapfile`, so its failure was the exit status of a
+# command substitution nobody checked, while `mapfile` returned cleanly with
+# the nine artifacts already printed. The guard read as a guard, printed its
+# message, and the release went out anyway.
+#
+# v0.35.0 is the release that proved it. It shipped nine assets with no
+# manifest and a signed `sha256.sum` that did not list one — so the installer
+# found an authority that did not cover the file that decides what it may
+# install, which is a refusal rather than an installation. The release had to
+# be repaired after the fact. A check that cannot fail is a comment.
+if [[ ! -f "${DISTRIB}/manifest.toml" ]]; then
+  echo "publish-release: ${DISTRIB}/manifest.toml is missing." >&2
+  echo "  Run scripts/pin-manifest-into-checksums.py before publishing, then" >&2
+  echo "  re-run scripts/sign-release-artifacts.sh so the signed sha256.sum" >&2
+  echo "  covers the manifest. The installer downloads the manifest and" >&2
+  echo "  decides from it which components it may install: a release without" >&2
+  echo "  one is a release nobody can install, and a signed sha256.sum that" >&2
+  echo "  does not list it is a verifier refusing what it cannot cover." >&2
+  exit 1
+fi
+
 # Uploading to a Release that already exists appends to it. `gh` does not
 # refuse on its own, and the result is a release whose artifact list is a mix
 # of two builds with one tag, which is exactly the state
