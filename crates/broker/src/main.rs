@@ -635,18 +635,25 @@ fn main() -> std::io::Result<()> {
             eprintln!("asv: cannot read --policy {}: {e}", path.display());
             std::process::exit(1);
         });
-        state.policy = asv_policy::PolicyEngine::from_policy_text(&text).unwrap_or_else(|e| {
-            // A policy that does not parse is not a policy this broker can run
-            // with. Exiting is the fail-closed answer; falling back to the
-            // built-in text would start a broker whose effective policy nobody
-            // wrote, and every decision it made afterwards would be attributed
-            // to a file the operator does not have.
-            eprintln!(
-                "asv: --policy {} is not valid Cedar policy: {e}",
-                path.display()
-            );
-            std::process::exit(1);
-        });
+        // Named for the file it was read from, so every decision this broker
+        // makes afterwards says which policy made it. The path rather than a
+        // generic "operator-delivered": an operator reading a receipt needs to
+        // open something, and this is the something they named on the command
+        // line.
+        state.policy =
+            asv_policy::PolicyEngine::from_named_policy_text(&text, &path.display().to_string())
+                .unwrap_or_else(|e| {
+                    // A policy that does not parse is not a policy this broker can run
+                    // with. Exiting is the fail-closed answer; falling back to the
+                    // built-in text would start a broker whose effective policy nobody
+                    // wrote, and every decision it made afterwards would be attributed
+                    // to a file the operator does not have.
+                    eprintln!(
+                        "asv: --policy {} is not valid Cedar policy: {e}",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                });
         tracing::info!(path = %path.display(), "Cedar policy loaded");
     }
 

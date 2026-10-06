@@ -19,6 +19,14 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The name every decision made by the **built-in** policy carries.
+///
+/// Only ever true of [`Self::default`] and [`Self::new`]. A broker started with
+/// `--policy` names the operator's file instead, because a receipt that credits
+/// the built-in for a decision somebody else's policy made is worse than a
+/// receipt with no name at all.
+pub const DEFAULT_POLICY_NAME: &str = "m3-default-policy";
+
 const POLICY_TEXT: &str = r#"
 permit (principal, action == Action::"git_fetch", resource);
 permit (principal, action == Action::"ssh_connect", resource);
@@ -731,6 +739,20 @@ pub struct PolicyEngine {
     /// Cedar validates the entity against the same schema the policies were
     /// validated against. One schema, held once, so the two cannot drift.
     schema: Arc<Schema>,
+    /// What to call this policy in every decision it produces.
+    ///
+    /// **It used to be the constant `"m3-default-policy"`, written into every
+    /// [`ExplainResult`] regardless of where the text came from.** Found by
+    /// running the broker with `--policy` pointing at a file an operator wrote:
+    /// the receipt said `allow by m3-default-policy` for a decision that policy
+    /// had made, which points the reader at the wrong file in the one artefact
+    /// whose purpose is to say who decided what.
+    ///
+    /// The name is carried rather than inferred because nothing downstream can
+    /// recover it — the broker has already forgotten where it read the text from
+    /// by the time a decision is written, and guessing from the text would mean
+    /// parsing Cedar to extract a filename.
+    policy_name: String,
 }
 
 impl fmt::Debug for PolicyEngine {
@@ -747,7 +769,7 @@ impl Default for PolicyEngine {
 
 impl PolicyEngine {
     pub fn new(clock: Arc<dyn Clock>) -> Result<Self, PolicyError> {
-        Self::from_policy_text_with_clock(POLICY_TEXT, clock)
+        Self::from_named_policy_text_with_clock(POLICY_TEXT, DEFAULT_POLICY_NAME, clock)
     }
 
     /// Loads policy text, validating it against the schema (D11).
@@ -755,11 +777,25 @@ impl PolicyEngine {
     /// Validation is the point: a rule naming an action this system does not
     /// have is a load-time error, not a rule that would quietly ALLOW it.
     pub fn from_policy_text(policy_text: &str) -> Result<Self, PolicyError> {
-        Self::from_policy_text_with_clock(policy_text, Arc::new(SystemClock))
+        Self::from_named_policy_text(policy_text, DEFAULT_POLICY_NAME)
     }
 
-    fn from_policy_text_with_clock(
+    /// The same, naming the policy for every decision it will produce.
+    ///
+    /// **The name goes in the receipt, so it has to be something an operator can
+    /// match against the file they delivered** — a path, or whatever the
+    /// deployment calls the policy. `&str` rather than `Path` because this is a
+    /// label in a document, not a path anything reads.
+    pub fn from_named_policy_text(
         policy_text: &str,
+        policy_name: &str,
+    ) -> Result<Self, PolicyError> {
+        Self::from_named_policy_text_with_clock(policy_text, policy_name, Arc::new(SystemClock))
+    }
+
+    fn from_named_policy_text_with_clock(
+        policy_text: &str,
+        policy_name: &str,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, PolicyError> {
         let schema = Schema::from_json_str(SCHEMA_JSON)
@@ -780,6 +816,7 @@ impl PolicyEngine {
             store: Mutex::new(Store::default()),
             clock,
             schema: Arc::new(schema),
+            policy_name: policy_name.to_string(),
         })
     }
 
@@ -1025,7 +1062,7 @@ impl PolicyEngine {
         ExplainResult {
             decision,
             reason,
-            rule: "m3-default-policy".into(),
+            rule: self.policy_name.clone(),
             session: request.session,
             action: request.action.clone(),
             resource: request.resource.clone(),
