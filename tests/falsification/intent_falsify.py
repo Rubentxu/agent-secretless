@@ -1,21 +1,41 @@
 #!/usr/bin/env python3
-"""Falsifying R4.B.1's intent chain, in the four files it spans.
+"""Falsifying the intent chain, in the four files it spans.
 
-`r4b1_intent_chain.rs` and the 240-odd rows in `crates/domain` and
+`r4b1_intent_chain.rs` and the 250-odd rows in `crates/domain` and
 `crates/integrations` assert that a plan bound to an intent notices when the
-world moves under it. Until this harness existed they were rows that passed,
+world moves under it, and — since R4.B.2 — that the receipt names the credential
+the execution would spend. Until this harness existed they were rows that passed,
 which is the weakest thing a row can be: a row nobody has tried to break
 measures nothing about whether it can fail.
 
-Five buckets, run one per invocation like every other harness here:
+Seven buckets, run one per invocation like every other harness here:
 
-    python3 intent_falsify.py binding   # whose word the binding records
-    python3 intent_falsify.py digest    # what goes into the config digest
-    python3 intent_falsify.py tool      # how the executable is resolved
-    python3 intent_falsify.py invalid   # which drift the check reaches
-    python3 intent_falsify.py chain     # the wiring, through the real binary
+    python3 intent_falsify.py binding    # whose word the binding records
+    python3 intent_falsify.py digest     # what goes into the config digest
+    python3 intent_falsify.py tool       # how the executable is resolved
+    python3 intent_falsify.py invalid    # which drift the check reaches
+    python3 intent_falsify.py chain      # the wiring, through the real binary
+    python3 intent_falsify.py stake      # what the receipt says is at stake
+    python3 intent_falsify.py inventory  # the real inventory, against a broker
 
-**Two of these mutations exist because a row here was wrong and this campaign
+**`stake` and `inventory` are R4.B.2's, and `inventory` found a bug the whole
+previous campaign could not see.**
+
+`chain` mutates the CLI and points at `r4b1_intent_chain.rs`, which runs with
+`--no-vault` because it has no broker — so every mutation it could express was
+measured against a chain that never asked what credentials existed. A row can
+only falsify a mutation when the fixture reaches the code being mutated, and
+that fixture did not. `inventory` points at `r4b2_bound_execute.rs`, which
+starts a real `asv-brokerd` over a real vault, and the first mutation it was
+given — restoring the empty inventory R4.B.1 shipped — took the live path where
+the other could not.
+
+What it turned up was worse than an unreached mutation: `--session` was
+mandatory, the broker pins a session to the PID that opened it, and so nothing
+an operator could type had ever authorized anything. Every row in the block
+passed anyway, because a refusal nobody reads is not a failing row.
+
+**Three of these mutations exist because a row here was wrong and this campaign
 is what showed it.**
 
 `digest` shipped a length-prefix mutation that survived: the collision row it
@@ -236,6 +256,116 @@ CHAIN = [
 # is exercised; neither alone would be enough, and no row here can stand in for
 # a swap that lands mid-invocation.
 
+# --- stake ----------------------------------------------------------------
+# What the receipt says is at stake. R4.B.2 added the inventory to `execute`
+# and the accessors that count what it bound, and every one of these is a
+# question a reader of a receipt has to be able to ask without counting `Binding`
+# arms by hand.
+#
+# **The empty case is the easy one and these rows are not about it.** A receipt
+# that reports nothing bound is right by default; the mutation that would break
+# it is `Vec::new()`, and that one lives in the CLI bucket below because that is
+# where the change to undo lives.
+STAKE = [
+    (
+        # The row this mutation is aimed at is about *ambiguity*, not about
+        # emptiness: two bearer tokens, one selector, and nothing in the
+        # inventory that could say which is the registry one. `entries` is
+        # non-empty there, so an emptiness test reports a decided spend for a
+        # binding that `plan` deliberately refused to make.
+        "ask whether the plan had any entries rather than whether anything bound",
+        """    pub fn bound_anything(&self) -> bool {
+        self.bound_count() > 0
+    }""",
+        """    pub fn bound_anything(&self) -> bool {
+        !self.plan.entries.is_empty()
+    }""",
+        "an_ambiguous_binding_is_not_reported_as_a_spend",
+    ),
+    (
+        "count every selector as bound, whatever its binding says",
+        """            .filter(|entry| matches!(entry.binding, crate::plan::Binding::Bound { .. }))""",
+        """            .filter(|_entry| true)""",
+        "a_selector_nothing_could_serve_is_counted_as_unbound_not_absent",
+    ),
+    (
+        "report nothing unbound, so the two counts stop adding up to the selectors",
+        """    pub fn unbound_count(&self) -> usize {
+        self.plan.entries.len().saturating_sub(self.bound_count())
+    }""",
+        """    pub fn unbound_count(&self) -> usize {
+        0
+    }""",
+        "the_two_counts_always_add_up_to_the_selectors",
+    ),
+    (
+        "report nothing as at stake, however much the plan bound",
+        """                crate::plan::Binding::Bound { credential, .. } => Some(*credential),
+                _ => None,""",
+        """                _ => None,""",
+        "a_bound_plan_names_the_credential_the_execution_would_spend",
+    ),
+    (
+        # The structural one. A receipt that does not carry its plan cannot name
+        # a credential, cannot be re-checked, and cannot distinguish "bound
+        # nothing" from "there was nothing to bind" — which is the whole of what
+        # R4.B.2 added.
+        "build the receipt over an empty plan instead of the one it was checked against",
+        "            plan: plan.clone(),",
+        '            plan: crate::plan::IntegrationPlan::new("npm", Vec::new(), 0),',
+        "the_receipt_carries_the_plan_it_was_checked_against",
+    ),
+]
+
+# --- inventory ------------------------------------------------------------
+# Through the product surface, against a **live broker**. R4.B.1 shipped this
+# command planning against `Vec::new()` on purpose, and R4.B.2's whole content is
+# the difference — so the mutation that reverts it belongs here and nowhere
+# else.
+#
+# These point at `r4b2_bound_execute.rs` rather than at `r4b1_intent_chain.rs`,
+# because a row can only falsify a mutation when the fixture reaches the code
+# being mutated: R4.B.1's rows all run with `--no-vault` precisely because they
+# have no broker, so an inventory mutation there would be measured against a
+# chain that never asked.
+INVENTORY = [
+    (
+        "plan against an empty inventory without being asked to, as R4.B.1 shipped",
+        """    let inventory: Vec<asv_domain::CredentialMetadata> = if no_vault {""",
+        """    let inventory: Vec<asv_domain::CredentialMetadata> = if true {""",
+        "an_execution_over_a_live_vault_names_the_credential_it_would_spend",
+    ),
+    (
+        # Found by running this command against a broker that was actually
+        # there. The summary was true, protocol-shaped, and useless: the broker
+        # had said *why* and the receipt dropped it, so an operator reading
+        # "the broker answered Error" went looking for a protocol fault instead
+        # of reading the session check that refused them.
+        "summarise the broker's refusal instead of carrying it",
+        """            reason: format!("the broker refused the authorization: {message}"),""",
+        """            reason: format!("the broker answered Error to an authorization request"),""",
+        "a_session_from_another_process_is_refused_with_the_brokers_own_reason",
+    ),
+    (
+        # The bug this bucket found by accident: `--session` was mandatory, the
+        # broker pins a session to a PID, and so nothing an operator could type
+        # ever authorized anything. Reverting to the mandatory flag makes every
+        # row in the file still pass except the one about the session, which is
+        # why that row exists.
+        "never open a session, and let the authorization answer for the absence",
+        """        None => match call(
+            socket,
+            &Request::CreateSession {
+                workspace: workspace.to_string(),
+            },
+        ) {
+            Ok(Response::SessionCreated { session, .. }) => Some(session.to_string()),""",
+        """        None => match call(socket, &Request::ListCredentialMetadata) {
+            Ok(Response::CredentialMetadata { .. }) => Some("unopened".into()),""",
+        "an_execution_authorizes_under_a_session_it_opened_itself",
+    ),
+]
+
 # One target per bucket, because the rows live in three different places, and a
 # bucket pointed at a target that does not contain its row produces `no-run`.
 #
@@ -246,6 +376,7 @@ CLI = f.REPO / "crates/cli/src/main.rs"
 LIB_PKG, LIB_TGT = "asv-integrations", "--lib"
 DOMAIN_PKG, DOMAIN_TGT = "asv-domain", "--lib"
 CHAIN_PKG, CHAIN_TGT = "asv-broker", "--test r4b1_intent_chain"
+BOUND_PKG, BOUND_TGT = "asv-broker", "--test r4b2_bound_execute"
 
 BUCKETS = {
     "binding": (LIB_PKG, LIB_TGT, "plan::tests::", PLAN, BINDING),
@@ -253,6 +384,8 @@ BUCKETS = {
     "tool": (LIB_PKG, LIB_TGT, "tool::tests::", TOOL, TOOL_MUTATIONS),
     "invalid": (DOMAIN_PKG, DOMAIN_TGT, "intent::tests::", INTENT, INVALID),
     "chain": (CHAIN_PKG, CHAIN_TGT, "", CLI, CHAIN),
+    "stake": (LIB_PKG, LIB_TGT, "execute::tests::", EXECUTE, STAKE),
+    "inventory": (BOUND_PKG, BOUND_TGT, "", CLI, INVENTORY),
 }
 
 
@@ -263,7 +396,7 @@ def main() -> int:
     f.CARGO_TARGET = target
     f.TEST_PREFIX = prefix
     f.STS = source
-    f.BUCKET_COUNT_LABEL = "five"
+    f.BUCKET_COUNT_LABEL = "seven"
     f.MUTATIONS[:] = mutations
     print(f"# falsifying {source.relative_to(f.REPO)} [{mode}] with {len(mutations)} mutations\n")
     return f.main()
