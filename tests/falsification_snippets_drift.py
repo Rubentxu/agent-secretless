@@ -16,9 +16,22 @@ wrong. The detection was right; nothing was reading it.
 
 This is the instrument that would have caught them at the time. It reads every
 harness, pulls out the code each mutation intends to replace, and checks that
-it still exists somewhere in the repository's Rust sources. It runs in
-milliseconds and launches no cargo, which is the only reason it would ever be
-run by anything.
+it still exists somewhere in the repository's sources. It launches no cargo,
+which is the only reason it would ever be run by anything; reading five hundred
+text files costs about a second and a half, and that is the honest figure
+rather than the "milliseconds" this file claimed while it read two hundred and
+twenty of them.
+
+Two limits, stated rather than smoothed over. **A snippet present more than
+once is deliberately not reported** -- it may be ambiguous for one particular
+target file, and the harness counts in the file it declared. And **a snippet
+that went stale inside its declared file while the same text survived elsewhere
+is invisible here**: this counts over the whole tree, so it sees the surviving
+copy and reports nothing. `identity_falsification.py` carries two such
+mutations whose edits name `crates/broker/src/main.rs` and whose text now lives
+in `crates/broker/src/identity.rs`, where the check moved; only running the
+harness found them. Closing that gap means resolving each mutation's declared
+`path=`, which this file does not parse, so it is recorded here instead.
 
 **It is red, and that is the finding.** On the tree this was written against it
 reports 28 further mutations across 11 harnesses that measure nothing, none of
@@ -58,15 +71,42 @@ from __future__ import annotations
 
 import ast
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-HARNESSES = REPO / "tests" / "falsification"
-CRATES = REPO / "crates"
+HARNESS_DIR = REPO / "tests" / "falsification"
+HARNESS_ROOT = REPO / "tests"
+
+#: Where the harnesses live, in two places and neither optional.
+#:
+#: `tests/falsification/*_falsify.py` is where they are written now, and it is
+#: where this check was first written. `tests/*_falsification.py` is where two
+#: dozen older ones live, including `identity_falsification.py` and
+#: `upstream_tls_falsification.py`, both of which carry a mutation this check
+#: could not see until it was widened. Scanning one directory and calling that
+#: "every harness" would have been a claim about 31 scripts that was true only
+#: of the 31.
+HARNESSES: tuple[Path, ...] = (HARNESS_DIR, HARNESS_ROOT)
 
 #: Below this, a multi-line constant is far more likely to be an argument to a
 #: command than a span of source to be mutated.
 MIN_SNIPPET = 25
+
+#: Suffixes worth reading as a source of snippets. A harness mutates whatever
+#: its subject is written in, and these harnesses mutate `scripts/*.sh`,
+#: `distribution/*` and Python as readily as they mutate Rust. Reading only
+#: `crates/**/*.rs` reported eighteen stale mutations across six of the older
+#: scripts, of which sixteen were this file's own false positives: the code was
+#: there, in a file this check refused to open.
+TEXT_SUFFIXES = frozenset({
+    ".rs", ".sh", ".bash", ".py", ".kts", ".kt", ".json", ".toml",
+    ".md", ".yml", ".yaml", ".txt", ".cfg", ".ini",
+})
+
+#: Directories that hold generated or vendored trees. Walking `target/` is how a
+#: check that claims to run in milliseconds ends up taking minutes.
+SKIP_DIRS = frozenset({".git", "target", "node_modules", "__pycache__", ".venv"})
 
 
 #: Where the code-to-be-replaced sits in each tuple shape these harnesses use.
@@ -143,12 +183,37 @@ def stale_snippets(harness_text: str, sources: dict[str, str]) -> list[str]:
     return missing
 
 
-def read_sources(root: Path = CRATES) -> dict[str, str]:
-    return {str(p): p.read_text(encoding="utf-8") for p in root.rglob("*.rs")}
+def read_sources(root: Path = REPO) -> dict[str, str]:
+    """Every text file in the repository, which is not the same as every `.rs`.
+
+    Widening this from `crates/**/*.rs` to the whole tree is what makes the
+    second harness directory meaningful. The older scripts mutate shell,
+    distribution manifests and Python; a snippet living in `scripts/install.sh`
+    is as resolvable as one living in `crates/broker/src/lib.rs`, and refusing
+    to open the first is how sixteen healthy mutations came to look broken.
+    """
+    out: dict[str, str] = {}
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix not in TEXT_SUFFIXES:
+            continue
+        if any(part in SKIP_DIRS for part in path.parts):
+            continue
+        try:
+            out[str(path)] = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+    return out
 
 
-def read_harnesses(root: Path = HARNESSES) -> dict[str, str]:
-    return {str(p): p.read_text(encoding="utf-8") for p in sorted(root.glob("*_falsify.py"))}
+def read_harnesses() -> dict[str, str]:
+    """Both directories, deduplicated: a script in one may also be named by the other."""
+    found: dict[str, str] = {}
+    for directory in HARNESSES:
+        patterns = ("*_falsify.py",) if directory == HARNESS_DIR else ("*_falsification.py",)
+        for pattern in patterns:
+            for path in sorted(directory.glob(pattern)):
+                found[str(path)] = path.read_text(encoding="utf-8")
+    return found
 
 
 def scan(harness_text: str, sources: dict[str, str]) -> tuple[bool, str]:
@@ -180,7 +245,7 @@ def _harness(snippet: str, replacement: str) -> str:
 
 
 def main() -> int:
-    if not HARNESSES.is_dir():
+    if not all(d.is_dir() for d in HARNESSES):
         print(f"FAIL harness directory not found: {HARNESSES}")
         return 1
 
@@ -238,6 +303,32 @@ def main() -> int:
     ok, out = scan(_harness("  --locked\n", "  --offline\n"), {})
     results.append(("a short command argument is not treated as a snippet", ok, out))
 
+    # 5b. The widened source set is itself falsifiable. Narrowing it back to
+    # `crates/**/*.rs` reported eighteen stale mutations across the older
+    # scripts and every one but two was this file's own false positive, so a
+    # future narrowing would look like sixteen new findings rather than a
+    # regression of the sweep. This case reads a real tree rather than a
+    # literal, because the thing being falsified is the *reader*.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "scripts").mkdir()
+        (root / "scripts" / "install.sh").write_text(
+            "#!/bin/sh\nexec asv setup --json\n", encoding="utf-8")
+        (root / "crates").mkdir()
+        (root / "crates" / "lib.rs").write_text("fn main() {}\n", encoding="utf-8")
+        (root / "target").mkdir()
+        (root / "target" / "generated.py").write_text(
+            "SECRET = 'should never be read'\n", encoding="utf-8")
+        read = read_sources(root)
+        shell_seen = any(v.startswith("#!/bin/sh") for v in read.values())
+        target_skipped = not any("should never be read" in v for v in read.values())
+    results.append((
+        "the source set reaches outside crates/ and skips generated trees",
+        shell_seen and target_skipped,
+        f"shell script {'found' if shell_seen else 'MISSING'}; "
+        f"target/ {'skipped' if target_skipped else 'READ'}",
+    ))
+
     # 6. The real repository, which is the only case that says anything about it.
     total_missing = 0
     detail: list[str] = []
@@ -247,7 +338,7 @@ def main() -> int:
         for snippet in missing:
             detail.append(f"{Path(path).name}: {snippet.splitlines()[0][:70]!r}")
     results.append((
-        f"every harness in {HARNESSES.relative_to(REPO)} names code that exists",
+        "every harness in tests/ names code that exists",
         total_missing == 0,
         f"{len(harnesses)} harnesses, {total_missing} stale" + (f" -- {'; '.join(detail[:5])}" if detail else ""),
     ))

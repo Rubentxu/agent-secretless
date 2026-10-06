@@ -165,8 +165,8 @@ MUTATIONS: tuple[Mutation, ...] = (
         name="T3 the configured anchors are ignored",
         path=BRIDGE,
         edits=((
-            "                let config = rustls::ClientConfig::builder()\n                    .with_root_certificates(self.destination_roots.as_ref().clone())",
-            "                let config = rustls::ClientConfig::builder()\n                    .with_root_certificates(rustls::RootCertStore::empty())",
+            "                    None => rustls::ClientConfig::builder()\n                        .with_root_certificates(roots)",
+            "                    None => rustls::ClientConfig::builder()\n                        .with_root_certificates(rustls::RootCertStore::empty())",
         ),),
         suite=SUITE,
         # Every TLS destination stops verifying, and the first one to say so is

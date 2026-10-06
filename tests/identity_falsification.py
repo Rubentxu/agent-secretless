@@ -129,7 +129,7 @@ MUTATIONS: tuple[Mutation, ...] = (
         path=IDENTITY,
         edits=(
             (
-                "        if let IdentityVerdict::Undeclared = verdict {\n"
+                "        if let IdentityVerdict::Undeclared { .. } = verdict {\n"
                 "            return Err(BrokerIdentityError::MissingDedicatedIdentity(\n"
                 "                MissingDedicatedIdentity::Undeclared,\n"
                 "            ));\n"
