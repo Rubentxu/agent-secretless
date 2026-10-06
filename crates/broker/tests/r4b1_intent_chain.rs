@@ -441,9 +441,9 @@ fn a_hijacked_npm_invalidates_a_real_bound_plan() {
 
 // ------------------------------------------- the credential the chain stakes
 
-/// The rows R4.B.1 could not write, and why: `execute` planned against a hard-
-/// coded empty inventory, so there was nothing to assert a credential was named.
-/// These are them.
+// The rows R4.B.1 could not write, and why: `execute` planned against a hard-
+// coded empty inventory, so there was nothing to assert a credential was named.
+// These are them.
 
 /// **A chain that cannot read the inventory stops.** R4.B.1 shipped
 /// `Vec::new()` here, which made every execution an authorization over a plan

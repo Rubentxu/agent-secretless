@@ -94,7 +94,6 @@ fn resolution_for(
 fn a_hijacked_tool_is_refused_before_anything_executes() {
     let intent = intent();
     let binding = binding_for(&intent);
-    let plan = curl_plan();
     let digest = intent.digest().expect("digests");
 
     let outcome = decide(
@@ -130,7 +129,6 @@ fn a_hijacked_tool_is_refused_before_anything_executes() {
 fn an_unchanged_world_and_a_permit_execute() {
     let intent = intent();
     let binding = binding_for(&intent);
-    let plan = curl_plan();
     let digest = intent.digest().expect("digests");
     let outcome = decide(
         &intent,
@@ -152,7 +150,6 @@ fn an_unchanged_world_and_a_permit_execute() {
 fn a_broker_refusal_is_carried_verbatim() {
     let intent = intent();
     let binding = binding_for(&intent);
-    let plan = curl_plan();
     let digest = intent.digest().expect("digests");
     let verdict = deny();
     let outcome = decide(
@@ -186,7 +183,6 @@ fn a_broker_refusal_is_carried_verbatim() {
 fn a_moved_world_outranks_a_broker_refusal() {
     let intent = intent();
     let binding = binding_for(&intent);
-    let plan = curl_plan();
     let digest = intent.digest().expect("digests");
     let outcome = decide(
         &intent,
@@ -208,7 +204,6 @@ fn a_moved_world_outranks_a_broker_refusal() {
 fn expiry_outranks_everything_else() {
     let intent = intent();
     let binding = binding_for(&intent);
-    let plan = curl_plan();
     let digest = intent.digest().expect("digests");
     let outcome = decide(
         &intent,
