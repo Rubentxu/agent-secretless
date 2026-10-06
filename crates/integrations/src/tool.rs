@@ -267,6 +267,15 @@ fn inspect_candidate(candidate: &Path, max_bytes: u64) -> CandidateOutcome {
     }
 }
 
+/// `sha256` over bytes, for a caller that already holds them.
+///
+/// Public because a receipt that records what was hashed is worth more than
+/// one that records only that something was hashed, and a row can only check
+/// that against the same primitive.
+pub fn sha256_of(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", sha2::Sha256::digest(bytes))
+}
+
 /// `sha256` over a file's bytes, streamed.
 fn digest_file(path: &Path) -> Result<String, std::io::Error> {
     let mut file = std::fs::File::open(path)?;

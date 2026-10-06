@@ -68,6 +68,7 @@
 
 pub mod adopt;
 pub mod curl;
+pub mod execute;
 pub mod fingerprint;
 pub mod gradle;
 pub mod maven;
@@ -82,6 +83,7 @@ pub use adopt::{
 pub use curl::{
     Curl, CurlCredential, CurlCredentialEntry, CurlDiscovery, CurlError, CurlFile, CurlOption,
 };
+pub use execute::{decide, AuthorizationVerdict, ExecuteOutcome, ExecuteReceipt, EXECUTE_SCHEMA};
 pub use fingerprint::{Drift, FileFingerprint, FingerprintError, FingerprintPolicy};
 pub use gradle::{Gradle, GradleDiscovery, GradleError};
 pub use maven::{Maven, MavenDiscovery, MavenError};

@@ -215,6 +215,63 @@ enum Command {
 
 #[derive(Subcommand)]
 enum IntegrationsCommand {
+    /// Run one `discover → intent → plan → authorize → execute` attempt, R4.B.1.
+    ///
+    /// The whole point of R4 is that authority binds to an *operation*, not to
+    /// a session. This is the stage where that becomes visible: every step
+    /// takes the previous one's output, and the last one refuses if anything
+    /// moved. The receipt it writes is the evidence, and it names both what
+    /// was promised and what was found.
+    ///
+    /// Authorization goes to the **broker** over IPC, not to a policy engine in
+    /// this process. A second evaluator is a second authority, which is the
+    /// failure this project exists to prevent.
+    Execute {
+        /// The tool family. `npm` or `curl`.
+        #[arg(long, value_name = "FAMILY", default_value = "npm")]
+        family: String,
+        /// Emit the `asv.integrations.execute/v1` receipt instead of prose.
+        #[arg(long)]
+        json: bool,
+        /// The executable to resolve and bind the plan to. A bare name is
+        /// looked up on `PATH`; a path is used as given.
+        #[arg(long, value_name = "COMMAND", default_value = "npm")]
+        tool: String,
+        /// Correlates every record this attempt produces.
+        #[arg(long, value_name = "ID")]
+        transaction: String,
+        /// Whoever is accountable for it.
+        #[arg(long, value_name = "WHO")]
+        principal: String,
+        /// The agent acting, as opposed to the principal behind it.
+        #[arg(long, value_name = "WHO", default_value = "cli")]
+        actor: String,
+        /// Where the instruction came from. Two of these are
+        /// attacker-influenced by construction, and a policy can single them
+        /// out without guessing from the request body.
+        #[arg(long, value_name = "ORIGIN", default_value = "human_direct")]
+        origin: String,
+        /// Seconds from now until the intent expires. An intent with no
+        /// deadline is a session wearing a different hat.
+        #[arg(long, value_name = "SECONDS", default_value_t = 300)]
+        ttl: u64,
+        /// The session the broker authorizes under.
+        #[arg(long, value_name = "UUID")]
+        session: String,
+        /// The workspace the authorization is scoped to.
+        #[arg(long, value_name = "DIR")]
+        workspace: String,
+        /// Directory holding the project-level configuration.
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        cwd: String,
+        /// Home directory holding the user-level configuration.
+        #[arg(long, value_name = "DIR")]
+        home: Option<String>,
+        /// Follow a configuration symlink whose target resolves inside this
+        /// directory. Refused by default, for the reason `discover` refuses.
+        #[arg(long, value_name = "DIR")]
+        allow_symlink_root: Option<String>,
+    },
     /// Describe what a tool's configuration file declares — R3's first stage.
     ///
     /// Reads the configuration and prints what it says: which registries, which
@@ -1646,6 +1703,36 @@ fn run_integrations(
             home.as_deref(),
             allow_symlink_root.as_deref(),
             *no_vault,
+        ),
+        IntegrationsCommand::Execute {
+            family,
+            json,
+            tool,
+            transaction,
+            principal,
+            actor,
+            origin,
+            ttl,
+            session,
+            workspace,
+            cwd,
+            home,
+            allow_symlink_root,
+        } => run_integrations_execute(
+            socket,
+            family,
+            *json,
+            tool,
+            transaction,
+            principal,
+            actor,
+            origin,
+            *ttl,
+            session,
+            workspace,
+            cwd,
+            home.as_deref(),
+            allow_symlink_root.as_deref(),
         ),
         IntegrationsCommand::Adopt {
             family,
@@ -4073,4 +4160,381 @@ fn planned_fingerprint(
                  re-run `asv integrations plan npm --json` and adopt from that"
             )
         })
+}
+/// Runs one `discover → intent → plan → authorize → execute` attempt and writes
+/// a receipt.
+///
+/// **Six stages, and the order is the argument.** Each one takes the previous
+/// one's output: the intent names the tool the plan must cover, the plan binds
+/// to the intent, the broker authorizes what the intent asked for, and the
+/// check compares the world *now* against what the plan promised earlier. A
+/// stage that skipped its predecessor would make the chain a list of steps
+/// rather than a chain, and the receipt would then be evidence of nothing.
+///
+/// The authorization goes over IPC to the broker. This function does not hold
+/// a policy engine, does not evaluate Cedar, and must not grow either: a
+/// second evaluator is a second authority.
+///
+/// The exit status is 0 only when the attempt actually executed. A refusal is
+/// a refusal whether or not a receipt was written, so a caller that shells out
+/// and checks `$?` cannot mistake "the receipt is in stdout" for "it ran".
+#[allow(clippy::too_many_arguments)]
+fn run_integrations_execute(
+    socket: &std::path::Path,
+    family: &str,
+    json: bool,
+    tool_command: &str,
+    transaction: &str,
+    principal: &str,
+    actor: &str,
+    origin: &str,
+    ttl: u64,
+    session: &str,
+    workspace: &str,
+    cwd: &str,
+    home: Option<&str>,
+    allow_symlink_root: Option<&str>,
+) -> std::io::Result<()> {
+    use asv_integrations::Adapter as _;
+
+    let (home, _, policy) = integrations_home_and_policy(home, allow_symlink_root)?;
+    let cwd_dir = std::path::PathBuf::from(cwd);
+
+    // --- 1. discover -------------------------------------------------------
+    // The typed discovery, kept typed. Routing it through `into_discovery`
+    // would erase which family produced it and force the plan stage to either
+    // downcast or read the files a second time.
+    enum Discovered {
+        Npm(Box<asv_integrations::npm::NpmDiscovery>),
+        Curl(Box<asv_integrations::curl::CurlDiscovery>),
+    }
+    let discovered = match family {
+        "npm" => match asv_integrations::Npm.discover(&policy, &home, &cwd_dir) {
+            Ok(discovery) => Discovered::Npm(Box::new(discovery)),
+            Err(error) => {
+                eprintln!("asv: discovery failed: {error}");
+                std::process::exit(1);
+            }
+        },
+        "curl" => match asv_integrations::Curl.discover(&policy, &home, &cwd_dir) {
+            Ok(discovery) => Discovered::Curl(Box::new(discovery)),
+            Err(error) => {
+                eprintln!("asv: discovery failed: {error}");
+                std::process::exit(1);
+            }
+        },
+        other => {
+            eprintln!(
+                "asv: no execute path for {other:?}; this build knows `npm` and `curl`. \
+                 Adding one is a module in asv-integrations, a `Selector` variant, and one \
+                 match arm here."
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // --- 2. resolve the executable ------------------------------------------
+    // Before the plan, because the plan records the tool *it* resolved and the
+    // binding takes the plan's. Resolving afterwards would leave the plan with
+    // nothing to bind.
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    let planned_tool = match asv_integrations::resolve_tool(tool_command, &path_var) {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            eprintln!("asv: {error}");
+            std::process::exit(1);
+        }
+    };
+    if planned_tool.resolved.is_none() {
+        // Refusing to continue is the point of a world-writable refusal being a
+        // refusal rather than a note: continuing would bind a plan to a tool
+        // nobody vouched for.
+        eprintln!("asv: `{tool_command}` did not resolve to a tool this build will vouch for:");
+        for candidate in &planned_tool.candidates {
+            eprintln!("  {}", candidate.outcome);
+        }
+        std::process::exit(1);
+    }
+
+    // --- 3. plan -------------------------------------------------------------
+    // The inventory is empty on purpose: `execute` is about the authority
+    // chain, and reaching the vault for it would make a step that holds no
+    // secret into one that could. A plan that binds nothing is still a plan,
+    // and the receipt says so.
+    let inventory: Vec<asv_domain::CredentialMetadata> = Vec::new();
+    let plan = match &discovered {
+        Discovered::Npm(discovery) => asv_integrations::plan_npm(discovery, &inventory),
+        Discovered::Curl(discovery) => asv_integrations::plan_curl(discovery, &inventory),
+    }
+    .with_tool(planned_tool.resolved.clone().expect("checked above"));
+
+    // --- 4. build the intent ------------------------------------------------
+    let origin = match origin {
+        "human_direct" => asv_domain::IntentOrigin::HumanDirect,
+        "scheduled_workflow" => asv_domain::IntentOrigin::ScheduledWorkflow,
+        "trusted_tool" => asv_domain::IntentOrigin::TrustedTool,
+        "retrieved_content" => asv_domain::IntentOrigin::RetrievedContent,
+        "untrusted_tool_output" => asv_domain::IntentOrigin::UntrustedToolOutput,
+        "delegated_agent" => asv_domain::IntentOrigin::DelegatedAgent,
+        other => {
+            eprintln!(
+                "asv: unknown origin {other:?}; expected one of human_direct, \
+                 scheduled_workflow, trusted_tool, retrieved_content, \
+                 untrusted_tool_output, delegated_agent"
+            );
+            std::process::exit(1);
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let intent = asv_domain::ActionIntent {
+        transaction: transaction.to_string(),
+        principal: principal.to_string(),
+        actor: actor.to_string(),
+        workload: session.to_string(),
+        action: action_for(family),
+        resource: resource_for(family),
+        tool: plan.tool.clone(),
+        config_fingerprint: None, // filled from the plan below
+        origin,
+        expires_at_unix: now.saturating_add(ttl),
+    };
+    // The intent's configuration claim is the plan's digest, so the two
+    // cannot disagree at this point and `bind_to` still checks it — a plan
+    // that recomputed it differently would be caught rather than believed.
+    let intent = asv_domain::ActionIntent {
+        config_fingerprint: Some(plan.config_digest()),
+        ..intent
+    };
+    if let Err(problem) = intent.contains_no_secret_material() {
+        eprintln!("asv: refusing to build an intent: {problem}");
+        std::process::exit(1);
+    }
+
+    // --- 5. bind ------------------------------------------------------------
+    let binding = match plan.bind_to(&intent) {
+        Ok(binding) => binding,
+        Err(error) => {
+            eprintln!("asv: the plan does not describe this intent: {error}");
+            std::process::exit(1);
+        }
+    };
+    let intent_digest = match intent.digest() {
+        Ok(digest) => digest,
+        Err(error) => {
+            eprintln!("asv: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    // --- 6. authorize, through the broker ------------------------------------
+    let verdict = authorize_over_ipc(socket, &intent, session, workspace, json);
+
+    // --- 7. check the world again --------------------------------------------
+    // Re-resolved, never reused. Reusing the plan's resolution would compare
+    // the plan against itself and always agree, which is the check this whole
+    // block exists to make impossible.
+    let observed_tool = match asv_integrations::resolve_tool(tool_command, &path_var) {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            eprintln!("asv: {error}");
+            std::process::exit(1);
+        }
+    };
+    let outcome = asv_integrations::decide(
+        &intent,
+        &intent_digest,
+        &binding,
+        observed_tool.resolved.as_ref(),
+        Some(plan.config_digest()).as_deref(),
+        now,
+        &verdict,
+    );
+
+    let receipt = asv_integrations::ExecuteReceipt::new(
+        family,
+        &intent,
+        &binding,
+        &planned_tool,
+        &observed_tool,
+        verdict,
+        outcome,
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&receipt).expect("the receipt serialises")
+        );
+    } else {
+        print_execute_prose(&receipt);
+    }
+    if receipt.is_executed() {
+        Ok(())
+    } else {
+        // A refusal is a refusal whether or not a receipt was written.
+        std::process::exit(1);
+    }
+}
+
+/// The domain action a family's operations authorise.
+///
+/// **Chosen by the caller, not inferred from the plan**, and the reason is
+/// worth stating: a plan that picked its own action would be able to describe
+/// an operation it had just decided was safe. The operator names the
+/// operation; the plan says what the credentials would unlock.
+fn action_for(family: &str) -> asv_domain::Action {
+    match family {
+        "npm" => asv_domain::Action::RegistryPush,
+        _ => asv_domain::Action::HttpRequest,
+    }
+}
+
+/// The resource a family's operations address.
+///
+/// For npm the registry is real: a `plan` entry carries it and the broker
+/// checks it against the credential's audience. For curl there is nothing to
+/// check, because a `.curlrc` names no host and the URL arrives per
+/// invocation — so this is the literal host `plan` could describe and an
+/// operator reading the receipt can see it is a placeholder.
+fn resource_for(family: &str) -> asv_domain::Resource {
+    match family {
+        "npm" => asv_domain::Resource::Api {
+            audience: asv_domain::Authority::canonicalize("registry.npmjs.org")
+                .expect("a literal, canonical host"),
+        },
+        _ => asv_domain::Resource::Host {
+            hostname: "(named per invocation: a .curlrc names no host)".into(),
+        },
+    }
+}
+
+/// Asks the broker to authorize this intent, and returns its verdict.
+///
+/// **The broker is the only authority here.** A failure to reach it is a
+/// `Deny`, not an `Executed` and not a panic: "we could not ask" and "we asked
+/// and were told no" must not look the same to a caller.
+fn authorize_over_ipc(
+    socket: &std::path::Path,
+    intent: &asv_domain::ActionIntent,
+    session: &str,
+    workspace: &str,
+    _json: bool,
+) -> asv_integrations::AuthorizationVerdict {
+    let session_id: asv_domain::AgentSessionId = match session.parse() {
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("asv: --session must be a UUID: {error}");
+            std::process::exit(1);
+        }
+    };
+    let request = asv_policy::AuthorizationRequest {
+        session: session_id,
+        action: intent.action.clone(),
+        resource: intent.resource.clone(),
+        context: asv_policy::PolicyContext {
+            workspace: workspace.to_string(),
+            protected_ref: None,
+            // The intent's digest is what the policy evaluated against, so a
+            // decision can be tied back to the exact request that produced it.
+            request_digest: intent.digest().ok(),
+            peer_uid: unsafe { libc::geteuid() },
+        },
+    };
+    match call(socket, &Request::ExplainAuthorization { request }) {
+        Ok(Response::Authorization { explanation }) => {
+            match explanation.decision {
+                asv_domain::Decision::Allow => asv_integrations::AuthorizationVerdict::Permit {
+                    decision: format!("allow by {}", explanation.rule),
+                },
+                asv_domain::Decision::Deny { reason } => {
+                    asv_integrations::AuthorizationVerdict::Deny {
+                        reason,
+                        reason_code: format!("{:?}", explanation.reason),
+                    }
+                }
+                // **Not a permit.** `RequireApproval` means a human has not
+                // said yes yet, and mapping it onto `Permit` would make an
+                // unreviewed publish look authorised. It carries the
+                // approval id, which is a handle and not a secret.
+                asv_domain::Decision::RequireApproval { approval } => {
+                    asv_integrations::AuthorizationVerdict::Deny {
+                        reason: format!(
+                            "a human approval is required and none was presented ({approval})"
+                        ),
+                        reason_code: format!("{:?}", explanation.reason),
+                    }
+                }
+            }
+        }
+        Ok(other) => asv_integrations::AuthorizationVerdict::Deny {
+            reason: format!(
+                "the broker answered {} to an authorization request",
+                response_kind(&other)
+            ),
+            reason_code: "UnexpectedResponse".into(),
+        },
+        Err(error) => asv_integrations::AuthorizationVerdict::Deny {
+            reason: format!("could not reach the broker to authorize: {error}"),
+            reason_code: "BrokerUnreachable".into(),
+        },
+    }
+}
+
+/// The human form of a receipt: the three questions, in the order an operator
+/// asks them.
+fn print_execute_prose(receipt: &asv_integrations::ExecuteReceipt) {
+    println!(
+        "asv {} execute — {}",
+        receipt.family,
+        receipt.outcome.headline()
+    );
+    println!();
+    println!("asked for:");
+    println!("  transaction: {}", receipt.intent.transaction);
+    println!("  principal:   {}", receipt.intent.principal);
+    println!("  actor:       {}", receipt.intent.actor);
+    println!("  origin:      {}", receipt.origin.wire_name());
+    println!("  action:      {}", receipt.intent.action);
+    println!("  expires at:  {}", receipt.intent.expires_at_unix);
+    println!(
+        "  intent:      {}",
+        receipt.intent.digest().unwrap_or_default()
+    );
+    println!();
+    println!("promised about the world:");
+    println!(
+        "  tool:    {}",
+        describe_tool(receipt.binding.tool.as_ref())
+    );
+    println!(
+        "  config:  {}",
+        receipt.config_digest().unwrap_or("(none)").to_string()
+    );
+    match &receipt.planned_tool.resolved {
+        Some(planned) => println!("  resolved: {}", planned.path.display()),
+        None => println!("  resolved: (nothing)"),
+    }
+    println!();
+    println!("authorized:");
+    match &receipt.authorization {
+        asv_integrations::AuthorizationVerdict::Permit { decision } => {
+            println!("  {decision}")
+        }
+        asv_integrations::AuthorizationVerdict::Deny {
+            reason,
+            reason_code,
+        } => println!("  DENIED ({reason_code}): {reason}"),
+    }
+    println!();
+    println!("outcome:");
+    println!("  {}", receipt.outcome.headline());
+}
+
+fn describe_tool(tool: Option<&asv_domain::ToolIdentity>) -> String {
+    match tool {
+        Some(tool) => format!("{} ({})", tool.path.display(), tool.digest),
+        None => "(the intent named no tool)".into(),
+    }
 }

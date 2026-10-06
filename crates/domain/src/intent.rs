@@ -323,7 +323,12 @@ pub struct PlanBinding {
 /// refusal an operator cannot act on is a refusal that gets worked around. The
 /// spec writes `PLAN_INVALIDATED`; the reason it is an enum is that the two
 /// fields in it are the whole diagnostic.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serialisable because a refusal has to survive into the receipt: a log line
+/// an operator can read is not the same artefact as one they can re-check, and
+/// the re-check needs both `planned` and `found` rather than a rendered string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PlanInvalidation {
     /// A different binary would run.
     ToolChanged {

@@ -118,6 +118,11 @@ base64.workspace = true
 # the supported way to say it: it applies to the lib *as a dependency of the
 # test*, and never to the binary.
 asv-broker = { path = ".", features = ["test-support"] }
+# R4.B.1: the intent-chain verticals drive `asv_integrations::decide` in-process
+# to show the drift the CLI also goes through. A dev-dependency, like the
+# connectors above — the broker must not grow a dependency on the adapter crate
+# to satisfy a test, and in production it has none.
+asv-integrations = { workspace = true }
 serde_json = "1"
 tempfile = "3"
 # The end-to-end tests drive the real connector against a local TLS origin.
