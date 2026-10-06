@@ -102,10 +102,15 @@ TIMEOUT = 1800
 
 # The client config, verbatim, with the indentation the source has.
 CLIENT_CONFIG = (
-    "                let config = rustls::ClientConfig::builder()\n"
-    "                    .with_root_certificates(self.destination_roots.as_ref().clone())\n"
-    "                    .with_no_client_auth();"
+    "                    None => rustls::ClientConfig::builder()\n"
+    "                        .with_root_certificates(roots)\n"
+    "                        .with_no_client_auth(),\n"
 )
+# **Re-anchored.** The roots are now computed into a local `roots` above the
+# match and the no-identity arm is one arm of a match on `Option<..>`, so the
+# old `let config = ...; self.destination_roots.as_ref().clone()` spelling occurs
+# nowhere. The three rows below all build the same value in the same place, so
+# the anchor is shared on purpose: one construction, three ways to weaken it.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -129,10 +134,15 @@ MUTATIONS: tuple[Mutation, ...] = (
         edits=(
             (
                 CLIENT_CONFIG,
-                "                let mut config = rustls::ClientConfig::builder()\n"
-                "                    .with_root_certificates(self.destination_roots.as_ref().clone())\n"
-                "                    .with_no_client_auth();\n"
-                "                config.alpn_protocols = vec![b\"h2\".to_vec(), b\"http/1.1\".to_vec()];",
+                "                    None => {\n"
+                "                        // MUTANT: the upstream leg offers ALPN and lets\n"
+                "                        // the destination choose between h2 and http/1.1\n"
+                "                        let mut config = rustls::ClientConfig::builder()\n"
+                "                            .with_root_certificates(roots)\n"
+                "                            .with_no_client_auth();\n"
+                '                        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];\n'
+                "                        config\n"
+                "                    },",
             ),
         ),
         # The origin offers both protocols and is built to accept a selection,
@@ -148,12 +158,12 @@ MUTATIONS: tuple[Mutation, ...] = (
         edits=(
             (
                 CLIENT_CONFIG,
-                "                let config =\n"
-                "                    rustls::ClientConfig::builder_with_protocol_versions(&[\n"
-                "                        &rustls::version::TLS12,\n"
-                "                    ])\n"
-                "                    .with_root_certificates(self.destination_roots.as_ref().clone())\n"
-                "                    .with_no_client_auth();",
+                "                    None =>\n"
+                "                        rustls::ClientConfig::builder_with_protocol_versions(&[\n"
+                "                            &rustls::version::TLS12,\n"
+                "                        ])\n"
+                "                        .with_root_certificates(roots)\n"
+                "                        .with_no_client_auth(),",
             ),
         ),
         # A destination that offers only TLS 1.3 answers with a fatal
@@ -171,12 +181,12 @@ MUTATIONS: tuple[Mutation, ...] = (
         edits=(
             (
                 CLIENT_CONFIG,
-                "                let config =\n"
-                "                    rustls::ClientConfig::builder_with_protocol_versions(&[\n"
-                "                        &rustls::version::TLS13,\n"
-                "                    ])\n"
-                "                    .with_root_certificates(self.destination_roots.as_ref().clone())\n"
-                "                    .with_no_client_auth();",
+                "                    None =>\n"
+                "                        rustls::ClientConfig::builder_with_protocol_versions(&[\n"
+                "                            &rustls::version::TLS13,\n"
+                "                        ])\n"
+                "                        .with_root_certificates(roots)\n"
+                "                        .with_no_client_auth(),",
             ),
         ),
         # The floor row, and only the floor row. The observed-ceiling test still

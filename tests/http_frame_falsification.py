@@ -121,10 +121,19 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         name="H7 a head over the limit is truncated rather than refused",
         before="""            if len > max {
-                return Err(FrameError::TooLarge { limit: max });
+                return Err(FrameError::TooLarge {
+                    limit: max,
+                    subject: Subject::Head,
+                });
             }
             Ok(Some(len))""",
+        # **Re-anchored.** `FrameError::TooLarge` carries a `subject` now, so
+        # the error is built over three lines rather than one and the old
+        # spelling occurs nowhere. The refusal is the same one: a head longer
+        # than the cap is refused, not truncated and not kept buffering.
         after="""            if len > max {
+                // MUTANT: an oversized head is answered "not yet", so the
+                // caller keeps buffering a head it will never accept
                 return Ok(None);
             }
             Ok(Some(len))""",
