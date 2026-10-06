@@ -2631,9 +2631,74 @@ limit, named here rather than left for an operator to discover. The in-flight
 adapter name must match exactly, so a build using `storePasswordBackup` is
 reported as undescribed rather than guessed at.
 
-**R3's exit criterion is now two families of four.** npm (R3.A.1) and Maven
-(R3.B.1) have a real vertical; curl has none. The criterion is not met, and the
-remaining gap is a family rather than a measurement.
+**R3's exit criterion is now three families of four.** npm (R3.A.1), Maven
+(R3.B.1) and Gradle (R3.B.2) have a real vertical; curl has none. The criterion
+is not met, and the remaining gap is a family rather than a measurement.
+
+*(Superseded by R3.B.3 below, which adds curl and closes the criterion. Left in
+place because this is the state as it stood when Gradle landed, and rewriting it
+would erase the record of what the gap was.)*
+
+### R3.B.3 — curl, the fourth family, and the measurement that closes the criterion
+
+`curl` is the fourth family, and the first one whose **precedence is a choice
+rather than a layering**. npm, Maven and Gradle all merge every file they find,
+so a report for them is a loop with no state. curl walks an ordered list and
+takes **the first file that exists**; the rest are never opened. A `~/.curlrc`
+holding a credential is invisible to a user who also has
+`~/.config/curlrc`, and no amount of reading either file reveals that.
+
+Three things about this family are structural rather than incidental:
+
+- **The credential is compound.** curl's `user` carries `name:secret` on one
+  line. npm has tokens, Maven passwords, Gradle a user and a password in two
+  keys — none of them puts two secrets in one place, so none of them has had to
+  answer "who" and "how long" as two questions.
+- **There is no env-reference case.** npm expands `${NPM_TOKEN}`, Maven
+  `${env.MVN_TOKEN}`, Gradle `${VAR}`. A literal in a `.curlrc` **is** a
+  literal, so the field would be false on every row of every real file. It is
+  absent rather than always-false.
+- **Two of curl's own lookup paths are environment variables**
+  (`$CURL_HOME/.curlrc`, `$XDG_CONFIG_HOME/curlrc`) and `Adapter::discover`
+  takes `home` and `cwd` precisely so it does not read this process's
+  environment. The report says so in a field, not in a doc comment.
+
+**The family shipped with a bug that every vertical row passed through.** The
+first version listed the project `.curlrc` first, because every other family
+here reads a project file and `Origin::Project` already existed to name it. That
+made the project file shadow the home file — and curl has **no project-level
+configuration at all**; a `.curlrc` beside the project is read only when a
+command passes `--config`. So the report was telling operators their credential
+lived in the one file curl never reads automatically.
+
+Every row in the vertical passed while that was true, because each used a
+project file *or* a home file, and both orderings give the same answer for
+either. The row that sees it puts a credential in **both** and asks which won.
+This is the strongest argument in R3 for shipping a falsification harness rather
+than only rows: the defect was not subtle in the code, it was **invisible in the
+tests**.
+
+The correction split the report into `lookup` (curl's automatic order) and
+`project_config` (reported apart, and labelled as needing `--config`), so the
+file curl would never choose can never shadow the one it would.
+
+**R3's exit criterion is met, and it is met by measurement rather than by
+assertion.** All four families have a real vertical. Three consecutive additions
+— Maven, Gradle, curl — touched no broker file and no domain file, and the last
+two widened nothing in this crate's shared vocabulary either.
+
+| Family | Vertical | What the family added that the others did not |
+|---|---|---|
+| npm (R3.A.1) | `r3a_npm_discovery.rs` | the first shape; forced `Candidate::origin` out of `npm::Origin` |
+| Maven (R3.B.1) | `r3b1_maven_discovery.rs` | four XML hazards; one shared-type lift |
+| Gradle (R3.B.2) | `r3b2_gradle_discovery.rs` | a flat format with **no** nesting; no change at all |
+| curl (R3.B.3) | `r3b3_curl_discovery.rs` | first-match-wins, a compound credential, no env expansion, and a project file that is **not** a layer |
+
+**Still not done, and named rather than left for an operator to discover:** `plan`,
+`adopt` and the rest of the pipeline do not exist for Maven, Gradle or curl, and
+are not simulated. curl's `--config` invocations are invisible to the report,
+because which file a command names is a command-line fact this adapter cannot
+observe.
 
 ### The broker's accept loop, and the two rows that were missing for it
 
