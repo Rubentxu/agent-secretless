@@ -218,20 +218,75 @@ fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-/// A timestamp as `HH:MM:SS`, which is the resolution that makes "eight hours
-/// older" legible at a glance.
+/// A timestamp as `YYYY-MM-DD HH:MM:SS UTC`.
+///
+/// **The date is not decoration.** This string exists to be read by someone
+/// who has just been told their measurement is invalid, and the first question
+/// is always how stale. `HH:MM:SS` alone cannot answer it: a binary built a
+/// minute ago and one built the previous afternoon print identically, and the
+/// reader is sent to rebuild when the fact worth knowing is that the file in
+/// front of them was produced under a different build configuration entirely.
+///
+/// That is not hypothetical. This message printed `20:12:00 UTC` about a
+/// binary from the day before, sitting in a target directory cargo no longer
+/// uses, while the sources it was being compared against were hours newer.
+/// Nothing in the message said so.
 fn humantime(time: SystemTime) -> String {
     let seconds = time
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let (year, month, day) = civil_from_days((seconds / 86_400) as i64);
     let clock = seconds % 86_400;
     format!(
-        "{:02}:{:02}:{:02} UTC",
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC ({})",
         clock / 3600,
         (clock % 3600) / 60,
-        clock % 60
+        clock % 60,
+        age_of(time)
     )
+}
+
+/// How long ago `time` was, in the unit that makes it legible: days, hours,
+/// minutes, seconds. "5 days old" and "12 minutes old" call for different
+/// reactions, and a reader who has to work that out from a clock time is
+/// doing arithmetic the message should have done.
+fn age_of(time: SystemTime) -> String {
+    let Ok(built) = time.duration_since(SystemTime::UNIX_EPOCH) else {
+        return "of unknown age".to_string();
+    };
+    let Ok(now) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) else {
+        return "of unknown age".to_string();
+    };
+    let secs = now.saturating_sub(built).as_secs();
+    if secs < 60 {
+        return format!("{secs}s old");
+    }
+    if secs < 3_600 {
+        return format!("{}m old", secs / 60);
+    }
+    if secs < 86_400 {
+        return format!("{}h old", secs / 3_600);
+    }
+    format!("{}d old", secs / 86_400)
+}
+
+/// Days since 1970-01-01 to a proleptic Gregorian `(year, month, day)`.
+///
+/// Howard Hinnant's `civil_from_days`: exact across the whole range a
+/// `SystemTime` can hold, with no lookup table and no dependency. The broker's
+/// dependency policy is not a good enough reason to ship a wrong date.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 #[cfg(test)]
@@ -272,6 +327,42 @@ mod tests {
             None,
             "asv-brokerd comes from this package, so there is nothing to check"
         );
+    }
+
+    /// **The staleness message says how old the binary is, and this row is
+    /// why the date is in it.**
+    ///
+    /// The message used to render `HH:MM:SS` alone. A binary from the previous
+    /// afternoon and one from a minute ago then printed the same string, and
+    /// the reader is sent to rebuild either way — so the one fact that would
+    /// have saved the diagnosis, that the file in front of them predates the
+    /// build configuration cargo is using now, was absent from the sentence
+    /// that exists to explain the failure.
+    ///
+    /// The row renders a timestamp the test chooses, so it cannot pass by
+    /// asserting that some digits appear.
+    #[test]
+    fn the_staleness_message_names_the_date_and_the_age() {
+        use std::time::Duration;
+        // 2021-01-01T00:00:00Z. A fixed point rather than "now", so the
+        // expected prefix is a fact and not a recomputation of this code.
+        let then = SystemTime::UNIX_EPOCH + Duration::from_secs(1_609_459_200);
+        let rendered = humantime(then);
+        assert!(
+            rendered.starts_with("2021-01-01 00:00:00 UTC"),
+            "the timestamp lost its date, which is the part that says how stale \
+             the binary is: {rendered}"
+        );
+        assert!(
+            rendered.ends_with("old)"),
+            "the timestamp does not say how old the binary is: {rendered}"
+        );
+        // The calendar conversion at the boundaries a table gets wrong: the
+        // epoch, a leap day, and the century that is not one.
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+        assert_eq!(civil_from_days(11_017), (2000, 3, 1));
+        assert_eq!(civil_from_days(18_321), (2020, 2, 29));
     }
 
     /// The locator finds the binary that cargo just built for this package.
