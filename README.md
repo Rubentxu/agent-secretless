@@ -14,7 +14,7 @@ agent ──(surrogate / socket)──▶ broker ──(real credential)──�
         no secret material                the only holder
 ```
 
-> **Status: pre-1.0, at v0.30.0. Not certified, and the gates say so.**
+> **Status: pre-1.0, at v0.31.0. Not certified, and the gates say so.**
 >
 > The workspace compiles and **1885 tests are enumerated**. Under `cargo test`,
 > 1884 of them run and pass and 1 is gated out of debug builds by construction:
@@ -187,7 +187,7 @@ Each item says where its detail lives, because none of it is a guess.
 # the verifier is required: the installer refuses to proceed without it
 cargo install rsign2          # or your distribution's package manager
 curl -LsSf https://raw.githubusercontent.com/Rubentxu/agent-secretless/main/scripts/install.sh \
-  | sh -s -- --version 0.30.0 --prefix "$HOME/.local"
+  | sh -s -- --version 0.31.0 --prefix "$HOME/.local"
 ```
 
 The installer requires `sha256.sum` to carry a valid minisign signature before
