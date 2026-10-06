@@ -42,7 +42,8 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use asv_domain::{
-    CredentialClass, CredentialId, CredentialKind, CredentialMetadata, Exportability,
+    ActionIntent, CredentialClass, CredentialId, CredentialKind, CredentialMetadata, Exportability,
+    PlanBinding, PlanInvalidation, ToolIdentity,
 };
 use serde::{Deserialize, Serialize};
 
@@ -413,6 +414,16 @@ pub struct IntegrationPlan {
     /// read of a plan a compile error in the consumer rather than an error here.
     pub schema: String,
     pub family: String,
+    /// The executable this plan is about, when one was resolved.
+    ///
+    /// **On the plan, not only on the binding.** A plan that names a tool
+    /// records what the planner saw; the binding carries that forward to
+    /// execution, where it is compared against what actually resolves. Putting
+    /// it on the plan too means the receipt can show the plan's view *and* the
+    /// execution's, which is the pair an operator needs — and it means
+    /// [`IntegrationPlan::bind_to`] has something of its own to check the
+    /// intent against rather than trusting the intent's claim.
+    pub tool: Option<ToolIdentity>,
     /// One entry per discovered auth selector, in the order the tool reads its
     /// files and the order it reads the selectors within them.
     pub entries: Vec<PlanEntry>,
@@ -431,9 +442,120 @@ impl IntegrationPlan {
         Self {
             schema: PLAN_SCHEMA.to_string(),
             family: family.into(),
+            tool: None,
             entries,
             inventory_size,
         }
+    }
+
+    /// Records which executable this plan is about.
+    pub fn with_tool(mut self, tool: ToolIdentity) -> Self {
+        self.tool = Some(tool);
+        self
+    }
+
+    /// One digest standing for "the configuration this plan read".
+    ///
+    /// **A digest, not a list, and not a substitute for [`Self::revalidate`].**
+    /// The spec gives `ActionIntent` a single `config_fingerprint`, and a plan
+    /// for npm spans several files, so something has to collapse them. This is
+    /// that something: `sha256` over the entries' fingerprints in path order.
+    ///
+    /// It answers "is this the same world?" and `revalidate` answers "what
+    /// changed?". Both are needed and neither replaces the other — a caller
+    /// who only has the digest learns that something moved and nothing about
+    /// what, and a caller who only revalidates has no single value to put in an
+    /// intent, hash, and receipt.
+    ///
+    /// Deterministic by construction: entries are sorted by path before
+    /// hashing, so two plans over the same files agree regardless of the order
+    /// discovery happened to produce them in. Each field is length-prefixed, so
+    /// no combination of values can produce the same bytes as a different
+    /// combination — the classic concatenation ambiguity, avoided rather than
+    /// assumed away.
+    pub fn config_digest(&self) -> String {
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        // The family is in the hash so a digest from a curl plan can never be
+        // presented as a digest from an npm plan for "the same" files.
+        field_into(&mut hasher, b"family", self.family.as_bytes());
+        let mut ordered: Vec<&PlanEntry> = self.entries.iter().collect();
+        ordered.sort_by(|a, b| {
+            a.file
+                .cmp(&b.file)
+                .then(a.selector.to_string().cmp(&b.selector.to_string()))
+        });
+        for entry in ordered {
+            let f = &entry.fingerprint;
+            field_into(&mut hasher, b"path", f.path.as_os_str().as_encoded_bytes());
+            field_into(
+                &mut hasher,
+                b"resolved",
+                f.resolved_path.as_os_str().as_encoded_bytes(),
+            );
+            field_into(&mut hasher, b"inode", &f.inode.to_be_bytes());
+            field_into(&mut hasher, b"uid", &f.owner_uid.to_be_bytes());
+            field_into(&mut hasher, b"mode", &f.mode.to_be_bytes());
+            field_into(&mut hasher, b"size", &f.size.to_be_bytes());
+            field_into(&mut hasher, b"digest", f.digest.as_bytes());
+        }
+        format!("sha256:{:x}", hasher.finalize())
+    }
+
+    /// Binds this plan to an intent, refusing an intent that already
+    /// contradicts the world the plan read.
+    ///
+    /// **The binding records the plan's view, never the intent's claim.** That
+    /// is the whole point: a binding built by copying `intent.tool` would be
+    /// compared at execution time against whatever execution resolved, and the
+    /// intent's half of that comparison would be the caller's own assertion —
+    /// which is exactly the check that always passes.
+    ///
+    /// So the digest is the plan's, and the tool is the plan's, and the intent
+    /// is checked against both. An intent whose config fingerprint disagrees
+    /// with the files on disk is refused here rather than bound and then
+    /// noticed later.
+    pub fn bind_to(&self, intent: &ActionIntent) -> Result<PlanBinding, PlanBindingError> {
+        let config_digest = self.config_digest();
+        let digest_error = |source: asv_domain::IntentDigestError| PlanBindingError::IntentDigest {
+            message: source.to_string(),
+        };
+        match &intent.config_fingerprint {
+            Some(claimed) if *claimed != config_digest => {
+                return Err(PlanBindingError::PlanDrift {
+                    invalidation: PlanInvalidation::ConfigChanged {
+                        planned: Some(claimed.clone()),
+                        found: Some(config_digest),
+                    },
+                })
+            }
+            _ => {}
+        }
+        // The tool is checked the same way, and for the same reason: the
+        // binding takes the plan's.
+        if let (Some(claimed), Some(planned)) = (&intent.tool, &self.tool) {
+            if !planned.matches(claimed) {
+                return Err(PlanBindingError::PlanDrift {
+                    invalidation: if planned.path == claimed.path {
+                        PlanInvalidation::ToolBytesChanged {
+                            path: planned.path.clone(),
+                            planned_digest: planned.digest.clone(),
+                            found_digest: claimed.digest.clone(),
+                        }
+                    } else {
+                        PlanInvalidation::ToolChanged {
+                            planned: planned.clone(),
+                            found: claimed.clone(),
+                        }
+                    },
+                });
+            }
+        }
+        Ok(PlanBinding {
+            intent_digest: intent.digest().map_err(digest_error)?,
+            tool: self.tool.clone(),
+            config_fingerprint: Some(config_digest),
+        })
     }
 
     /// Re-checks every file the plan is about, per §6.
@@ -469,6 +591,29 @@ impl IntegrationPlan {
         let _ = (home, cwd);
         Ok(())
     }
+}
+
+/// Why a plan could not be bound to an intent.
+#[derive(Debug, thiserror::Error)]
+pub enum PlanBindingError {
+    #[error("the plan no longer describes the intent it was being bound to: {invalidation}")]
+    PlanDrift { invalidation: PlanInvalidation },
+    #[error("the intent could not be digested: {message}")]
+    IntentDigest { message: String },
+}
+
+/// One length-prefixed field, so two different field sequences can never hash
+/// to the same bytes.
+///
+/// `4-byte big-endian length, then the bytes`. Without it, a file called `ab`
+/// with digest `c` and a file called `a` with digest `bc` would produce the
+/// same stream, and a digest that admits two different configurations is a
+/// digest an attacker can choose between.
+fn field_into(hasher: &mut impl sha2::Digest, name: &[u8], value: &[u8]) {
+    hasher.update((name.len() as u32).to_be_bytes());
+    hasher.update(name);
+    hasher.update((value.len() as u32).to_be_bytes());
+    hasher.update(value);
 }
 
 /// Why a plan could not be revalidated.

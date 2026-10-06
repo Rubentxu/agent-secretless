@@ -1055,3 +1055,478 @@ fn a_user_without_a_password_is_still_a_credential() {
         BTreeSet::from([Operation::Transfer])
     );
 }
+
+// ------------------------------------------------------- binding to intent
+
+/// An intent for a plan over `fingerprint_for(...)` files, so the digest in it
+/// can be the plan's own — which is the case a caller is actually in.
+fn intent_for(plan: &IntegrationPlan) -> asv_domain::ActionIntent {
+    asv_domain::ActionIntent {
+        transaction: "tx-bind-1".into(),
+        principal: "release-bot@example.test".into(),
+        actor: "packager-agent".into(),
+        workload: "ci/publish".into(),
+        action: asv_domain::Action::RegistryPush,
+        resource: asv_domain::Resource::Api {
+            audience: asv_domain::Authority::canonicalize("registry.example.test")
+                .expect("canonical"),
+        },
+        tool: plan.tool.clone(),
+        config_fingerprint: Some(plan.config_digest()),
+        origin: asv_domain::IntentOrigin::HumanDirect,
+        expires_at_unix: 1_800_000_000,
+    }
+}
+
+fn npm_plan() -> IntegrationPlan {
+    plan_npm(
+        &token_discovery(),
+        &[metadata("npm", CredentialKind::BearerToken)],
+    )
+}
+
+const NPM_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+fn npm_tool() -> asv_domain::ToolIdentity {
+    asv_domain::ToolIdentity::new("/usr/bin/npm", NPM_A).expect("a well-formed digest")
+}
+
+/// The happy path: an intent that agrees with the world produces a binding, and
+/// the binding's digest is the intent's own.
+#[test]
+fn a_plan_binds_to_an_intent_that_agrees_with_it() {
+    let plan = npm_plan().with_tool(npm_tool());
+    let intent = intent_for(&plan);
+    let binding = plan.bind_to(&intent).expect("the intent agrees");
+
+    assert_eq!(binding.intent_digest, intent.digest().expect("digests"));
+    assert_eq!(binding.config_fingerprint, Some(plan.config_digest()));
+    assert_eq!(binding.tool, Some(npm_tool()));
+    // And it executes.
+    binding
+        .check_execution(
+            &intent.digest().expect("digests"),
+            Some(&npm_tool()),
+            Some(plan.config_digest()).as_deref(),
+            1_700_000_000,
+            intent.expires_at_unix,
+        )
+        .expect("nothing moved");
+}
+
+/// **The load-bearing row of this whole section.** The binding must record the
+/// *plan's* tool, not the intent's. A binding built by copying `intent.tool`
+/// would be compared at execution time against whatever execution resolved, and
+/// the intent's half of that comparison would be the caller's own assertion —
+/// a check that always passes.
+#[test]
+fn a_binding_records_the_plans_tool_rather_than_the_intents_claim() {
+    let plan = npm_plan().with_tool(npm_tool());
+
+    // An intent that *claims* a different tool is refused, so it cannot reach
+    // the binding at all. That is the first line of defence.
+    let mut lying = intent_for(&plan);
+    lying.tool = Some(
+        asv_domain::ToolIdentity::new(
+            "/home/dev/project/bin/npm",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .expect("well-formed"),
+    );
+    assert!(
+        matches!(
+            plan.bind_to(&lying),
+            Err(PlanBindingError::PlanDrift {
+                invalidation: asv_domain::PlanInvalidation::ToolChanged { .. }
+            })
+        ),
+        "a binding built from a false claim is the failure this row exists for"
+    );
+}
+
+/// The same, from the other side: if the intent names no tool and the plan does,
+/// the binding carries the **plan's**. Silently dropping it would produce a
+/// tool-agnostic binding for a plan that is about a specific binary, and the
+/// execute-time check would then refuse to notice a swapped npm.
+#[test]
+fn a_tool_agnostic_intent_does_not_make_the_binding_tool_agnostic() {
+    let plan = npm_plan().with_tool(npm_tool());
+    let mut intent = intent_for(&plan);
+    intent.tool = None;
+    let binding = plan
+        .bind_to(&intent)
+        .expect("the intent claims nothing to contradict");
+    assert_eq!(
+        binding.tool,
+        Some(npm_tool()),
+        "the plan named a tool and the binding dropped it"
+    );
+}
+
+/// A plan over no files has a digest like any other, and it is a real answer:
+/// "the configuration is nothing", not "unknown". A plan whose config digest
+/// were `None` here would make the execute-time check compare `Some` against
+/// `None` and refuse forever.
+#[test]
+fn a_plan_over_no_files_still_has_a_configuration_digest() {
+    let plan = IntegrationPlan::new("curl", Vec::new(), 0);
+    let digest = plan.config_digest();
+    assert!(digest.starts_with("sha256:"));
+    assert_eq!(digest.len(), 71);
+    // Deterministic across two calls and across a rebuild of the same plan.
+    assert_eq!(digest, plan.config_digest());
+    assert_eq!(
+        digest,
+        IntegrationPlan::new("curl", Vec::new(), 0).config_digest()
+    );
+}
+
+/// Every dimension of every fingerprint participates, because `revalidate`
+/// compares all of them and a digest that skipped one would let a plan survive
+/// exactly the change its own re-check calls drift.
+#[test]
+fn every_fingerprint_dimension_changes_the_configuration_digest() {
+    let base = npm_plan();
+    let baseline = base.config_digest();
+
+    let mut entry = base.entries[0].clone();
+    let original = entry.fingerprint.clone();
+
+    let mutations: Vec<(&str, FileFingerprint)> = vec![
+        (
+            "path",
+            FileFingerprint {
+                path: Path::new("/home/u/other").into(),
+                ..original.clone()
+            },
+        ),
+        (
+            "resolved_path",
+            FileFingerprint {
+                resolved_path: Path::new("/elsewhere").into(),
+                ..original.clone()
+            },
+        ),
+        (
+            "inode",
+            FileFingerprint {
+                inode: original.inode.wrapping_add(1),
+                ..original.clone()
+            },
+        ),
+        (
+            "owner_uid",
+            FileFingerprint {
+                owner_uid: original.owner_uid.wrapping_add(1),
+                ..original.clone()
+            },
+        ),
+        (
+            "mode",
+            FileFingerprint {
+                mode: original.mode ^ 0o077,
+                ..original.clone()
+            },
+        ),
+        (
+            "size",
+            FileFingerprint {
+                size: original.size.wrapping_add(1),
+                ..original.clone()
+            },
+        ),
+        (
+            "digest",
+            FileFingerprint {
+                digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    .into(),
+                ..original.clone()
+            },
+        ),
+    ];
+    for (dimension, fingerprint) in mutations {
+        entry.fingerprint = fingerprint;
+        let mutated = IntegrationPlan::new(base.family.clone(), vec![entry.clone()], 0);
+        assert_ne!(
+            mutated.config_digest(),
+            baseline,
+            "changing `{dimension}` did not change the digest, so a plan would \\
+             survive exactly the drift `revalidate` calls drift"
+        );
+    }
+}
+
+/// The digest is over the *set* of files, so entry order must not matter. Two
+/// planners reading the same files in different orders describe the same world.
+///
+/// **Three entries on three paths, deliberately.** An earlier version of this
+/// row used two entries from one file, and it passed with the sort deleted —
+/// because reversing a two-element list happened to produce the sorted order,
+/// so the row was correct about nothing. A row that cannot fail when the
+/// thing it names is broken is a row that measures nothing; the third entry is
+/// what makes reversal and sorting genuinely different.
+#[test]
+fn the_configuration_digest_does_not_depend_on_entry_order() {
+    let at = |name: &str, inode: u64| FileFingerprint {
+        path: Path::new(name).into(),
+        resolved_path: Path::new(name).into(),
+        inode,
+        owner_uid: 1000,
+        mode: 0o600,
+        size: 10,
+        digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
+    };
+    let a = entry_with(at("/home/u/.curlrc", 1));
+    let b = entry_with(at("/home/u/.npmrc", 2));
+    let c = entry_with(at("/home/u/settings.xml", 3));
+
+    let forward = IntegrationPlan::new("curl", vec![a.clone(), b.clone(), c.clone()], 0);
+    let backward = IntegrationPlan::new("curl", vec![c, b, a], 0);
+
+    // Precondition: the two orderings really are different. Without this the
+    // row could pass for the same reason the two-entry version did.
+    assert_ne!(
+        forward
+            .entries
+            .iter()
+            .map(|e| e.file.clone())
+            .collect::<Vec<_>>(),
+        backward
+            .entries
+            .iter()
+            .map(|e| e.file.clone())
+            .collect::<Vec<_>>(),
+        "precondition: the two orders are the same"
+    );
+    assert_eq!(
+        forward.config_digest(),
+        backward.config_digest(),
+        "two plans over the same files in opposite order described different worlds"
+    );
+}
+
+/// **The concatenation row, constructed rather than asserted.**
+///
+/// Without a length prefix the digest stream is `name || value || name ||
+/// value`, so shifting a byte across the boundary between two values produces
+/// an identical stream. This pair does exactly that:
+///
+/// ```text
+/// A: path="/a"          resolved="/xresolved"
+/// B: path="/a/resolved/x"   resolved=""
+/// ```
+///
+/// Without a prefix both streams are the bytes `"path" "/a" "resolved"
+/// "/xresolved"` and `"path" "/a/resolved/x" "resolved" ""`, which are the
+/// same string: B's `path` ends where A's `resolved` begins, and A's
+/// `resolved` spells the field name that B writes next. With the prefix in
+/// place the two are different digests; without it they are the same digest,
+/// and an operator cannot tell which configuration they are holding.
+///
+/// The row failed when the prefix was deleted from `field_into`, which is the
+/// only reason it is here rather than a comment.
+#[test]
+fn two_different_configurations_cannot_produce_the_same_digest() {
+    let base = FileFingerprint {
+        path: Path::new("/a").into(),
+        resolved_path: Path::new("/xresolved").into(),
+        inode: 7,
+        owner_uid: 1000,
+        mode: 0o600,
+        size: 3,
+        digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
+    };
+    let shifted = FileFingerprint {
+        path: Path::new("/a/resolved/x").into(),
+        resolved_path: Path::new("").into(),
+        ..base.clone()
+    };
+    let a = IntegrationPlan::new("curl", vec![entry_with(base)], 0);
+    let b = IntegrationPlan::new("curl", vec![entry_with(shifted)], 0);
+    assert_ne!(
+        a.config_digest(),
+        b.config_digest(),
+        "two different paths collided in the digest: a byte moved across a value \
+         boundary, which is what a length prefix exists to prevent"
+    );
+}
+
+/// The other two dimensions a byte can shift across, for the same reason: a
+/// path is not the only string in the stream.
+#[test]
+fn a_digest_cannot_be_moved_across_by_repartitioning_one_field() {
+    let base = FileFingerprint {
+        path: Path::new("/home/u/.npmrc").into(),
+        resolved_path: Path::new("/home/u/.npmrc").into(),
+        inode: 42,
+        owner_uid: 1000,
+        mode: 0o600,
+        size: 89,
+        digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
+    };
+    let baseline = IntegrationPlan::new("curl", vec![entry_with(base.clone())], 0).config_digest();
+    for shifted in [
+        // `inode` is 8 bytes; splitting 42 across the `path`/`resolved` seam
+        // would need the same byte count, which is why this shifts `size` and
+        // `inode` together instead.
+        FileFingerprint {
+            size: 0,
+            inode: 42 * 256,
+            ..base.clone()
+        },
+        FileFingerprint {
+            size: 42,
+            inode: 89,
+            ..base.clone()
+        },
+    ] {
+        assert_ne!(
+            IntegrationPlan::new("curl", vec![entry_with(shifted)], 0).config_digest(),
+            baseline,
+            "repartitioning two numeric fields collided in the digest"
+        );
+    }
+}
+
+/// The family is inside the hash, so a digest from one family cannot be
+/// presented as another's for "the same" files.
+#[test]
+fn a_digest_does_not_travel_between_families() {
+    let npm = npm_plan();
+    let other = IntegrationPlan::new("curl", npm.entries.clone(), 0);
+    assert_ne!(
+        npm.config_digest(),
+        other.config_digest(),
+        "the same files planned as two families hashed the same"
+    );
+}
+
+/// The whole block, end to end and in one row: bind a plan, move the world,
+/// and be refused with the spec's own token.
+#[test]
+fn a_plan_bound_then_watched_invalidates_when_the_world_moves() {
+    let plan = npm_plan().with_tool(npm_tool());
+    let intent = intent_for(&plan);
+    let binding = plan.bind_to(&intent).expect("binds");
+
+    // The execution resolves a different npm — the spec's example.
+    let hijacked = asv_domain::ToolIdentity::new(
+        "/home/dev/project/bin/npm",
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+    .expect("well-formed");
+    let refusal = binding
+        .check_execution(
+            &intent.digest().expect("digests"),
+            Some(&hijacked),
+            Some(plan.config_digest()).as_deref(),
+            1_700_000_000,
+            intent.expires_at_unix,
+        )
+        .expect_err("the world moved");
+    assert!(
+        refusal.to_string().starts_with("PLAN_INVALIDATED:"),
+        "{refusal}"
+    );
+    match refusal {
+        asv_domain::PlanInvalidation::ToolChanged { planned, found } => {
+            assert_eq!(planned, npm_tool());
+            assert_eq!(found, hijacked);
+        }
+        other => panic!("expected ToolChanged, got {other}"),
+    }
+}
+
+/// And the configuration half of the same promise: revalidate finds the drift,
+/// and the digest finds it too. Two layers, one world.
+#[test]
+fn a_changed_file_is_seen_by_both_revalidate_and_the_digest() {
+    let project = CurlProject::new();
+    let rc = project.rc_in_home("user = \"alice:one\"\n");
+    let discovery = project.discover();
+    let plan = plan_curl(&discovery, &[]);
+    let intent = intent_for(&plan);
+    plan.bind_to(&intent).expect("binds");
+
+    let before = plan.config_digest();
+    write_rc(&rc, "user = \"mallory:two\"\n");
+
+    let policy = crate::FingerprintPolicy::strict();
+    assert!(
+        plan.revalidate(&policy, &project.home(), &project.cwd())
+            .is_err(),
+        "revalidate is the layer that says which fields drifted"
+    );
+    // And a plan rebuilt now hashes differently, which is the layer an intent
+    // and a receipt can carry.
+    let after = plan_curl(&project.discover(), &[]).config_digest();
+    assert_ne!(before, after, "the digest did not move");
+}
+
+/// A plan whose world drifted before it was ever bound is refused, not bound
+/// and noticed later. The intent is asking about a configuration that is not
+/// there.
+#[test]
+fn an_intent_naming_a_different_configuration_is_refused_at_bind_time() {
+    let plan = npm_plan();
+    let mut intent = intent_for(&plan);
+    intent.config_fingerprint =
+        Some("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into());
+    assert!(
+        matches!(
+            plan.bind_to(&intent),
+            Err(PlanBindingError::PlanDrift {
+                invalidation: asv_domain::PlanInvalidation::ConfigChanged { .. }
+            })
+        ),
+        "an intent claiming a configuration the files do not have must not bind"
+    );
+}
+
+/// A binding round-trips into a receipt and back, because that is where it
+/// travels after execution.
+#[test]
+fn a_binding_round_trips_through_json() {
+    let plan = npm_plan().with_tool(npm_tool());
+    let intent = intent_for(&plan);
+    let binding = plan.bind_to(&intent).expect("binds");
+    let json = serde_json::to_string(&binding).expect("serialises");
+    let back: asv_domain::PlanBinding = serde_json::from_str(&json).expect("deserialises");
+    assert_eq!(back, binding);
+}
+
+/// A plan round-trips with the tool it recorded, so a consumer reading a plan
+/// from disk sees which executable the plan was about.
+#[test]
+fn a_plan_round_trips_with_its_tool() {
+    let plan = npm_plan().with_tool(npm_tool());
+    let json = serde_json::to_string(&plan).expect("serialises");
+    assert!(json.contains("/usr/bin/npm"), "{json}");
+    let back: IntegrationPlan = serde_json::from_str(&json).expect("deserialises");
+    assert_eq!(back, plan);
+    assert_eq!(back.tool, Some(npm_tool()));
+}
+
+/// A minimal entry carrying one fingerprint, for the digest rows that do not
+/// care about the binding.
+fn entry_with(fingerprint: FileFingerprint) -> PlanEntry {
+    // Built by hand rather than planned: these rows are about the digest over
+    // a fingerprint, and a plan needs a whole discovery to exist.
+    PlanEntry {
+        origin: Origin::User,
+        file: fingerprint.path.clone(),
+        fingerprint,
+        selector: Selector::Curl {
+            option: "user".into(),
+            kind: crate::curl::CurlCredential::User,
+            user_len: 1,
+            password_len: 1,
+            has_password: true,
+        },
+        binding: Binding::Unbound {
+            reason: UnboundReason::NoUsableCredential { inventory_size: 0 },
+        },
+        operations: BTreeSet::from([Operation::Transfer]),
+        strategies: Vec::new(),
+    }
+}
