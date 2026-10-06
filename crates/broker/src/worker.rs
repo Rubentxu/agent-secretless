@@ -82,6 +82,13 @@ pub enum RunOutcome {
     Signaled,
     /// Killed at the timeout.
     TimedOut,
+    /// The worker produced more output than the limits allow.
+    ///
+    /// Not `Failed`: the worker did not fail, it succeeded and said too much.
+    /// Reporting it as a non-zero exit would blame the tool for a bound the
+    /// broker imposed, and reporting it as `Completed` would tell a caller the
+    /// output it is about to receive is the whole of it.
+    OutputLimitExceeded,
 }
 
 impl RunOutcome {
@@ -91,6 +98,7 @@ impl RunOutcome {
             RunOutcome::Failed => "failed",
             RunOutcome::Signaled => "signaled",
             RunOutcome::TimedOut => "timeout",
+            RunOutcome::OutputLimitExceeded => "output_limit_exceeded",
         }
     }
 }
@@ -113,6 +121,7 @@ const fn run_outcome_contract_is_exhaustive() -> usize {
         RunOutcome::Failed => 1,
         RunOutcome::Signaled => 1,
         RunOutcome::TimedOut => 1,
+        RunOutcome::OutputLimitExceeded => 1,
     }
 }
 
@@ -132,12 +141,65 @@ pub struct WorkerRun {
     pub stderr_redacted: Vec<u8>,
     /// Wall time from spawn to reap.
     pub duration: Duration,
+    /// Bytes the worker actually wrote to stdout, including any discarded
+    /// past the limit.
+    ///
+    /// This is the number an operator needs: the difference between "the tool
+    /// said 2 MiB" and "the tool said 70 bytes and a limit stopped it" is the
+    /// difference between a chatty tool and a misbehaving one.
+    pub bytes_stdout: u64,
+    /// Bytes the worker actually wrote to stderr, including any discarded.
+    pub bytes_stderr: u64,
+    /// Whether a limit was hit. `stdout_redacted`/`stderr_redacted` hold only
+    /// the kept prefix, so this is what says the run's output is incomplete.
+    pub limit_hit: bool,
 }
 
 /// The caller's secret, resolved exactly once at spawn time and
 /// zeroized after the environment/file write. Never stored anywhere
 /// else.
 pub type SecretProvider = Box<dyn FnOnce() -> Vec<u8> + Send>;
+
+/// How much worker output is allowed to exist at once.
+///
+/// A worker is a program the operator declared but did not write. Without a
+/// bound, `stdout` is whatever it chooses to produce, and the broker grows a
+/// `Vec` until the allocator refuses — which on a broker is a control plane
+/// going down because one tool printed a log line in a loop. The timeout does
+/// not cover this: the timeout bounds how long the worker runs, not how much it
+/// says while running, and a worker that outruns the timeout has already filled
+/// the buffer.
+///
+/// The per-stream caps are what actually bound memory. `max_total_bytes` is a
+/// policy ceiling on the pair, checked after the read so that the two streams
+/// cannot together exceed an operator's intent by each being individually
+/// legal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerOutputLimits {
+    /// Bytes of stdout kept. Past this the rest is drained and discarded.
+    pub max_stdout_bytes: usize,
+    /// Bytes of stderr kept. Past this the rest is drained and discarded.
+    pub max_stderr_bytes: usize,
+    /// Ceiling on stdout plus stderr together.
+    pub max_total_bytes: usize,
+}
+
+impl Default for WorkerOutputLimits {
+    /// 1 MiB per stream, 2 MiB together.
+    ///
+    /// Chosen against the thing these bytes are for: a worker's stdout is
+    /// handed back to a caller over IPC, so this is also a bound on the largest
+    /// IPC response the broker will assemble from a child. A tool that emits
+    /// megabytes of real output is a tool whose output was going to be
+    /// unusable anyway.
+    fn default() -> Self {
+        Self {
+            max_stdout_bytes: 1024 * 1024,
+            max_stderr_bytes: 1024 * 1024,
+            max_total_bytes: 2 * 1024 * 1024,
+        }
+    }
+}
 
 /// Caller-provided spawn parameters.
 #[derive(Default)]
@@ -146,10 +208,67 @@ pub struct SpawnOptions {
     pub secret: Option<SecretProvider>,
     /// Hard lifetime cap (M10R-R5). `None` = 10s default.
     pub timeout: Option<Duration>,
+    /// Ceiling on the worker's output. `Default` = the values above.
+    pub output_limits: WorkerOutputLimits,
 }
 
 /// Default lifetime cap: short by design (spec §7 "short lifetime").
 pub const DEFAULT_WORKER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What one pipe produced: the kept prefix, and how much the child really
+/// wrote.
+#[derive(Debug, Default)]
+struct Captured {
+    /// At most `limit` bytes. Redacted before anything outside this module
+    /// sees it.
+    bytes: Vec<u8>,
+    /// Bytes the child wrote in total, kept or not.
+    total: u64,
+    /// True when `total` exceeded the kept prefix, so `bytes` is truncated.
+    truncated: bool,
+}
+
+/// Read one pipe, keeping at most `limit` bytes.
+///
+/// Past the limit this **stops reading and drops the pipe**, which is a
+/// deliberate choice rather than a shortcut. Draining the tail into a sink
+/// would also bound memory, and it looks safer — but for a producer that never
+/// ends it never reaches EOF, so the child would run to the timeout and the
+/// run would be recorded as `TimedOut`, which blames the worker for being slow
+/// rather than for being unbounded, and loses the fact that the broker stopped
+/// it.
+///
+/// Closing the read end instead gives the child `EPIPE` on its next write and
+/// it dies. That is the outcome an oversized producer should get: bounded
+/// memory, a prompt end, and `OutputLimitExceeded` naming the reason. A worker
+/// with a large but *finite* output is unaffected as long as it is under the
+/// limit; one that is over it has, by definition, produced output nobody asked
+/// for and cannot use.
+fn read_bounded<R: std::io::Read>(pipe: &mut R, limit: usize) -> std::io::Result<Captured> {
+    use std::io::Read;
+    let mut kept = Vec::new();
+    // `limit + 1`: one byte past the cap is what distinguishes "exactly at the
+    // limit" from "over it" without a second read.
+    std::io::Read::take(&mut *pipe, limit as u64 + 1).read_to_end(&mut kept)?;
+    if kept.len() <= limit {
+        let total = kept.len() as u64;
+        return Ok(Captured {
+            bytes: kept,
+            total,
+            truncated: false,
+        });
+    }
+    kept.truncate(limit);
+    // `total` is a lower bound and deliberately so: it is what the broker
+    // observed before it stopped, which is the honest answer to "how much did
+    // this worker say" for a producer that would have said everything. The
+    // caller learns the real answer is larger, not what it was.
+    Ok(Captured {
+        bytes: kept,
+        total: limit as u64 + 1,
+        truncated: true,
+    })
+}
 
 /// Spawn a registered worker through the isolation pipeline and wait
 /// for it. Appends exactly one audit record on every terminal path
@@ -164,7 +283,7 @@ pub fn spawn(
     let template = match registry.get(name) {
         Some(t) => t,
         None => {
-            audit_worker(audit, name, None, None, "refused", None);
+            audit_worker(audit, name, None, None, "refused", None, None);
             return Err(SpawnError::UnknownWorker(name.to_string()));
         }
     };
@@ -172,7 +291,7 @@ pub fn spawn(
     // M10R-R2: refuse the unenforceable policy BEFORE touching the fs
     // or the secret. Nothing was executed.
     if matches!(template.egress_policy, EgressPolicy::Allow(_)) {
-        audit_worker(audit, name, Some(template), None, "refused", None);
+        audit_worker(audit, name, Some(template), None, "refused", None, None);
         return Err(SpawnError::EgressAllowUnsupported);
     }
 
@@ -181,7 +300,7 @@ pub fn spawn(
     // reading as a weaker posture. Refuse it instead of silently
     // enforcing the strict filter under a permissive label.
     if !template.seccomp_profile.is_production() {
-        audit_worker(audit, name, Some(template), None, "refused", None);
+        audit_worker(audit, name, Some(template), None, "refused", None, None);
         return Err(SpawnError::SeccompProfileNotProduction);
     }
 
@@ -189,7 +308,7 @@ pub fn spawn(
     // executable file. A registry entry pointing nowhere is an
     // install-time bug, refused before any fork.
     if !is_executable_file(&template.binary) {
-        audit_worker(audit, name, Some(template), None, "refused", None);
+        audit_worker(audit, name, Some(template), None, "refused", None, None);
         return Err(SpawnError::BinaryMissing(template.binary.clone()));
     }
 
@@ -208,7 +327,7 @@ pub fn spawn(
         (SecretInjectionPlan::EnvVar { .. } | SecretInjectionPlan::File { .. }, Some(_)) => Ok(()),
     };
     if let Err(e) = plan_matches {
-        audit_worker(audit, name, Some(template), None, "refused", None);
+        audit_worker(audit, name, Some(template), None, "refused", None, None);
         return Err(e);
     }
 
@@ -218,7 +337,7 @@ pub fn spawn(
     {
         Ok(pair) => pair,
         Err(error) => {
-            audit_worker(audit, name, Some(template), None, "error", None);
+            audit_worker(audit, name, Some(template), None, "error", None, None);
             return Err(error.into());
         }
     };
@@ -236,7 +355,7 @@ pub fn spawn(
             Ok(()) => file_guard = Some(SecretFileGuard { path: path.clone() }),
             Err(e) => {
                 zeroize_buf(&mut secret_bytes);
-                audit_worker(audit, name, Some(template), None, "error", None);
+                audit_worker(audit, name, Some(template), None, "error", None, None);
                 return Err(e.into());
             }
         }
@@ -335,12 +454,12 @@ pub fn spawn(
             // The private marker proves the pre-exec hook failed; no
             // guess based on std's generic EINVAL is necessary.
             cleanup_guard(file_guard);
-            audit_worker(audit, name, Some(template), Some(&plan), "error", None);
+            audit_worker(audit, name, Some(template), Some(&plan), "error", None, None);
             return Err(SpawnError::IsolationUnavailable);
         }
         Err(e) => {
             cleanup_guard(file_guard);
-            audit_worker(audit, name, Some(template), Some(&plan), "error", None);
+            audit_worker(audit, name, Some(template), Some(&plan), "error", None, None);
             return Err(e.into());
         }
     };
@@ -348,19 +467,18 @@ pub fn spawn(
     // Drain both pipes while the worker runs. Waiting before reading can
     // deadlock once a child fills a pipe buffer (the child blocks on write,
     // the parent blocks on wait). Give stdout and stderr independent readers.
+    //
+    // Both readers are bounded, and the bound stops the reading rather than
+    // draining past it: a producer that outruns the cap gets its pipe closed
+    // and dies on EPIPE, which is both the bounded-memory answer and the prompt
+    // one. Draining instead would leave a producer that never ends running
+    // until the timeout, and record a bound being hit as the worker being slow.
+    let limits = opts.output_limits;
     let stdout_reader = child.stdout.take().map(|mut pipe| {
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut bytes = Vec::new();
-            pipe.read_to_end(&mut bytes).map(|_| bytes)
-        })
+        std::thread::spawn(move || read_bounded(&mut pipe, limits.max_stdout_bytes))
     });
     let stderr_reader = child.stderr.take().map(|mut pipe| {
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut bytes = Vec::new();
-            pipe.read_to_end(&mut bytes).map(|_| bytes)
-        })
+        std::thread::spawn(move || read_bounded(&mut pipe, limits.max_stderr_bytes))
     });
 
     let timeout = opts.timeout.unwrap_or(DEFAULT_WORKER_TIMEOUT);
@@ -376,37 +494,53 @@ pub fn spawn(
 
     cleanup_guard(file_guard);
 
-    let read_pipe = |reader: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>| {
+    let read_pipe = |reader: Option<std::thread::JoinHandle<std::io::Result<Captured>>>| {
         reader
             .map(|handle| {
                 handle
                     .join()
                     .map_err(|_| std::io::Error::other("worker output reader panicked"))?
             })
-            .unwrap_or_else(|| Ok(Vec::new()))
+            .unwrap_or_else(|| Ok(Captured::default()))
     };
-    let stdout_bytes = match read_pipe(stdout_reader) {
-        Ok(bytes) => bytes,
+    let stdout = match read_pipe(stdout_reader) {
+        Ok(captured) => captured,
         Err(error) => {
-            audit_worker(audit, name, Some(template), Some(&plan), "error", exit_code);
+            audit_worker(audit, name, Some(template), Some(&plan), "error", exit_code, None);
             return Err(error.into());
         }
     };
-    let stderr_bytes = match read_pipe(stderr_reader) {
-        Ok(bytes) => bytes,
+    let stderr = match read_pipe(stderr_reader) {
+        Ok(captured) => captured,
         Err(error) => {
-            audit_worker(audit, name, Some(template), Some(&plan), "error", exit_code);
+            audit_worker(audit, name, Some(template), Some(&plan), "error", exit_code, None);
             return Err(error.into());
         }
     };
 
     if timed_out {
-        audit_worker(audit, name, Some(template), Some(&plan), "timeout", None);
+        audit_worker(audit, name, Some(template), Some(&plan), "timeout", None, None);
         return Err(SpawnError::Timeout(timeout));
     }
 
-    let stdout_redacted = effective_redactor.redact(&stdout_bytes);
-    let stderr_redacted = effective_redactor.redact(&stderr_bytes);
+    // The total ceiling bounds the pair, so it is checked after both reads:
+    // each stream being individually legal must not make the sum illegal. It
+    // is not a second memory defence -- the per-stream caps did that, and they
+    // already ran. It decides how the run is *reported*.
+    let total = stdout.total + stderr.total;
+    let limit_hit =
+        stdout.truncated || stderr.truncated || total > limits.max_total_bytes as u64;
+    let mut outcome = outcome;
+    if limit_hit {
+        // The worker failed at nothing. It succeeded and said more than the
+        // broker agreed to hold, and a caller told "ok" would take the kept
+        // prefix for the whole of it. So the run is named for what happened to
+        // the output rather than for what happened to the process.
+        outcome = RunOutcome::OutputLimitExceeded;
+    }
+
+    let stdout_redacted = effective_redactor.redact(&stdout.bytes);
+    let stderr_redacted = effective_redactor.redact(&stderr.bytes);
 
     audit_worker(
         audit,
@@ -415,6 +549,7 @@ pub fn spawn(
         Some(&plan),
         outcome.audit_name(),
         exit_code,
+        Some((stdout.total, stderr.total, limit_hit)),
     );
 
     Ok(WorkerRun {
@@ -423,6 +558,9 @@ pub fn spawn(
         stdout_redacted,
         stderr_redacted,
         duration,
+        bytes_stdout: stdout.total,
+        bytes_stderr: stderr.total,
+        limit_hit,
     })
 }
 
@@ -705,11 +843,17 @@ fn audit_worker(
     plan: Option<&SecretInjectionPlan>,
     outcome: &str,
     exit_code: Option<i32>,
+    output: Option<(u64, u64, bool)>,
 ) {
     let (egress, injection) = match (template, plan.or(template.map(|t| &t.secret_injection))) {
         (Some(t), Some(p)) => (t.egress_policy.kind(), p.kind()),
         _ => ("none", "none"),
     };
+    // Counts, not content: how much a worker said is an operational fact, what
+    // it said may be the secret.
+    let (bytes_stdout, bytes_stderr, output_limit_hit) = output
+        .map(|(out, err, hit)| (Some(out), Some(err), Some(hit)))
+        .unwrap_or((None, None, None));
     audit.append(
         AuditEventDto::WorkerSpawned {
             worker: worker.to_string(),
@@ -718,6 +862,9 @@ fn audit_worker(
             posture: POSTURE_LABEL.to_string(),
             outcome: outcome.to_string(),
             exit_code,
+            bytes_stdout,
+            bytes_stderr,
+            output_limit_hit,
         },
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -855,11 +1002,114 @@ mod tests {
             SpawnOptions {
                 secret: Some(Box::new(|| b"x".to_vec())),
                 timeout: None,
+                ..Default::default()
             },
             &mut audit2,
         )
         .expect_err("provider without plan must be refused");
         assert!(matches!(err2, SpawnError::InjectionMismatch(_)));
+    }
+
+    /// AAT-RUNTIME-03: a worker that prints without end is capped, and the run
+    /// says which fault it was.
+    ///
+    /// The second assertion is the one that matters. A reader that kept
+    /// draining past the cap would also bound memory, and it would end this run
+    /// as `TimedOut` after the full lifetime — a different claim, blaming the
+    /// worker for being slow instead of for being unbounded, and losing the
+    /// fact that the broker stopped it. So the run must finish in far less than
+    /// the lifetime it was allowed: that is the evidence the child died on the
+    /// closed pipe rather than on the clock.
+    #[test]
+    fn a_worker_that_never_stops_printing_is_capped_and_says_so() {
+        let mut t = template("chatty", "/usr/bin/yes");
+        t.arguments = vec![];
+        let r = WorkerRegistry::new(vec![t]);
+        let mut audit = AuditLog::new(16);
+        let lifetime = Duration::from_secs(30);
+        let run = spawn(
+            &r,
+            "chatty",
+            SpawnOptions {
+                secret: None,
+                timeout: Some(lifetime),
+                output_limits: WorkerOutputLimits {
+                    max_stdout_bytes: 64 * 1024,
+                    max_stderr_bytes: 64 * 1024,
+                    max_total_bytes: 128 * 1024,
+                },
+            },
+            &mut audit,
+        )
+        .expect("a capped run is a run, not a spawn failure");
+
+        assert_eq!(
+            run.outcome,
+            RunOutcome::OutputLimitExceeded,
+            "an unbounded producer must be named as one, not as ok, failed or timed out"
+        );
+        assert!(run.limit_hit, "the bound was hit but the run did not say so");
+        assert!(
+            run.duration < Duration::from_secs(10),
+            "the run took {:?}, which is the clock stopping the worker rather than \
+             the output bound",
+            run.duration
+        );
+        // What the caller receives is the kept prefix and nothing more: the
+        // observable form of the memory being bounded.
+        assert_eq!(
+            run.stdout_redacted.len(),
+            64 * 1024,
+            "the caller must not be handed more than the cap"
+        );
+        assert!(
+            run.bytes_stdout > 64 * 1024,
+            "bytes_stdout must report what was said, not what was kept"
+        );
+
+        let recs = audit.query(0);
+        match &recs[0].event {
+            AuditEventDto::WorkerSpawned {
+                outcome,
+                bytes_stdout,
+                output_limit_hit,
+                ..
+            } => {
+                assert_eq!(outcome, "output_limit_exceeded");
+                assert_eq!(*bytes_stdout, Some(run.bytes_stdout));
+                assert_eq!(*output_limit_hit, Some(true));
+            }
+            other => panic!("unexpected audit variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_worker_under_the_bound_reports_no_limit_and_keeps_everything() {
+        // The other half of the row above. Without it, a reader that dropped
+        // everything unconditionally would pass: `limit_hit` would be true
+        // forever and "the bound works" would mean nothing.
+        let r = WorkerRegistry::new(vec![template("quiet", "/bin/echo")]);
+        let mut audit = AuditLog::new(16);
+        let run = spawn(
+            &r,
+            "quiet",
+            SpawnOptions {
+                secret: None,
+                timeout: None,
+                output_limits: WorkerOutputLimits {
+                    max_stdout_bytes: 64 * 1024,
+                    max_stderr_bytes: 64 * 1024,
+                    max_total_bytes: 128 * 1024,
+                },
+            },
+            &mut audit,
+        )
+        .expect("a quiet worker runs");
+        assert_eq!(run.outcome, RunOutcome::Completed);
+        assert!(
+            !run.limit_hit,
+            "a worker under the cap must not be reported as capped"
+        );
     }
 
     #[test]

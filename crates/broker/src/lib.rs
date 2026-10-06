@@ -1328,6 +1328,7 @@ fn outcome_name(outcome: crate::worker::RunOutcome) -> &'static str {
         Failed => "failed",
         Signaled => "signaled",
         TimedOut => "timed_out",
+        OutputLimitExceeded => "output_limit_exceeded",
     }
 }
 
@@ -1948,6 +1949,13 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             let opts = crate::worker::SpawnOptions {
                 secret,
                 timeout: timeout_ms.map(std::time::Duration::from_millis),
+                // The broker's own output bound, for the same reason the
+                // lifetime cap is not the client's to raise: a client that
+                // could set the output ceiling would make it advisory for the
+                // one verb that hands out a real credential. A caller that
+                // needs a worker to say more than this is a worker this verb
+                // should not be running.
+                output_limits: Default::default(),
             };
 
             // `args` are appended to the template's own arguments. They are

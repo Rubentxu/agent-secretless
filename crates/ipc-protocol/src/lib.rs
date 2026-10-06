@@ -1020,6 +1020,19 @@ pub enum AuditEventDto {
         /// Child exit code when the child ran and exited; `None` for
         /// signals, timeouts and refusals.
         exit_code: Option<i32>,
+        /// Bytes the worker wrote to stdout, including any discarded past the
+        /// limit. `None` on paths that never reached a run.
+        bytes_stdout: Option<u64>,
+        /// Bytes the worker wrote to stderr, including any discarded past the
+        /// limit. `None` on paths that never reached a run.
+        bytes_stderr: Option<u64>,
+        /// True when an output bound stopped the read.
+        ///
+        /// Carried because `outcome` alone cannot say it: a run capped at the
+        /// limit and a run that simply finished are the same process exit, and
+        /// a consumer reading only `outcome` would take a truncated prefix for
+        /// the whole of the output. Counts, never content.
+        output_limit_hit: Option<bool>,
     },
     /// A credential was substituted on the CONNECT path, or refused there
     /// (ADR-0019).
