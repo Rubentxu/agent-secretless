@@ -112,17 +112,22 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         name="O3 a careless trace of the forwarded request prints the credential",
         target=ROOT / "crates/broker/src/tls_bridge.rs",
-        before="""        let forwarded = rewritten.len();
-        // The buffer that carried the credential upstream is wiped here, not
-        // left to the allocator's discretion.""",
-        after="""        let forwarded = rewritten.len();
-        tracing::info!(
-            head = ?String::from_utf8_lossy(&rewritten),
-            forwarded,
-            "forwarded the substituted request"
-        );
-        // The buffer that carried the credential upstream is wiped here, not
-        // left to the allocator's discretion.""",
+        before="""            forwarded += rewritten.len();
+            // The buffer that carried the credential upstream is wiped here, not
+            // left to the allocator's discretion.""",
+        # **Re-anchored.** The counter became an accumulator and the whole block
+        # sits one level deeper, so `let forwarded = rewritten.len();` at eight
+        # spaces occurs nowhere in the file. The careless trace is unchanged:
+        # the head that now carries the credential, printed whole, before the
+        # buffer is wiped.
+        after="""            forwarded += rewritten.len();
+            tracing::info!(
+                head = ?String::from_utf8_lossy(&rewritten),
+                forwarded,
+                "forwarded the substituted request"
+            );
+            // The buffer that carried the credential upstream is wiped here, not
+            // left to the allocator's discretion.""",
         targets=[
             Target(
                 VERTICAL,
