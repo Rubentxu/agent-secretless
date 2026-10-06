@@ -91,11 +91,21 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         name="L1 a lock is held across the relay",
         target=ROOT / "crates/broker/src/connect_runtime.rs",
-        before="""        let mut port =
-            SubstitutionPort::new(self.surrogates.as_ref(), self.secrets.as_ref(), family, family_name);
+        before="""        let mut port = SubstitutionPort::new(
+            Arc::clone(&self.surrogates)
+                as Arc<dyn crate::surrogate::SurrogateLending + Send + Sync>,
+            Arc::clone(&self.secrets) as Arc<dyn asv_connector_http::SecretPort + Send + Sync>,
+            family,
+            family_name,
+        );
         let outcome = tunnel.relay_substituted(&mut port, &mut audit, self.limits)?;""",
-        after="""        let mut port =
-            SubstitutionPort::new(self.surrogates.as_ref(), self.secrets.as_ref(), family, family_name);
+        after="""        let mut port = SubstitutionPort::new(
+            Arc::clone(&self.surrogates)
+                as Arc<dyn crate::surrogate::SurrogateLending + Send + Sync>,
+            Arc::clone(&self.secrets) as Arc<dyn asv_connector_http::SecretPort + Send + Sync>,
+            family,
+            family_name,
+        );
         let _held = self
             .surrogates
             .lock()
@@ -169,7 +179,7 @@ MUTATIONS: list[Mutation] = [
                 let s = crate::connect_listener::ShutdownSignal::new();
                 s.stop();
                 Arc::new(s)
-            }""",
+            },""",
         targets=[
             Target(
                 WIRING,
@@ -188,17 +198,49 @@ MUTATIONS: list[Mutation] = [
         after="""                // mutation: a poll tick with nothing to say is simply retried
                 continue;""",
         targets=[
-            Target(VERTICAL, LIFECYCLE, "a tunnel outlived the session that authorised it"),
+            # **Re-anchored twice, and the first attempt is worth recording.**
+            # This named the revocation row and stayed green — correctly. There
+            # are two cancellation sites: the head read consults
+            # `cancel_reason(session)` and notices a revoked session first, while
+            # this one is the *idle pollable* branch of the relay copy.
+            # Revocation is caught upstream; shutdown is what has to reach here.
+            #
+            # The second attempt put the shutdown row's message in the revocation
+            # row's `expect` slot, which is the same mistake one level down:
+            # `Target(binary, test, expect)` takes a test *name*, so that run
+            # executed the revocation test, looked for words it does not say,
+            # and stayed green again for a reason that had nothing to do with
+            # the product. Measured: with this mutation the revocation row passes
+            # and `a_terminated_broker_ends_its_tunnels_by_shutdown_and_says_so`
+            # goes red, failing on the audit chain having no tunnel recorded as
+            # cancelled by shutdown.
+            Target(
+                VERTICAL,
+                "a_terminated_broker_ends_its_tunnels_by_shutdown_and_says_so",
+                "no tunnel in the chain was recorded as cancelled by shutdown",
+            ),
         ],
     ),
     Mutation(
         name="L7 the origin never holds the connection at all",
         target=ROOT / "crates/broker/tests/connect_vertical_e2e.rs",
         before="""    fn start_holding() -> Self {
-        Self::spawn(1, true)
+        Self::spawn(
+            OriginMode::Serve {
+                per_connection: 1,
+                holding: true,
+            },
+            Some,
+        )
     }""",
         after="""    fn start_holding() -> Self {
-        Self::spawn(1, false)
+        Self::spawn(
+            OriginMode::Serve {
+                per_connection: 1,
+                holding: false,
+            },
+            Some,
+        )
     }""",
         targets=[
             # Caught at the *first* gate, not the settle window: an origin that
@@ -216,7 +258,7 @@ MUTATIONS: list[Mutation] = [
         // No deadline. From here the connection ends when the tunnel ends and
         // for no other reason, which is what lets `open_connections` answer
         // "is the tunnel still there" instead of "has the timeout fired".
-        stream.set_read_timeout(None).ok();
+        stream.set_origin_timeout(None);
         let mut buf = [0u8; 256];
         while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
     }""",
