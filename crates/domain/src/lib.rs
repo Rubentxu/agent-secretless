@@ -9,8 +9,13 @@
 //! 2. [`IntegrationPosture`] is a closed enum, so an integration can never be
 //!    silently relabelled as stronger than it is (ADR-0014, R10 release gate).
 
+pub mod intent;
 pub mod secret;
 
+pub use intent::{
+    ActionIntent, IntentDigestError, IntentOrigin, IntentSecretLeak, PlanBinding, PlanInvalidation,
+    ToolIdentity, ToolIdentityError,
+};
 pub use secret::{SecretBytes, SecretPurpose};
 
 use core::fmt;
