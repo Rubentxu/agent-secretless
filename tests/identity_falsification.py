@@ -78,15 +78,18 @@ SUITE = "broker_identity"
 TIMEOUT = 2400
 
 # The check, verbatim, at the position that matters.
-CHECK_BLOCK = """    if let Err(error) = asv_broker::identity::check(
+CHECK_BLOCK = """    let identity_verdict = match asv_broker::identity::check(
         unsafe { libc::getuid() },
         unsafe { libc::geteuid() },
         declared_uid,
         require_dedicated_identity,
     ) {
-        eprintln!("asv: {error}");
-        std::process::exit(1);
-    }
+        Ok(verdict) => verdict,
+        Err(error) => {
+            eprintln!("asv: {error}");
+            std::process::exit(1);
+        }
+    };
 """
 
 
@@ -102,7 +105,19 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         name="I1 the identity check is deleted",
         path=MAIN,
-        edits=((CHECK_BLOCK, ""),),
+        # **This used to be an empty string, and it cannot be one any more.**
+        # `main` now binds the verdict because line 720 reads it back with
+        # `as_measured()`, so deleting the block leaves `identity_verdict`
+        # undefined and the build fails -- which measures the borrow checker,
+        # not this row. Fabricating the verdict is the same defect in the shape
+        # the code now has: the check never runs, the answer is invented, and
+        # the broker goes on serving. `Dedicated` is the variant that claims the
+        # declared uid is in force, which is what a caller would reach for to
+        # get past the refusal.
+        edits=((CHECK_BLOCK,
+                "    let identity_verdict = asv_broker::identity::IdentityVerdict::Dedicated {\n"
+                "        uid: unsafe { libc::getuid() },\n"
+                "    };\n"),),
         # Every refusal test fires on the same named phrase, because what
         # actually happens when the gate is absent is the alarming thing rather
         # than a timeout: the broker starts, opens the vault and keeps serving.
@@ -145,38 +160,28 @@ MUTATIONS: tuple[Mutation, ...] = (
         # a flag rather than by getting a number wrong.
         expect="kept serving instead of refusing",
     ),
-    Mutation(
-        name="I4 the identity check runs after the vault is opened",
-        path=MAIN,
-        # Two edits: remove it from the position that matters, put it back
-        # after the passphrase has been read. The whole difference between this
-        # row and no row at all is a move, which is why a test that only watched
-        # the exit status could not tell them apart.
-        edits=(
-            (CHECK_BLOCK, ""),
-            (
-                """        let store = VaultStore::open(&vault_path, &passphrase).unwrap_or_else(|err| {
-            eprintln!("asv: cannot open vault {}: {err:?}", vault_path.display());
-            std::process::exit(1);
-        });""",
-                """        let store = VaultStore::open(&vault_path, &passphrase).unwrap_or_else(|err| {
-            eprintln!("asv: cannot open vault {}: {err:?}", vault_path.display());
-            std::process::exit(1);
-        });
-""" + CHECK_BLOCK,
-            ),
-        ),
-        # **This row did not go red the way the row above expected, and the
-        # way it went red is the finding.** The broker still refuses, still
-        # exits non-zero and still names its declared and actual uid — every
-        # message assertion passes. What it does not do is refuse *first*:
-        # `main` binds the socket at line 555 and opens the vault at 627, so a
-        # check placed after the vault has been listening the whole time. The
-        # witness is therefore the filesystem and not the prose, which is why
-        # `a_refused_broker_leaves_no_socket_and_no_listener` exists as a test
-        # of its own rather than as a side assertion.
-        expect="a refused broker that bound a listener",
-    ),
+    # **I4 is retired, and the reason is worth more than the mutation.**
+    #
+    # It moved the identity check from before the vault open to after it, and
+    # the property it guarded -- a refusal that arrives after the passphrase has
+    # been read is a refusal that already had the secret -- is real and is
+    # still held by an executable row:
+    # `the_identity_refusal_happens_before_the_vault_is_opened` in
+    # `crates/broker/tests/broker_identity.rs`, which runs a sandbox with no
+    # vault at all, so a broker that complained about the vault would be
+    # caught immediately.
+    #
+    # The move stopped being expressible. `main` now binds the verdict because
+    # line 720 reads it back through `as_measured()` for the self-report, and
+    # the vault opens at 763. Removing the block from its position and putting
+    # it back after the open leaves the use before the declaration, and the
+    # mutation does not compile -- so it measured the borrow checker rather
+    # than this property. Keeping it would have meant a SKIP in every run that
+    # looks like a defect and is not one.
+    #
+    # The row it originally was filed against is the same file's
+    # `a_refused_broker_leaves_no_socket_and_no_listener`, and the honest
+    # record of the original surprise is kept in that row rather than here.
     Mutation(
         name="I5 an unparsable uid falls through to a default",
         path=MAIN,
