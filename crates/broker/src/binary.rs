@@ -283,16 +283,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Runs `body` with the default panic hook silenced and returns the message
-    /// it panicked with, or `None` if it did not panic.
+    thread_local! {
+        /// True only on the thread running a deliberate panic inside
+        /// [`catch_panic`], and only for as long as that body is running.
+        static DELIBERATE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn silence_deliberate_panics() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                if !DELIBERATE_PANIC.with(std::cell::Cell::get) {
+                    previous(info);
+                }
+            }));
+        });
+    }
+
+    /// Runs `body` and returns the message it panicked with, or `None` if it did
+    /// not panic.
     ///
-    /// The hook has to go, or every one of these runs prints a backtrace to the
-    /// test output for a panic the test is asking for on purpose.
+    /// **The deliberate panic is silenced per thread, not process-wide.** The
+    /// first version took the default hook, installed a no-op, and restored the
+    /// saved hook on the way out. The panic hook is global to the process and
+    /// `cargo test` runs every test in this binary on its own thread, so two
+    /// guards overlap by default: the second one saves the *first's* silence and
+    /// restores that on its way out, and the process finishes with a hook that
+    /// swallows every later panic. With two guards in this module that was the
+    /// normal case rather than a corner one.
+    ///
+    /// The symptom is not a wrong answer. It is a **failing test that prints no
+    /// reason at all**, which is the one thing a falsification campaign cannot
+    /// tell apart from a mutation that was not caught: `relay_loop` reported four
+    /// of its rows as "red, but not for the expected reason" when the named
+    /// assertion had in fact fired.
+    ///
+    /// So the hook is installed once and forwards everything that is not a
+    /// deliberate panic on a guarded thread. A real failure elsewhere still
+    /// prints, and there is no restore step left to lose.
     fn catch_panic<F: FnOnce() + std::panic::UnwindSafe>(body: F) -> Option<String> {
-        let hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let outcome = std::panic::catch_unwind(body);
-        std::panic::set_hook(hook);
+        silence_deliberate_panics();
+        let outcome = DELIBERATE_PANIC.with(|deliberate| {
+            deliberate.set(true);
+            let outcome = std::panic::catch_unwind(body);
+            deliberate.set(false);
+            outcome
+        });
         match outcome {
             Ok(()) => None,
             Err(payload) => Some(

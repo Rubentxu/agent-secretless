@@ -165,17 +165,53 @@ mod tests {
     /// cannot be inspected afterwards, precisely because it does not implement
     /// `Clone`. The canary is therefore checked against a freshly created
     /// secret, which is a stronger statement than reusing one.
+    thread_local! {
+        /// True only on the thread running a deliberate panic, and only while
+        /// its body is running. See [`catch_deliberate_panic`].
+        static DELIBERATE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Runs `body`, silencing the panic message it is about to cause.
+    ///
+    /// **The silence is per thread, not process-wide.** The panic hook belongs to
+    /// the process and every test in this binary gets its own thread, so taking
+    /// the hook, installing a no-op, and restoring the saved one leaves a window
+    /// in which *another* test's failure prints no reason at all. A failing test
+    /// with no message is indistinguishable from a mutation that was not caught,
+    /// which is the one distinction a falsification campaign cannot afford to
+    /// lose.
+    ///
+    /// The same helper in `crates/broker/src/binary.rs` had the worse version of
+    /// this bug — two call sites, so the second saved the first's silence and
+    /// restored *that*, and the process finished with a permanently muted hook.
+    /// Installing once and forwarding everything that is not a deliberate panic
+    /// on this thread removes both the window and the restore step.
+    fn catch_deliberate_panic<F: FnOnce() + std::panic::UnwindSafe>(body: F) -> bool {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                if !DELIBERATE_PANIC.with(std::cell::Cell::get) {
+                    previous(info);
+                }
+            }));
+        });
+        DELIBERATE_PANIC.with(|deliberate| {
+            deliberate.set(true);
+            let outcome = std::panic::catch_unwind(body);
+            deliberate.set(false);
+            outcome.is_err()
+        })
+    }
+
     #[test]
     fn panic_message_never_contains_canary() {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
         let secret = canary_secret();
-        let result = std::panic::catch_unwind(move || {
+        let result = catch_deliberate_panic(move || {
             panic!("boom with {secret:?}");
         });
-        std::panic::set_hook(previous);
 
-        assert!(result.is_err());
+        assert!(result);
         let other = canary_secret();
         let leaked = format!("{other:?}").contains(CANARY);
         assert!(!leaked, "panic path leaked the canary");

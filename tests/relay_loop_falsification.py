@@ -167,6 +167,15 @@ MUTATIONS: list[Mutation] = [
         edits=(('        if &terminator != b"\\r\\n" {\n            return Err(BridgeError::Io("a chunk was not terminated by CRLF".into()));\n        }\n        to.write_all(b"\\r\\n")\n            .map_err(|e| BridgeError::Io(e.to_string()))?;',
                 '        if &terminator != b"\\r\\n" {\n            return Err(BridgeError::Io("a chunk was not terminated by CRLF".into()));\n        }'),),
         suite='--lib',
+        # **This wording was right all along, and it was being reported wrong.**
+        # `crates/broker/src/binary.rs` muted the process panic hook and, with two
+        # overlapping guards, left it muted -- so every failure in the lib binary
+        # printed no message at all and this row came back WRONG with nothing to
+        # read. Re-anchoring the expectation would have "fixed" the campaign by
+        # pointing it at an assertion that never fires: the byte count at
+        # tls_bridge.rs:1539 panics first, so the "framing was rewritten"
+        # assertion at the end of the row is never reached. The defect was the
+        # swallowed reason, not the expectation.
         expect='the byte count and the bytes written disagree',
     ),
     Mutation(
