@@ -274,7 +274,7 @@ enum IntegrationsCommand {
         /// be named rather than inferred.
         #[arg(value_name = "FAMILY")]
         family: String,
-        /// Emit the `asv.integrations.plan/v1` envelope instead of prose.
+        /// Emit the `asv.integrations.plan/v2` envelope instead of prose.
         #[arg(long)]
         json: bool,
         /// Directory holding the project-level configuration.
@@ -1856,10 +1856,34 @@ fn run_integrations_plan(
             };
             asv_integrations::plan_npm(&discovery, &inventory)
         }
+        // R4.B.1's second family. Same four stages, different vocabulary: the
+        // discovery produces `Selector::Curl` and nothing else had to change.
+        "curl" => {
+            let discovery = match asv_integrations::Curl.discover(&policy, &home, &cwd) {
+                Ok(discovery) => discovery,
+                Err(error) => {
+                    if json {
+                        let failure = serde_json::json!({
+                            "schema": asv_integrations::PLAN_SCHEMA,
+                            "family": family,
+                            "error": error.to_string(),
+                        });
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&failure).unwrap_or_default()
+                        );
+                    } else {
+                        eprintln!("asv: {error}");
+                    }
+                    std::process::exit(1);
+                }
+            };
+            asv_integrations::plan_curl(&discovery, &inventory)
+        }
         other => {
             eprintln!(
-                "asv: no adapter for {other:?}; this build knows `npm`. Adding one is a module in \
-                 asv-integrations and one match arm here."
+                "asv: no plan for {other:?}; this build plans `npm` and `curl`. Adding one is a \
+                 module in asv-integrations, a variant in `Selector`, and one match arm here."
             );
             std::process::exit(1);
         }
@@ -1880,24 +1904,45 @@ fn run_integrations_plan(
 fn print_plan_prose(plan: &asv_integrations::IntegrationPlan) {
     if plan.entries.is_empty() {
         println!(
-            "npm: no auth selectors found in any configuration file, so there is nothing to plan."
+            "{}: no credential selectors found in any configuration file, so there is nothing to \
+             plan.",
+            plan.family
         );
         return;
     }
     println!(
-        "npm plan — {} selector(s), against {} stored credential(s)",
+        "{} plan — {} selector(s), against {} stored credential(s)",
+        plan.family,
         plan.entries.len(),
         plan.inventory_size
     );
     for entry in &plan.entries {
         println!();
-        println!(
-            "{} ({:?}) -> {}",
-            entry.file.display(),
-            entry.origin,
-            entry.audience
-        );
-        println!("  field: {}", entry.field);
+        println!("{} ({:?})", entry.file.display(), entry.origin);
+        // The two families name different things and the type is what stops a
+        // renderer from printing one of them for the other. A curl entry has
+        // no audience to print because a `.curlrc` names no host.
+        match &entry.selector {
+            asv_integrations::Selector::Npm {
+                field, audience, ..
+            } => {
+                println!("  -> {audience}");
+                println!("  field: {field}");
+            }
+            asv_integrations::Selector::Curl {
+                option,
+                kind,
+                user_len,
+                password_len,
+                has_password,
+            } => {
+                println!("  option: {option} ({kind:?})");
+                println!("  name: {user_len} bytes, password: {password_len} bytes");
+                if !has_password {
+                    println!("    no password half was written: curl sends an empty one.");
+                }
+            }
+        }
         match &entry.binding {
             asv_integrations::Binding::Bound {
                 credential,
@@ -1918,8 +1963,8 @@ fn print_plan_prose(plan: &asv_integrations::IntegrationPlan) {
                 }
                 println!("    name one with `asv integrations adopt` to disambiguate.");
             }
-            asv_integrations::Binding::NotACredential { field } => {
-                println!("  not a credential npm will authenticate with: {field}");
+            asv_integrations::Binding::NotACredential { selector } => {
+                println!("  not a credential the tool will authenticate with: {selector}");
             }
             asv_integrations::Binding::Unbound { reason } => match reason {
                 asv_integrations::UnboundReason::NoUsableCredential { inventory_size } => println!(
@@ -4011,7 +4056,15 @@ fn planned_fingerprint(
     plan.entries
         .into_iter()
         .find(|entry| {
-            entry.file.as_path() == file && entry.audience == audience && entry.field == *field
+            entry.file.as_path() == file
+                && matches!(
+                    &entry.selector,
+                    asv_integrations::Selector::Npm {
+                        field: found,
+                        audience: found_audience,
+                        ..
+                    } if found == field && found_audience == audience
+                )
         })
         .map(|entry| entry.fingerprint)
         .ok_or_else(|| {

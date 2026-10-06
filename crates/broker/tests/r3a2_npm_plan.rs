@@ -302,7 +302,7 @@ fn planning_with_nothing_stored_still_answers_the_question() {
     let (ok, out) = fixture.plan(&["--json"]);
     assert!(ok, "plan failed with an empty vault: {out}");
     assert!(
-        out.contains("asv.integrations.plan/v1"),
+        out.contains("asv.integrations.plan/v2"),
         "the empty plan does not declare its schema:\n{out}"
     );
     // Every selector is still reported. The absence is in the *binding*, not in
@@ -361,7 +361,7 @@ fn the_first_run_answer_needs_no_broker() {
         (out.status.success(), text)
     };
     assert!(ok, "--no-vault reached for the broker anyway: {out}");
-    assert!(out.contains("asv.integrations.plan/v1"), "{out}");
+    assert!(out.contains("asv.integrations.plan/v2"), "{out}");
 }
 
 /// **Two credentials of the same shape come back `ambiguous`, not resolved.**

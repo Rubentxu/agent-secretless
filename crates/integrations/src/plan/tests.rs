@@ -19,6 +19,25 @@ use std::path::Path;
 use asv_domain::{CredentialId, CredentialKind, CredentialMetadata, Exportability};
 
 use super::*;
+
+/// The npm fields of an entry, for a row that only cares about an npm plan.
+///
+/// A helper rather than a `match` at each call site so a row about npm cannot
+/// start passing vacuously against a curl entry, which has no audience at all.
+fn npm_field(entry: &PlanEntry) -> (&AuthField, &str, usize, bool) {
+    match &entry.selector {
+        Selector::Npm {
+            field,
+            audience,
+            value_len,
+            value_is_env_reference,
+        } => (field, audience, *value_len, *value_is_env_reference),
+        Selector::Curl { option, .. } => panic!(
+            "expected an npm entry, found a curl selector `{option}`: the two families \
+             do not share a shape, which is the point of Selector"
+        ),
+    }
+}
 use crate::npm::{NpmFile, Registry};
 
 const TOKEN: &str = "npm_AbCdEf0123456789XyZ";
@@ -81,6 +100,13 @@ fn exportable(
 /// A consumer that parsed a discovery and is handed a plan has been handed a
 /// document about credentials that are not yet moved. A plan that claimed
 /// `asv.discovery/v1` would be a plan claiming to be a report about files.
+///
+/// **The literal is pinned rather than read from the constant**, so a schema
+/// bump fails here instead of passing itself. It was bumped from `v1` to `v2`
+/// for R4.B.1 when `PlanEntry`'s four npm-shaped fields (`audience`, `field`,
+/// `value_len`, `value_is_env_reference`) became one family-tagged `selector`:
+/// the JSON a consumer parses changed shape, and a version that did not move
+/// would have let an old consumer read a new plan and half-understand it.
 #[test]
 fn the_plan_declares_its_own_schema() {
     let plan = plan_npm(
@@ -89,7 +115,7 @@ fn the_plan_declares_its_own_schema() {
     );
     let json = serde_json::to_string(&plan).expect("serialises");
     assert!(
-        json.contains(r#""schema":"asv.integrations.plan/v1""#),
+        json.contains(r#""schema":"asv.integrations.plan/v2""#),
         "{json}"
     );
     assert!(
@@ -308,12 +334,12 @@ fn an_email_is_not_a_credential_and_gets_no_strategy() {
         &discovery_with(AuthField::Email, "ops@example.test"),
         &[metadata("npm-pat", CredentialKind::BearerToken)],
     );
-    assert_eq!(
-        plan.entries[0].binding,
+    match &plan.entries[0].binding {
         Binding::NotACredential {
-            field: AuthField::Email
-        }
-    );
+            selector: Selector::Npm { field, .. },
+        } => assert_eq!(field, &AuthField::Email),
+        other => panic!("expected NotACredential, got {other:?}"),
+    }
     assert!(
         plan.entries[0].operations.is_empty(),
         "an email authorises no operation"
@@ -337,7 +363,10 @@ fn a_misspelled_auth_field_is_not_a_credential() {
     assert!(matches!(
         &plan.entries[0].binding,
         Binding::NotACredential {
-            field: AuthField::Unrecognised(_)
+            selector: Selector::Npm {
+                field: AuthField::Unrecognised(_),
+                ..
+            }
         }
     ));
     assert!(plan.entries[0].strategies.is_empty());
@@ -388,7 +417,10 @@ fn the_entry_names_credential_audience_and_operations() {
     // And the entry agrees with itself, which is what makes the JSON a report
     // rather than a rendering.
     let entry = &plan.entries[0];
-    assert_eq!(entry.audience, "registry.example.test");
+    assert!(matches!(
+        &entry.selector,
+        Selector::Npm { audience, field: AuthField::AuthToken, .. } if audience == "registry.example.test"
+    ));
     assert_eq!(
         entry.operations,
         BTreeSet::from([Operation::Read, Operation::Publish]),
@@ -436,11 +468,13 @@ fn an_entry_reports_the_audience_and_length_its_selector_carried() {
     );
 
     assert_eq!(
-        plan.entries[0].audience, "localhost:4873",
+        npm_field(&plan.entries[0]).1,
+        "localhost:4873",
         "the plan named an audience its selector did not carry"
     );
     assert_eq!(
-        plan.entries[0].value_len, 34,
+        npm_field(&plan.entries[0]).2,
+        34,
         "the plan reported a length the file did not have"
     );
 }
@@ -668,5 +702,356 @@ fn a_plan_round_trips_through_the_shape_a_consumer_actually_reads() {
     assert_eq!(
         parsed, plan,
         "a plan that does not survive its own round trip is not a contract"
+    );
+}
+
+// ------------------------------------------------------------------- curl
+
+/// A home, a working directory, and whatever `.curlrc` files the row asks for.
+///
+/// Built on disk and run through the real adapter, rather than hand-assembling
+/// a `CurlDiscovery`. A hand-built one could have a `fingerprint: Some(..)` for
+/// a file that does not exist, and every row about "a shadowed file gets no
+/// entry" would then be asserting against a fiction.
+struct CurlProject {
+    root: tempfile::TempDir,
+}
+
+impl CurlProject {
+    fn new() -> Self {
+        Self {
+            root: tempfile::tempdir().expect("tempdir"),
+        }
+    }
+
+    fn home(&self) -> PathBuf {
+        self.root.path().join("home")
+    }
+
+    fn cwd(&self) -> PathBuf {
+        self.root.path().join("project")
+    }
+
+    /// Writes a `.curlrc` with curl's own permissions for a credential file.
+    fn rc_in_home(&self, body: &str) -> PathBuf {
+        std::fs::create_dir_all(self.home()).expect("mkdir home");
+        write_rc(&self.home().join(".curlrc"), body)
+    }
+
+    fn rc_in_cwd(&self, body: &str) -> PathBuf {
+        std::fs::create_dir_all(self.cwd()).expect("mkdir project");
+        write_rc(&self.cwd().join(".curlrc"), body)
+    }
+
+    fn discover(&self) -> crate::curl::CurlDiscovery {
+        use crate::Adapter as _;
+        crate::Curl
+            .discover(
+                &crate::FingerprintPolicy::strict(),
+                &self.home(),
+                &self.cwd(),
+            )
+            .expect("the fixture is readable and owned by us")
+    }
+}
+
+fn write_rc(path: &Path, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, body).expect("write .curlrc");
+    // 0600: what a credential file should be. 0644 is what npm writes, and
+    // discovery *reports* that rather than refusing it, but there is no reason
+    // for a row's fixture to test that path twice.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    path.to_path_buf()
+}
+
+fn curl_selector(entry: &PlanEntry) -> (&str, crate::curl::CurlCredential, usize, usize, bool) {
+    match &entry.selector {
+        Selector::Curl {
+            option,
+            kind,
+            user_len,
+            password_len,
+            has_password,
+        } => (option, *kind, *user_len, *password_len, *has_password),
+        Selector::Npm { field, .. } => panic!(
+            "expected a curl entry, found an npm selector `{field}`: a curl entry has no \
+             audience and no npm field, which is why Selector is an enum and not four options"
+        ),
+    }
+}
+
+/// The R4.B.1 second family. A `.curlrc` credential becomes a plan entry, with
+/// its lengths and never its value.
+#[test]
+fn a_curlrc_credential_becomes_a_plan_entry() {
+    let project = CurlProject::new();
+    project.rc_in_home("user = \"alice:s3cr3t\"\n");
+    let discovery = project.discover();
+
+    let plan = plan_curl(
+        &discovery,
+        &[metadata("deploy", CredentialKind::BearerToken)],
+    );
+    assert_eq!(plan.family, "curl");
+    assert_eq!(plan.entries.len(), 1);
+    let entry = &plan.entries[0];
+    let (option, kind, user_len, password_len, has_password) = curl_selector(entry);
+    assert_eq!(option, "user");
+    assert_eq!(kind, crate::curl::CurlCredential::User);
+    assert_eq!(user_len, 5, "alice");
+    assert_eq!(password_len, 6, "s3cr3t");
+    assert!(has_password);
+
+    // The structural law, restated for the second family: a plan names
+    // credentials and holds none.
+    let json = serde_json::to_string(&plan).expect("serialises");
+    assert!(
+        !json.contains("s3cr3t"),
+        "the plan leaked the value: {json}"
+    );
+    assert!(!json.contains("alice"), "the plan leaked the name: {json}");
+}
+
+/// The two curl options are different permissions, not two spellings of one:
+/// the pair goes to the origin in the first case and to the middlebox in the
+/// second. A policy that allowed `Transfer` and meant to allow `ProxyTransfer`
+/// would be a policy whose author did not notice.
+#[test]
+fn user_and_proxy_user_authorise_different_operations() {
+    let project = CurlProject::new();
+    project.rc_in_home("user = \"alice:one\"\nproxy-user = \"carol:two\"\n");
+    let discovery = project.discover();
+
+    let plan = plan_curl(
+        &discovery,
+        &[metadata("deploy", CredentialKind::BearerToken)],
+    );
+    assert_eq!(plan.entries.len(), 2);
+
+    let by_option = |wanted: &str| {
+        plan.entries
+            .iter()
+            .find(|e| curl_selector(e).0 == wanted)
+            .unwrap_or_else(|| panic!("no `{wanted}` entry"))
+    };
+    assert_eq!(
+        by_option("user").operations,
+        BTreeSet::from([Operation::Transfer]),
+        "`user` spends the pair on the origin"
+    );
+    assert_eq!(
+        by_option("proxy-user").operations,
+        BTreeSet::from([Operation::ProxyTransfer]),
+        "`proxy-user` spends it on the middlebox"
+    );
+}
+
+/// A curl entry has **no audience**, and that is not a missing value — a
+/// `.curlrc` names no host. The row is that the type makes saying one
+/// impossible, so no consumer can read `None` as "not recorded".
+#[test]
+fn a_curl_entry_cannot_name_an_audience() {
+    let project = CurlProject::new();
+    project.rc_in_home("user = \"alice:one\"\n");
+    let discovery = project.discover();
+    let plan = plan_curl(&discovery, &[]);
+
+    assert!(
+        !matches!(plan.entries[0].selector, Selector::Npm { .. }),
+        "a curl entry must not be spelled as an npm one"
+    );
+    // And there is no accessor that would hand one back.
+    let json = serde_json::to_string(&plan.entries[0].selector).expect("serialises");
+    assert!(!json.contains("audience"), "{json}");
+}
+
+/// curl takes the first file it finds and never opens the rest. A plan entry
+/// for the losing file would describe a configuration curl would not read —
+/// and `revalidate`, which re-reads every entry's file, would then demand a
+/// file that never contributed anything.
+#[test]
+fn a_shadowed_file_gets_no_plan_entry() {
+    let project = CurlProject::new();
+    project.rc_in_home("user = \"winner:one\"\n");
+    // A project `.curlrc` exists on disk. It is only read under `--config`, so
+    // it is NOT shadowed by the home one, and it must get its own entry.
+    project.rc_in_cwd("user = \"project:two\"\n");
+
+    let discovery = project.discover();
+    // Precondition: the two files really are in different categories.
+    assert_eq!(
+        discovery.lookup.len(),
+        1,
+        "only the home file is in the lookup"
+    );
+    assert!(
+        discovery.project_config.is_some(),
+        "the project file is separate, not a lower-precedence layer"
+    );
+
+    let plan = plan_curl(
+        &discovery,
+        &[metadata("deploy", CredentialKind::BearerToken)],
+    );
+    assert_eq!(
+        plan.entries.len(),
+        2,
+        "the lookup file and the project config both get entries"
+    );
+
+    // Every entry names a file that was actually read.
+    for entry in &plan.entries {
+        assert!(
+            entry.fingerprint.path.exists(),
+            "planned a file that is not there: {}",
+            entry.fingerprint.path.display()
+        );
+    }
+}
+
+/// Within the lookup, only the file curl would open is planned. Two files, one
+/// winner: the loser is present, unread, and gets nothing.
+///
+/// The two candidates are `$XDG_CONFIG_HOME/curlrc` (defaulting to
+/// `~/.config/curlrc`) and `~/.curlrc`, both derived from the `home` the row
+/// controls. Writing to `$XDG_CONFIG_HOME` instead would mean mutating the
+/// process environment, which is a race with every other row in this binary —
+/// a flaky row is worse than no row.
+#[test]
+fn only_the_file_curl_would_open_is_planned() {
+    let project = CurlProject::new();
+    // Precedence, per curl 8.18's own lookup: `.config/curlrc` first.
+    let xdg = project.home().join(".config");
+    std::fs::create_dir_all(&xdg).expect("mkdir .config");
+    write_rc(&xdg.join("curlrc"), "user = \"winner:one\"\n");
+    project.rc_in_home("user = \"loser:two\"\n");
+
+    let discovery = project.discover();
+    let shadowed = discovery
+        .lookup
+        .iter()
+        .find(|f| f.shadowed_by.is_some())
+        .expect("a second candidate exists");
+    assert!(
+        shadowed.fingerprint.is_none(),
+        "precondition: curl never opened it, so there is no fingerprint"
+    );
+
+    let plan = plan_curl(
+        &discovery,
+        &[metadata("deploy", CredentialKind::BearerToken)],
+    );
+    assert_eq!(plan.entries.len(), 1, "an unread file must not be planned");
+    assert_eq!(
+        plan.entries[0].fingerprint.path,
+        xdg.join("curlrc"),
+        "the winner is the one curl opens"
+    );
+}
+
+/// A `.curlrc` with no credential-bearing option produces a plan with no
+/// entries — not a refused plan. `discover` reporting flags is the ordinary
+/// case and the plan has to render it as such.
+#[test]
+fn a_curlrc_with_no_credentials_plans_nothing() {
+    let project = CurlProject::new();
+    project.rc_in_home("silent\nmax-time = 30\n");
+    let discovery = project.discover();
+    let plan = plan_curl(
+        &discovery,
+        &[metadata("deploy", CredentialKind::BearerToken)],
+    );
+    assert!(plan.entries.is_empty());
+    assert_eq!(
+        plan.inventory_size, 1,
+        "a credential was offered; nothing could serve it, and that is not the same as no offer"
+    );
+}
+
+/// The binding machinery is shared, so the ambiguity rule applies to curl
+/// exactly as it does to npm: two usable credentials and no way to tell them
+/// apart is `Ambiguous`, not a coin flip.
+#[test]
+fn two_usable_credentials_are_ambiguous_for_curl_too() {
+    let project = CurlProject::new();
+    project.rc_in_home("user = \"alice:one\"\n");
+    let discovery = project.discover();
+    let plan = plan_curl(
+        &discovery,
+        &[
+            metadata("deploy", CredentialKind::BearerToken),
+            metadata("ci", CredentialKind::BearerToken),
+        ],
+    );
+    assert!(
+        matches!(plan.entries[0].binding, Binding::Ambiguous { .. }),
+        "the plan chose between two credentials it cannot tell apart"
+    );
+}
+
+/// §6, restated for the second family: the fingerprint a plan carries is the
+/// one re-read before anything is written. A drift is `ConfigChanged`, and the
+/// answer is to replan.
+#[test]
+fn a_curled_entry_revitalidates_and_refuses_a_changed_file() {
+    let project = CurlProject::new();
+    let rc = project.rc_in_home("user = \"alice:one\"\n");
+    let discovery = project.discover();
+    let plan = plan_curl(&discovery, &[]);
+
+    let policy = crate::FingerprintPolicy::strict();
+    plan.revalidate(&policy, &project.home(), &project.cwd())
+        .expect("nothing moved");
+
+    // Change the bytes without changing the path.
+    write_rc(&rc, "user = \"mallory:two\"\n");
+    let drift = plan
+        .revalidate(&policy, &project.home(), &project.cwd())
+        .expect_err("the file moved under the plan");
+    assert!(matches!(drift, PlanError::ConfigChanged { .. }), "{drift}");
+}
+
+/// The family name and the schema are the plan's own, and a curl plan is a
+/// plan: a consumer parsing it must be able to tell it from a discovery.
+#[test]
+fn a_curl_plan_is_a_plan_document() {
+    let project = CurlProject::new();
+    project.rc_in_home("user = \"alice:one\"\n");
+    let discovery = project.discover();
+    let plan = plan_curl(&discovery, &[]);
+    assert_eq!(plan.schema, PLAN_SCHEMA);
+    let json = serde_json::to_string(&plan).expect("serialises");
+    assert!(
+        json.contains(r#""schema":"asv.integrations.plan/v2""#),
+        "{json}"
+    );
+    assert!(!json.contains("asv.discovery/v1"), "{json}");
+    // And it round-trips, because a plan is read back by a consumer.
+    let back: IntegrationPlan = serde_json::from_str(&json).expect("deserialises");
+    assert_eq!(back, plan);
+}
+
+/// `user = "alice"` — one name, no colon, so curl sends an empty password.
+/// That is a reachable configuration and a different fact from "no password
+/// was written", so the entry has to carry it.
+#[test]
+fn a_user_without_a_password_is_still_a_credential() {
+    let project = CurlProject::new();
+    project.rc_in_home("user = \"alice\"\n");
+    let discovery = project.discover();
+    let plan = plan_curl(
+        &discovery,
+        &[metadata("deploy", CredentialKind::BearerToken)],
+    );
+    let (_, kind, user_len, password_len, has_password) = curl_selector(&plan.entries[0]);
+    assert_eq!(kind, crate::curl::CurlCredential::User);
+    assert_eq!(user_len, 5);
+    assert_eq!(password_len, 0);
+    assert!(!has_password, "no colon was written");
+    // And it is still planned: an empty password is still authentication.
+    assert_eq!(
+        plan.entries[0].operations,
+        BTreeSet::from([Operation::Transfer])
     );
 }

@@ -49,12 +49,18 @@ use serde::{Deserialize, Serialize};
 use crate::fingerprint::{Drift, FileFingerprint, FingerprintPolicy};
 use crate::npm::{AuthField, AuthSelector, NpmDiscovery, NpmFile, Origin};
 
-/// `asv.integrations.plan/v1`.
+/// `asv.integrations.plan/v2`.
 ///
 /// A different schema string from `asv.discovery/v1`, deliberately. A consumer
 /// that parsed a discovery and is handed a plan has been handed a document about
 /// credentials that are *not yet moved*, and the two have different questions.
-pub const PLAN_SCHEMA: &str = "asv.integrations.plan/v1";
+///
+/// **`v2` because `PlanEntry`'s shape changed.** Its four npm-shaped fields
+/// (`audience`, `field`, `value_len`, `value_is_env_reference`) became one
+/// family-tagged [`Selector`], which is a different JSON document. A version
+/// that did not move would let an old consumer read a new plan and half
+/// understand it — the failure mode a schema version exists to prevent.
+pub const PLAN_SCHEMA: &str = "asv.integrations.plan/v2";
 
 /// How exposed the tool would be, strongest first.
 ///
@@ -114,6 +120,21 @@ pub enum Operation {
     Read,
     /// Uploading a package to it.
     Publish,
+    /// Spending `user` against an HTTP endpoint (`curl -u`).
+    ///
+    /// **Not a registry verb, and deliberately named rather than folded into
+    /// [`Self::Read`].** A `.curlrc` names no host, so the operation cannot be
+    /// "read from this audience" — and an operation whose audience is unknown
+    /// is a different permission from one scoped to a registry, even though
+    /// both move a credential over the wire.
+    Transfer,
+    /// The same pair, spent on the proxy instead of the origin (`--proxy-user`).
+    ///
+    /// A separate variant because the two are handed to different parties: one
+    /// to the host being talked to, one to the middlebox. A policy that allowed
+    /// `Transfer` and meant to allow `ProxyTransfer` would be a policy whose
+    /// author did not notice the difference.
+    ProxyTransfer,
 }
 
 impl Operation {
@@ -121,6 +142,8 @@ impl Operation {
         match self {
             Self::Read => "read",
             Self::Publish => "publish",
+            Self::Transfer => "transfer",
+            Self::ProxyTransfer => "proxy_transfer",
         }
     }
 }
@@ -183,7 +206,7 @@ pub enum Binding {
     /// it is also the honest description of a real gap in the input.
     Ambiguous { candidates: Vec<BindingCandidate> },
     /// The field names something that is not a registry credential.
-    NotACredential { field: AuthField },
+    NotACredential { selector: Selector },
     /// No credential in the inventory has a shape that could serve this.
     Unbound { reason: UnboundReason },
 }
@@ -228,6 +251,127 @@ pub enum Exclusion {
     DatabaseShaped { kind: CredentialKind },
 }
 
+/// One discovered credential selector, in the vocabulary of the family that
+/// found it.
+///
+/// **An enum of families rather than one struct with optional parts.** npm's
+/// selector names a registry, a field and a value length; curl's names an
+/// option, whether a password half exists at all, and **no audience**, because
+/// a `.curlrc` names no host — the host arrives on the command line. Flattening
+/// those into `audience: Option<String>` and `value_len: Option<usize>` would
+/// make a reader unable to tell "this family has no such concept" from "this
+/// family has one and it was not recorded", which is the one ambiguity a
+/// security report cannot have.
+///
+/// The cost is that a consumer matches. That is the right cost: the consumer
+/// rendering a curl entry must say something different from the one rendering
+/// an npm entry, and the type is what makes that unavoidable rather than a
+/// convention somebody has to remember.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Selector {
+    /// An npm auth selector from a user or project `.npmrc`.
+    Npm {
+        /// The field as npm spells it, so an operator can grep the file.
+        field: AuthField,
+        /// The registry this selector addresses, in canonical spelling.
+        audience: String,
+        /// The length of the value found. A length is not a value: it does not
+        /// narrow a high-entropy token, and it is not an oracle for a
+        /// low-entropy one, because the caller would still have to produce the
+        /// value.
+        value_len: usize,
+        /// Whether the value was a `${VAR}` reference rather than a literal.
+        value_is_env_reference: bool,
+    },
+    /// A credential-bearing option from a `.curlrc`.
+    Curl {
+        /// The option as written, without its leading dashes and lower-cased:
+        /// `user` or `proxy-user`. Three spellings (`--user`, `-u`, `user`) are
+        /// one credential, so this is normalised rather than repeated.
+        option: String,
+        kind: crate::curl::CurlCredential,
+        /// Length of the username half, never the name. A report that prints
+        /// usernames hands out half of the pair an attacker needs to target.
+        user_len: usize,
+        /// Length of the password half, never the password.
+        password_len: usize,
+        /// Whether a password half was present at all. `user = "alice"`
+        /// authenticates as `alice` with an empty password, which is a real
+        /// configuration and a different fact from one where nothing was
+        /// written.
+        has_password: bool,
+    },
+}
+
+impl Selector {
+    /// What a credential held in this selector would be spent on.
+    ///
+    /// The operations are this crate's own vocabulary rather than the domain's
+    /// `Action`, because a plan names *what the credential unlocks* and a
+    /// domain action names *what the broker will authorise*. They are related
+    /// and they are not the same list, and pretending otherwise would mean a
+    /// plan could promise an operation no action could authorise.
+    pub fn operations(&self) -> BTreeSet<Operation> {
+        let pair = |a: Operation, b: Operation| BTreeSet::from([a, b]);
+        match self {
+            // npm accepts these to fetch and to publish. A token that could
+            // not publish would be a different thing from what an operator's
+            // `.npmrc` usually holds.
+            Self::Npm {
+                field:
+                    AuthField::AuthToken | AuthField::Auth | AuthField::Username | AuthField::Password,
+                ..
+            } => pair(Operation::Read, Operation::Publish),
+            // A client certificate authenticates the transport. `plan` does
+            // not model mTLS-backed publish, and claiming it would put a
+            // strategy in a plan that `adopt` could not carry out.
+            Self::Npm {
+                field: AuthField::CertFile | AuthField::KeyFile,
+                ..
+            } => BTreeSet::from([Operation::Read]),
+            // npm sends an email as a header on publish. It is a contact field,
+            // not a credential, and a plan that offered to protect it would be
+            // protecting something that needs no protection. A typo npm ignores
+            // is the same: no credential, no operation.
+            Self::Npm {
+                field: AuthField::Email | AuthField::Unrecognised(_),
+                ..
+            } => BTreeSet::new(),
+            Self::Curl { kind, .. } => match kind {
+                crate::curl::CurlCredential::User => BTreeSet::from([Operation::Transfer]),
+                crate::curl::CurlCredential::ProxyUser => {
+                    BTreeSet::from([Operation::ProxyTransfer])
+                }
+            },
+        }
+    }
+
+    /// Whether this selector names something that is not a credential at all.
+    pub fn is_not_a_credential(&self) -> bool {
+        match self {
+            Self::Npm {
+                field: AuthField::Email | AuthField::Unrecognised(_),
+                ..
+            } => true,
+            // npm's remaining fields are credentials that authorise nothing.
+            Self::Npm { .. } => false,
+            // Both curl options the adapter models carry a pair, so there is
+            // no shape here that is not a credential.
+            Self::Curl { .. } => false,
+        }
+    }
+}
+
+impl std::fmt::Display for Selector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Npm { field, .. } => write!(f, "{field}"),
+            Self::Curl { option, kind, .. } => write!(f, "{option} ({kind:?})"),
+        }
+    }
+}
+
 /// One discovered selector, and what could be done with it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -240,16 +384,9 @@ pub struct PlanEntry {
     /// bytes at this inode under this mode*, and it is void the moment that is
     /// no longer true.
     pub fingerprint: FileFingerprint,
-    /// The registry this selector addresses, in canonical spelling.
-    pub audience: String,
-    /// npm's own field name, so an operator can grep the file for it.
-    pub field: AuthField,
-    /// The length of the value found. A length is not a value: it does not
-    /// narrow a high-entropy token, and it is not an oracle for a low-entropy
-    /// one, because the caller would still have to produce the value.
-    pub value_len: usize,
-    /// Whether the value was a `${VAR}` reference rather than a literal.
-    pub value_is_env_reference: bool,
+    /// Which selector this is, in its own family's vocabulary. See
+    /// [`Selector`] for why this is not four optional fields.
+    pub selector: Selector,
     /// What this would bind to.
     pub binding: Binding,
     /// The operations the binding authorises, strongest first. Empty when the
@@ -266,7 +403,7 @@ pub struct PlanEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct IntegrationPlan {
-    /// `asv.integrations.plan/v1`, set by the constructor rather than by a
+    /// `asv.integrations.plan/v2`, set by the constructor rather than by a
     /// caller. A field is something a caller sets and a schema string is
     /// something the build is.
     ///
@@ -365,15 +502,26 @@ fn plan_selector(
     selector: &AuthSelector,
     inventory: &[CredentialMetadata],
 ) -> PlanEntry {
-    let operations = operations_for(&selector.field);
-    let binding = match &operations {
+    let described = Selector::Npm {
+        field: selector.field.clone(),
+        audience: selector.registry.audience.to_string(),
+        value_len: selector.value_len,
+        value_is_env_reference: selector.value_is_env_reference,
+    };
+    let operations = if described.is_not_a_credential() {
+        BTreeSet::new()
+    } else {
+        described.operations()
+    };
+    let binding = if operations.is_empty() {
         // The field names something npm does not treat as a credential, so
         // there is nothing to bind and offering a strategy would be offering to
         // protect a contact address.
-        None => Binding::NotACredential {
-            field: selector.field.clone(),
-        },
-        Some(_) => bind(inventory),
+        Binding::NotACredential {
+            selector: described.clone(),
+        }
+    } else {
+        bind(inventory)
     };
     let strategies = match &binding {
         Binding::Bound {
@@ -387,45 +535,10 @@ fn plan_selector(
         origin: file.origin,
         file: file.fingerprint.path.clone(),
         fingerprint: file.fingerprint.clone(),
-        audience: selector.registry.audience.to_string(),
-        field: selector.field.clone(),
-        value_len: selector.value_len,
-        value_is_env_reference: selector.value_is_env_reference,
+        selector: described,
         binding,
-        operations: operations.unwrap_or_default(),
+        operations,
         strategies,
-    }
-}
-
-/// The operations a field authorises, or `None` when it authorises none.
-///
-/// `None` and `Some(empty)` are different answers and both exist: `email`
-/// authorises nothing because it is not a credential, which is not the same as
-/// a credential that happens to authorise nothing.
-fn operations_for(field: &AuthField) -> Option<BTreeSet<Operation>> {
-    let pair = |a: Operation, b: Operation| {
-        let mut set = BTreeSet::new();
-        set.insert(a);
-        set.insert(b);
-        set
-    };
-    match field {
-        // npm accepts these to fetch and to publish. A token that could not
-        // publish would be a different thing from what an operator's `.npmrc`
-        // usually holds.
-        AuthField::AuthToken | AuthField::Auth | AuthField::Username | AuthField::Password => {
-            Some(pair(Operation::Read, Operation::Publish))
-        }
-        // A client certificate authenticates the transport. `plan` does not
-        // yet model mTLS-backed publish, and claiming it would put a strategy
-        // in a plan that `adopt` could not carry out.
-        AuthField::CertFile | AuthField::KeyFile => Some(BTreeSet::from([Operation::Read])),
-        // npm sends an email as a header on publish. It is a contact field, not
-        // a credential, and a plan that offered to protect it would be
-        // protecting something that needs no protection.
-        AuthField::Email => None,
-        // A typo npm ignores. There is no credential and no operation.
-        AuthField::Unrecognised(_) => None,
     }
 }
 
@@ -534,3 +647,82 @@ fn strategies_for(kind: CredentialKind, exportability: Exportability) -> Vec<Str
 
 #[cfg(test)]
 mod tests;
+
+// ------------------------------------------------------------------- curl
+
+/// The curl plan: one entry per credential-bearing option in a `.curlrc` that
+/// was actually read.
+///
+/// **R4.B.1's second family.** npm was the only family `plan` understood, so a
+/// plan was a claim about a registry and nothing else. curl proves the layer
+/// generalises: the pipeline is the same four stages, the vocabulary differs,
+/// and nothing outside this crate had to change.
+///
+/// Three facts of shape, none of them optional:
+///
+/// - A `.curlrc` **names no host**. The audience arrives on the command line,
+///   so a curl entry has no `audience` field to be absent *from* — it has a
+///   different type. See [`Selector`].
+/// - `user` and `proxy-user` are different permissions, not two spellings of
+///   one. The pair goes to the origin in the first case and to the middlebox in
+///   the second, and a policy author who did not notice the difference wrote a
+///   policy they did not mean.
+/// - **A shadowed file gets no entry.** curl stops at the first file it finds,
+///   so a lower-precedence one was never opened and has no fingerprint. An entry
+///   for it would be the plan describing a file curl would never read — and
+///   [`IntegrationPlan::revalidate`], which re-reads every entry's file, would
+///   then demand a file that does not exist.
+pub fn plan_curl(
+    discovery: &crate::curl::CurlDiscovery,
+    inventory: &[CredentialMetadata],
+) -> IntegrationPlan {
+    let mut entries: Vec<PlanEntry> = Vec::new();
+    // `lookup` first and in curl's own order, then the project config, which is
+    // not part of the lookup at all. Ordered that way so an operator reading
+    // the plan top-down sees what curl would reach first.
+    for file in discovery
+        .lookup
+        .iter()
+        .chain(discovery.project_config.iter())
+    {
+        // Not read, so no fingerprint, so no entry. See the doc comment.
+        let Some(fingerprint) = file.fingerprint.clone() else {
+            continue;
+        };
+        for credential in &file.credentials {
+            let selector = Selector::Curl {
+                option: credential.option.clone(),
+                kind: credential.kind,
+                user_len: credential.user_len,
+                password_len: credential.password_len,
+                has_password: credential.has_password,
+            };
+            let operations = selector.operations();
+            let binding = if selector.is_not_a_credential() {
+                Binding::NotACredential {
+                    selector: selector.clone(),
+                }
+            } else {
+                bind(inventory)
+            };
+            let strategies = match &binding {
+                Binding::Bound {
+                    kind,
+                    exportability,
+                    ..
+                } => strategies_for(*kind, *exportability),
+                _ => Vec::new(),
+            };
+            entries.push(PlanEntry {
+                origin: file.origin,
+                file: fingerprint.path.clone(),
+                fingerprint: fingerprint.clone(),
+                selector,
+                binding,
+                operations,
+                strategies,
+            });
+        }
+    }
+    IntegrationPlan::new("curl", entries, inventory.len())
+}

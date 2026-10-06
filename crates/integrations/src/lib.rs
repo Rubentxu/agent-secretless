@@ -87,8 +87,8 @@ pub use gradle::{Gradle, GradleDiscovery, GradleError};
 pub use maven::{Maven, MavenDiscovery, MavenError};
 pub use npm::{Npm, NpmDiscovery, NpmError};
 pub use plan::{
-    plan_npm, Binding, BindingCandidate, Exclusion, IntegrationPlan, Operation, PlanEntry,
-    PlanError, Posture, Strategy, UnboundReason, Why, PLAN_SCHEMA,
+    plan_curl, plan_npm, Binding, BindingCandidate, Exclusion, IntegrationPlan, Operation,
+    PlanEntry, PlanError, Posture, Selector, Strategy, UnboundReason, Why, PLAN_SCHEMA,
 };
 pub use registry_audience::{RegistryAudience, RegistryAudienceError};
 pub use tool::{resolve_tool, CandidateOutcome, PathCandidate, ToolResolution, MAX_TOOL_BYTES};
