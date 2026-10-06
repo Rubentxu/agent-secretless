@@ -16,7 +16,7 @@ agente ──(sustituto / socket)──▶ broker ──(credencial real)──�
 
 > **Estado: pre-1.0, en v0.33.0. Sin certificar, y los gates lo dicen.**
 >
-> El workspace compila y hay **2011 tests enumerados**. Con `cargo test`, 2010
+> El workspace compila y hay **2029 tests enumerados**. Con `cargo test`, 2028
 > se ejecutan y pasan y 1 queda fuera de las compilaciones de depuración por
 > construcción: el presupuesto de latencia p95 lleva
 > `#[cfg_attr(debug_assertions, ignore)]`, porque un presupuesto de latencia
@@ -221,7 +221,7 @@ permisos de fichero. Es una carencia registrada para cerrar antes de 1.0.
 cargo build --release --workspace
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# esperado: passed=2009 failed=0 ignored=0
+# esperado: passed=2027 failed=0 ignored=0
 ```
 
 2009 y no 2011 porque el comando de arriba se salta dos: `uat_028` levanta un

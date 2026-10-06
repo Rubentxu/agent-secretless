@@ -16,8 +16,8 @@ agent ──(surrogate / socket)──▶ broker ──(real credential)──�
 
 > **Status: pre-1.0, at v0.33.0. Not certified, and the gates say so.**
 >
-> The workspace compiles and **2011 tests are enumerated**. Under `cargo test`,
-> 2010 of them run and pass and 1 is gated out of debug builds by construction:
+> The workspace compiles and **2029 tests are enumerated**. Under `cargo test`,
+> 2028 of them run and pass and 1 is gated out of debug builds by construction:
 > the p95 latency budget carries `#[cfg_attr(debug_assertions, ignore)]`,
 > because a latency budget measured against debug ed25519 is a statement about
 > `debug_assertions` rather than about the product. It runs and passes under
@@ -211,7 +211,7 @@ permissions alone. That is a recorded gap to close before 1.0.
 cargo build --release --workspace
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# expected: passed=2009 failed=0 ignored=0
+# expected: passed=2027 failed=0 ignored=0
 ```
 
 2009 rather than 2011 because the command above skips two of them: `uat_028`
