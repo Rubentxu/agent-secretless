@@ -49,10 +49,30 @@ use std::time::SystemTime;
 /// Explicit rather than derived: the whole point is to know which sources a
 /// given binary is supposed to contain, and a convention inferred from a name
 /// would be wrong the first time a binary is renamed.
-fn producing_package(name: &str) -> Option<&'static str> {
+fn producing_package(name: &str) -> Option<&'static [&'static str]> {
     match name {
         // `asv` comes from `asv-cli`. This is the one that bit.
-        "asv" => Some("cli"),
+        //
+        // **Every crate it is built from, not just the one that owns the
+        // binary.** This used to return `Some("cli")` and check
+        // `crates/cli/src` alone, which is a guard that says nothing about the
+        // code most of the verticals are actually measuring: `asv` spends most
+        // of its time in `asv-integrations`, and a change to
+        // `crates/integrations/src/execute.rs` left the binary stale with
+        // nothing to say so.
+        //
+        // Found by a falsification mutation that came back green: `decide`
+        // was rewritten to refuse every permitted execution, and a vertical
+        // asserting `outcome == "executed"` stayed green because the binary it
+        // spawned predated the mutation. The row was not weak — the program it
+        // measured did not contain the change.
+        //
+        // The list is a plain literal rather than a read of the dependency
+        // graph because the dependency graph is not available here and a
+        // conservative over-approximation is what a freshness guard wants: an
+        // extra crate listed costs a panic when it is genuinely newer, and a
+        // missing one costs a vertical silently measuring the wrong program.
+        "asv" => Some(&["cli", "domain", "integrations", "ipc-protocol"]),
         // `asv-brokerd` comes from this package, so cargo has just built it and
         // there is nothing to check.
         "asv-brokerd" => None,
@@ -78,8 +98,10 @@ pub fn locate(name: &str) -> PathBuf {
         )
     });
 
-    if let Some(package) = producing_package(name) {
-        assert_not_stale(&binary, name, package);
+    if let Some(packages) = producing_package(name) {
+        for package in packages {
+            assert_not_stale(&binary, name, package);
+        }
     }
     binary
 }
@@ -144,6 +166,8 @@ fn assert_not_stale(binary: &Path, name: &str, package: &str) {
          is measuring the wrong program. This is what eight `connect_vertical_e2e` \
          failures looked like once: curl answered 000 and every message pointed \
          at the tunnel.\n\
+         Note which crate is named: it is not always `asv-cli`'s own sources, \
+         because the binary is built from all of them.\n\
          Run `cargo build --workspace` and try again. If the binary is current \
          and this still fires, then a source file was touched without being \
          built, and that is worth saying out loud.",
@@ -213,6 +237,42 @@ fn humantime(time: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The guard watches every crate `asv` is built from, and this row is why
+    /// that is a list rather than one name.**
+    ///
+    /// It returned `Some("cli")` until R4.B.3, which checked `crates/cli/src`
+    /// and nothing else — so a change to `crates/integrations/src/execute.rs`,
+    /// where most of what a vertical measures actually lives, left the binary
+    /// stale with nothing to say so. A falsification mutation that made `decide`
+    /// refuse every permitted execution came back **green** on a row asserting
+    /// `outcome == "executed"`, because the binary that row spawned did not
+    /// contain the change.
+    ///
+    /// The membership assertion is the tripwire, for the reason the `Api`
+    /// allowlist row is: a guard that watches a set nothing probes stays green
+    /// while the set shrinks. `domain` and `ipc-protocol` are listed for the
+    /// same reason `cli` is — they are in the graph, and a conservative
+    /// over-approximation costs a panic while an omission costs a vertical
+    /// measuring the wrong program.
+    #[test]
+    fn the_freshness_guard_watches_every_crate_the_client_is_built_from() {
+        let watched = producing_package("asv").expect("asv is guarded");
+        for crate_name in ["cli", "domain", "integrations", "ipc-protocol"] {
+            assert!(
+                watched.contains(&crate_name),
+                "the freshness guard does not watch crates/{crate_name}/src, so a change \
+                 there leaves the `asv` binary stale with nothing to say so. Watched: \
+                 {watched:?}"
+            );
+        }
+        // And the one that is not guarded has a reason: cargo has just built it.
+        assert_eq!(
+            producing_package("asv-brokerd"),
+            None,
+            "asv-brokerd comes from this package, so there is nothing to check"
+        );
+    }
 
     /// The locator finds the binary that cargo just built for this package.
     #[test]

@@ -123,6 +123,28 @@ asv-broker = { path = ".", features = ["test-support"] }
 # connectors above — the broker must not grow a dependency on the adapter crate
 # to satisfy a test, and in production it has none.
 asv-integrations = { workspace = true }
+# R4.B.3: these verticals spawn the real `asv` binary, and cargo does not build
+# another package's binary just because a test in *this* package runs it. So
+# there is nothing to declare here, and the temptation is worth naming: a path
+# dev-dependency on `asv-cli` looks like it would fix that, and it does not.
+#
+# `asv-cli` ships only a `[[bin]]`, with no lib target, so cargo refuses to link
+# it and says so on every single build:
+#
+#     warning: asv-broker v0.34.0 ignoring invalid dependency `asv-cli`
+#     which is missing a lib target
+#
+# The dependency is recorded in Cargo.lock and affects nothing else, which is
+# worse than having none: the manifest reads as though the binary were current
+# by construction, and it is not. R4.B.3 shipped that line and its comment
+# described a mechanism cargo was actively contradicting; the release build
+# printed the contradiction on every invocation and the comment stayed.
+#
+# The mechanism that does work is `binary.rs::assert_not_stale`, which watches
+# the sources of every crate `asv` is built from and panics when a test is
+# about to spawn a binary that predates them. That guard is the guarantee, and
+# it is loud. Anything added here in the belief that it keeps `asv` fresh is
+# decoration.
 serde_json = "1"
 tempfile = "3"
 # The end-to-end tests drive the real connector against a local TLS origin.
