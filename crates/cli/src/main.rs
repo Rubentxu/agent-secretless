@@ -4357,6 +4357,7 @@ fn run_integrations_execute(
         family,
         &intent,
         &binding,
+        &plan,
         &planned_tool,
         &observed_tool,
         verdict,

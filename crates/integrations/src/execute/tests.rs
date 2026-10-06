@@ -49,6 +49,13 @@ fn intent() -> ActionIntent {
     }
 }
 
+/// A plan over the curl fixture's `.curlrc`, which is what the receipt rows
+/// carry. Real `CurlFile`s would drag the whole discovery into a test whose
+/// subject is the receipt's shape.
+fn curl_plan() -> crate::plan::IntegrationPlan {
+    crate::plan::IntegrationPlan::new("curl", Vec::new(), 0)
+}
+
 fn binding_for(intent: &ActionIntent) -> PlanBinding {
     PlanBinding {
         intent_digest: intent.digest().expect("digests"),
@@ -87,6 +94,7 @@ fn resolution_for(
 fn a_hijacked_tool_is_refused_before_anything_executes() {
     let intent = intent();
     let binding = binding_for(&intent);
+    let plan = curl_plan();
     let digest = intent.digest().expect("digests");
 
     let outcome = decide(
@@ -122,6 +130,7 @@ fn a_hijacked_tool_is_refused_before_anything_executes() {
 fn an_unchanged_world_and_a_permit_execute() {
     let intent = intent();
     let binding = binding_for(&intent);
+    let plan = curl_plan();
     let digest = intent.digest().expect("digests");
     let outcome = decide(
         &intent,
@@ -143,6 +152,7 @@ fn an_unchanged_world_and_a_permit_execute() {
 fn a_broker_refusal_is_carried_verbatim() {
     let intent = intent();
     let binding = binding_for(&intent);
+    let plan = curl_plan();
     let digest = intent.digest().expect("digests");
     let verdict = deny();
     let outcome = decide(
@@ -176,6 +186,7 @@ fn a_broker_refusal_is_carried_verbatim() {
 fn a_moved_world_outranks_a_broker_refusal() {
     let intent = intent();
     let binding = binding_for(&intent);
+    let plan = curl_plan();
     let digest = intent.digest().expect("digests");
     let outcome = decide(
         &intent,
@@ -197,6 +208,7 @@ fn a_moved_world_outranks_a_broker_refusal() {
 fn expiry_outranks_everything_else() {
     let intent = intent();
     let binding = binding_for(&intent);
+    let plan = curl_plan();
     let digest = intent.digest().expect("digests");
     let outcome = decide(
         &intent,
@@ -225,6 +237,7 @@ fn expiry_outranks_everything_else() {
 fn the_receipt_carries_the_intent_the_binding_and_the_outcome() {
     let intent = intent();
     let binding = binding_for(&intent);
+    let plan = curl_plan();
     let tmp = tempfile::tempdir().expect("tempdir");
     let (planned, _) = resolution_for(tmp.path(), "npm", NPM_A);
 
@@ -232,6 +245,7 @@ fn the_receipt_carries_the_intent_the_binding_and_the_outcome() {
         "npm",
         &intent,
         &binding,
+        &plan,
         &planned,
         &planned,
         permit(),
@@ -256,6 +270,7 @@ fn the_receipt_carries_the_intent_the_binding_and_the_outcome() {
 fn the_receipt_carries_both_the_planned_and_the_observed_resolution() {
     let intent = intent();
     let binding = binding_for(&intent);
+    let plan = curl_plan();
     let tmp = tempfile::tempdir().expect("tempdir");
     let (planned, observed) = resolution_for(tmp.path(), "the real npm", NPM_A);
 
@@ -263,6 +278,7 @@ fn the_receipt_carries_both_the_planned_and_the_observed_resolution() {
         "npm",
         &intent,
         &binding,
+        &plan,
         &planned,
         &observed,
         permit(),
@@ -283,12 +299,14 @@ fn the_receipt_carries_both_the_planned_and_the_observed_resolution() {
 fn the_receipt_holds_no_secret_material() {
     let intent = intent();
     let binding = binding_for(&intent);
+    let plan = curl_plan();
     let tmp = tempfile::tempdir().expect("tempdir");
     let (planned, observed) = resolution_for(tmp.path(), "npm", NPM_A);
     let receipt = ExecuteReceipt::new(
         "npm",
         &intent,
         &binding,
+        &plan,
         &planned,
         &observed,
         permit(),
@@ -313,6 +331,7 @@ fn the_receipt_holds_no_secret_material() {
 fn a_refused_receipt_round_trips_through_json_with_both_sides() {
     let intent = intent();
     let binding = binding_for(&intent);
+    let plan = curl_plan();
     let digest = intent.digest().expect("digests");
     let outcome = decide(
         &intent,
@@ -329,6 +348,7 @@ fn a_refused_receipt_round_trips_through_json_with_both_sides() {
         "npm",
         &intent,
         &binding,
+        &plan,
         &planned,
         &observed,
         permit(),
@@ -370,12 +390,27 @@ fn the_verdict_vocabulary_is_permit_or_deny_and_nothing_else() {
 
 /// The schema is its own, distinct from the plan and the adopt receipt, so a
 /// consumer handed one cannot mistake a record for the advice it came from.
+///
+/// **Asserted on the top-level field, not on the whole document.** An earlier
+/// version of this row forbade the *string* `asv.integrations.plan/v2` anywhere
+/// in the receipt, which was true for the wrong reason — the receipt simply did
+/// not carry a plan. It now does, deliberately, and the nested plan has its own
+/// schema string. What has to stay true is that the receipt does not *claim*
+/// to be a plan, and that is a question about one field.
+///
+/// The row was written before the receipt carried a plan and had to be
+/// rewritten rather than deleted, because the property it protects is real and
+/// the version of it that failed was the version that could not see its own
+/// subject.
 #[test]
 fn the_receipt_declares_its_own_schema() {
+    let intent = intent();
+    let plan = curl_plan();
     let receipt = ExecuteReceipt::new(
         "npm",
-        &intent(),
-        &binding_for(&intent()),
+        &intent,
+        &binding_for(&intent),
+        &plan,
         &ToolResolution {
             command: "npm".into(),
             path: "/usr/bin".into(),
@@ -392,15 +427,276 @@ fn the_receipt_declares_its_own_schema() {
         ExecuteOutcome::Executed,
     );
     let json = serde_json::to_string(&receipt).expect("serialises");
-    assert!(
-        json.contains(r#""schema":"asv.integrations.execute/v1""#),
-        "{json}"
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("parses");
+
+    assert_eq!(
+        parsed["schema"], "asv.integrations.execute/v1",
+        "the receipt must claim its own schema"
     );
-    for other in [
-        "asv.integrations.plan/v2",
-        "asv.integrations.adopt/v1",
-        "asv.discovery/v1",
-    ] {
+    // The nested plan keeps its own schema, and the two do not collide.
+    assert_eq!(parsed["plan"]["schema"], crate::plan::PLAN_SCHEMA);
+    assert_ne!(
+        parsed["schema"], parsed["plan"]["schema"],
+        "a receipt and the plan it carries must not share a schema string"
+    );
+    for other in ["asv.integrations.adopt/v1", "asv.discovery/v1"] {
         assert!(!json.contains(other), "a receipt claimed {other}: {json}");
+    }
+}
+
+/// **The property R4.B.1 claimed and did not have.** The receipt said it was
+/// re-checkable, and it did not carry the plan — so a reader could see that an
+/// operation was authorized and could not see *which credential* it would
+/// spend. The row is the receipt carrying it, asserted rather than described.
+#[test]
+fn the_receipt_carries_the_plan_it_was_checked_against() {
+    let intent = intent();
+    let binding = binding_for(&intent);
+    let plan = crate::plan::IntegrationPlan::new("npm", Vec::new(), 3);
+    let none = ToolResolution {
+        command: "npm".into(),
+        path: "/usr/bin".into(),
+        candidates: Vec::new(),
+        resolved: None,
+    };
+    let receipt = ExecuteReceipt::new(
+        "npm",
+        &intent,
+        &binding,
+        &plan,
+        &none,
+        &none,
+        permit(),
+        ExecuteOutcome::Executed,
+    );
+    assert_eq!(receipt.plan, plan, "the receipt lost the plan");
+    assert_eq!(receipt.plan.inventory_size, 3, "and its inventory with it");
+
+    let json = serde_json::to_string(&receipt).expect("serialises");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("parses");
+    assert_eq!(parsed["plan"]["inventory_size"], 3, "not in the document");
+    let back: ExecuteReceipt = serde_json::from_str(&json).expect("deserialises");
+    assert_eq!(back.plan, plan, "and it did not survive a round trip");
+}
+
+/// An execution that is authorized and binds nothing is a real state, and it is
+/// not the same as one that spends a credential. A reader who has to count
+/// `Binding::Bound` arms by hand will eventually stop counting.
+#[test]
+fn an_execution_that_binds_nothing_says_so() {
+    let intent = intent();
+    let binding = binding_for(&intent);
+    let empty = crate::plan::IntegrationPlan::new("npm", Vec::new(), 0);
+    let none = ToolResolution {
+        command: "npm".into(),
+        path: "/usr/bin".into(),
+        candidates: Vec::new(),
+        resolved: None,
+    };
+    let receipt = ExecuteReceipt::new(
+        "npm",
+        &intent,
+        &binding,
+        &empty,
+        &none,
+        &none,
+        permit(),
+        ExecuteOutcome::Executed,
+    );
+    assert!(
+        !receipt.bound_anything(),
+        "an empty inventory must not read as a binding"
+    );
+    assert_eq!(receipt.bound_count(), 0);
+    assert_eq!(receipt.unbound_count(), 0, "there were no selectors at all");
+    assert!(
+        receipt.credentials_at_stake().is_empty(),
+        "nothing may be reported as at stake when nothing bound"
+    );
+    // And it is authorized anyway — which is precisely the fact that has to be
+    // visible rather than inferred, because the two together are the case a
+    // reader most needs to notice.
+    assert!(receipt.is_executed());
+    assert_eq!(receipt.plan.inventory_size, 0);
+}
+
+// ------------------------------------------------- a plan that binds something
+
+/// A `.curlrc` on disk and the inventory one credential, so the rows below run
+/// against a plan that actually resolved a binding rather than an empty one.
+///
+/// The empty case has its own row, and an empty case is the easy one: a
+/// receipt that reports nothing bound is right by default. These are the rows
+/// that would notice if "bound" stopped meaning anything.
+fn bound_receipt(inventory: &[asv_domain::CredentialMetadata]) -> ExecuteReceipt {
+    use crate::Adapter as _;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let rc = home.join(".curlrc");
+    std::fs::write(&rc, "user = \"deploy:s3cr3t-value\"\n").expect("write");
+    std::fs::set_permissions(
+        &rc,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .expect("chmod");
+
+    let discovery = crate::Curl
+        .discover(&crate::FingerprintPolicy::strict(), &home, tmp.path())
+        .expect("the fixture is readable and ours");
+    let plan = crate::plan::plan_curl(&discovery, inventory);
+
+    let intent = intent();
+    let binding = binding_for(&intent);
+    let none = ToolResolution {
+        command: "curl".into(),
+        path: "/usr/bin".into(),
+        candidates: Vec::new(),
+        resolved: None,
+    };
+    ExecuteReceipt::new(
+        "curl",
+        &intent,
+        &binding,
+        &plan,
+        &none,
+        &none,
+        permit(),
+        ExecuteOutcome::Executed,
+    )
+}
+
+fn one_bearer(label: &str) -> Vec<asv_domain::CredentialMetadata> {
+    vec![asv_domain::CredentialMetadata::new(
+        label,
+        asv_domain::CredentialKind::BearerToken,
+    )]
+}
+
+/// The positive half: one selector, one credential, and the receipt names it.
+///
+/// **On the label, which this row asserts is *present*.** The first version of
+/// it forbade the label, on the reasoning that a label is "half the pair an
+/// attacker needs" — which confuses a credential *label* with a credential
+/// *user name*. `deploy-token` is the operator's own name for a vault entry and
+/// is what every R3 vertical already prints; design §7 is explicit that a
+/// binding is not a label, meaning the opposite: a receipt that can name a
+/// credential id with no way to recognise it is a receipt nobody can act on.
+///
+/// What must not appear is what came out of the `.curlrc`: the value, and the
+/// user name curl would authenticate as. Those are asserted below, and they are
+/// the distinction the row was trying to make before it confused the two.
+#[test]
+fn a_bound_plan_names_the_credential_the_execution_would_spend() {
+    let receipt = bound_receipt(&one_bearer("deploy-token"));
+    assert_eq!(receipt.plan.entries.len(), 1, "precondition: one selector");
+    assert!(receipt.bound_anything());
+    assert_eq!(receipt.bound_count(), 1);
+    assert_eq!(receipt.unbound_count(), 0);
+    assert_eq!(receipt.credentials_at_stake().len(), 1);
+
+    let json = serde_json::to_string(&receipt).expect("serialises");
+    // The handle is there, and the label is there: an operator reading this
+    // months later needs to recognise which vault entry this was.
+    assert!(
+        json.contains("deploy-token"),
+        "the label is missing: {json}"
+    );
+    // What came out of the tool's file is not.
+    assert!(
+        !json.contains("s3cr3t-value"),
+        "the password leaked into the receipt: {json}"
+    );
+    assert!(
+        !json.contains("deploy\":"),
+        "the user name leaked into the receipt: {json}"
+    );
+    // The id is what the accessor returns, and it is the only thing it returns.
+    let ids = receipt.credentials_at_stake();
+    assert_eq!(ids.len(), 1);
+    assert!(
+        json.contains(&ids[0].to_string()),
+        "the id the accessor reports is not in the document"
+    );
+}
+
+/// **Ambiguity is not a binding, and this is the row that says so.** Two
+/// credentials of one shape cannot be told apart by anything in the inventory,
+/// so `plan` refuses to choose. A receipt that counted `Ambiguous` as bound
+/// would report a spend that cannot happen — worse than reporting none,
+/// because it looks like an answer.
+#[test]
+fn an_ambiguous_binding_is_not_reported_as_a_spend() {
+    let receipt = bound_receipt(&[
+        asv_domain::CredentialMetadata::new(
+            "deploy-token",
+            asv_domain::CredentialKind::BearerToken,
+        ),
+        asv_domain::CredentialMetadata::new("ci-token", asv_domain::CredentialKind::BearerToken),
+    ]);
+    assert!(!receipt.bound_anything());
+    assert_eq!(receipt.bound_count(), 0);
+    assert!(
+        receipt.credentials_at_stake().is_empty(),
+        "an ambiguous binding was reported as a decided spend"
+    );
+    assert_eq!(
+        receipt.unbound_count(),
+        1,
+        "but the selector is still named"
+    );
+    // And the receipt says *which* case it was, rather than leaving the reader
+    // to infer it from a count of zero.
+    assert!(
+        matches!(
+            receipt.plan.entries[0].binding,
+            crate::plan::Binding::Ambiguous { .. }
+        ),
+        "{:?}",
+        receipt.plan.entries[0].binding
+    );
+}
+
+/// Nothing usable is also not a binding, and it is a different case again:
+/// `unbound_count` counts selectors, not refusals, so a receipt can say "one
+/// selector, nothing bound" and a reader can tell that from "no selectors".
+#[test]
+fn a_selector_nothing_could_serve_is_counted_as_unbound_not_absent() {
+    let receipt = bound_receipt(&[]);
+    assert_eq!(receipt.plan.entries.len(), 1, "the selector is still there");
+    assert_eq!(receipt.bound_count(), 0);
+    assert_eq!(
+        receipt.unbound_count(),
+        1,
+        "a selector that bound nothing must be counted, not dropped"
+    );
+    assert!(receipt.credentials_at_stake().is_empty());
+}
+
+/// The two counts add up to the number of selectors, always. A receipt whose
+/// arithmetic does not close is a receipt whose counts cannot both be right.
+#[test]
+fn the_two_counts_always_add_up_to_the_selectors() {
+    for inventory in [
+        Vec::new(),
+        one_bearer("deploy-token"),
+        vec![
+            asv_domain::CredentialMetadata::new(
+                "deploy-token",
+                asv_domain::CredentialKind::BearerToken,
+            ),
+            asv_domain::CredentialMetadata::new(
+                "ci-token",
+                asv_domain::CredentialKind::BearerToken,
+            ),
+        ],
+    ] {
+        let receipt = bound_receipt(&inventory);
+        assert_eq!(
+            receipt.bound_count() + receipt.unbound_count(),
+            receipt.plan.entries.len(),
+            "inventory of {} credentials",
+            inventory.len()
+        );
     }
 }

@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use asv_domain::{ActionIntent, IntentOrigin, PlanBinding, PlanInvalidation};
 
+use crate::plan::IntegrationPlan;
 use crate::tool::ToolResolution;
 
 /// `asv.integrations.execute/v1`.
@@ -124,6 +125,21 @@ pub struct ExecuteReceipt {
     pub origin: IntentOrigin,
     /// What the plan promised about the world.
     pub binding: PlanBinding,
+    /// The plan itself, with every binding it resolved.
+    ///
+    /// **Added because the receipt claimed to be re-checkable and was not.**
+    /// A receipt that names a credential but not the binding that named it
+    /// leaves a reader unable to ask the only question that matters — *which
+    /// credential, for which audience, under which operations* — and the claim
+    /// on the receipt was a claim about a document that did not contain the
+    /// answer. Carrying the whole plan also means "nothing was bound" is a
+    /// fact an auditor can read rather than an absence they have to infer from
+    /// a field that is not there.
+    ///
+    /// It is the same `IntegrationPlan` the command printed and the same value
+    /// `bind_to` was called with, not a summary of it: a receipt carrying a
+    /// *rendering* of the plan would be re-checkable only against the renderer.
+    pub plan: IntegrationPlan,
     /// The executable the plan resolved, and every directory that was searched
     /// to find it.
     pub planned_tool: ToolResolution,
@@ -146,10 +162,12 @@ impl ExecuteReceipt {
     /// here, so the resolution the receipt shows is the one the check actually
     /// used. A receipt that resolved the tool a second time for its own
     /// convenience would be a receipt reporting on a moment nobody checked.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         family: impl Into<String>,
         intent: &ActionIntent,
         binding: &PlanBinding,
+        plan: &IntegrationPlan,
         planned_tool: &ToolResolution,
         observed_tool: &ToolResolution,
         authorization: AuthorizationVerdict,
@@ -161,6 +179,7 @@ impl ExecuteReceipt {
             intent: intent.clone(),
             origin: intent.origin,
             binding: binding.clone(),
+            plan: plan.clone(),
             planned_tool: planned_tool.clone(),
             observed_tool: observed_tool.clone(),
             authorization,
@@ -176,6 +195,73 @@ impl ExecuteReceipt {
     /// Whether this attempt may proceed.
     pub fn is_executed(&self) -> bool {
         self.outcome.is_executed()
+    }
+
+    /// Whether the plan bound a credential to at least one selector.
+    ///
+    /// **Its own question, asked before any other.** An execution that is
+    /// authorized and binds nothing is a real state — the vault was empty, or
+    /// the operator asked for a machine with nothing in it — and it is *not*
+    /// the same as an execution that spends a credential. A reader who has to
+    /// count `Binding::Bound` arms by hand to tell them apart will eventually
+    /// stop counting.
+    pub fn bound_anything(&self) -> bool {
+        self.bound_count() > 0
+    }
+
+    /// How many selectors the plan bound a credential to.
+    pub fn bound_count(&self) -> usize {
+        self.plan
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.binding, crate::plan::Binding::Bound { .. }))
+            .count()
+    }
+
+    /// How many selectors the plan could not bind.
+    pub fn unbound_count(&self) -> usize {
+        self.plan.entries.len().saturating_sub(self.bound_count())
+    }
+
+    /// The credential ids this execution would spend, in plan order.
+    ///
+    /// Ids and not labels or values: an id is a handle an operator can act on,
+    /// and a value has no business being in this document.
+    pub fn credentials_at_stake(&self) -> Vec<asv_domain::CredentialId> {
+        self.plan
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.binding {
+                crate::plan::Binding::Bound { credential, .. } => Some(*credential),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The same credentials with the names the operator gave them.
+    ///
+    /// **Both halves, because neither is enough on its own.** A `uuid` is a
+    /// handle somebody can paste into `asv credentials delete`, and it is
+    /// nothing a person can recognise on a screen; `deploy-token` is instantly
+    /// recognisable and cannot be acted on without the id. The prose is read by
+    /// somebody deciding whether to press on, and the document is read by
+    /// somebody deciding whether to act — so this returns both, and the caller
+    /// prints both.
+    ///
+    /// Found by running the chain against a live broker: the prose was naming
+    /// the credential by id alone, and the label the operator had typed into
+    /// `add-credential` never appeared anywhere outside the JSON.
+    pub fn credentials_named(&self) -> Vec<(String, asv_domain::CredentialId)> {
+        self.plan
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.binding {
+                crate::plan::Binding::Bound {
+                    credential, label, ..
+                } => Some((label.clone(), *credential)),
+                _ => None,
+            })
+            .collect()
     }
 }
 
