@@ -223,6 +223,26 @@ def main() -> int:
                 if line.strip():
                     print(f"{'':<30} | {line}")
     print()
+    # The control exists to prove the probe is measuring the client rather than
+    # the host, and until now nothing checked it. If the canary reaches a
+    # CONNECT head that asked for no header, something on this machine is
+    # injecting it -- a proxy in the environment, a wrapper script, a shell
+    # alias -- and every row above is then a reading of that thing instead of
+    # the client it names. The table would still print, and it would still look
+    # like evidence. That is the failure this refuses.
+    #
+    # Environment-independent on purpose: it says nothing about which clients
+    # exist or what they support, only that the measurement itself is sound.
+    control = next((r for r in rows if "control, no flag" in str(r["client"])), None)
+    if control is not None and control["carried"] is True:
+        print(
+            "CONTROL LEAKED: the canary appeared on a CONNECT head that asked "
+            "for no header.\n"
+            "  Something on this host is injecting it, so the rows above measure\n"
+            "  the environment rather than the clients they name, and none of them\n"
+            "  can be believed."
+        )
+        return 1
     return 0
 
 
