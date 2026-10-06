@@ -477,6 +477,38 @@ fn a_response_larger_than_the_bound_is_refused_by_the_transport() {
     }
 }
 
+/// The half of the size bound that a `content-length` fixture cannot reach.
+///
+/// The row above is the cheap path: the origin declares its length, so the
+/// transport refuses before the body moves. This is the expensive one, and it
+/// is the half that actually bounds memory. A peer that omits `content-length`
+/// -- or frames the body chunked, which is how a streaming origin would answer
+/// -- cannot be sized before it is read, so nothing but a check on the bytes
+/// that arrived stands between it and an unbounded allocation.
+///
+/// `OriginResponse::chunked` was added to the fixture for exactly this and, until
+/// this row, nothing called it: the R2.C campaign recorded the post-read bound
+/// as a survivor and the mutation stayed green for as long as every response in
+/// the tree declared its size.
+#[test]
+fn a_response_that_never_declares_its_size_is_refused_by_the_read_bound() {
+    let filler = "x".repeat(70 * 1024);
+    let oversized = format!("{}{filler}", assume_role_response());
+    let origin = TlsOrigin::start(
+        "sts.amazonaws.com",
+        Arc::new(move |_: &Observed| OriginResponse::chunked(200, oversized.clone())),
+    );
+    let (port, _grants) = CountingPort::new(LONG_LIVED_KEY.as_bytes());
+    let client = client_for(&origin);
+
+    match client.assume_role(&port, CREDENTIAL, at(NOW)) {
+        Err(StsClientError::Transport(
+            asv_connector_http::transport::TransportError::ResponseTooLarge { .. },
+        )) => {}
+        other => panic!("an oversized chunked response was read: {other:?}"),
+    }
+}
+
 #[test]
 fn a_success_carrying_a_location_is_not_followed_as_a_redirect() {
     // A 200 with a `Location` is not a redirection, and a client that follows

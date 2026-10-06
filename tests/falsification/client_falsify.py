@@ -142,15 +142,21 @@ MUTATIONS = [
     (
         # Known and recorded as NOT MEASURED, in the test file's own header and
         # in the roadmap. It is the *second* size bound -- the one that checks
-        # the bytes after reading them. The fake origin always declares a
-        # `content-length`, so the first bound fires first and this branch is
-        # never reached. It is left in the list rather than deleted because
-        # deleting a mutation that stays green hides the fact that a branch has
-        # no row; what the campaign must not do is call it falsified.
+        # the bytes after reading them.
+        #
+        # **This mutation was a survivor until this row existed.** The fake
+        # origin declared a `content-length` on every response, so the first
+        # bound fired first and this branch was never reached: the mutation
+        # stayed green for a reason that had nothing to do with the bound. The
+        # fixture gained `OriginResponse::chunked` to close exactly that gap and
+        # nothing called it, so the branch had no row at all. It is filed against
+        # `a_response_that_never_declares_its_size_is_refused_by_the_read_bound`,
+        # which frames its body chunked so a client cannot size it in advance --
+        # the case where this bound is the only thing bounding memory.
         "drop the post-read transport bound on the response",
         "        if bytes.len() > MAX_RESPONSE_BYTES {",
         "        if false {",
-        "a_response_larger_than_the_bound_is_refused_by_the_transport",
+        "a_response_that_never_declares_its_size_is_refused_by_the_read_bound",
     ),
 ]
 

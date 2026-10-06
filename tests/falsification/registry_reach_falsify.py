@@ -84,13 +84,23 @@ VERTICAL = ("--test r2f_registry_vertical", "asv-broker", "")
 # (label, old, new, row that must go red, target)
 SELFREPORT_MUTATIONS = [
     (
-        # The defect, restated as a mutation. Classifying the request as
-        # plumbing leaves the capability advertised with nothing behind it,
-        # which is precisely what `every_advertised_capability_is_handled`
-        # exists to refuse.
-        "classify a manifest pull as plumbing instead of an operation",
-        '            Request::PullManifest { .. } => "registry.manifest.read",',
-        "            Request::PullManifest { .. } => return None,",
+        # The defect, restated as a mutation. A capability advertised with no
+        # request behind it is a promise the broker cannot keep, which is
+        # precisely what `every_advertised_capability_is_handled` exists to
+        # refuse.
+        #
+        # **The mutation had to change shape when `compiled_capabilities()`
+        # stopped being a second list.** It used to be derived from
+        # `CAPABILITIES`, so `served` and `advertised` now read the same table
+        # and a `Some(..) -> None` edit removes the capability from *both*
+        # sides at once: the row stayed green no matter what. Classifying the
+        # request as plumbing is therefore no longer a mutation of anything
+        # this row can see. The only disagreement the row can still witness is
+        # a capability that is advertised but unreachable, which is a key that
+        # matches no method -- so that is what this edits.
+        "advertise a capability no request can serve",
+        '    ("registry_pull_manifest", Some("registry.manifest.read")),',
+        '    ("registry_pull_manifest_typo", Some("registry.manifest.read")),',
         "every_advertised_capability_is_handled",
         LIB,
     ),
@@ -99,8 +109,8 @@ SELFREPORT_MUTATIONS = [
         # name. An agent reading its capabilities concludes the product cannot
         # pull, and it is right about what it read.
         "stop advertising the blob read",
-        '        "registry.blob.read".to_string(),\n',
-        "",
+        '    ("registry_pull_blob", Some("registry.blob.read")),',
+        '    ("registry_pull_blob", None),',
         "an_agent_asking_what_the_broker_can_do_is_told_about_registry",
         VERTICAL,
     ),
@@ -118,8 +128,8 @@ SELFREPORT_MUTATIONS = [
         # advertises. The row was right and the mutation was aimed at the wrong
         # thing; this one counts the classification itself.
         "classify a blob read under the manifest's name",
-        '            Request::PullBlob { .. } => "registry.blob.read",',
-        '            Request::PullBlob { .. } => "registry.manifest.read",',
+        '    ("registry_pull_blob", Some("registry.blob.read")),',
+        '    ("registry_pull_blob", Some("registry.manifest.read")),',
         "two_operations_do_not_share_one_capability_name",
         LIB,
     ),

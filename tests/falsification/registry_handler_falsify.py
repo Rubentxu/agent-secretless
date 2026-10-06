@@ -136,13 +136,21 @@ MUTATIONS = [
         # unwell, which is the opposite of the truth and the reason the two
         # codes exist.
         "report a malformed reference as an upstream failure",
-        "                Err(error) => {\n"
+        "            // Parsed here rather than in the grant because only a manifest is\n"
+        "            // addressed by a reference; a blob is addressed by a digest and the\n"
+        "            // two grammars are not interchangeable.\n"
+        "            let reference = match ImageReference::parse(&reference) {\n"
+        "                Ok(reference) => reference,\n"        "                Err(error) => {\n"
         "                    return Response::Error {\n"
         "                        code: ErrorCode::InvalidRequest,\n"
         "                        message: format!(\"the reference is not an image reference: {error}\"),\n"
         "                    }\n"
         "                }",
-        "                Err(error) => {\n"
+        "            // Parsed here rather than in the grant because only a manifest is\n"
+        "            // addressed by a reference; a blob is addressed by a digest and the\n"
+        "            // two grammars are not interchangeable.\n"
+        "            let reference = match ImageReference::parse(&reference) {\n"
+        "                Ok(reference) => reference,\n"        "                Err(error) => {\n"
         "                    return Response::Error {\n"
         "                        code: ErrorCode::Upstream,\n"
         "                        message: format!(\"the reference is not an image reference: {error}\"),\n"
@@ -204,6 +212,13 @@ MUTATIONS = [
         # why it is its own type in the connector. Accepting any string lets a
         # tag name a blob, and a name is not a check.
         "accept any string as a content digest",
+        "                Action::RegistryPull,\n"
+        "                &registry,\n"
+        "                &repository,\n"
+        "            ) {\n"
+        "                Ok(grant) => grant,\n"
+        "                Err(refusal) => return refusal,\n"
+        "            };\n"
         "            let digest = match ContentDigest::parse(&digest) {\n"
         "                Ok(digest) => digest,\n"
         "                Err(error) => {\n"
