@@ -17,6 +17,8 @@ Seven buckets, run one per invocation like every other harness here:
     python3 intent_falsify.py chain      # the wiring, through the real binary
     python3 intent_falsify.py stake      # what the receipt says is at stake
     python3 intent_falsify.py inventory  # the real inventory, against a broker
+    python3 intent_falsify.py permit     # the branch where the operation runs
+    python3 intent_falsify.py policy     # which policy says so
 
 **`stake` and `inventory` are R4.B.2's, and `inventory` found a bug the whole
 previous campaign could not see.**
@@ -366,6 +368,55 @@ INVENTORY = [
     ),
 ]
 
+# --- permit ----------------------------------------------------------------
+# The branch R4.B.2 deliberately never took: an execution that is *permitted*.
+# Everything R4.B.2 asserted is true on the denied path, and a property that has
+# only ever been observed on one branch has not been observed at all.
+#
+# A negative row cannot be mutated into failing, and `npm_cannot_be_permitted_by_
+# any_policy_the_schema_accepts` is one: it goes red when the code starts
+# permitting npm, which is a mutation that would have to add a permit somewhere
+# rather than remove one. So this bucket aims at the rows that carry weight.
+PERMIT = [
+    (
+        # The receipt would say "executed" for anything the broker did not
+        # refuse, which is the failure this row was written to catch: a
+        # permitted execution is the branch where an operator is about to spend
+        # a credential, so being wrong about it in the optimistic direction is
+        # the one direction that matters.
+        "execute anything the broker permitted",
+        "        AuthorizationVerdict::Permit { .. } => ExecuteOutcome::Executed,",
+        """        AuthorizationVerdict::Permit { .. } => ExecuteOutcome::Unauthorized {
+            reason: "executed anyway".into(),
+            reason_code: "Mutation".into(),
+        },""",
+        "a_permitted_execution_names_the_credential_it_would_spend",
+    ),
+]
+
+# --- policy ----------------------------------------------------------------
+# Which policy decided. Found by running the broker with `--policy` rather than
+# by reading it: `PolicyEngine::result` wrote one constant for every decision it
+# ever produced, so a receipt told an operator that the built-in text had
+# authorised an operation their own policy file had authorised.
+POLICY = [
+    (
+        # The load side: a delivered policy that announces itself as the built-in.
+        "name every policy after the built-in one, whatever was delivered",
+        "            policy_name: policy_name.to_string(),",
+        "            policy_name: DEFAULT_POLICY_NAME.to_string(),",
+        "the_receipt_names_the_policy_that_decided_rather_than_the_built_in",
+    ),
+    (
+        # The report side, kept as a separate mutation because the two fail
+        # differently: this one leaves the engine honest and the receipt lying.
+        "report the built-in name regardless of what the engine carries",
+        "            rule: self.policy_name.clone(),",
+        '            rule: "m3-default-policy".into(),',
+        "the_receipt_names_the_policy_that_decided_rather_than_the_built_in",
+    ),
+]
+
 # One target per bucket, because the rows live in three different places, and a
 # bucket pointed at a target that does not contain its row produces `no-run`.
 #
@@ -377,6 +428,8 @@ LIB_PKG, LIB_TGT = "asv-integrations", "--lib"
 DOMAIN_PKG, DOMAIN_TGT = "asv-domain", "--lib"
 CHAIN_PKG, CHAIN_TGT = "asv-broker", "--test r4b1_intent_chain"
 BOUND_PKG, BOUND_TGT = "asv-broker", "--test r4b2_bound_execute"
+PERMIT_PKG, PERMIT_TGT = "asv-broker", "--test r4b3_permitted_execute"
+POLICY_SRC = f.REPO / "crates/policy/src/lib.rs"
 
 BUCKETS = {
     "binding": (LIB_PKG, LIB_TGT, "plan::tests::", PLAN, BINDING),
@@ -386,6 +439,8 @@ BUCKETS = {
     "chain": (CHAIN_PKG, CHAIN_TGT, "", CLI, CHAIN),
     "stake": (LIB_PKG, LIB_TGT, "execute::tests::", EXECUTE, STAKE),
     "inventory": (BOUND_PKG, BOUND_TGT, "", CLI, INVENTORY),
+    "permit": (PERMIT_PKG, PERMIT_TGT, "", EXECUTE, PERMIT),
+    "policy": (PERMIT_PKG, PERMIT_TGT, "", POLICY_SRC, POLICY),
 }
 
 
@@ -396,7 +451,7 @@ def main() -> int:
     f.CARGO_TARGET = target
     f.TEST_PREFIX = prefix
     f.STS = source
-    f.BUCKET_COUNT_LABEL = "seven"
+    f.BUCKET_COUNT_LABEL = "nine"
     f.MUTATIONS[:] = mutations
     print(f"# falsifying {source.relative_to(f.REPO)} [{mode}] with {len(mutations)} mutations\n")
     return f.main()
