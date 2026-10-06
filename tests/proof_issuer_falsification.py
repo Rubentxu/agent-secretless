@@ -47,8 +47,24 @@ MUTATIONS: dict[str, tuple[str, str, str, list[str]]] = {
     ),
     "counter_returned_on_failure": (
         "a failed signing hands the counter back, so it can be walked backwards",
-        "        let counter = self.counter.fetch_add(1, Ordering::SeqCst);\n        let signature = self\n            .client\n            .sign(&self.key_blob, &proof_nonce(&self.key_blob, host, port, counter))?;",
-        "        let counter = self.counter.load(Ordering::SeqCst);\n        let signature = match self\n            .client\n            .sign(&self.key_blob, &proof_nonce(&self.key_blob, host, port, counter))\n        {\n            Ok(s) => { self.counter.store(counter + 1, Ordering::SeqCst); s }\n            Err(e) => { self.counter.store(counter, Ordering::SeqCst); return Err(e); }\n        };",
+        # **Re-anchored.** `rustfmt` reflowed the chained call into a vertical
+        # argument list, so the old `self\n.client\n.sign(...)` spelling occurs
+        # nowhere in the file and this row measured nothing. The mutation is the
+        # same defect against the shape the code has now: spend with `load`, and
+        # put the counter back when the signing fails.
+        "        let counter = self.counter.fetch_add(1, Ordering::SeqCst);\n"
+        "        let signature = self.client.sign(\n"
+        "            &self.key_blob,\n"
+        "            &proof_nonce(&self.key_blob, host, port, counter),\n"
+        "        )?;",
+        "        let counter = self.counter.load(Ordering::SeqCst);\n"
+        "        let signature = match self.client.sign(\n"
+        "            &self.key_blob,\n"
+        "            &proof_nonce(&self.key_blob, host, port, counter),\n"
+        "        ) {\n"
+        "            Ok(s) => { self.counter.store(counter + 1, Ordering::SeqCst); s }\n"
+        "            Err(e) => { self.counter.store(counter, Ordering::SeqCst); return Err(e); }\n"
+        "        };",
         ["a_failed_signing_still_spends_its_counter"],
     ),
     "counter_not_in_the_proof": (
@@ -59,8 +75,8 @@ MUTATIONS: dict[str, tuple[str, str, str, list[str]]] = {
     ),
     "nonce_ignores_destination": (
         "the nonce is derived without the destination, so a proof is good for any host",
-        "            .sign(&self.key_blob, &proof_nonce(&self.key_blob, host, port, counter))?;",
-        "            .sign(&self.key_blob, &proof_nonce(&self.key_blob, \"\", 0, counter))?;",
+        "            &proof_nonce(&self.key_blob, host, port, counter),",
+        "            &proof_nonce(&self.key_blob, \"\", 0, counter),",
         # The destination test was only negatives and could not see this, so it
         # now carries its own positive half. The round trip is listed too
         # because it is the other place the real nonce is checked.
