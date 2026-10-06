@@ -85,7 +85,7 @@ impl Sandbox {
         }
     }
 
-    fn start(&self) -> Child {
+    fn start(&self) -> Broker {
         let broker = Command::new(asv_broker::binary::locate("asv-brokerd"))
             .arg(&self.sock)
             .arg("--vault")
@@ -104,7 +104,28 @@ impl Sandbox {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        broker
+        Broker(broker)
+    }
+}
+
+/// A daemon that dies with the row that started it.
+///
+/// `std::process::Child` has **no** `Drop` impl that terminates the child:
+/// dropping one only closes the handle and reaps nothing, and the daemon keeps
+/// running against a vault path `Sandbox::drop` is about to delete. Every other
+/// broker-spawning test in this crate wraps the child in exactly this guard for
+/// exactly this reason; without it each of the three rows below left one
+/// `asv-brokerd` alive for the lifetime of the host, measured at 25 orphans
+/// after a handful of suite runs.
+///
+/// Drop order matters and is already right: `_broker` is declared after
+/// `sandbox`, so the daemon is killed and waited before the directory goes.
+struct Broker(Child);
+
+impl Drop for Broker {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
