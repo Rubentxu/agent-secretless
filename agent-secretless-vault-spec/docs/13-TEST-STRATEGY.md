@@ -114,3 +114,41 @@ Linux matrix should include at least:
 - Landlock/memfd_secret feature detection paths.
 
 Do not make unsupported kernel features silently required for portable mode.
+
+## 8. The build directory is part of what a test measures
+
+Most of the end-to-end corpus spawns the real `asv` and `asv-brokerd` binaries,
+so a test measures the product only if the binary on disk is the one this tree
+built. Two ways that quietly stops being true, both observed in practice:
+
+**A stale binary.** Restoring a file that a harness mutated — even byte for
+byte — updates its mtime. That is enough for the freshness check to decide the
+binary predates its sources, and every e2e in the package then reports the
+staleness instead of the property it went to measure. `binary::locate` fails
+loudly on purpose: the alternative is a suite that passes against code nobody
+is looking at. The fix is `cargo build --workspace`, which is also why `cargo
+test` alone is not sufficient — it does not necessarily produce the binary the
+locator resolves.
+
+**Two checkouts sharing one target directory.** Cargo derives the unit hash of
+a workspace member from its path *relative to the workspace*, not from the
+absolute root. Two checkouts of the same repository therefore produce the same
+hash, and if they share a `CARGO_TARGET_DIR` the second links artifacts
+compiled by the first, with the first's paths embedded in the debug info. A
+test then fails naming a file that does not exist, in a checkout where nothing
+is wrong.
+
+This is not hypothetical for anyone using `git worktree`, which is the obvious
+way to isolate an experiment. Rules that follow from it:
+
+- **An isolated checkout needs its own `CARGO_TARGET_DIR`.** Sharing one is
+  never safe, whatever the isolation is for.
+- `cargo clean -p <package>` does not repair it. It clears the package whose
+  failure is visible and leaves its workspace dependencies holding the other
+  checkout's artifacts. Clean every workspace member, or use a fresh directory.
+- Before believing that a failing test found a defect, check whether its
+  artifact carries another checkout's path:
+  `grep -c <suspect-path> $CARGO_TARGET_DIR/debug/deps/<test-binary>`.
+
+A suite result is evidence about a tree *and a build directory*. Recording the
+target directory alongside the commit is what makes a failure reproducible.
