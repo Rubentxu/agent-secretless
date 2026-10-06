@@ -68,6 +68,7 @@
 
 pub mod adopt;
 pub mod fingerprint;
+pub mod gradle;
 pub mod maven;
 pub mod npm;
 pub mod plan;
@@ -77,6 +78,7 @@ pub use adopt::{
     selector_for, AdoptError, AdoptReceipt, AdoptSelector, NpmAdoption, PendingStep, ADOPT_SCHEMA,
 };
 pub use fingerprint::{Drift, FileFingerprint, FingerprintError, FingerprintPolicy};
+pub use gradle::{Gradle, GradleDiscovery, GradleError};
 pub use maven::{Maven, MavenDiscovery, MavenError};
 pub use npm::{Npm, NpmDiscovery, NpmError};
 pub use plan::{
@@ -225,6 +227,7 @@ impl Discovery {
 pub enum AnyReport {
     Npm(NpmDiscovery),
     Maven(MavenDiscovery),
+    Gradle(GradleDiscovery),
 }
 
 /// Something discovery noticed that the operator should see.

@@ -1730,9 +1730,14 @@ fn run_integrations_discover(
             .discover(&policy, &home, &cwd)
             .map(asv_integrations::MavenDiscovery::into_discovery)
             .map_err(|error| error.to_string()),
+        "gradle" => asv_integrations::Gradle
+            .discover(&policy, &home, &cwd)
+            .map(asv_integrations::GradleDiscovery::into_discovery)
+            .map_err(|error| error.to_string()),
         other => Err(format!(
-            "no adapter for {other:?}; this build knows `npm` and `maven`. Adding one is a \
-             module in asv-integrations, a variant in `AnyReport`, and one match arm here."
+            "no adapter for {other:?}; this build knows `npm`, `maven` and `gradle`. \
+             Adding one is a module in asv-integrations, a variant in `AnyReport`, \
+             and one match arm here."
         )),
     };
 
@@ -1975,6 +1980,7 @@ fn print_discovery_prose(discovery: &asv_integrations::Discovery) {
     match &discovery.report {
         asv_integrations::AnyReport::Npm(report) => print_npm_discovery(report),
         asv_integrations::AnyReport::Maven(report) => print_maven_discovery(report),
+        asv_integrations::AnyReport::Gradle(report) => print_gradle_discovery(report),
     }
 }
 
@@ -2106,6 +2112,61 @@ fn print_maven_discovery(report: &asv_integrations::MavenDiscovery) {
     print_findings(&report.findings);
 }
 
+fn print_gradle_discovery(report: &asv_integrations::GradleDiscovery) {
+    // Same rule as the other two families: with a finding pending, "none was
+    // found" is a claim about a file that exists.
+    if report.files.is_empty() {
+        if report.findings.is_empty() {
+            println!("no gradle.properties or init script was found for this project or account");
+        }
+        print_findings(&report.findings);
+        return;
+    }
+    for file in &report.files {
+        let origin = match file.origin {
+            asv_integrations::Origin::Project => "project",
+            asv_integrations::Origin::User => "user",
+            asv_integrations::Origin::Global => "global",
+            asv_integrations::Origin::Tool => "tool",
+        };
+        let readable = if file.fingerprint.is_untrusted_readable() {
+            "  (readable by group or other — a password in here is exposed)"
+        } else {
+            ""
+        };
+        println!("{origin} {}", file.fingerprint.path.display());
+        println!("  {}{readable}", file.fingerprint.digest);
+        for credential in &file.credentials {
+            println!("  credential  {}  ({:?})", credential.key, credential.kind);
+            match (&credential.env_reference, credential.len) {
+                // Named, never resolved. The environment is the caller's, not
+                // the file's, and resolving it here would be this process
+                // reading a secret it was not asked to read.
+                (Some(name), _) => println!("    value  from ${{{name}}}"),
+                (None, Some(len)) => println!("    value  {len} bytes"),
+                (None, None) => println!("    value  (empty)"),
+            }
+        }
+        // **The bulk of the file, and it is not a list of credentials.**
+        // Most of a `gradle.properties` is JVM flags and daemon tuning. An
+        // operator reading this needs to know two separate things: how many
+        // credentials there are, and how much of the file is something this
+        // adapter does not model. Printing them as one list would imply the
+        // second is a finding, and the first time an operator learned to
+        // ignore this report would be the first time it hid something.
+        if !file.undescribed.is_empty() {
+            println!(
+                "  {} other key(s) not described by this adapter",
+                file.undescribed.len()
+            );
+            for entry in &file.undescribed {
+                println!("    {}  {} bytes", entry.key, entry.len);
+            }
+        }
+    }
+    print_findings(&report.findings);
+}
+
 /// What discovery declined to read, and why.
 ///
 /// Written for the second family rather than the first, which is worth saying:
@@ -2157,7 +2218,10 @@ fn print_findings(findings: &[asv_integrations::Finding]) {
 /// forgetting this match is a compile error naming the verb, not a silent
 /// no-op. The direction is not guessed from the fields: it comes from which
 /// enum the verb is in.
-fn run_registry_dispatch(socket: &std::path::Path, command: &RegistryCommand) -> std::io::Result<()> {
+fn run_registry_dispatch(
+    socket: &std::path::Path,
+    command: &RegistryCommand,
+) -> std::io::Result<()> {
     match command {
         RegistryCommand::Manifest(RegistryManifestCommand::Read { .. })
         | RegistryCommand::Blob(RegistryBlobCommand::Read { .. }) => run_registry(socket, command),
@@ -2177,7 +2241,14 @@ fn run_registry(socket: &std::path::Path, command: &RegistryCommand) -> std::io:
             reference,
             out,
             json,
-        }) => (credential, registry, repository, Selector::Reference(reference), out, json),
+        }) => (
+            credential,
+            registry,
+            repository,
+            Selector::Reference(reference),
+            out,
+            json,
+        ),
         RegistryCommand::Blob(RegistryBlobCommand::Read {
             credential,
             registry,
@@ -2185,7 +2256,14 @@ fn run_registry(socket: &std::path::Path, command: &RegistryCommand) -> std::io:
             digest,
             out,
             json,
-        }) => (credential, registry, repository, Selector::Digest(digest), out, json),
+        }) => (
+            credential,
+            registry,
+            repository,
+            Selector::Digest(digest),
+            out,
+            json,
+        ),
         // Unreachable through `run_registry_dispatch`, which routes a push here
         // only by mistake. Present so that adding a verb to either enum cannot
         // leave this function silently unhandled: a write reaching a reader
@@ -2265,9 +2343,7 @@ fn run_registry(socket: &std::path::Path, command: &RegistryCommand) -> std::io:
             digest,
             media_type,
         } => (body.clone(), digest.clone(), media_type.clone()),
-        Response::BlobRead { bytes, digest } => {
-            (bytes.clone(), digest.clone(), None)
-        }
+        Response::BlobRead { bytes, digest } => (bytes.clone(), digest.clone(), None),
         // A refusal and an unexpected answer are reported by the arms below,
         // which distinguish "the broker said no" from "I did not understand
         // the answer". Returning here rather than falling through to the write
@@ -2314,12 +2390,10 @@ fn run_registry(socket: &std::path::Path, command: &RegistryCommand) -> std::io:
         }
         println!(
             "{}",
-            render::json::envelope(&render::json::for_result(
-                &ipc::ApplicationResult::Ok {
-                    summary: format!("{body_len} byte(s) at {destination}", body_len = body.len()),
-                    data,
-                }
-            ))
+            render::json::envelope(&render::json::for_result(&ipc::ApplicationResult::Ok {
+                summary: format!("{body_len} byte(s) at {destination}", body_len = body.len()),
+                data,
+            }))
         );
     } else {
         // stderr, so that `... > layer.tar.gz` gets exactly the bytes and an
@@ -2419,7 +2493,12 @@ fn run_registry_push(socket: &std::path::Path, command: &RegistryCommand) -> std
             file,
             json,
         }) => (
-            credential, registry, repository, file, Some(reference), json,
+            credential,
+            registry,
+            repository,
+            file,
+            Some(reference),
+            json,
         ),
         RegistryCommand::Blob(RegistryBlobCommand::Push {
             credential,
@@ -2579,12 +2658,10 @@ fn print_registry_push_json(response: &Response, digest: &str, bytes: usize) {
     data["bytes"] = serde_json::json!(bytes);
     println!(
         "{}",
-        render::json::envelope(&render::json::for_result(
-            &ipc::ApplicationResult::Ok {
-                summary: format!("{bytes} byte(s) pushed as {digest}"),
-                data,
-            }
-        ))
+        render::json::envelope(&render::json::for_result(&ipc::ApplicationResult::Ok {
+            summary: format!("{bytes} byte(s) pushed as {digest}"),
+            data,
+        }))
     );
 }
 

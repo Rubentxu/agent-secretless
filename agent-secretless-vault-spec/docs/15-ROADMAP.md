@@ -2556,6 +2556,85 @@ TOCTOU revalidation is not reachable because there is no plan to revalidate.
 caller's, not the file's. The `registry_audience`/`asv-domain` audience gap that
 blocks a Maven binding is unchanged and still belongs to R2.F.3.
 
+### R3.B.2 — Gradle, and the second measurement of the exit criterion
+
+`asv integrations discover --family gradle`. The third family, and the first
+one whose purpose is the **number it produces** rather than the family it adds.
+
+**What it touched:**
+
+```text
+crates/integrations/src/gradle.rs   the family
+crates/integrations/src/lib.rs      module, re-export, one AnyReport variant
+crates/cli/src/main.rs              one match arm, one prose printer
+── nothing else ──
+crates/broker/src/  crates/domain/src/  crates/ipc-protocol/src/
+```
+
+That list is the finding, and it is the **negative** one. Maven's measurement
+cost a change: `Candidate::origin` had to be lifted out of `npm::Origin` before
+a second family could express its precedence. Gradle needed no shared-type
+change at all — the two levels it reads (`Project`, `User`) were already in
+`crate::Origin` because npm had them. So the exit criterion has now been
+measured twice, once at a cost and once at none, and it is a property of the
+tree rather than of which family happened to arrive second.
+
+**It also shows the criterion holds for a different format.** Maven needed four
+XML protections from §5 and three came free from `roxmltree`; a properties file
+has no DTD, no entities and **no nesting**, so `MAX_DEPTH` and the quote-aware
+pre-scan have nothing to do here. The absence is deliberate and named
+(`NO_DEPTH_LIMIT`), because writing a ceiling that cannot be violated is not a
+safety property and would have implied a hazard the format does not have.
+
+**The shape of the honest report is inverted.** Most of a `gradle.properties` is
+**not** a credential: on the machine this was written on, the user's file holds
+exactly two keys, `org.gradle.jvmargs` and `org.gradle.daemon.idletimeout`, and
+neither is one. Maven's `undescribed` is a rare corner; Gradle's is **the bulk
+of every file**. An adapter that treated each line as a potential credential
+would report "4 credentials" on a file holding two JVM flags, and an operator
+would learn to distrust the number. So the prose prints them under an explicit
+`N other key(s) not described by this adapter` heading rather than folding them
+into the credential list.
+
+**Measured:** 29 rows in `crates/integrations/src/gradle/tests.rs`, 10 in the
+vertical `crates/broker/tests/r3b2_gradle_discovery.rs` against the real `asv`
+binary, and **5 mutations across four buckets** — leak, classify, reference,
+parser — **5 red, 0 survivors, 0 compiler-refused, 0 unmeasured**.
+
+**Two of those mutations are the two bugs this file shipped with**, which is
+why they are the strongest entries in the campaign: a mutation that was once
+the code demonstrates that the row catching it is capable of catching that
+shape of defect.
+
+- The key and value were joined into one `key=value` string and split apart
+  again. An **escaped** separator inside a key survived the join and was
+  mistaken for the real one, so `a\=b=value` came back as the key `a`.
+- `push_unescaped` decoded `\uXXXX` and its caller advanced **two**
+  characters, so the four hex digits were read again as literals: `\u00e9`
+  measured six bytes instead of two.
+
+Both were caught by the rows while the family was being written, which is the
+argument for writing rows alongside the code rather than after it.
+
+**The obvious leak mutation does not compile**, and that is recorded rather
+than worked around: putting a value where the length belongs is `E0308`, because
+`len` is `Option<usize>`. The type makes the most likely leak unexpressible, so
+the attack had to be routed through `env_reference` — a field whose entire job
+is to carry text out of the file, which is what makes it the honest place to
+try smuggling a value.
+
+**Not started, and not simulated.** `plan` and `adopt` for Gradle do not exist,
+for the same reason Maven's do not. `~/.gradle/credentials/` is a binary store
+and is not read. Groovy is not parsed, so **a repository declared inline in a
+`build.gradle` with a literal password is invisible to this report** — a real
+limit, named here rather than left for an operator to discover. The in-flight
+adapter name must match exactly, so a build using `storePasswordBackup` is
+reported as undescribed rather than guessed at.
+
+**R3's exit criterion is now two families of four.** npm (R3.A.1) and Maven
+(R3.B.1) have a real vertical; curl has none. The criterion is not met, and the
+remaining gap is a family rather than a measurement.
+
 ### The broker's accept loop, and the two rows that were missing for it
 
 `crates/broker/src/lib.rs` and `main.rs` changed shape, and until now no row

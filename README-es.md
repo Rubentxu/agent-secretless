@@ -16,14 +16,14 @@ agente ──(sustituto / socket)──▶ broker ──(credencial real)──�
 
 > **Estado: pre-1.0, en v0.30.0. Sin certificar, y los gates lo dicen.**
 >
-> El workspace compila y hay **1846 tests enumerados**. Con `cargo test`, 1845
+> El workspace compila y hay **1885 tests enumerados**. Con `cargo test`, 1884
 > se ejecutan y pasan y 1 queda fuera de las compilaciones de depuración por
 > construcción: el presupuesto de latencia p95 lleva
 > `#[cfg_attr(debug_assertions, ignore)]`, porque un presupuesto de latencia
 > medido contra ed25519 en depuración es una afirmación sobre
 > `debug_assertions`, no sobre el producto. Ese test sí se ejecuta y pasa con
 > `--release` — medido aquí en 1490us contra un presupuesto de 6000us — así que
-> la corrida en release de abajo ejecuta 1844 de ellos. El conteo y la aritmética
+> la corrida en release de abajo ejecuta 1883 de ellos. El conteo y la aritmética
 > del inicio rápido los vuelve a derivar en cada corrida de CI el gate
 > `R11 README test count`, que resta los filtros `--skip` que documenta el propio
 > inicio rápido en vez de comprobar una suma, de modo que un bloque que se salta
@@ -221,14 +221,14 @@ permisos de fichero. Es una carencia registrada para cerrar antes de 1.0.
 cargo build --release --workspace
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# esperado: passed=1844 failed=0 ignored=0
+# esperado: passed=1883 failed=0 ignored=0
 ```
 
-1844 y no 1846 porque el comando de arriba se salta dos: `uat_028` levanta un
+1883 y no 1885 porque el comando de arriba se salta dos: `uat_028` levanta un
 `sshd` real y necesita un host donde correr, y el presupuesto p95 se afirma por
 separado en `--release` para que el inicio rápido siga siendo rápido. Los dos
-saltos se cuentan como filtrados, no como ignorados, así que 1844 + 2
-filtrados son los 1846 enumerados.
+saltos se cuentan como filtrados, no como ignorados, así que 1883 + 2
+filtrados son los 1885 enumerados.
 
 El paso de build es `--workspace` y no `-p asv-broker` porque las filas
 verticales invocan el binario `asv`, que es del crate del CLI, y
