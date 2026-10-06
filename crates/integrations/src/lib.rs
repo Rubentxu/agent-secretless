@@ -67,6 +67,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod adopt;
+pub mod curl;
 pub mod fingerprint;
 pub mod gradle;
 pub mod maven;
@@ -76,6 +77,9 @@ pub mod registry_audience;
 
 pub use adopt::{
     selector_for, AdoptError, AdoptReceipt, AdoptSelector, NpmAdoption, PendingStep, ADOPT_SCHEMA,
+};
+pub use curl::{
+    Curl, CurlCredential, CurlCredentialEntry, CurlDiscovery, CurlError, CurlFile, CurlOption,
 };
 pub use fingerprint::{Drift, FileFingerprint, FingerprintError, FingerprintPolicy};
 pub use gradle::{Gradle, GradleDiscovery, GradleError};
@@ -228,6 +232,7 @@ pub enum AnyReport {
     Npm(NpmDiscovery),
     Maven(MavenDiscovery),
     Gradle(GradleDiscovery),
+    Curl(CurlDiscovery),
 }
 
 /// Something discovery noticed that the operator should see.

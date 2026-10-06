@@ -1734,10 +1734,14 @@ fn run_integrations_discover(
             .discover(&policy, &home, &cwd)
             .map(asv_integrations::GradleDiscovery::into_discovery)
             .map_err(|error| error.to_string()),
+        "curl" => asv_integrations::Curl
+            .discover(&policy, &home, &cwd)
+            .map(asv_integrations::CurlDiscovery::into_discovery)
+            .map_err(|error| error.to_string()),
         other => Err(format!(
-            "no adapter for {other:?}; this build knows `npm`, `maven` and `gradle`. \
-             Adding one is a module in asv-integrations, a variant in `AnyReport`, \
-             and one match arm here."
+            "no adapter for {other:?}; this build knows `npm`, `maven`, `gradle` \
+             and `curl`. Adding one is a module in asv-integrations, a variant in \
+             `AnyReport`, and one match arm here."
         )),
     };
 
@@ -1981,6 +1985,7 @@ fn print_discovery_prose(discovery: &asv_integrations::Discovery) {
         asv_integrations::AnyReport::Npm(report) => print_npm_discovery(report),
         asv_integrations::AnyReport::Maven(report) => print_maven_discovery(report),
         asv_integrations::AnyReport::Gradle(report) => print_gradle_discovery(report),
+        asv_integrations::AnyReport::Curl(report) => print_curl_discovery(report),
     }
 }
 
@@ -2161,6 +2166,121 @@ fn print_gradle_discovery(report: &asv_integrations::GradleDiscovery) {
             );
             for entry in &file.undescribed {
                 println!("    {}  {} bytes", entry.key, entry.len);
+            }
+        }
+    }
+    print_findings(&report.findings);
+}
+
+/// curl, and the one family whose precedence is a **choice** rather than a
+/// **layering**.
+///
+/// The other three merge every file they find, so this report could have been a
+/// loop with no state. curl takes the first file that exists and never opens the
+/// rest, so the report's first job is to say which one that was — an operator
+/// with a `~/.curlrc` and a `~/.config/curlrc` has a credential in one of them
+/// and no way to tell which without being told.
+fn print_curl_discovery(report: &asv_integrations::CurlDiscovery) {
+    // Said before the file list, because it qualifies every line below it: two
+    // of curl's own lookup paths are environment variables this report cannot
+    // resolve, so the list is not the whole of what curl could have used.
+    if report.env_paths_unseen {
+        println!(
+            "note: curl reads $CURL_HOME/.curlrc and $XDG_CONFIG_HOME/curlrc ahead of \
+             every path below, and neither is resolvable without reading this process's \
+             environment. If you set either, your real configuration is not in this list."
+        );
+    }
+
+    if report.considered().is_empty() {
+        if report.findings.is_empty() {
+            println!("no .curlrc was found for this project or account");
+        }
+        print_findings(&report.findings);
+        return;
+    }
+
+    // The project file is printed under its own heading and after the lookup,
+    // because it is not a lower-precedence layer of the same thing. Printed
+    // inline with the others it would read as "the project's configuration,
+    // overridden by your home one" — which is the opposite of the truth, since
+    // curl reads it only when a command says `--config`.
+    let ordered: Vec<&asv_integrations::CurlFile> = report
+        .lookup
+        .iter()
+        .chain(report.project_config.iter())
+        .collect();
+    let split_at = report.lookup.len();
+
+    for (index, file) in ordered.into_iter().enumerate() {
+        if index == split_at {
+            println!();
+            println!("(the next file is beside the project; curl reads it only when a command names it with --config, never automatically)");
+        }
+        let origin = match file.origin {
+            asv_integrations::Origin::Project => "project",
+            asv_integrations::Origin::User => "user",
+            asv_integrations::Origin::Global => "global",
+            asv_integrations::Origin::Tool => "tool",
+        };
+
+        // **The shadowed rows are the point of this family.** They are files
+        // that exist and were not opened, which is a different sentence from
+        // "a file was opened and had nothing in it". Printing them as empty
+        // would be the single most misleading thing this report could do: an
+        // operator would learn that their `~/.curlrc` is empty when in fact
+        // curl never read it.
+        let Some(fingerprint) = file.fingerprint.as_ref() else {
+            println!("{origin} {}", file.path.display());
+            println!("  not read — shadowed by an earlier file curl would have used");
+            if let Some(winner) = file.shadowed_by.as_ref() {
+                println!("    shadowed by {}", winner.display());
+            }
+            continue;
+        };
+
+        let readable = if fingerprint.is_untrusted_readable() {
+            "  (readable by group or other — a password in here is exposed)"
+        } else {
+            ""
+        };
+        println!("{origin} {}", fingerprint.path.display());
+        println!("  {}{readable}", fingerprint.digest);
+
+        for credential in &file.credentials {
+            println!(
+                "  credential  {}  ({:?})",
+                credential.option, credential.kind
+            );
+            // **Two lengths, because there are two questions.** curl's `user`
+            // carries `name:secret` on one line, and a single length for the
+            // pair answers neither "who does this authenticate as" nor "how long
+            // is the secret". No other family has to make this split, which is
+            // why this is the first place the report prints two numbers.
+            println!("    user       {} bytes", credential.user_len);
+            println!(
+                "    password   {}",
+                if credential.has_password {
+                    format!("{} bytes", credential.password_len)
+                } else {
+                    "(absent — curl authenticates with an empty password)".to_string()
+                }
+            );
+        }
+
+        // The bulk of a real `.curlrc`, and not a list of credentials: most
+        // lines are `--silent`, `--max-time` and `--retry`. Same reasoning as
+        // Gradle's undescribed keys.
+        if !file.options.is_empty() {
+            println!(
+                "  {} other option(s) not described by this adapter",
+                file.options.len()
+            );
+            for option in &file.options {
+                match option.len {
+                    Some(len) => println!("    {}  {} bytes", option.option, len),
+                    None => println!("    {}  (flag)", option.option),
+                }
             }
         }
     }
