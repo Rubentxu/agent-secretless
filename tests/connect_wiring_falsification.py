@@ -53,10 +53,16 @@ MUTATIONS = [
         edits=[
             (
                 RUNTIME,
-                "        crate::SessionStore::resolve(&*store, presented_key, nonce, signature)",
-                """        let _ = (&store, presented_key, nonce, signature);
+                # **Re-anchored.** The port no longer calls a free function; it
+                # implements `SessionProofs::authenticate` and delegates to
+                # `SessionStore::authenticate` under the store's own guard. Same
+                # defect, current spelling: a proxy wired to a store it never
+                # reads binds, accepts, refuses every proof and reports every
+                # refusal correctly.
+                "        crate::SessionStore::authenticate(&mut store, proof, target)",
+                """        let _ = (&store, proof, target);
         // MUTANT: the port never consults the store it was given
-        None""",
+        Err(crate::ProofRejection::NoSuchSession)""",
             )
         ],
         expect_red="the_shared_store_resolves_a_proof_and_an_empty_one_cannot",
@@ -75,13 +81,22 @@ MUTATIONS = [
         edits=[
             (
                 LIB,
-                "            if registered != presented_key {\n                return None;\n            }",
-                "            // MUTANT: the presented blob is no longer compared to the\n            // registered one",
+                # **Re-anchored.** The comparison moved into the `find_map`
+                # closure, so it is indented at 16 and names `proof.key` rather
+                # than a free `presented_key`. The comment above it says a
+                # falsification run already proved this line alone is not what
+                # holds the property — which is exactly why this mutation is two
+                # edits and not one.
+                "                if registered != proof.key {\n                    return None;\n                }\n",
+                "                // MUTANT: the presented blob is no longer compared to the\n                // registered one\n",
             ),
             (
                 LIB,
-                "            asv_ssh_agent::verify_proof(registered, nonce, signature).then_some(*id)",
-                "            asv_ssh_agent::verify_proof(presented_key, nonce, signature).then_some(*id)",
+                # **Re-anchored, and the shape changed.** Verification is not a
+                # `then_some` folded into the lookup any more; it is an early
+                # return in its own right. Dropping it means any signature passes.
+                "        if !asv_ssh_agent::verify_proof(&registered, &nonce, &proof.signature) {\n            return Err(ProofRejection::NoSuchSession);\n        }",
+                "        if !asv_ssh_agent::verify_proof(&proof.key, &nonce, &proof.signature) {\n            return Err(ProofRejection::NoSuchSession);\n        }",
             ),
         ],
         expect_red="a_proof_under_one_key_never_resolves_to_another_session",
@@ -103,8 +118,8 @@ MUTATIONS = [
         edits=[
             (
                 LIB,
-                "            asv_ssh_agent::verify_proof(registered, nonce, signature).then_some(*id)",
-                "            // MUTANT: the signature is never checked\n            let _ = (nonce, signature);\n            Some(*id)",
+                "        if !asv_ssh_agent::verify_proof(&registered, &nonce, &proof.signature) {\n            return Err(ProofRejection::NoSuchSession);\n        }",
+                "        // MUTANT: the signature is never checked\n        let _ = (&registered, &nonce);",
             )
         ],
         expect_red="a_matching_blob_with_a_bad_signature_resolves_to_nothing",
@@ -118,11 +133,19 @@ MUTATIONS = [
         name="an-ended-session-still-resolves",
         edits=[
             (
-                RUNTIME,
-                "        crate::SessionStore::resolve(&*store, presented_key, nonce, signature)",
-                """        // MUTANT: the table is never consulted
-        let _ = &store;
-        None""",
+                LIB,
+                # **Re-anchored, and de-duplicated.** This used to mutate the very
+                # same `SessionStore::resolve` line as
+                # `the-listener-resolves-nothing-at-all`, with a replacement that
+                # also made the port resolve nothing: two names for one
+                # measurement, and neither one doing the defect its name claims.
+                # Ending a session is now one removal from the table, and
+                # `authenticate` refuses precisely by not finding the id — so the
+                # removal *is* the window this row is about, and this is what
+                # reopens it.
+                "        self.sessions.remove(&id).is_some()",
+                """        // MUTANT: the session stays in the table, so it still resolves
+        self.sessions.contains_key(&id)""",
             )
         ],
         expect_red="an_ended_session_stops_resolving",
