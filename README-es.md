@@ -16,14 +16,18 @@ agente ──(sustituto / socket)──▶ broker ──(credencial real)──�
 
 > **Estado: pre-1.0, en v0.34.0. Sin certificar, y los gates lo dicen.**
 >
-> El workspace compila y hay **2029 tests enumerados**. Con `cargo test`, 2028
+> El workspace compila y hay **2035 tests enumerados**. Con `cargo test`, 2034
 > se ejecutan y pasan y 1 queda fuera de las compilaciones de depuración por
 > construcción: el presupuesto de latencia p95 lleva
 > `#[cfg_attr(debug_assertions, ignore)]`, porque un presupuesto de latencia
 > medido contra ed25519 en depuración es una afirmación sobre
-> `debug_assertions`, no sobre el producto. Ese test sí se ejecuta y pasa con
-> `--release` — medido aquí en 1490us contra un presupuesto de 6000us — así que
-> la corrida en release de abajo ejecuta 2009 de ellos. El conteo y la aritmética
+> `debug_assertions`, no sobre el producto. Ese test se afirma con `--release`,
+> y por eso la corrida en release de abajo — con los dos filtros `--skip` que
+> documenta — ejecuta 2033 de ellos. Medido en el host de certificación sobre
+> este árbol, ese presupuesto pasa con **p95=5332us frente a 6000us** — 11% de
+> margen, sobre un Xeon E5-2682 v4. Revisiones anteriores de este fichero
+> afirmaban 1490us; la cifra nunca se volvió a derivar y la fila había dejado de
+> ser una medición. El conteo y la aritmética
 > del inicio rápido los vuelve a derivar en cada corrida de CI el gate
 > `R11 README test count`, que resta los filtros `--skip` que documenta el propio
 > inicio rápido en vez de comprobar una suma, de modo que un bloque que se salta
@@ -221,14 +225,21 @@ permisos de fichero. Es una carencia registrada para cerrar antes de 1.0.
 cargo build --release --workspace
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# esperado: passed=2027 failed=0 ignored=0
+# esperado: passed=2033 failed=0 ignored=0
 ```
 
-2009 y no 2011 porque el comando de arriba se salta dos: `uat_028` levanta un
+2033 y no 2035 porque el comando de arriba se salta dos: `uat_028` levanta un
 `sshd` real y necesita un host donde correr, y el presupuesto p95 se afirma por
 separado en `--release` para que el inicio rápido siga siendo rápido. Los dos
-saltos se cuentan como filtrados, no como ignorados, así que 2009 + 2
-filtrados son los 2011 enumerados.
+saltos se cuentan como filtrados, no como ignorados, así que 2033 + 2
+filtrados son los 2035 enumerados.
+
+Medido en el host de certificación sobre este árbol: depuración 110 bloques /
+2034 pasadas / 0 fallidas / 1 ignorada, release 110 bloques / 2033 pasadas /
+0 fallidas / 0 ignoradas / 2 filtradas. Ambos enumeran 2035. Los dos números no
+son variantes de una misma medición — la corrida de depuración no lleva ningún
+`--skip` y la de release lleva dos, y la fila p95 queda `ignore` en depuración
+y se afirma en release.
 
 El paso de build es `--workspace` y no `-p asv-broker` porque las filas
 verticales invocan el binario `asv`, que es del crate del CLI, y
