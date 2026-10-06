@@ -107,10 +107,14 @@ fn harness() -> Harness {
     // A credential for the pair the operator would have granted. Its presence
     // is what makes the refused cases mean something: there *was* a secret to
     // take, and the broker did not take it.
-    state.credentials.lock().expect("not poisoned").push(CredentialMetadata::new(
-        "pg/app/readonly",
-        CredentialKind::DatabaseCredential,
-    ));
+    state
+        .credentials
+        .lock()
+        .expect("not poisoned")
+        .push(CredentialMetadata::new(
+            "pg/app/readonly",
+            CredentialKind::DatabaseCredential,
+        ));
 
     let mut peer = WorkloadIdentity::from_peer(PeerCredentials {
         pid: std::process::id() as i32,

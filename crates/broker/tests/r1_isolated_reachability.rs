@@ -473,7 +473,11 @@ fn r1_a_lent_credential_does_not_come_back_in_the_response() {
     // The reference a caller sends is the credential's wire id, which is what
     // the vault is keyed by — not its label.
     let credential_ref = credential.id.to_wire();
-    state.credentials.lock().expect("not poisoned").push(credential);
+    state
+        .credentials
+        .lock()
+        .expect("not poisoned")
+        .push(credential);
     let session = open_session(&mut state, &peer);
 
     let response = handle(
@@ -522,7 +526,11 @@ fn r1_the_injected_credential_reaches_the_child() {
     let credential =
         asv_domain::CredentialMetadata::new("fixture", asv_domain::CredentialKind::GenericSecret);
     let credential_ref = credential.id.to_wire();
-    state.credentials.lock().expect("not poisoned").push(credential);
+    state
+        .credentials
+        .lock()
+        .expect("not poisoned")
+        .push(credential);
     let session = open_session(&mut state, &peer);
 
     let response = handle(

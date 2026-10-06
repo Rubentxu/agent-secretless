@@ -154,7 +154,11 @@ fn an_admitted_principal_can_create() {
         Response::CredentialCreated { id, .. } => id,
         other => panic!("admission granted and the write failed: {other:?}"),
     };
-    assert_eq!(b.state.credentials.lock().expect("not poisoned").len(), 1, "the inventory did not follow");
+    assert_eq!(
+        b.state.credentials.lock().expect("not poisoned").len(),
+        1,
+        "the inventory did not follow"
+    );
     assert!(b.file_holds(&id.to_wire()), "the file does not hold it");
 }
 

@@ -171,7 +171,13 @@ impl Fixture {
     }
 
     /// `asv integrations adopt npm ...`, with a plan this fixture wrote.
-    fn adopt(&self, plan: &std::path::Path, audience: &str, label: &str, json: bool) -> (bool, String) {
+    fn adopt(
+        &self,
+        plan: &std::path::Path,
+        audience: &str,
+        label: &str,
+        json: bool,
+    ) -> (bool, String) {
         let mut args = vec![
             "integrations".to_string(),
             "adopt".to_string(),
@@ -247,7 +253,10 @@ fn the_receipt_names_the_binding_and_leaves_the_scrub_outstanding() {
         out.contains("registry.npmjs.org"),
         "the receipt names no audience: {out}"
     );
-    assert!(out.contains("npm-registry"), "the receipt names no credential: {out}");
+    assert!(
+        out.contains("npm-registry"),
+        "the receipt names no credential: {out}"
+    );
     assert!(out.contains("\"read\""), "no read operation named: {out}");
     assert!(
         out.contains("human_approval"),
@@ -300,7 +309,10 @@ fn an_environment_reference_imports_nothing() {
 
     let (ok, out) = fixture.adopt(&plan, "registry.npmjs.org", "npm-registry", true);
     assert!(!ok, "a reference was imported as a credential: {out}");
-    assert!(out.contains("env_reference"), "the reason is not named: {out}");
+    assert!(
+        out.contains("env_reference"),
+        "the reason is not named: {out}"
+    );
 
     let (_, listing) = fixture.asv(&["credentials", "--json"]);
     assert!(
@@ -320,7 +332,10 @@ fn a_selector_for_another_registry_imports_nothing() {
     fixture.plan_to(&plan);
 
     let (ok, out) = fixture.adopt(&plan, "other.example.test", "wrong-registry", true);
-    assert!(!ok, "a selector for one registry was served another's credential: {out}");
+    assert!(
+        !ok,
+        "a selector for one registry was served another's credential: {out}"
+    );
 
     let (_, listing) = fixture.asv(&["credentials", "--json"]);
     assert!(

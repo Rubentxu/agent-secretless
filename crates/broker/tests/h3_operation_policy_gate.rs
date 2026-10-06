@@ -217,7 +217,11 @@ fn harness(kind: CredentialKind) -> Harness {
 
     let metadata = CredentialMetadata::new("h3-gate", kind);
     let credential = metadata.id;
-    state.credentials.lock().expect("not poisoned").push(metadata);
+    state
+        .credentials
+        .lock()
+        .expect("not poisoned")
+        .push(metadata);
 
     Harness {
         state,

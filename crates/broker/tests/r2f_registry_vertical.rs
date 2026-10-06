@@ -48,9 +48,7 @@ use std::sync::Arc;
 use asv_broker::{handle, BrokerState, ConnectorFactory, VaultSecretPort};
 use asv_connector_http::fake_origin::{Observed, OriginResponse, TlsOrigin};
 use asv_connector_http::registry::client::{RegistryClient, RegistryError};
-use asv_connector_http::{
-    AddressPolicy, Certificate, GithubClient, ResolvedAudience, SecretPort,
-};
+use asv_connector_http::{AddressPolicy, Certificate, GithubClient, ResolvedAudience, SecretPort};
 use asv_connector_pg::{PgError, PostgresClient};
 use asv_domain::{AgentSessionId, Authority, CredentialId, SecretBytes};
 use asv_identity::{PeerCredentials, WorkloadIdentity};
@@ -344,8 +342,8 @@ impl Vertical {
         state.registries =
             asv_broker::registry_declaration::load(&declaration_path).expect("valid declarations");
 
-        state.policy =
-            PolicyEngine::from_policy_text(&composed(PULL_ANY)).expect("the fixture policy is valid");
+        state.policy = PolicyEngine::from_policy_text(&composed(PULL_ANY))
+            .expect("the fixture policy is valid");
 
         // The token origin: a realm that grants exactly what it was asked for,
         // which is what a real endpoint does and what leaves the narrowing in
@@ -378,7 +376,8 @@ impl Vertical {
                     .iter()
                     .any(|(name, value)| name == "authorization" && value.starts_with("Bearer "));
                 if !has_bearer {
-                    return OriginResponse::new(401, "").with_header("www-authenticate", &challenge);
+                    return OriginResponse::new(401, "")
+                        .with_header("www-authenticate", &challenge);
                 }
                 // The write is answered before the read branch, and the order is
                 // load-bearing rather than tidy: the upload path
@@ -625,8 +624,7 @@ impl Base64 {
             if chunk.len() == 4 {
                 let mut bits = 0u32;
                 for symbol in &chunk {
-                    bits = (bits << 6)
-                        | Base64::value(*symbol).ok_or(())? as u32;
+                    bits = (bits << 6) | Base64::value(*symbol).ok_or(())? as u32;
                 }
                 out.push((bits >> 16) as u8);
                 out.push((bits >> 8) as u8);
@@ -800,9 +798,7 @@ fn the_manifest_digest_is_computed_and_a_lying_header_is_ignored() {
             let asked = asked_scope(&observed.request_line);
             OriginResponse::json(
                 200,
-                format!(
-                    r#"{{"token":"issued-token-value","expires_in":300,"scope":"{asked}"}}"#
-                ),
+                format!(r#"{{"token":"issued-token-value","expires_in":300,"scope":"{asked}"}}"#),
             )
         }),
     );
@@ -1012,9 +1008,10 @@ fn a_different_spelling_of_the_declared_host_is_the_same_host() {
 
     // The name that went on the wire is the declaration's.
     let last = v.last_request();
-    let host = last.host_header.as_deref().unwrap_or_else(|| {
-        panic!("the registry saw a request: {:?}", last.request_line)
-    });
+    let host = last
+        .host_header
+        .as_deref()
+        .unwrap_or_else(|| panic!("the registry saw a request: {:?}", last.request_line));
     // The host header carries the port, so the name is compared rather than
     // the whole value. The port is the test's and says nothing about which
     // *name* was dialled, which is the whole subject of this row.
@@ -1041,7 +1038,12 @@ fn a_host_ending_with_the_declared_one_is_not_the_declared_one() {
     let surrogate = v.mint();
 
     let code = assert_denial(
-        v.pull_manifest(&surrogate, "evil.localhost.localdomain", REPOSITORY, "latest"),
+        v.pull_manifest(
+            &surrogate,
+            "evil.localhost.localdomain",
+            REPOSITORY,
+            "latest",
+        ),
         "a lookalike host",
     );
     assert_eq!(code, ErrorCode::Denied);
@@ -1388,14 +1390,8 @@ fn a_manifest_and_a_blob_are_advertised_as_two_operations() {
     // the row a tripwire for an unrelated feature: adding push turned it red
     // without either read having been folded onto one name. The push names are
     // pinned by `a_push_is_advertised_as_two_more_operations` below.
-    let reads: Vec<&&String> = registry
-        .iter()
-        .filter(|c| c.ends_with(".read"))
-        .collect();
-    let pushes: Vec<&&String> = registry
-        .iter()
-        .filter(|c| c.ends_with(".push"))
-        .collect();
+    let reads: Vec<&&String> = registry.iter().filter(|c| c.ends_with(".read")).collect();
+    let pushes: Vec<&&String> = registry.iter().filter(|c| c.ends_with(".push")).collect();
     assert_eq!(
         reads.len(),
         2,

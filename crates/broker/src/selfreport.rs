@@ -431,8 +431,7 @@ mod tests {
         }
         for (capability, count) in &seen {
             assert_eq!(
-                *count,
-                1,
+                *count, 1,
                 "{count} requests classify as {capability}; an agent reading the \
                  advertisement cannot tell them apart, and the row that checks the \
                  second one proves nothing"

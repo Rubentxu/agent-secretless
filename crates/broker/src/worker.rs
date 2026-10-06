@@ -466,11 +466,27 @@ pub fn spawn(
         Err(_error) if pre_exec_hook_failed(&mut hook_status_reader) => {
             // The private marker proves the pre-exec hook failed; no
             // guess based on std's generic EINVAL is necessary.
-            audit_worker(audit, name, Some(template), Some(&plan), "error", None, None);
+            audit_worker(
+                audit,
+                name,
+                Some(template),
+                Some(&plan),
+                "error",
+                None,
+                None,
+            );
             return Err(SpawnError::IsolationUnavailable);
         }
         Err(e) => {
-            audit_worker(audit, name, Some(template), Some(&plan), "error", None, None);
+            audit_worker(
+                audit,
+                name,
+                Some(template),
+                Some(&plan),
+                "error",
+                None,
+                None,
+            );
             return Err(e.into());
         }
     };
@@ -503,7 +519,6 @@ pub fn spawn(
         WaitResult::TimedOut => (RunOutcome::TimedOut, None, true),
     };
 
-
     let read_pipe = |reader: Option<std::thread::JoinHandle<std::io::Result<Captured>>>| {
         reader
             .map(|handle| {
@@ -516,20 +531,44 @@ pub fn spawn(
     let stdout = match read_pipe(stdout_reader) {
         Ok(captured) => captured,
         Err(error) => {
-            audit_worker(audit, name, Some(template), Some(&plan), "error", exit_code, None);
+            audit_worker(
+                audit,
+                name,
+                Some(template),
+                Some(&plan),
+                "error",
+                exit_code,
+                None,
+            );
             return Err(error.into());
         }
     };
     let stderr = match read_pipe(stderr_reader) {
         Ok(captured) => captured,
         Err(error) => {
-            audit_worker(audit, name, Some(template), Some(&plan), "error", exit_code, None);
+            audit_worker(
+                audit,
+                name,
+                Some(template),
+                Some(&plan),
+                "error",
+                exit_code,
+                None,
+            );
             return Err(error.into());
         }
     };
 
     if timed_out {
-        audit_worker(audit, name, Some(template), Some(&plan), "timeout", None, None);
+        audit_worker(
+            audit,
+            name,
+            Some(template),
+            Some(&plan),
+            "timeout",
+            None,
+            None,
+        );
         return Err(SpawnError::Timeout(timeout));
     }
 
@@ -538,8 +577,7 @@ pub fn spawn(
     // is not a second memory defence -- the per-stream caps did that, and they
     // already ran. It decides how the run is *reported*.
     let total = stdout.total + stderr.total;
-    let limit_hit =
-        stdout.truncated || stderr.truncated || total > limits.max_total_bytes as u64;
+    let limit_hit = stdout.truncated || stderr.truncated || total > limits.max_total_bytes as u64;
     let mut outcome = outcome;
     if limit_hit {
         // The worker failed at nothing. It succeeded and said more than the
@@ -1010,7 +1048,10 @@ mod tests {
             RunOutcome::OutputLimitExceeded,
             "an unbounded producer must be named as one, not as ok, failed or timed out"
         );
-        assert!(run.limit_hit, "the bound was hit but the run did not say so");
+        assert!(
+            run.limit_hit,
+            "the bound was hit but the run did not say so"
+        );
         assert!(
             run.duration < Duration::from_secs(10),
             "the run took {:?}, which is the clock stopping the worker rather than \

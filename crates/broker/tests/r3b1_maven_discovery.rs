@@ -134,7 +134,11 @@ fn an_operator_types_the_command_and_gets_a_report_with_no_credential_in_it() {
     let account = Account::with_settings();
 
     for rendering in [&["--json"][..], &[].as_slice()] {
-        let label = if rendering.is_empty() { "prose" } else { "json" };
+        let label = if rendering.is_empty() {
+            "prose"
+        } else {
+            "json"
+        };
         let (stdout, stderr, ok) = account.discover(rendering);
         assert!(ok, "{label}: the command failed: {stderr}");
         assert!(!stdout.is_empty(), "{label}: the command printed nothing");
@@ -144,7 +148,10 @@ fn an_operator_types_the_command_and_gets_a_report_with_no_credential_in_it() {
         // contract and prose is for a person, and an earlier version of this
         // row asserted it in both — which asked the prose renderer to print a
         // schema string at nobody in particular.
-        assert!(stdout.contains("maven"), "{label}: the family is missing: {stdout}");
+        assert!(
+            stdout.contains("maven"),
+            "{label}: the family is missing: {stdout}"
+        );
         if label == "json" {
             assert!(
                 stdout.contains("asv.discovery/v1"),

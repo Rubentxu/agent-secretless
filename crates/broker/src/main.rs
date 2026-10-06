@@ -691,7 +691,10 @@ fn main() -> std::io::Result<()> {
                 state.registries = declarations;
             }
             Err(error) => {
-                eprintln!("asv: --registries {} cannot be used: {error}", path.display());
+                eprintln!(
+                    "asv: --registries {} cannot be used: {error}",
+                    path.display()
+                );
                 std::process::exit(1);
             }
         }

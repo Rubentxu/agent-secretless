@@ -273,8 +273,18 @@ mod tests {
         );
         assert_eq!(state.credentials.lock().expect("not poisoned").len(), 2);
         // The two ids survive as the same handles the vault named them by.
-        assert!(state.credentials.lock().expect("not poisoned").iter().any(|c| c.id.to_wire() == UUID_A));
-        assert!(state.credentials.lock().expect("not poisoned").iter().any(|c| c.id.to_wire() == UUID_B));
+        assert!(state
+            .credentials
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .any(|c| c.id.to_wire() == UUID_A));
+        assert!(state
+            .credentials
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .any(|c| c.id.to_wire() == UUID_B));
     }
 
     /// The M6 naming convention is not a `CredentialId`, so it is left out and

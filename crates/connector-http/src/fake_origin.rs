@@ -171,10 +171,7 @@ impl OriginResponse {
     pub fn chunked(status: u16, body: impl Into<Vec<u8>>) -> Self {
         Self {
             status,
-            headers: vec![(
-                "transfer-encoding".to_string(),
-                "chunked".to_string(),
-            )],
+            headers: vec![("transfer-encoding".to_string(), "chunked".to_string())],
             body: body.into(),
             chunked: true,
         }
@@ -609,8 +606,11 @@ fn render(response: &OriginResponse) -> Vec<u8> {
         // directly. One chunk for the whole body rather than several: the
         // property under test is that the *reader* stops, and splitting the body
         // into many chunks would make a slow fixture for no extra coverage.
-        let mut wire = format!("HTTP/1.1 {}\r\n{extra}connection: close\r\n\r\n", status_line(response.status))
-            .into_bytes();
+        let mut wire = format!(
+            "HTTP/1.1 {}\r\n{extra}connection: close\r\n\r\n",
+            status_line(response.status)
+        )
+        .into_bytes();
         wire.extend_from_slice(format!("{:x}\r\n", response.body.len()).as_bytes());
         wire.extend_from_slice(&response.body);
         wire.extend_from_slice(b"\r\n0\r\n\r\n");

@@ -603,8 +603,7 @@ fn server_from(node: roxmltree::Node<'_, '_>) -> MavenServer {
         undescribed: node
             .children()
             .filter(|child| {
-                child.is_element()
-                    && !MODELLED_SERVER_CHILDREN.contains(&child.tag_name().name())
+                child.is_element() && !MODELLED_SERVER_CHILDREN.contains(&child.tag_name().name())
             })
             .map(|child| UndescribedSetting {
                 element: child.tag_name().name().to_string(),
@@ -687,10 +686,7 @@ fn children<'a, 'i, 'name>(
 /// descendant text is concatenated instead. An element that had no text
 /// because of *how* it was written is not the same as one with no text at all,
 /// and a report that cannot tell them apart is guessing.
-fn child_text<'a, 'i>(
-    parent: roxmltree::Node<'a, 'i>,
-    name: &str,
-) -> Option<String> {
+fn child_text<'a, 'i>(parent: roxmltree::Node<'a, 'i>, name: &str) -> Option<String> {
     let node = children(parent, name).next()?;
     let text: String = node
         .descendants()

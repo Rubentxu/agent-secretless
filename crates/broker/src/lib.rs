@@ -589,8 +589,10 @@ pub trait ConnectorFactory {
         audience: Authority,
         credential: CredentialId,
         secrets: Arc<dyn SecretPort>,
-    ) -> Result<asv_connector_http::registry::client::RegistryClient, asv_connector_http::registry::client::RegistryError>
-    {
+    ) -> Result<
+        asv_connector_http::registry::client::RegistryClient,
+        asv_connector_http::registry::client::RegistryError,
+    > {
         let _ = (audience, credential, secrets);
         Err(asv_connector_http::registry::client::RegistryError::NoRegistryConnector)
     }
@@ -1065,7 +1067,10 @@ impl std::fmt::Debug for BrokerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BrokerState")
             .field("sessions", &self.sessions)
-            .field("credentials", &self.credentials.lock().ok().map(|r| r.len()))
+            .field(
+                "credentials",
+                &self.credentials.lock().ok().map(|r| r.len()),
+            )
             .field("surrogates", &self.surrogates.lock().ok().map(|r| r.len()))
             .field("vault_open", &self.secrets.is_some())
             .field("postgres_open", &self.postgres.len())
@@ -1201,7 +1206,10 @@ fn mint_session_surrogates(
         // is not.
         let (class, label) = match state.credentials() {
             Ok(inventory) => match inventory.iter().find(|c| c.id == credential) {
-                Some(metadata) => (CredentialClass::from_kind(metadata.kind), metadata.label.clone()),
+                Some(metadata) => (
+                    CredentialClass::from_kind(metadata.kind),
+                    metadata.label.clone(),
+                ),
                 None => {
                     tracing::warn!(
                         destination = %route.endpoint(),
@@ -2429,10 +2437,12 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                     }
                 }
             };
-            match grant
-                .client
-                .put_manifest(&grant.audience, &grant.repository, &reference, &manifest)
-            {
+            match grant.client.put_manifest(
+                &grant.audience,
+                &grant.repository,
+                &reference,
+                &manifest,
+            ) {
                 Ok(()) => {
                     // Content-addressed here for the same reason the pull arm
                     // does it: an agent that pushed by tag needs to learn what
@@ -3107,17 +3117,12 @@ impl BrokerState {
                 message: format!("the registry is not a bare host: {error}"),
             })
         })?;
-        let declaration = self
-            .registries
-            .credential_for(&requested)
-            .ok_or_else(|| {
-                Box::new(Response::Error {
-                    code: ErrorCode::Denied,
-                    message: format!(
-                        "this deployment does not declare the registry {requested}"
-                    ),
-                })
-            })?;
+        let declaration = self.registries.credential_for(&requested).ok_or_else(|| {
+            Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: format!("this deployment does not declare the registry {requested}"),
+            })
+        })?;
         // The policy sees the DECLARED authority and the request's repository.
         // One half of the resource is the operator's and the other is the
         // agent's, and the resource type exists precisely because both halves
@@ -3182,15 +3187,12 @@ impl BrokerState {
         // poison case is spelled out instead of routing a lock failure through
         // a macro that would refuse to compile here.
         let credential = match self.surrogates() {
-            Ok(mut guard) => match guard.redeem_for(
-                surrogate,
-                session,
-                OperationFamily::Registry,
-                now_secs(),
-            ) {
-                Ok(credential) => credential,
-                Err(error) => return Err(surrogate_failure(error)),
-            },
+            Ok(mut guard) => {
+                match guard.redeem_for(surrogate, session, OperationFamily::Registry, now_secs()) {
+                    Ok(credential) => credential,
+                    Err(error) => return Err(surrogate_failure(error)),
+                }
+            }
             Err(poisoned) => return Err(Response::from(poisoned)),
         };
         if credential != declaration.credential {
@@ -3942,8 +3944,6 @@ pub(crate) struct RegistryGrant {
     pub(crate) audience: asv_connector_http::transport::ResolvedAudience,
 }
 
-
-
 fn surrogate_failure(error: SurrogateError) -> Response {
     use SurrogateError::*;
     let code = match error {
@@ -4077,7 +4077,11 @@ pub fn register_inventory_credential(
     metadata: CredentialMetadata,
 ) -> asv_domain::CredentialId {
     let id = metadata.id;
-    state.credentials.lock().expect("credential inventory is not poisoned").push(metadata);
+    state
+        .credentials
+        .lock()
+        .expect("credential inventory is not poisoned")
+        .push(metadata);
     id
 }
 
@@ -5337,7 +5341,12 @@ mod tests {
         // The refusal did not touch the store: the credential is still there,
         // so a denied delete cannot be mistaken for a revocation.
         assert!(
-            state.credentials.lock().expect("credential inventory is not poisoned").iter().any(|c| c.id == known),
+            state
+                .credentials
+                .lock()
+                .expect("credential inventory is not poisoned")
+                .iter()
+                .any(|c| c.id == known),
             "a refused deletion must leave the credential in place"
         );
 
@@ -5463,7 +5472,12 @@ mod tests {
         state.control_plane = enrolment_of_this_binary();
 
         assert!(
-            state.credentials.lock().expect("credential inventory is not poisoned").iter().any(|c| c.id == id),
+            state
+                .credentials
+                .lock()
+                .expect("credential inventory is not poisoned")
+                .iter()
+                .any(|c| c.id == id),
             "the fixture must actually have loaded the credential it claims to hold"
         );
         (dir, path, state, id)
@@ -5520,7 +5534,12 @@ mod tests {
         handle(&mut state, &peer, Request::DeleteCredential { id });
 
         assert!(
-            !state.credentials.lock().expect("credential inventory is not poisoned").iter().any(|c| c.id == id),
+            !state
+                .credentials
+                .lock()
+                .expect("credential inventory is not poisoned")
+                .iter()
+                .any(|c| c.id == id),
             "the mirror still advertises a deleted credential"
         );
         match handle(&mut state, &peer, Request::ListCredentialMetadata) {
@@ -5570,7 +5589,12 @@ mod tests {
         }
 
         assert!(
-            state.credentials.lock().expect("credential inventory is not poisoned").iter().any(|c| c.id == ghost),
+            state
+                .credentials
+                .lock()
+                .expect("credential inventory is not poisoned")
+                .iter()
+                .any(|c| c.id == ghost),
             "a write that never happened must not change the mirror"
         );
         assert_eq!(
@@ -5671,7 +5695,12 @@ mod tests {
         }
         // And the real credential is untouched by the failed attempt.
         assert!(
-            state.credentials.lock().expect("credential inventory is not poisoned").iter().any(|c| c.id == id),
+            state
+                .credentials
+                .lock()
+                .expect("credential inventory is not poisoned")
+                .iter()
+                .any(|c| c.id == id),
             "a refused delete must not remove anything"
         );
     }
@@ -5769,7 +5798,12 @@ mod tests {
             messages[0]
         );
         assert!(
-            state.credentials.lock().expect("credential inventory is not poisoned").iter().any(|c| c.id == id),
+            state
+                .credentials
+                .lock()
+                .expect("credential inventory is not poisoned")
+                .iter()
+                .any(|c| c.id == id),
             "a refused deletion must leave the credential in place"
         );
     }

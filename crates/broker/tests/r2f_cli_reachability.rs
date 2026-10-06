@@ -38,8 +38,8 @@
 //! refusal, because a row that only says "the CLI got as far as the broker" is
 //! satisfied by a CLI that sends nothing at all.
 
-use std::path::{Path, PathBuf};
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -416,8 +416,8 @@ fn a_deployment_with_no_declaration_file_declares_nothing() {
     let dir = scratch("undeclared");
     let (vault, passphrase) = vault_with_two_credentials(&dir.0);
 
-    let (_broker, sock) =
-        start_broker(&dir.0, &vault, &passphrase, None).expect("the broker starts without the flag");
+    let (_broker, sock) = start_broker(&dir.0, &vault, &passphrase, None)
+        .expect("the broker starts without the flag");
 
     let (ok, _, stderr) = registry(&sock, &declared_pull(CRED, DECLARED));
     assert!(!ok, "an undeclared registry must be refused: {stderr}");
@@ -503,8 +503,8 @@ fn the_verb_reaches_the_broker_and_is_answered_by_it() {
         &dir.0,
         &format!(r#"[{{"registry":"{DECLARED}","credential":"{CRED}"}}]"#),
     );
-    let (_broker, sock) = start_broker(&dir.0, &vault, &passphrase, Some(&declarations))
-        .expect("the broker starts");
+    let (_broker, sock) =
+        start_broker(&dir.0, &vault, &passphrase, Some(&declarations)).expect("the broker starts");
 
     let (ok, _, stderr) = registry(&sock, &declared_pull(CRED, UNDECLARED));
     assert!(!ok, "an undeclared host must be refused: {stderr}");
@@ -555,17 +555,16 @@ fn a_surrogate_for_a_credential_no_registry_serves_is_refused() {
     .expect("the broker starts");
 
     let (ok, _, stderr) = registry(&sock, &declared_pull(OTHER_CRED, DECLARED));
-    assert!(!ok, "a surrogate for another credential must be refused: {stderr}");
+    assert!(
+        !ok,
+        "a surrogate for another credential must be refused: {stderr}"
+    );
     assert!(
         stderr.contains(CRED) && stderr.contains(OTHER_CRED),
         "the refusal must name both credentials, or it is not the equality \
          refusing: {stderr}"
     );
-    assert_refused(
-        "a surrogate for another credential",
-        "stands for",
-        &stderr,
-    );
+    assert_refused("a surrogate for another credential", "stands for", &stderr);
 }
 
 /// A malformed `--credential` is refused by the CLI, before a socket.
@@ -586,8 +585,8 @@ fn a_malformed_credential_is_refused_by_the_cli_itself() {
         &dir.0,
         &format!(r#"[{{"registry":"{DECLARED}","credential":"{CRED}"}}]"#),
     );
-    let (_broker, sock) = start_broker(&dir.0, &vault, &passphrase, Some(&declarations))
-        .expect("the broker starts");
+    let (_broker, sock) =
+        start_broker(&dir.0, &vault, &passphrase, Some(&declarations)).expect("the broker starts");
 
     let (ok, _, stderr) = registry(&sock, &declared_pull("not-a-vault-id", DECLARED));
     assert!(
@@ -625,8 +624,8 @@ fn the_blob_verb_reaches_the_same_declaration_check() {
         &dir.0,
         &format!(r#"[{{"registry":"{DECLARED}","credential":"{CRED}"}}]"#),
     );
-    let (_broker, sock) = start_broker(&dir.0, &vault, &passphrase, Some(&declarations))
-        .expect("the broker starts");
+    let (_broker, sock) =
+        start_broker(&dir.0, &vault, &passphrase, Some(&declarations)).expect("the broker starts");
 
     let (ok, _, stderr) = registry(
         &sock,
@@ -643,12 +642,11 @@ fn the_blob_verb_reaches_the_same_declaration_check() {
             "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         ],
     );
-    assert!(!ok, "an undeclared host must be refused on the blob verb too");
-    assert_refused(
-        "the blob verb",
-        "does not declare the registry",
-        &stderr,
+    assert!(
+        !ok,
+        "an undeclared host must be refused on the blob verb too"
     );
+    assert_refused("the blob verb", "does not declare the registry", &stderr);
 }
 
 /// Nothing this CLI prints carries the credential.
@@ -667,8 +665,8 @@ fn no_path_prints_the_credential() {
         &dir.0,
         &format!(r#"[{{"registry":"{DECLARED}","credential":"{CRED}"}}]"#),
     );
-    let (_broker, sock) = start_broker(&dir.0, &vault, &passphrase, Some(&declarations))
-        .expect("the broker starts");
+    let (_broker, sock) =
+        start_broker(&dir.0, &vault, &passphrase, Some(&declarations)).expect("the broker starts");
 
     let mut seen: Vec<String> = Vec::new();
 

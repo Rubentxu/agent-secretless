@@ -383,7 +383,9 @@ fn state_loss_does_not_resurrect_a_session_or_surrogate() {
     // authority to redeem anything, and that is the closest thing to a real
     // restart this suite can build.
     let mut restarted = BrokerState {
-        credentials: std::sync::Arc::new(std::sync::Mutex::new(first.credentials.lock().expect("not poisoned").clone())),
+        credentials: std::sync::Arc::new(std::sync::Mutex::new(
+            first.credentials.lock().expect("not poisoned").clone(),
+        )),
         ..BrokerState::default()
     };
 

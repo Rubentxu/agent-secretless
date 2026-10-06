@@ -116,7 +116,10 @@ fn the_serialised_report_contains_no_credential() {
         assert_eq!(discovery.files[0].proxies[0].password_len, Some(14));
     }
     let json = serde_json::to_string(&discovery.into_discovery()).expect("serialises");
-    assert!(!json.contains(PASSWORD), "the password reached the report: {json}");
+    assert!(
+        !json.contains(PASSWORD),
+        "the password reached the report: {json}"
+    );
     assert!(
         !json.contains("proxy-password"),
         "the proxy password reached the report: {json}"
@@ -131,7 +134,10 @@ fn the_serialised_report_contains_no_credential() {
 #[test]
 fn the_debug_rendering_contains_no_credential_either() {
     let rendered = format!("{:?}", report(&settings()));
-    assert!(!rendered.contains(PASSWORD), "the password reached Debug: {rendered}");
+    assert!(
+        !rendered.contains(PASSWORD),
+        "the password reached Debug: {rendered}"
+    );
     assert!(
         !rendered.contains("proxy-password"),
         "the proxy password reached Debug: {rendered}"
@@ -393,10 +399,7 @@ fn markup_inside_a_comment_or_cdata_does_not_count_towards_the_depth() {
 /// *Red by:* skipping a tag with a plain `position(|b| b == b'>')`.
 #[test]
 fn a_gt_inside_an_attribute_value_does_not_end_the_tag() {
-    let text = format!(
-        "<settings>{}</settings>",
-        r#"<a b="q></a>">"#.repeat(70)
-    );
+    let text = format!("<settings>{}</settings>", r#"<a b="q></a>">"#.repeat(70));
     // 70 real levels: over `MAX_DEPTH`. Were the scanner naive, this document
     // would measure as flat and parse — and the row fails on the missing
     // refusal.
@@ -522,7 +525,8 @@ fn an_id_is_reported_verbatim_because_a_pom_refers_to_it() {
 /// *Red by:* `.and_then(|v| v.parse().ok()).unwrap_or(0)`.
 #[test]
 fn a_port_that_is_not_a_port_is_absent_rather_than_zero() {
-    let text = "<settings><proxies><proxy><id>p</id><port>70000</port></proxy></proxies></settings>";
+    let text =
+        "<settings><proxies><proxy><id>p</id><port>70000</port></proxy></proxies></settings>";
     let parsed = parse_settings(text).expect("parses");
     assert_eq!(parsed.proxies[0].port, None);
     assert_eq!(parsed.proxies[0].host, None);
@@ -655,9 +659,7 @@ fn a_refusal_message_carries_no_value() {
     // opened, so the parser stops at a point well after the text it must not
     // repeat. A well-formed document would have produced no refusal at all,
     // which is a different row entirely.
-    let text = format!(
-        "<settings><servers><server><id>{PASSWORD}</id></servers></settings>"
-    );
+    let text = format!("<settings><servers><server><id>{PASSWORD}</id></servers></settings>");
     let error = parse_settings(&text).expect_err("this document is malformed");
     for rendered in [error.to_string(), format!("{error:?}")] {
         assert!(
@@ -713,7 +715,10 @@ fn the_maven_report_reaches_the_envelope_the_cli_prints() {
     assert_eq!(discovery.family, "maven");
     assert_eq!(discovery.schema, crate::DISCOVERY_SCHEMA);
     let json = serde_json::to_string(&discovery).expect("serialises");
-    assert!(json.contains(r#""maven""#), "the family has no envelope variant: {json}");
+    assert!(
+        json.contains(r#""maven""#),
+        "the family has no envelope variant: {json}"
+    );
 
     // And it round-trips, because a report an agent cannot hand back to the
     // next command is half a contract. `plan` reads a report back for `adopt`.
@@ -751,14 +756,14 @@ fn a_world_writable_settings_file_is_refused_and_reported_as_a_finding() {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).expect("chmods");
 
-    let report = Maven.discover(
-        &FingerprintPolicy::strict(),
-        home.path(),
-        home.path(),
-    )
-    .expect("discovery succeeds; the refusal is a finding, not a failure");
+    let report = Maven
+        .discover(&FingerprintPolicy::strict(), home.path(), home.path())
+        .expect("discovery succeeds; the refusal is a finding, not a failure");
 
-    assert!(report.files.is_empty(), "a refused file was described: {report:?}");
+    assert!(
+        report.files.is_empty(),
+        "a refused file was described: {report:?}"
+    );
     assert_eq!(report.findings.len(), 1, "{report:?}");
     assert_eq!(report.findings[0].severity, crate::Severity::Refused);
     assert!(
@@ -806,7 +811,9 @@ fn the_only_candidate_is_the_user_settings_file() {
     assert_eq!(candidates.len(), 1);
     assert_eq!(
         candidates[0].path,
-        std::path::Path::new("/home/u").join(".m2").join("settings.xml")
+        std::path::Path::new("/home/u")
+            .join(".m2")
+            .join("settings.xml")
     );
     assert_eq!(candidates[0].origin, crate::Origin::User);
 }
