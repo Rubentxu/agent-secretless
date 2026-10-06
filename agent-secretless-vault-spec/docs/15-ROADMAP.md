@@ -4906,3 +4906,76 @@ only falsify a mutation when the fixture gets there.
   realistic two-token CI setup produces no binding at all. The broker reports a
   credential's kind and not its audience over IPC, and closing that gap is a
   protocol change rather than a plan change.
+
+### R4.B.3 — the branch where the operation runs, and a guard that measured nothing
+
+R4.B.2 closed with a sentence that was true and unfinished: *"What these rows do
+not assert is the outcome … a row that insisted on the outcome would be asserting
+the policy rather than the plan."* That was the right call for a block about
+reaching the vault, and it left R4's central property observed on one branch
+only. A receipt that names a credential on the **denied** path is worth having.
+One that names one on the **permitted** path is what an operator acts on, and
+nothing in this repository had ever watched it happen.
+
+The lever already existed: `--policy`, which the broker has had since M3 and
+which nothing in the verticals had used. With a policy the operator wrote, curl
+reaches authorization — `http_request` applies to `Host`, and the two-entry
+`ALLOWED_AUDIENCES` list gates `Api` and only `Api`, so a rule naming `Host` is
+reachable where the same rule naming `Api` would never be evaluated at all.
+
+**npm cannot be permitted by any policy, and that is not a missing policy.**
+`action_for("npm")` is `Action::RegistryPush` and `resource_for("npm")` is
+`Resource::Api`, while the Cedar schema applies `registry_push` to `Registry`.
+The pair this build asks for has no rule that can match it in either direction.
+Three policies are written to try, in every pairing the schema allows, and the
+row reports which one the broker refused at load and which reached the engine —
+because "no policy can permit npm" is true for three different reasons and only
+one of them is the interesting one.
+
+**The finding that was not in the plan.** The falsification campaign produced a
+survivor that was not a weak row:
+
+> rewriting `decide` to refuse every permitted execution left
+> `a_permitted_execution_names_the_credential_it_would_spend` **green**
+
+The row was fine. The program it measured was not. `crates/broker` did not depend
+on `asv-cli`, so `cargo test -p asv-broker` ran whatever `asv` was sitting in the
+target directory — possibly the one built for an earlier commit. The staleness
+guard in `binary.rs` existed to catch exactly that and watched
+`crates/cli/src`, while `asv` spends most of its time in `asv-integrations`.
+
+**Every vertical in this repository that spawns the `asv` binary was, until
+this block, one `cargo build --workspace` away from measuring the wrong
+program.** Whether any of them did is not recoverable. Both halves are fixed:
+`asv-cli` is a dev-dependency of the broker, so a content change rebuilds the
+client as part of building the tests; and the guard watches every crate the
+client is built from and names which one is stale. A membership row sits beside
+it, because a guard that watches a set nothing probes stays green while the set
+shrinks.
+
+### A receipt that credited the wrong file
+
+`PolicyEngine::result` wrote the literal `m3-default-policy` into every
+`ExplainResult` it produced, whatever the text came from. A broker started with
+`--policy` therefore reported *"allow by m3-default-policy"* for a decision the
+operator's own file had made — pointing at the wrong file in the one artefact
+whose purpose is to say who decided what. The engine carries the name it was
+built with, and the broker names it after the path it read.
+
+**Still not done, and named rather than left for an operator to discover:**
+
+- **npm has no path to `EXECUTED` at all.** `RegistryPush` over `Api` is not a
+  pairing Cedar can express. The repair is a resource-model decision — an npm
+  publication is not an OCI repository, and `Resource::Registry` carries OCI
+  semantics (`library/alpine`) that a package name does not fit — so it is a
+  block of its own rather than a line changed here. It needs either a
+  `PackageRegistry` type whose authority comes from operator configuration the
+  way `OAuth2Client`'s does, or an admission that npm cannot be published
+  through `execute` at all.
+- **The curl resource is still a placeholder.** `Resource::Host` carries
+  `"(named per invocation: a .curlrc names no host)"`, so a policy can permit it
+  and the permission compares against a string constant. The row above proves
+  the wiring, not that an operator is choosing a host.
+- No vertical has watched a **real** target being reached with a substituted
+  credential; every `execute` row stops at the receipt.
+- `plan` and `adopt` still do not exist for Maven or Gradle.
