@@ -30,7 +30,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 LIB = ROOT / "crates/broker/src/lib.rs"
 BRIDGE = ROOT / "crates/broker/src/tls_bridge.rs"
-SOURCES = (LIB, BRIDGE)
+# The nonce derivation and the wire parser moved here. The broker's own tests
+# still hold the properties -- they run through `asv_ssh_agent::proof_nonce` and
+# `SessionProof::decode` -- so the mutations move with the code rather than
+# being retired.
+PROOF = ROOT / "crates/ssh-agent/src/proof.rs"
+SOURCES = (LIB, BRIDGE, PROOF)
 
 COMPILE_ERROR = r"^(error\[E\d+\]:|error: could not compile)"
 
@@ -62,7 +67,11 @@ MUTATIONS = [
         name="the-counter-is-not-in-the-nonce",
         edits=[
             (
-                BRIDGE,
+                PROOF,
+                # **Re-anchored.** The broker's `proof_nonce` is now a
+                # delegation; the hash that commits to the counter is built in
+                # `asv_ssh_agent::proof_nonce`. The row that holds this property
+                # is still the broker's, and still reaches it.
                 "    hasher.update(counter.to_be_bytes());",
                 "    // MUTANT: the counter never reaches the hash\n    let _ = counter;",
             )
@@ -193,9 +202,11 @@ MUTATIONS = [
         name="a-missing-counter-is-defaulted-to-zero",
         edits=[
             (
-                BRIDGE,
-                "    let counter: u64 = counter_text.parse().ok()?;",
-                "    // MUTANT: a counter that will not parse becomes zero\n    let counter: u64 = counter_text.parse().unwrap_or(0);",
+                PROOF,
+                # **Re-anchored.** `SessionProof::decode` is where the wire
+                # segments are parsed now; `parse_session_proof` reaches it.
+                "        let counter: u64 = parts.next()?.parse().ok()?;",
+                "        // MUTANT: a counter that will not parse becomes zero\n        let counter: u64 = parts.next()?.parse().unwrap_or(0);",
             )
         ],
         expect_red="a_counter_that_is_not_a_number_is_refused_rather_than_coerced",
@@ -210,24 +221,25 @@ MUTATIONS = [
         name="the-two-segment-legacy-header-is-accepted",
         edits=[
             (
-                BRIDGE,
-                """    let mut parts = raw.split('.');
-    let key = base64_decode(parts.next()?)?;
-    let counter_text = parts.next()?;""",
-                """    // MUTANT: the pre-counter wire format is read as counter 0
-    let mut parts = raw.split('.');
-    let key = base64_decode(parts.next()?)?;
-    let counter_text = match parts.clone().next() {
-        Some(part) if !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) => part,
-        _ => "0",
-    };
-    if parts.clone().next().is_none() {
-        let signature = base64_decode(parts.next()?)?;
-        if key.is_empty() || signature.is_empty() {
-            return None;
-        }
-        return Some(SessionProof { key, signature, counter: 0 });
-    }""",
+                PROOF,
+                # **Re-anchored, and the shape changed with the parser.** The
+                # broker used to read the segments out of a header line into
+                # `counter_text`; `SessionProof::decode` now splits the value
+                # itself and takes the counter as its second segment. Same
+                # defect -- a proof that stops after the key is read as counter
+                # 0 -- and the previous replacement was written against a parser
+                # that no longer exists, so it could not have been applied to the
+                # code that replaced it.
+                """        let mut parts = value.split('.');
+        let key = base64_decode(parts.next()?)?;
+        let counter: u64 = parts.next()?.parse().ok()?;""",
+                """        let mut parts = value.split('.');
+        let key = base64_decode(parts.next()?)?;
+        // MUTANT: the pre-counter wire format is read as counter 0
+        let counter: u64 = match parts.clone().next() {
+            Some(text) => text.parse().unwrap_or(0),
+            None => 0,
+        };""",
             )
         ],
         expect_red="a_proof_without_a_counter_is_refused_rather_than_defaulted",
