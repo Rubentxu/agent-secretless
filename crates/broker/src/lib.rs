@@ -816,7 +816,16 @@ pub struct BrokerState {
     /// `SessionStore::new()`, which compiled, bound, served and refused
     /// everything — a proxy that looks alive and can never establish a tunnel.
     pub sessions: Arc<Mutex<SessionStore>>,
-    pub credentials: Vec<CredentialMetadata>,
+    /// The broker's inventory of credentials, behind its own lock.
+    ///
+    /// Domain-scoped for the same reason `surrogates` is, and for a different
+    /// reason than `surrogates` had: `surrogates` was locked because two paths
+    /// mint against one registry. This one was locked because the accept loop
+    /// stopped being the only reader. `serve` used to be called once per
+    /// connection from a single thread holding `&mut BrokerState`, so `&mut`
+    /// was the borrow checker standing in for a concurrency design. Giving the
+    /// vector its own lock is what lets every other field be shared as `&`.
+    pub credentials: Arc<Mutex<Vec<CredentialMetadata>>>,
     pub policy: PolicyEngine,
     /// M4: the tokens an agent holds instead of credentials (D3).
     ///
@@ -857,7 +866,7 @@ pub struct BrokerState {
     pub registries: crate::registry_declaration::RegistryDeclarations,
     /// M4 CU-2.2: how to reach GitHub. Injected so a test can point the very
     /// same authorisation path at a local origin.
-    pub connectors: Box<dyn ConnectorFactory>,
+    pub connectors: Box<dyn ConnectorFactory + Send + Sync>,
     /// M6: the live PostgreSQL sessions the broker holds open.
     ///
     /// Separate from `sessions`, which records *agent* sessions and outlives
@@ -990,7 +999,7 @@ impl Default for BrokerState {
     fn default() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(SessionStore::default())),
-            credentials: Vec::new(),
+            credentials: Arc::new(Mutex::new(Vec::new())),
             policy: PolicyEngine::default(),
             surrogates: Arc::new(Mutex::new(SurrogateRegistry::default())),
             // Fail-closed by construction: the only way a semantic operation
@@ -1031,6 +1040,21 @@ impl Default for BrokerState {
     }
 }
 
+/// `BrokerState` must be shareable across threads, and the compiler is the one
+/// that has to say so.
+///
+/// This used to be a `&mut` borrowed by a single accept loop, so nothing in the
+/// type system ever asked whether two connections could be in flight at once.
+/// The property was enforced by having exactly one thread, which is a property
+/// of `main.rs` rather than of the state — and the kind that a reader cannot
+/// check from the type. Every field now carries its own synchronisation and
+/// this assertion is what keeps it that way: the first field that loses its
+/// `Sync` turns into a build error here rather than a data race at runtime.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<BrokerState>();
+};
+
 impl std::fmt::Debug for BrokerState {
     /// Hand-written because the two `dyn` fields are not `Debug`, and deriving
     /// would either fail or force `Debug` onto the traits for no gain.
@@ -1041,7 +1065,7 @@ impl std::fmt::Debug for BrokerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BrokerState")
             .field("sessions", &self.sessions)
-            .field("credentials", &self.credentials.len())
+            .field("credentials", &self.credentials.lock().ok().map(|r| r.len()))
             .field("surrogates", &self.surrogates.lock().ok().map(|r| r.len()))
             .field("vault_open", &self.secrets.is_some())
             .field("postgres_open", &self.postgres.len())
@@ -1059,6 +1083,16 @@ impl std::fmt::Debug for BrokerState {
 macro_rules! surrogates {
     ($state:expr) => {
         match $state.surrogates() {
+            Ok(guard) => guard,
+            Err(poisoned) => return Response::from(poisoned),
+        }
+    };
+}
+
+/// The credential inventory, under the same discipline as the registry.
+macro_rules! credentials {
+    ($state:expr) => {
+        match $state.credentials() {
             Ok(guard) => guard,
             Err(poisoned) => return Response::from(poisoned),
         }
@@ -1118,7 +1152,7 @@ macro_rules! sessions {
 /// destinations. Two surrogates for one credential would be two budget counters
 /// for one secret, which is the confusion the counter was meant to remove.
 fn mint_session_surrogates(
-    state: &mut BrokerState,
+    state: &BrokerState,
     session: AgentSessionId,
     peer: &WorkloadIdentity,
 ) -> Vec<asv_ipc_protocol::SessionSurrogate> {
@@ -1160,15 +1194,29 @@ fn mint_session_surrogates(
             continue;
         }
 
-        let Some(metadata) = state.credentials.iter().find(|c| c.id == credential) else {
-            tracing::warn!(
-                destination = %route.endpoint(),
-                "route names a credential this broker has not loaded; no surrogate minted"
-            );
-            continue;
+        // Read the one field needed and drop the guard immediately. Holding
+        // the inventory lock across `authorize_surrogate_mint` would mean two
+        // mutexes live for the whole of one loop iteration, and a lock order
+        // that happens to be right today is a deadlock waiting for the day it
+        // is not.
+        let (class, label) = match state.credentials() {
+            Ok(inventory) => match inventory.iter().find(|c| c.id == credential) {
+                Some(metadata) => (CredentialClass::from_kind(metadata.kind), metadata.label.clone()),
+                None => {
+                    tracing::warn!(
+                        destination = %route.endpoint(),
+                        "route names a credential this broker has not loaded; no surrogate minted"
+                    );
+                    continue;
+                }
+            },
+            // The same rule the surrogate registry gets a few lines above:
+            // poison is reported and nothing is minted, never recovered from.
+            Err(_) => {
+                tracing::error!("the credential inventory is poisoned; no surrogate minted");
+                return Vec::new();
+            }
         };
-
-        let class = CredentialClass::from_kind(metadata.kind);
         if let Err(response) = state.authorize_surrogate_mint(session, peer, class) {
             // The policy refused. Say so rather than dropping the route quietly.
             tracing::warn!(
@@ -1190,7 +1238,7 @@ fn mint_session_surrogates(
             Ok((token, _expires_at, remaining)) => {
                 spent.push(credential);
                 minted.push(asv_ipc_protocol::SessionSurrogate {
-                    label: metadata.label.clone(),
+                    label,
                     token,
                     destination: route.endpoint().to_string(),
                     max_uses: remaining,
@@ -1259,7 +1307,7 @@ pub fn session_surrogate_budget() -> u32 {
     SESSION_SURROGATE_MAX_USES
 }
 
-pub fn handle(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request) -> Response {
+pub fn handle(state: &BrokerState, peer: &WorkloadIdentity, request: Request) -> Response {
     // The method is read *before* the request is consumed, and this is the
     // whole reason the audit names a verb on a refusal.
     //
@@ -1353,7 +1401,7 @@ fn spawn_error_code(error: &crate::worker::SpawnError) -> ErrorCode {
 
 /// The pre-R9 dispatcher. Unchanged in behavior; every request reaches it
 /// exactly once, through the auditing wrapper above.
-fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Request) -> Response {
+fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) -> Response {
     // A connection whose process could not be pinned is still usable, but the
     // weaker evidence is recorded rather than hidden.
     let evidence_note = if peer.is_pidfd_pinned() {
@@ -1491,7 +1539,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
         }
 
         Request::ListCredentialMetadata => Response::CredentialMetadata {
-            entries: state.credentials.iter().map(Into::into).collect(),
+            entries: credentials!(state).iter().map(Into::into).collect(),
         },
 
         Request::CreateCredential {
@@ -1592,7 +1640,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             // in-memory list follows it. Updating it first would produce a
             // broker advertising a credential the file does not have.
             if let Some(projected) = inventory::project_one(&metadata) {
-                state.credentials.push(projected);
+                credentials!(state).push(projected);
             }
 
             Response::CredentialCreated {
@@ -1676,7 +1724,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             }
 
             // The write succeeded, so the mirror may now follow it.
-            state.credentials.retain(|c| c.id != id);
+            credentials!(state).retain(|c| c.id != id);
 
             // And the tokens that stood for it go with it. The vault alone
             // would have made them useless; this is what stops the registry
@@ -1800,15 +1848,24 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
             // than from `provider`, which is a free-form string: `uat_027`
             // stores `"o/r"` there. `CredentialKind` is a closed enum, and the
             // lookup was happening anyway, so the class is free.
-            let Some(metadata) = state.credentials.iter().find(|c| c.id == credential) else {
-                // An unknown credential would mint a token that always fails
-                // later. Refusing here reports the real problem instead.
-                return Response::Error {
-                    code: ErrorCode::InvalidRequest,
-                    message: "credential is not available".into(),
-                };
+            // `let … else` over a guard temporary does not borrow-check: the
+            // guard is dropped at the end of the statement while the binding
+            // still refers into it. Resolving under the lock and dropping it
+            // before the binding escapes is the shape that compiles.
+            let class = match state.credentials() {
+                Ok(inventory) => match inventory.iter().find(|c| c.id == credential) {
+                    Some(metadata) => CredentialClass::from_kind(metadata.kind),
+                    // An unknown credential would mint a token that always
+                    // fails later. Refusing here reports the real problem.
+                    None => {
+                        return Response::Error {
+                            code: ErrorCode::InvalidRequest,
+                            message: "credential is not available".into(),
+                        }
+                    }
+                },
+                Err(poisoned) => return Response::from(poisoned),
             };
-            let class = CredentialClass::from_kind(metadata.kind);
 
             // H2: the policy is consulted *here*, once, at issuance — not on
             // every operation. Before this, the GitHub path consulted nothing,
@@ -1906,7 +1963,7 @@ fn handle_inner(state: &mut BrokerState, peer: &WorkloadIdentity, request: Reque
                     // The metadata lookup is the same one `MintSurrogate`
                     // makes. An unknown id would otherwise be discovered by
                     // the vault at spawn time, after the plan was accepted.
-                    if !state.credentials.iter().any(|c| c.id.to_wire() == id) {
+                    if !credentials!(state).iter().any(|c| c.id.to_wire() == id) {
                         return Response::Error {
                             code: ErrorCode::InvalidRequest,
                             message: format!("unknown credential `{id}`"),
@@ -2647,6 +2704,19 @@ impl From<RegistryPoisoned> for asv_ipc_protocol::Response {
 }
 
 impl BrokerState {
+    /// Borrow the credential inventory, with the registry's poisoning rule.
+    ///
+    /// The reason is the same one that applies to `surrogates`, and it is worth
+    /// stating rather than borrowing: a `Vec` that panicked halfway through a
+    /// `retain` is not a shorter list, it is a list whose invariant the thread
+    /// that panicked was in the middle of establishing. Answering from it means
+    /// advertising a credential the vault may no longer hold.
+    pub fn credentials(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Vec<CredentialMetadata>>, RegistryPoisoned> {
+        self.credentials.lock().map_err(|_| RegistryPoisoned)
+    }
+
     /// Borrow the surrogate registry.
     ///
     /// A poisoned lock is an **error, not a recovery**. The tempting
@@ -3523,7 +3593,7 @@ impl BrokerState {
     /// any point, in any form.
     #[allow(clippy::too_many_arguments)]
     fn postgres_connect(
-        &mut self,
+        &self,
         session: AgentSessionId,
         host: &str,
         host_addr: &str,
@@ -3706,7 +3776,7 @@ impl BrokerState {
     }
 
     /// Runs one statement on a live session.
-    fn postgres_query(&mut self, session: AgentSessionId, sql: &str) -> Response {
+    fn postgres_query(&self, session: AgentSessionId, sql: &str) -> Response {
         let Some(runtime) = self.runtime.clone() else {
             return Response::Error {
                 code: ErrorCode::Upstream,
@@ -3728,7 +3798,7 @@ impl BrokerState {
     /// conservative default bolted on: a session that does not exist has no
     /// backend, so there is nothing that could have been terminated, and
     /// reporting `true` would be claiming an observation nobody made.
-    fn postgres_revoke(&mut self, session: AgentSessionId) -> bool {
+    fn postgres_revoke(&self, session: AgentSessionId) -> bool {
         let Some(runtime) = self.runtime.clone() else {
             return false;
         };
@@ -4007,7 +4077,7 @@ pub fn register_inventory_credential(
     metadata: CredentialMetadata,
 ) -> asv_domain::CredentialId {
     let id = metadata.id;
-    state.credentials.push(metadata);
+    state.credentials.lock().expect("credential inventory is not poisoned").push(metadata);
     id
 }
 
@@ -5267,7 +5337,7 @@ mod tests {
         // The refusal did not touch the store: the credential is still there,
         // so a denied delete cannot be mistaken for a revocation.
         assert!(
-            state.credentials.iter().any(|c| c.id == known),
+            state.credentials.lock().expect("credential inventory is not poisoned").iter().any(|c| c.id == known),
             "a refused deletion must leave the credential in place"
         );
 
@@ -5393,7 +5463,7 @@ mod tests {
         state.control_plane = enrolment_of_this_binary();
 
         assert!(
-            state.credentials.iter().any(|c| c.id == id),
+            state.credentials.lock().expect("credential inventory is not poisoned").iter().any(|c| c.id == id),
             "the fixture must actually have loaded the credential it claims to hold"
         );
         (dir, path, state, id)
@@ -5450,7 +5520,7 @@ mod tests {
         handle(&mut state, &peer, Request::DeleteCredential { id });
 
         assert!(
-            !state.credentials.iter().any(|c| c.id == id),
+            !state.credentials.lock().expect("credential inventory is not poisoned").iter().any(|c| c.id == id),
             "the mirror still advertises a deleted credential"
         );
         match handle(&mut state, &peer, Request::ListCredentialMetadata) {
@@ -5500,7 +5570,7 @@ mod tests {
         }
 
         assert!(
-            state.credentials.iter().any(|c| c.id == ghost),
+            state.credentials.lock().expect("credential inventory is not poisoned").iter().any(|c| c.id == ghost),
             "a write that never happened must not change the mirror"
         );
         assert_eq!(
@@ -5601,7 +5671,7 @@ mod tests {
         }
         // And the real credential is untouched by the failed attempt.
         assert!(
-            state.credentials.iter().any(|c| c.id == id),
+            state.credentials.lock().expect("credential inventory is not poisoned").iter().any(|c| c.id == id),
             "a refused delete must not remove anything"
         );
     }
@@ -5699,7 +5769,7 @@ mod tests {
             messages[0]
         );
         assert!(
-            state.credentials.iter().any(|c| c.id == id),
+            state.credentials.lock().expect("credential inventory is not poisoned").iter().any(|c| c.id == id),
             "a refused deletion must leave the credential in place"
         );
     }
@@ -5787,7 +5857,7 @@ mod surrogate_tests {
 
     fn mint(state: &mut BrokerState, peer: &WorkloadIdentity) -> (AgentSessionId, String) {
         let session = sess(state).create("/repo".to_string(), peer);
-        let credential = state.credentials[0].id;
+        let credential = state.credentials.lock().expect("not poisoned")[0].id;
         match handle(
             state,
             peer,
@@ -5852,7 +5922,7 @@ mod surrogate_tests {
 
         let peer = pinned_peer();
         let session = sess(&state).create("/repo".to_string(), &peer);
-        let credential = state.credentials[0].id;
+        let credential = state.credentials.lock().expect("not poisoned")[0].id;
         assert_eq!(
             credential.to_wire(),
             ID,
@@ -6597,7 +6667,7 @@ mod e2e {
         // Re-mint with a single use. `brokered` grants two so other tests can
         // make two calls; here one is the whole point.
         state.surrogates = Arc::new(Mutex::new(SurrogateRegistry::default()));
-        let credential = state.credentials[0].id;
+        let credential = state.credentials.lock().expect("not poisoned")[0].id;
         let token = match handle(
             &mut state,
             &peer,

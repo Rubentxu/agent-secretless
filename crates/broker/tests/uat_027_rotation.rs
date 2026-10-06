@@ -207,7 +207,7 @@ impl Fixture {
     /// reference. Held as a value, never re-derived from the vault, because
     /// the requirement is that *this* id keeps working.
     fn credential_id(&self) -> asv_domain::CredentialId {
-        self.state.credentials[0].id
+        self.state.credentials.lock().expect("not poisoned")[0].id
     }
 
     fn mint(&mut self, max_uses: u32) -> String {

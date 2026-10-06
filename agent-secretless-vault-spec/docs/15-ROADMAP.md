@@ -2556,6 +2556,68 @@ TOCTOU revalidation is not reachable because there is no plan to revalidate.
 caller's, not the file's. The `registry_audience`/`asv-domain` audience gap that
 blocks a Maven binding is unchanged and still belongs to R2.F.3.
 
+### The broker's accept loop, and the two rows that were missing for it
+
+`crates/broker/src/lib.rs` and `main.rs` changed shape, and until now no row
+in this file described that change or measured it.
+
+**`BrokerState` stopped being `&mut`.** `serve` and `handle` took
+`&mut BrokerState` because the accept loop called them once per connection
+from a single thread. So nothing in the type system had ever asked whether two
+connections could be in flight at once — the property was enforced by having
+exactly one thread, which is a property of `main.rs` rather than of the state,
+and not one a reader can check. The credential inventory now carries its own
+`Arc<Mutex<Vec<CredentialMetadata>>>`, `connectors` is
+`Box<dyn ConnectorFactory + Send + Sync>`, and a `const _: ()` block asserts
+`Send + Sync` at compile time, so the first field to lose the property is a
+build error rather than a data race.
+
+**The loop became a thread per connection, bounded by a cap.** Each accepted
+socket is served on its own thread with its own 5s read/write deadline, and
+`MAX_IN_FLIGHT_CONNECTIONS = 64` refuses rather than queues. The counter is
+incremented before the spawn and decremented inside the thread, so a burst
+arriving faster than it is served cannot race past the cap. Unbounded threads
+would be the same denial of service the sequential loop had, moved somewhere
+less visible: a peer opening thousands of sockets costs thousands of stacks.
+
+**Measured now, measured before in neither.** Two rows in
+`crates/broker/tests/concurrent_connections_do_not_queue.rs`, against the real
+`asv-brokerd` binary and a real socket:
+
+| Row | Measured | Bound |
+|---|---|---|
+| `an_honest_client_is_answered_while_a_silent_peer_is_still_open` | **604µs** | 2s |
+| `a_burst_past_the_in_flight_cap_is_refused_rather_than_queued` | **149µs**, after 64 in flight | 5s socket deadline |
+
+Both numbers are printed by the rows rather than only asserted, because a bound
+nothing approaches is indistinguishable from a bound that is simply far away.
+The first row is falsifiable rather than decorative because a serialised loop
+cannot answer before the silent peer's 5s deadline expires — so 604µs is not
+"fast", it is a statement about concurrency. The second separates *refused*
+from *waited its turn*: 149µs is three orders of magnitude inside the deadline,
+so nothing was served and then abandoned.
+
+**The row that claimed this coverage did not have it.**
+`idle_connection_does_not_block_the_broker.rs` bounds its honest client at 20s
+against a 5s socket deadline, so it passes against a broker that waits the
+silent peer out *and* against one that answers immediately. Its module doc also
+still described the loop as calling `serve` "before it accepts again", which
+stopped being true with this change. The row is still worth running — it is
+what a mutation removing `set_read_timeout` will exhaust, through the real
+binary — but its doc now says plainly that it is not the sharpest statement of
+the property, and names the file that is.
+
+**Not closed, and not simulated.** The cap refuses *everyone* past 64,
+including an honest agent: a flood is indistinguishable from a busy install at
+the accept loop, so a peer that opens 65 sockets can lock out the 65th honest
+agent for up to 5s. That is the deliberate trade named in `main.rs` — a visible
+refusal beats an invisible stall — and it is a policy question this cycle does
+not settle. Separately, the TCP tunnel listener carries its own `InFlight`
+gauge with its own accounting, and no row here covers that path either. And
+`main.rs` still has no falsification harness at all: the two rows above are
+integration rows against a spawned binary, which is a weaker kind of evidence
+than the campaign the connector and registry crates carry.
+
 ---
 
 ## v1.0 — Certified product line

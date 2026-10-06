@@ -1159,14 +1159,50 @@ fn main() -> std::io::Result<()> {
         runtime_guard.spawn(async move { connect_listener.run(tcp, handler, report).await });
     }
 
+    // Shared, not borrowed. The loop below hands a handle to every connection
+    // thread, and `BrokerState` is `Send + Sync` because each capability
+    // carries its own lock rather than the state carrying one lock for all of
+    // them.
+    let state = Arc::new(state);
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
-                if let Err(e) = serve(&mut state, stream) {
-                    // One bad connection must not take the broker down
-                    // (UAT-017 requires fail-closed, not fail-crashed).
-                    tracing::warn!(error = %e, "connection failed");
+                // The counter is incremented BEFORE the thread is spawned and
+                // decremented inside it, so a burst of connections arriving
+                // faster than they are served cannot race past the cap.
+                let admitted = in_flight
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |n| (n < MAX_IN_FLIGHT_CONNECTIONS).then_some(n + 1),
+                    )
+                    .is_ok();
+                if !admitted {
+                    // Refused rather than queued. A queued connection is a
+                    // client waiting on work the broker has not agreed to do,
+                    // and refusing fails closed: nothing was read, nothing was
+                    // applied, the client sees a closed socket.
+                    tracing::warn!(
+                        limit = MAX_IN_FLIGHT_CONNECTIONS,
+                        "connection refused: that many are already in flight"
+                    );
+                    continue;
                 }
+                let state = Arc::clone(&state);
+                let in_flight = Arc::clone(&in_flight);
+                std::thread::spawn(move || {
+                    // One bad connection must not take the broker down
+                    // (UAT-017 requires fail-closed, not fail-crashed), and one
+                    // slow connection must not delay another agent: `serve`
+                    // runs to its own 5s deadline on this thread while the
+                    // accept loop is already back on the next `incoming()`.
+                    if let Err(e) = serve(&state, stream) {
+                        tracing::warn!(error = %e, "connection failed");
+                    }
+                    in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                });
             }
             Err(e) => tracing::warn!(error = %e, "accept failed"),
         }
@@ -1197,7 +1233,20 @@ fn main() -> std::io::Result<()> {
 /// permanent.
 const CONNECTION_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-fn serve(state: &mut BrokerState, stream: UnixStream) -> std::io::Result<()> {
+/// How many connections may be in flight at once.
+///
+/// A thread per connection is what makes "one slow peer does not stop every
+/// other agent" true, and unbounded threads is its own denial of service: a
+/// peer that opens thousands of sockets costs thousands of stacks, which is
+/// the same failure the sequential loop had, only moved somewhere less visible.
+///
+/// Sixty-four is chosen against the thing it bounds. The workers a broker
+/// actually runs at once is small — a handful of agents — so the cap is never
+/// what makes an operator feel it, and a peer that opens more gets a refusal
+/// it can see rather than a stall it cannot.
+const MAX_IN_FLIGHT_CONNECTIONS: usize = 64;
+
+fn serve(state: &BrokerState, stream: UnixStream) -> std::io::Result<()> {
     // Identity first, before reading a single request byte. This ordering is
     // the whole point of ADR-0003: the peer's claims are never consulted.
     use std::os::fd::AsFd;

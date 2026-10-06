@@ -195,7 +195,7 @@ fn register_pg_credential(state: &mut BrokerState, database: &str, role: &str) -
         format!("pg/{database}/{role}"),
         CredentialKind::DatabaseCredential,
     );
-    state.credentials.push(metadata);
+    state.credentials.lock().expect("not poisoned").push(metadata);
     format!("pg/{database}/{role}")
 }
 

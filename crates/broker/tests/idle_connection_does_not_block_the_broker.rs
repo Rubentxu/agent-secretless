@@ -1,32 +1,34 @@
-//! The broker serves connections one at a time, and a peer that opens one and
-//! says nothing must not stop the next peer being served.
+//! A peer that opens a connection and says nothing must not stop the next peer
+//! being served.
 //!
 //! ## What this is about
 //!
-//! `main.rs` accepts in a loop and calls `serve` on the accepted stream before
-//! it accepts again. `serve` blocks on a `read`. So the broker's availability
-//! depends on every peer finishing its exchange, and a peer that connects and
-//! then writes nothing holds that read open for as long as it likes.
+//! `serve` blocks on a `read`, so the broker's availability used to depend on
+//! every peer finishing its exchange: `main.rs` accepted in a loop and called
+//! `serve` before it accepted again, so a peer that connected and then wrote
+//! nothing held the loop for as long as the deadline allowed. That is not a
+//! remote attack — the socket is `0600` in a `0700` directory, so the peer
+//! shares the uid the installation already gave the broker. It is also not
+//! hypothetical: any process that crashes mid-exchange, or a client killed
+//! between `connect` and `write`, is exactly this peer.
 //!
-//! That is not a remote attack — the socket is `0600` in a `0700` directory, so
-//! the peer shares the uid the installation already gave the broker. It is also
-//! not hypothetical: any process that crashes mid-exchange, or a client killed
-//! between `connect` and `write`, is exactly this peer. The fix is a deadline
-//! on the socket (`CONNECTION_IO_TIMEOUT` in `main.rs`) rather than a claim that
-//! well-behaved peers finish on their own.
+//! The deadline on the socket (`CONNECTION_IO_TIMEOUT` in `main.rs`) is still
+//! what keeps one silent peer from pinning a worker. But the accept loop no
+//! longer serialises behind it — each connection is served on its own thread,
+//! bounded by an in-flight cap — so this row is no longer the sharpest
+//! statement of that property. `PATIENCE` here is 20s against a 5s deadline,
+//! which means it passes against a broker that waits the silent peer out
+//! *and* against one that answers immediately, and cannot tell the two apart.
+//! `concurrent_connections_do_not_queue.rs` bounds the honest client at 2s,
+//! which a serialised loop cannot reach, and also covers the cap.
 //!
-//! ## What makes this row falsifiable
+//! ## What still makes this row worth running
 //!
-//! The row asserts a *second*, healthy connection is answered while the first is
-//! still open and still silent. Without the deadline the second connection is
-//! never accepted, because the loop has not come back around, and this test
-//! hangs rather than failing — so it is bounded, and the bound is what the
-//! mutation of removing `set_read_timeout` will exhaust.
-//!
-//! The bound is generous relative to what it has to cover (a loopback `AgentInfo`
-//! answered in microseconds) because the failure it must distinguish is "the
-//! broker is stuck" from "the broker answered", and a tight bound would make
-//! the second indistinguishable from the first on a loaded machine.
+//! It asserts a second, healthy connection is answered while the first is
+//! still open and still silent, through the real `asv-brokerd` binary and a
+//! real socket. Without the deadline the second connection is never answered,
+//! so the row would hang rather than fail — hence the bound, and the bound is
+//! what the mutation of removing `set_read_timeout` will exhaust.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;

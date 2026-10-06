@@ -107,7 +107,7 @@ fn harness() -> Harness {
     // A credential for the pair the operator would have granted. Its presence
     // is what makes the refused cases mean something: there *was* a secret to
     // take, and the broker did not take it.
-    state.credentials.push(CredentialMetadata::new(
+    state.credentials.lock().expect("not poisoned").push(CredentialMetadata::new(
         "pg/app/readonly",
         CredentialKind::DatabaseCredential,
     ));
@@ -180,7 +180,7 @@ fn assert_never_borrowed(h: &Harness, response: Response, what: &str) {
 /// A deployment that declared `DECLARED_HOST`/`DECLARED_ADDR`, and nothing
 /// else. This is the whole configuration surface: a list of destinations the
 /// broker is willing to lend to.
-fn declaring_deployment() -> Box<dyn asv_broker::ConnectorFactory> {
+fn declaring_deployment() -> Box<dyn asv_broker::ConnectorFactory + Send + Sync> {
     Box::new(asv_broker::LiveConnectorFactory {
         destinations: vec![asv_broker::PgDestination::new(
             DECLARED_HOST,

@@ -286,7 +286,7 @@ impl Fixture {
     }
 
     fn mint_token(&mut self) -> String {
-        let credential = self.state.credentials[0].id;
+        let credential = self.state.credentials.lock().expect("not poisoned")[0].id;
         match handle(
             &mut self.state,
             &self.peer,

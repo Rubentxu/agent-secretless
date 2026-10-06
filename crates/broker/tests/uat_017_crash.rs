@@ -108,7 +108,7 @@ fn state_with_session_id() -> (
         asv_broker::inventory::load(&mut state, &store);
     }
     assert_eq!(
-        state.credentials.len(),
+        state.credentials.lock().expect("not poisoned").len(),
         1,
         "the fixture vault holds exactly one canonical credential"
     );
@@ -383,7 +383,7 @@ fn state_loss_does_not_resurrect_a_session_or_surrogate() {
     // authority to redeem anything, and that is the closest thing to a real
     // restart this suite can build.
     let mut restarted = BrokerState {
-        credentials: first.credentials.clone(),
+        credentials: std::sync::Arc::new(std::sync::Mutex::new(first.credentials.lock().expect("not poisoned").clone())),
         ..BrokerState::default()
     };
 

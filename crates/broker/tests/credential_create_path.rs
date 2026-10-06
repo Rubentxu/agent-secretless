@@ -154,7 +154,7 @@ fn an_admitted_principal_can_create() {
         Response::CredentialCreated { id, .. } => id,
         other => panic!("admission granted and the write failed: {other:?}"),
     };
-    assert_eq!(b.state.credentials.len(), 1, "the inventory did not follow");
+    assert_eq!(b.state.credentials.lock().expect("not poisoned").len(), 1, "the inventory did not follow");
     assert!(b.file_holds(&id.to_wire()), "the file does not hold it");
 }
 
@@ -183,7 +183,7 @@ fn an_unenrolled_caller_is_refused_by_name() {
         other => panic!("an unenrolled caller created a credential: {other:?}"),
     }
     assert!(
-        b.state.credentials.is_empty(),
+        b.state.credentials.lock().expect("not poisoned").is_empty(),
         "a refused create touched the inventory"
     );
     assert!(
@@ -443,9 +443,12 @@ fn every_storable_kind_survives_the_round_trip() {
         let projected = b
             .state
             .credentials
+            .lock()
+            .expect("not poisoned")
             .iter()
             .find(|m| m.id == id)
-            .expect("inventory entry");
+            .expect("inventory entry")
+            .clone();
         assert_eq!(projected.kind, kind, "{kind:?} came back as something else");
     }
     // All five are in the file, not four: a kind that stored but failed to

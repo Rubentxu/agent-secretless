@@ -69,7 +69,7 @@ fn harness(kind: CredentialKind) -> Harness {
 
     let metadata = CredentialMetadata::new("h2-issuance", kind);
     let credential = metadata.id;
-    state.credentials.push(metadata);
+    state.credentials.lock().expect("not poisoned").push(metadata);
 
     Harness {
         state,
@@ -234,7 +234,7 @@ fn the_class_decides_which_verb_the_policy_is_asked_about() {
 #[test]
 fn the_harness_really_does_have_a_credential() {
     let h = harness(CredentialKind::GenericSecret);
-    assert_eq!(h.state.credentials.len(), 1, "exactly one credential");
+    assert_eq!(h.state.credentials.lock().expect("not poisoned").len(), 1, "exactly one credential");
     assert!(
         h.state
             .sessions

@@ -68,10 +68,20 @@ pub struct InventoryLoad {
 /// boot, because a vault holding
 /// one legacy id is still a vault whose other credentials are usable, and
 /// refusing to start would take away access the operator already had.
-pub fn load(state: &mut BrokerState, store: &VaultStore) -> InventoryLoad {
+pub fn load(state: &BrokerState, store: &VaultStore) -> InventoryLoad {
     let records = store.list();
     let (credentials, result) = project_records(&records);
-    state.credentials.extend(credentials);
+    // `&BrokerState`, not `&mut`: the inventory is loaded once at startup, but
+    // the borrow it used to need was the same borrow that made every later
+    // reader serialise behind it. Poison is reported rather than recovered
+    // from, for the registry's reason -- a list that panicked mid-extend is not
+    // a shorter list.
+    match state.credentials.lock() {
+        Ok(mut inventory) => inventory.extend(credentials),
+        Err(_) => {
+            tracing::error!("the credential inventory is poisoned; startup load aborted")
+        }
+    }
     result
 }
 
@@ -261,10 +271,10 @@ mod tests {
                 collisions: 0,
             }
         );
-        assert_eq!(state.credentials.len(), 2);
+        assert_eq!(state.credentials.lock().expect("not poisoned").len(), 2);
         // The two ids survive as the same handles the vault named them by.
-        assert!(state.credentials.iter().any(|c| c.id.to_wire() == UUID_A));
-        assert!(state.credentials.iter().any(|c| c.id.to_wire() == UUID_B));
+        assert!(state.credentials.lock().expect("not poisoned").iter().any(|c| c.id.to_wire() == UUID_A));
+        assert!(state.credentials.lock().expect("not poisoned").iter().any(|c| c.id.to_wire() == UUID_B));
     }
 
     /// The M6 naming convention is not a `CredentialId`, so it is left out and
@@ -291,7 +301,7 @@ mod tests {
             }
         );
         assert_eq!(
-            state.credentials.len(),
+            state.credentials.lock().expect("not poisoned").len(),
             1,
             "the convention id must not load"
         );
@@ -320,7 +330,7 @@ mod tests {
 
         assert_eq!(result.loaded, 0);
         assert_eq!(result.skipped, 2);
-        assert!(state.credentials.is_empty());
+        assert!(state.credentials.lock().expect("not poisoned").is_empty());
     }
 
     #[test]
