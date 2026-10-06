@@ -1115,16 +1115,42 @@ fn a_plan_binds_to_an_intent_that_agrees_with_it() {
 }
 
 /// **The load-bearing row of this whole section.** The binding must record the
-/// *plan's* tool, not the intent's. A binding built by copying `intent.tool`
-/// would be compared at execution time against whatever execution resolved, and
-/// the intent's half of that comparison would be the caller's own assertion —
-/// a check that always passes.
+/// *plan's* tool. A binding built by copying `intent.tool` would be compared
+/// at execution time against whatever execution resolved, and the intent's
+/// half of that comparison would be the caller's own assertion — a check that
+/// always passes.
+///
+/// **What this row can and cannot show**, stated so the next reader does not
+/// over-trust it. It asserts that an agreeing intent yields a binding carrying
+/// a tool. That is necessary and it is **not sufficient**: when the intent and
+/// the plan agree, the two fields hold the same value, so nothing here can tell
+/// "the plan's word" from "the intent's word". The row that *does* distinguish
+/// them is
+/// [`a_tool_agnostic_intent_does_not_make_the_binding_tool_agnostic`], where
+/// the intent names no tool and the binding must still carry the plan's.
+///
+/// This row was originally only the refusal below, under this row's name, and
+/// the falsification campaign caught it: copying `intent.tool` left it green,
+/// because a disagreeing intent is refused either way. Split in two, each
+/// named for what it checks.
 #[test]
-fn a_binding_records_the_plans_tool_rather_than_the_intents_claim() {
+fn an_agreeing_intent_yields_a_binding_that_carries_a_tool() {
     let plan = npm_plan().with_tool(npm_tool());
+    let intent = intent_for(&plan);
+    let binding = plan.bind_to(&intent).expect("the intent agrees");
+    assert_eq!(
+        binding.tool,
+        Some(npm_tool()),
+        "the binding recorded no executable, so execution would have nothing to check"
+    );
+    assert_eq!(binding.intent_digest, intent.digest().expect("digests"));
+}
 
-    // An intent that *claims* a different tool is refused, so it cannot reach
-    // the binding at all. That is the first line of defence.
+/// The refusal half, on its own. An intent claiming an executable the plan did
+/// not resolve is refused at bind time, rather than bound and noticed later.
+#[test]
+fn an_intent_claiming_a_different_tool_is_refused_at_bind_time() {
+    let plan = npm_plan().with_tool(npm_tool());
     let mut lying = intent_for(&plan);
     lying.tool = Some(
         asv_domain::ToolIdentity::new(
@@ -1133,15 +1159,16 @@ fn a_binding_records_the_plans_tool_rather_than_the_intents_claim() {
         )
         .expect("well-formed"),
     );
-    assert!(
-        matches!(
-            plan.bind_to(&lying),
-            Err(PlanBindingError::PlanDrift {
-                invalidation: asv_domain::PlanInvalidation::ToolChanged { .. }
-            })
+    match plan.bind_to(&lying) {
+        Err(PlanBindingError::PlanDrift {
+            invalidation: asv_domain::PlanInvalidation::ToolChanged { .. },
+        }) => {}
+        Err(other) => panic!("expected a ToolChanged drift, got {other}"),
+        Ok(binding) => panic!(
+            "a binding was produced from a false claim: {:?}",
+            binding.tool
         ),
-        "a binding built from a false claim is the failure this row exists for"
-    );
+    }
 }
 
 /// The same, from the other side: if the intent names no tool and the plan does,

@@ -33,6 +33,7 @@ its total still looks like a number.
 From the repository root, with cargo on `PATH`:
 
 ```bash
+python3 tests/falsification/intent_falsify.py
 python3 tests/falsification/sigv4_falsify.py
 python3 tests/falsification/sts_falsify.py
 python3 tests/falsification/client_falsify.py
@@ -464,3 +465,37 @@ is a change to that function's contract, so it is not made here. A deployment
 pinned to a regional endpoint will load, sign correctly for its region, and then
 be refused by policy. That is the correct order: the refusal is loud, and it is
 the policy crate's decision rather than something a broker should widen quietly.
+
+
+## `intent_falsify.py` — R4.B.1's intent chain
+
+Five buckets, sixteen mutations, zero survivors. It is the first campaign here
+that spans four source files (`crates/domain/src/intent.rs`,
+`crates/integrations/src/plan.rs`, `crates/integrations/src/tool.rs` and
+`crates/cli/src/main.rs`), so it has one bucket per file and one target per
+bucket — `binding` and `digest` against the integrations library, `invalid`
+against the domain library, `tool` against the resolver, `chain` against the
+broker vertical.
+
+**It found three defective rows in this block and one limit of the framework.**
+All three rows were mine and all three had passed:
+
+- A digest-collision row built from a shift that did not actually collide, so
+  the mutation deleting the length prefix survived. The pair now hashes
+  identically once the prefix is gone.
+- An entry-order row using **two** entries. Reversing a two-element list
+  happens to produce the sorted order, so it passed with `sort_by` deleted. It
+  is now three entries on three paths.
+- A binding row named `a_binding_records_the_plans_tool_rather_than_the_intents_claim`
+  that only asserted the *refusal*. A binding built from the intent's claim is
+  refused either way, so copying the claim left it green. It is now split into
+  two rows, each named for what it checks, and each says what it cannot show.
+
+The fourth is not a row's fault. `observed_tool = planned_tool.clone()` in the
+CLI is indistinguishable from the real thing inside one invocation: both calls
+read the same `PATH` microseconds apart, so the two JSON blocks are identical
+either way, and the row one would point at runs in process without reading
+`main.rs` at all. That is a bucket pointed at a target that does not contain
+its row — the `no-run` failure this framework exists to make loud — so the
+mutation was **removed and the reason written down**, rather than left in the
+campaign to survive forever and teach the next reader to skim past survivors.

@@ -4705,3 +4705,104 @@ Do not optimize for number of credential providers. Prefer integrations that imp
 3. reduction of privilege scope,
 4. quality of attribution/audit,
 5. portability without weakening invariants.
+
+### R4.B.1 — ActionIntent, and the first operation-bound authority
+
+R3 built the surface: four families that discover a credential and describe
+it. None of them could say **for which operation**, on **whose** authority,
+against **which binary**, with **which configuration**. Everything ASV had was
+bound to a **session**, and a session outlives every one of those facts — so a
+credential lent under one could be spent under another.
+
+`ActionIntent` had been written down in
+`docs/asv-agent-first-security-evolution-v2-2026-10-02/02-ARCHITECTURE.md` and
+`05-IDENTITY-AUTHORITY-PLAN-BOUND.md` since before R0, and existed in **zero**
+`.rs` files until this block. It exists now, and so does the check the spec's
+own worked example asks for:
+
+```text
+plan:   /usr/bin/npm      sha256=A
+execute: ~/project/bin/npm sha256=B
+=> PLAN_INVALIDATED
+```
+
+**Where each piece landed, and why there.** `ActionIntent`, `ToolIdentity` and
+`PlanBinding` are in `crates/domain`, not `crates/integrations`: the planner
+lives in `integrations` and the executor in the broker, both compute the same
+digest, and putting the type beside `Action` and `Resource` makes that agreement
+structural instead of a convention between two crates. The PATH resolver is in
+`crates/integrations/src/tool.rs` because reading the filesystem is what that
+crate already does. The receipt is there too, so its properties are testable
+without a broker — and the driver is in the CLI, because a step that could reach
+a vault is a step that could be *made* to.
+
+**Three choices that a reviewer should check against the code, not take on
+faith.**
+
+- The binding records the **plan's** view, never the intent's claim. A binding
+  built by copying `intent.tool` would be compared at execution time against
+  whatever execution resolved, and the intent's half of that comparison would
+  be the caller's own assertion — a check that always passes. `bind_to` refuses
+  an intent that already contradicts the world instead of binding it and
+  noticing later.
+- The intent's identities are `String`, not `WorkloadIdentity`. An intent
+  crosses a boundary — serialised, hashed, stored in a receipt, read by an
+  operator — and `WorkloadIdentity` owns an `OwnedFd` and cannot be serialised
+  at all. Taking a uid out of one without the pidfd would have carried the
+  *appearance* of pinning with none of the guarantee.
+- There is **no clock** in the intent. `expires_at_unix` is a number the caller
+  supplies and `is_expired(now)` takes a second one, because a type that read
+  the clock would make a digest depend on when it was computed, and two
+  planners computing "the same" intent seconds apart would disagree for no
+  reason anyone could see.
+
+**What the second family cost.** `plan_curl` could not be written without
+generalising `PlanEntry`, whose four fields (`audience`, `field`, `value_len`,
+`value_is_env_reference`) were all npm-shaped. A `.curlrc` names no host at
+all, so the audience arrives per invocation — flattening that into
+`Option<String>` would leave a reader unable to tell "this family has no such
+concept" from "this family has one and it was not recorded", which is the one
+ambiguity a security report cannot have. `Selector` is now an enum tagged by
+family, the plan schema moved to `asv.integrations.plan/v2`, and the literal is
+pinned in a row so the next bump has to be deliberate.
+
+**R4's exit criterion is met**: `discover → ActionIntent → plan → authorize →
+execute → receipt` runs end to end in npm and in curl, from
+`asv integrations execute`, writing `asv.integrations.execute/v1`.
+
+| Family | Vertical | Rows in the chain |
+|---|---|---|
+| npm | `r4b1_intent_chain.rs` | six stages, drift on both halves of the spec's example |
+| curl | `r4b1_intent_chain.rs` | the same six stages with a vocabulary that has no audience at all |
+
+**Falsified.** `tests/falsification/intent_falsify.py`, five buckets, sixteen
+mutations, zero survivors. Three of them exist because a row in this block was
+wrong and the campaign is what showed it: a digest-collision row whose shift did
+not actually collide, an entry-order row whose two-element reversal happened to
+produce the sorted order, and a binding row named for a property it only
+checked the refusal of. The fourth survivor was not a row's fault but the
+framework's, and is now written down where the next reader will find it: no
+single `execute` invocation can falsify that its second tool resolution is
+fresh, because both calls read the same `PATH` microseconds apart and nothing
+can change in between.
+
+**Still not done, and named rather than left for an operator to discover:**
+
+- `plan` and `adopt` still do not exist for Maven or Gradle. R4 did not widen
+  the family list; it made the layer general enough that adding them is a
+  `Selector` variant and a planner.
+- `execute` carries an **empty credential inventory** on purpose: it is about
+  the authority chain, and reaching the vault for it would make a step that
+  holds no secret into one that could. So a receipt today records an authority
+  decision over a plan that bound nothing, which is honest but is not yet the
+  whole story.
+- The action and the resource come from `action_for(family)` and
+  `resource_for(family)`, one hard-coded pair per family. For curl the resource
+  is a literal placeholder, because a `.curlrc` genuinely names no host. An
+  operator naming a host on the command line is not yet a thing this command
+  can express.
+- No vertical can make a real binary swap land between the two resolutions
+  inside one invocation. The wiring is covered and the drift is covered, in
+  process, through the same `decide` the CLI calls — but a mid-invocation swap
+  is covered by neither, and inventing a test hook that mutates the tool
+  between the two resolutions would prove the hook.
