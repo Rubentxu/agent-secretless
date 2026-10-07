@@ -207,8 +207,30 @@ pipeline {
         // creating a GitHub Release that other people can already see is not,
         // and the two should not share a failure domain. Nothing above this
         // line touches the network.
+        //
+        // `--confirm --draft`, and both flags are load-bearing.
+        //
+        // This stage ran `scripts/publish-release.sh` with no arguments, which
+        // is the dry-run branch: it prints "publish-release: dry run. Nothing
+        // was uploaded.", lists the assets it would upload, and `exit 0`. So
+        // the stage reported success and no Release existed:
+        //
+        //     stage publish, outcome=success
+        //     gh release view v0.37.0    release not found
+        //
+        // A gate that reports something happened when it did not is the defect
+        // this project exists to remove, and it sat on the one step whose whole
+        // purpose is that it happened. The dry-run branch exits 0 on purpose —
+        // it is the answer to `--help`-adjacent questions and its exit code is
+        // about the script being usable without publishing, not about the world.
+        // The stage was consuming that exit code as a publish receipt.
+        //
+        // `--confirm` is what makes the upload real. `--draft` is what keeps the
+        // irreversible part bounded: the assets go up, nothing is announced, and
+        // a human decides whether to publish. Publishing v0.37.0 for real was a
+        // separate decision taken by hand, not this stage's default.
         stage("publish") {
-            sh("scripts/publish-release.sh")
+            sh("scripts/publish-release.sh --confirm --draft")
         }
 
         // The documented install, run as the document writes it.
