@@ -113,6 +113,18 @@ pipeline {
             sh("python3 tests/doc_claims_drift.py")
         }
 
+        // The counts in three documents are transcribed from a run by hand, and
+        // five numbers per profile is exactly the kind of thing that is wrong
+        // without anybody noticing. This stage does not run the suite -- it
+        // checks the arithmetic of two logs the release certification produced,
+        // which is why it takes its inputs as arguments and is documented for
+        // that rather than being wired to a path that does not exist on every
+        // machine. `tests/test_counts_drift.py` is what makes it a guard rather
+        // than a script: nine cases, of which eight must refuse.
+        stage("test-counts") {
+            sh("python3 tests/test_counts_drift.py")
+        }
+
         // Cheap, and it fails first on the things a reviewer would notice.
         stage("static") {
             sh("cargo fmt --all -- --check")
