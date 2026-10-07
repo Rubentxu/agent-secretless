@@ -264,15 +264,23 @@ mod tests {
                 protocol: PROTOCOL_VERSION,
             },
             Request::CreateSession {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 workspace: String::new(),
             },
             Request::RegisterSessionKey {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 public_key_blob: Vec::new(),
             },
-            Request::EndSession { session },
-            Request::ListCredentialMetadata,
+            Request::EndSession {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                session,
+            },
+            Request::ListCredentialMetadata {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            },
             Request::RunIsolated {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 worker: String::new(),
                 args: Vec::new(),
@@ -280,30 +288,38 @@ mod tests {
                 timeout_ms: None,
             },
             Request::CreateCredential {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 label: String::new(),
                 kind: CredentialKind::ApiKey,
                 provider: String::new(),
                 account: String::new(),
                 secret: OpaqueSecret::new(Vec::new()),
             },
-            Request::DeleteCredential { id: credential },
+            Request::DeleteCredential {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                id: credential,
+            },
             Request::MintSurrogate {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 credential,
                 max_uses: 0,
                 ttl_secs: 0,
             },
             Request::RevokeSurrogate {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 surrogate: surrogate.clone(),
             },
             Request::ReadIssue {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 surrogate: surrogate.clone(),
                 repo: String::new(),
                 number: 0,
             },
             Request::CreateIssue {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 surrogate: surrogate.clone(),
                 repo: String::new(),
@@ -311,6 +327,7 @@ mod tests {
                 body: String::new(),
             },
             Request::CreateRelease {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 surrogate: surrogate.clone(),
                 repo: String::new(),
@@ -319,15 +336,21 @@ mod tests {
                 body: String::new(),
             },
             Request::AwsCallerIdentity {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 credential: String::new(),
             },
             Request::OAuth2Identity {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 credential: String::new(),
             },
-            Request::AuditQuery { since_secs: 0 },
+            Request::AuditQuery {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                since_secs: 0,
+            },
             Request::PostgresConnect {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 host: String::new(),
                 host_addr: String::new(),
@@ -336,11 +359,16 @@ mod tests {
                 role: String::new(),
             },
             Request::PostgresQuery {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 sql: String::new(),
             },
-            Request::PostgresRevoke { session },
+            Request::PostgresRevoke {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                session,
+            },
             Request::PullManifest {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 surrogate: surrogate.clone(),
                 registry: String::new(),
@@ -348,6 +376,7 @@ mod tests {
                 reference: String::new(),
             },
             Request::PullBlob {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 surrogate: surrogate.clone(),
                 registry: String::new(),
@@ -355,6 +384,7 @@ mod tests {
                 digest: String::new(),
             },
             Request::PushManifest {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 surrogate: surrogate.clone(),
                 registry: String::new(),
@@ -363,6 +393,7 @@ mod tests {
                 manifest: Vec::new(),
             },
             Request::PushBlob {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 surrogate: surrogate.clone(),
                 registry: String::new(),

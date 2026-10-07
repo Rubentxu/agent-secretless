@@ -221,6 +221,7 @@ impl Vertical {
             &mut self.state,
             &self.peer,
             Request::MintSurrogate {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 credential: self.credential,
                 max_uses,
@@ -242,6 +243,7 @@ impl Vertical {
             &mut self.state,
             &self.peer,
             Request::ReadIssue {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 surrogate: surrogate.to_string(),
                 repo: repo.to_string(),
@@ -255,6 +257,7 @@ impl Vertical {
             &mut self.state,
             &self.peer,
             Request::CreateIssue {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 surrogate: surrogate.to_string(),
                 repo: REPO.to_string(),
@@ -269,6 +272,7 @@ impl Vertical {
             &mut self.state,
             &self.peer,
             Request::CreateRelease {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 surrogate: surrogate.to_string(),
                 repo: REPO.to_string(),
@@ -539,6 +543,7 @@ fn a_grant_does_not_outlive_the_session_it_was_minted_in() {
         &mut vertical.state,
         &vertical.peer,
         Request::EndSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session: vertical.session,
         },
     );
@@ -666,6 +671,7 @@ fn a_mint_for_a_credential_the_vault_does_not_hold_spends_nothing() {
         &mut vertical.state,
         &vertical.peer,
         Request::MintSurrogate {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session: vertical.session,
             credential: absent,
             max_uses: 1,

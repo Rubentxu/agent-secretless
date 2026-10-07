@@ -63,6 +63,7 @@ fn pinned_peer() -> WorkloadIdentity {
 
 fn create_request(kind: CredentialKind) -> Request {
     Request::CreateCredential {
+        protocol: asv_ipc_protocol::PROTOCOL_VERSION,
         label: "uat".into(),
         kind,
         provider: "github".into(),
@@ -298,6 +299,7 @@ fn a_created_credential_can_mint_a_surrogate_immediately() {
         &mut b.state,
         &b.handle,
         Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: "/w".into(),
         },
     ) {
@@ -309,6 +311,7 @@ fn a_created_credential_can_mint_a_surrogate_immediately() {
         &mut b.state,
         &b.handle,
         Request::MintSurrogate {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             credential: id,
             max_uses: 1,
@@ -408,7 +411,9 @@ fn a_kind_without_a_storage_class_is_stored_and_read_back_as_itself() {
     let listed = match asv_broker::handle(
         &mut b.state,
         &b.handle,
-        asv_ipc_protocol::Request::ListCredentialMetadata,
+        asv_ipc_protocol::Request::ListCredentialMetadata {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+        },
     ) {
         Response::CredentialMetadata { entries } => entries,
         other => panic!("expected a listing, got {other:?}"),

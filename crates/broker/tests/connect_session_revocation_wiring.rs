@@ -66,6 +66,7 @@ fn open(state: &mut BrokerState, who: &WorkloadIdentity) -> AgentSessionId {
         state,
         who,
         Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: "/repo".into(),
         },
     ) {
@@ -96,7 +97,14 @@ fn ending_a_session_revokes_the_tunnels_it_authorised() {
     );
 
     assert_eq!(
-        handle(&mut state, &peer(0), Request::EndSession { session }),
+        handle(
+            &mut state,
+            &peer(0),
+            Request::EndSession {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                session
+            }
+        ),
         Response::SessionEnded { session }
     );
 
@@ -124,7 +132,10 @@ fn ending_one_session_does_not_revoke_another() {
         handle(
             &mut state,
             &peer(0),
-            Request::EndSession { session: doomed }
+            Request::EndSession {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                session: doomed
+            }
         ),
         Response::SessionEnded { session: doomed }
     );
@@ -159,7 +170,14 @@ fn a_refused_end_session_revokes_nothing() {
     let stranger = peer(2);
     let session = open(&mut state, &owner);
 
-    let refused = handle(&mut state, &stranger, Request::EndSession { session });
+    let refused = handle(
+        &mut state,
+        &stranger,
+        Request::EndSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            session,
+        },
+    );
     assert!(
         matches!(&refused, Response::Error { .. }),
         "a stranger ended a session it does not own: {refused:?}"
@@ -173,7 +191,14 @@ fn a_refused_end_session_revokes_nothing() {
     // And the owner can still do it for real, or the refusal above would also
     // be satisfied by a handler that revoked nothing ever.
     assert_eq!(
-        handle(&mut state, &owner, Request::EndSession { session }),
+        handle(
+            &mut state,
+            &owner,
+            Request::EndSession {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                session
+            }
+        ),
         Response::SessionEnded { session }
     );
     assert!(revoked(&state, &session), "the rightful owner");

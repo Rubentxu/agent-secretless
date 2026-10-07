@@ -456,6 +456,7 @@ impl Vertical {
             &mut self.state,
             &self.peer,
             Request::MintSurrogate {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 credential,
                 max_uses,
@@ -488,6 +489,7 @@ impl Vertical {
             &mut self.state,
             &self.peer,
             Request::PullManifest {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 surrogate: surrogate.to_string(),
                 registry: registry.to_string(),
@@ -508,6 +510,7 @@ impl Vertical {
             &mut self.state,
             &self.peer,
             Request::PullBlob {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 surrogate: surrogate.to_string(),
                 registry: registry.to_string(),
@@ -534,6 +537,7 @@ impl Vertical {
             &mut self.state,
             &self.peer,
             Request::PushBlob {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 surrogate: surrogate.to_string(),
                 registry: registry.to_string(),
@@ -556,6 +560,7 @@ impl Vertical {
             &mut self.state,
             &self.peer,
             Request::PushManifest {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 surrogate: surrogate.to_string(),
                 registry: registry.to_string(),

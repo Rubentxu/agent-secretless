@@ -409,7 +409,7 @@ fn broker_lists_a_credential_that_exists_in_its_vault() {
 
     let response = request(
         &sock,
-        serde_json::json!({ "method": "list_credential_metadata" }),
+        serde_json::json!({ "method": "list_credential_metadata", "protocol": asv_ipc_protocol::PROTOCOL_VERSION }),
     );
 
     assert_eq!(
@@ -456,7 +456,7 @@ fn broker_lists_a_credential_that_exists_in_its_vault() {
 
     let session_response = request(
         &sock,
-        serde_json::json!({ "method": "create_session", "workspace": "/repo" }),
+        serde_json::json!({ "method": "create_session", "protocol": asv_ipc_protocol::PROTOCOL_VERSION, "workspace": "/repo" }),
     );
     let session = session_response
         .get("session")
@@ -466,6 +466,7 @@ fn broker_lists_a_credential_that_exists_in_its_vault() {
         &sock,
         serde_json::json!({
             "method": "mint_surrogate",
+            "protocol": asv_ipc_protocol::PROTOCOL_VERSION,
             "session": session,
             "credential": CRED_UUID,
             "max_uses": 2,
@@ -505,7 +506,7 @@ fn broker_excludes_a_non_uuid_credential_and_says_so() {
 
     let response = request(
         &sock,
-        serde_json::json!({ "method": "list_credential_metadata" }),
+        serde_json::json!({ "method": "list_credential_metadata", "protocol": asv_ipc_protocol::PROTOCOL_VERSION }),
     );
     let entries = response
         .get("entries")

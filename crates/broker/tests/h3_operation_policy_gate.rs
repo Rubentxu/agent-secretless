@@ -248,6 +248,7 @@ impl Harness {
             &mut self.state,
             &self.peer,
             Request::MintSurrogate {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 credential: self.credential,
                 max_uses: 4,
@@ -268,6 +269,7 @@ impl Harness {
             &mut self.state,
             &self.peer,
             Request::ReadIssue {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 surrogate: surrogate.into(),
                 repo: "acme/app".into(),
@@ -281,6 +283,7 @@ impl Harness {
             &mut self.state,
             &self.peer,
             Request::CreateIssue {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 surrogate: surrogate.into(),
                 repo: "acme/app".into(),
@@ -295,6 +298,7 @@ impl Harness {
             &mut self.state,
             &self.peer,
             Request::CreateRelease {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 surrogate: surrogate.into(),
                 repo: "acme/app".into(),
@@ -310,6 +314,7 @@ impl Harness {
             &mut self.state,
             &self.peer,
             Request::PostgresConnect {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 host: "db.internal".into(),
                 host_addr: "127.0.0.1".into(),

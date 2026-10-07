@@ -89,6 +89,7 @@ impl Harness {
             &mut self.state,
             &self.peer,
             Request::MintSurrogate {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 credential: self.credential,
                 max_uses: 2,

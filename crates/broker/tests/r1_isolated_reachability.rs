@@ -144,6 +144,7 @@ fn open_session(state: &mut BrokerState, peer: &WorkloadIdentity) -> AgentSessio
         state,
         peer,
         Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: "/repo".to_string(),
         },
     ) {
@@ -191,6 +192,7 @@ fn stranger() -> WorkloadIdentity {
 
 fn request(session: AgentSessionId, worker: &str, args: &[&str]) -> Request {
     Request::RunIsolated {
+        protocol: asv_ipc_protocol::PROTOCOL_VERSION,
         session,
         worker: worker.to_string(),
         args: args.iter().map(|s| s.to_string()).collect(),
@@ -484,6 +486,7 @@ fn r1_a_lent_credential_does_not_come_back_in_the_response() {
         &mut state,
         &peer,
         Request::RunIsolated {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             worker: "leaky".into(),
             args: vec![],
@@ -537,6 +540,7 @@ fn r1_the_injected_credential_reaches_the_child() {
         &mut state,
         &peer,
         Request::RunIsolated {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             worker: "leaky".into(),
             args: vec![],

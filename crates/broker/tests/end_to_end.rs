@@ -91,6 +91,7 @@ fn cli_and_broker_communicate_over_a_real_socket() {
     let created = roundtrip(
         &sock,
         &asv_ipc_protocol::Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: "/tmp/project".into(),
         },
     );
@@ -109,7 +110,13 @@ fn cli_and_broker_communicate_over_a_real_socket() {
         "M0 broker should start with an empty vault"
     );
 
-    let ended = roundtrip(&sock, &asv_ipc_protocol::Request::EndSession { session });
+    let ended = roundtrip(
+        &sock,
+        &asv_ipc_protocol::Request::EndSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            session,
+        },
+    );
     assert_eq!(ended, asv_ipc_protocol::Response::SessionEnded { session });
 
     let _ = std::fs::remove_file(&sock);

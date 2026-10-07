@@ -77,7 +77,7 @@ type system:
   format, authenticated headers, owner-only files. Backup/restore under a
   *separate* recovery passphrase. Passphrase **rekey** that re-wraps the same
   data key, so pre-rotation backups keep working (`crates/vault`).
-- **Broker daemon** (`asv-brokerd`) — Unix-socket IPC (protocol v10), `SO_PEERCRED`
+- **Broker daemon** (`asv-brokerd`) — Unix-socket IPC (protocol v11), `SO_PEERCRED`
   identity, Cedar policy with **deny-by-default**, fail-closed startup: it opens
   `--vault`/`--passphrase-file` at boot or refuses every brokered operation.
   Core dumps are disabled via `RLIMIT_CORE=0` before any secret exists.
@@ -274,7 +274,7 @@ rather than starting half-configured.
 ```text
 crates/
   domain/         core types, SecretBytes, Authority canonicalization
-  ipc-protocol/   versioned, length-bounded request/response (protocol v10)
+  ipc-protocol/   versioned, length-bounded request/response (protocol v11)
   identity/       SO_PEERCRED + pidfd workload identity
   vault/          encrypted envelope, backup/restore, rekey, TPM prototype
   policy/         Cedar integration, deny-by-default decisions

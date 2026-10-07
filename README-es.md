@@ -79,7 +79,7 @@ imposición es del sistema de tipos:
   una passphrase de recuperación *separada*. **Rekey** de passphrase que
   re-envuelve la misma clave de datos, de modo que los backups previos a la
   rotación siguen funcionando (`crates/vault`).
-- **Daemon broker** (`asv-brokerd`) — IPC por socket Unix (protocolo v10),
+- **Daemon broker** (`asv-brokerd`) — IPC por socket Unix (protocolo v11),
   identidad `SO_PEERCRED`, política Cedar con **deny-by-default**, arranque
   fail-closed: abre `--vault`/`--passphrase-file` al arrancar o niega toda
   operación brokered. Los core dumps se desactivan con `RLIMIT_CORE=0` antes
@@ -285,7 +285,7 @@ pisar una instancia en marcha. Si solo se pasa una de `--vault` /
 ```text
 crates/
   domain/         tipos core, SecretBytes, canonicalización de Authority
-  ipc-protocol/   request/response versionado y acotado por longitud (protocolo v10)
+  ipc-protocol/   request/response versionado y acotado por longitud (protocolo v11)
   identity/       identidad de carga de trabajo SO_PEERCRED + pidfd
   vault/          envelope cifrado, backup/restore, rekey, prototipo TPM
   policy/         integración Cedar, decisiones deny-by-default

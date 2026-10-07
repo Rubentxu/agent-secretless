@@ -124,6 +124,7 @@ fn state_with_session_id() -> (
         &mut state,
         &peer,
         Request::MintSurrogate {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             credential,
             ttl_secs: 300,
@@ -243,12 +244,14 @@ fn a_live_broker_without_a_vault_refuses_instead_of_degrading() {
     // `CreateIssue` but not in `ReadIssue` is still a fallback.
     for request in [
         Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate: token.clone(),
             repo: "owner/repo".into(),
             number: 1,
         },
         Request::CreateIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate: token.clone(),
             repo: "owner/repo".into(),
@@ -256,6 +259,7 @@ fn a_live_broker_without_a_vault_refuses_instead_of_degrading() {
             body: "b".into(),
         },
         Request::CreateRelease {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate: token.clone(),
             repo: "owner/repo".into(),
@@ -292,6 +296,7 @@ fn the_refusal_explains_the_missing_vault_without_leaking() {
         &mut state,
         &peer,
         Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate: token,
             repo: "owner/repo".into(),
@@ -330,6 +335,7 @@ fn a_dead_broker_leaves_nothing_printable_behind() {
         &mut state,
         &peer,
         Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate: token,
             repo: "owner/repo".into(),
@@ -393,6 +399,7 @@ fn state_loss_does_not_resurrect_a_session_or_surrogate() {
         &mut restarted,
         &peer,
         Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate: token,
             repo: "owner/repo".into(),
@@ -446,6 +453,7 @@ fn retrying_after_the_broker_restarts_is_still_denied() {
         &mut original,
         &peer,
         Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate: token.clone(),
             repo: "owner/repo".into(),
@@ -469,6 +477,7 @@ fn retrying_after_the_broker_restarts_is_still_denied() {
         &mut restarted,
         &peer,
         Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate: token,
             repo: "owner/repo".into(),

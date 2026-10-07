@@ -142,6 +142,7 @@ impl Harness {
             &mut self.state,
             &self.peer,
             Request::PostgresConnect {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 host: host.to_string(),
                 host_addr: host_addr.to_string(),

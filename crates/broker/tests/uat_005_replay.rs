@@ -171,6 +171,7 @@ fn live() -> (Fixture, AgentSessionId, String) {
         &mut state,
         &peer,
         Request::MintSurrogate {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             credential,
             max_uses: 3,
@@ -210,6 +211,7 @@ fn a_surrogate_copied_into_another_session_buys_nothing() {
         &mut fixture.state,
         &fixture.peer,
         Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session: other,
             surrogate: surrogate.clone(),
             repo: "o/r".into(),
@@ -248,6 +250,7 @@ fn a_surrogate_sent_straight_to_the_provider_is_not_a_credential() {
         &mut fixture.state,
         &fixture.peer,
         Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate: surrogate.clone(),
             repo: "o/r".into(),
@@ -307,6 +310,7 @@ fn a_surrogate_in_an_ordinary_shell_is_inert() {
         &mut without_broker,
         &orphan_peer,
         Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session: AgentSessionId::new(),
             surrogate,
             repo: "o/r".into(),
@@ -342,6 +346,7 @@ fn no_replay_path_exposes_the_real_credential() {
         &mut fixture.state,
         &fixture.peer,
         Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session: other,
             surrogate,
             repo: "o/r".into(),
@@ -380,6 +385,7 @@ fn a_successful_operation_leaks_the_credential_to_nothing_it_renders() {
         &mut fixture.state,
         &fixture.peer,
         Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate,
             repo: "o/r".into(),
@@ -433,6 +439,7 @@ fn a_credentialed_operation_is_audited_without_the_credential() {
         &mut fixture.state,
         &fixture.peer,
         Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate,
             repo: "o/r".into(),

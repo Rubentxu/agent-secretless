@@ -231,6 +231,7 @@ impl Vertical {
             &mut self.state,
             &self.peer,
             Request::AwsCallerIdentity {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 credential: credential.to_string(),
             },
@@ -393,6 +394,7 @@ fn a_session_this_peer_does_not_own_is_refused_before_any_socket() {
         &mut vertical.state,
         &vertical.peer,
         Request::AwsCallerIdentity {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             // A real, well-formed id that was never created, so the refusal is
             // ownership rather than a parse error.
             session: AgentSessionId::new(),
@@ -440,6 +442,7 @@ fn ending_the_session_stops_further_aws_calls() {
         &mut vertical.state,
         &vertical.peer,
         Request::EndSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session: vertical.session,
         },
     );

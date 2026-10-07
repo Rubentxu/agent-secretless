@@ -239,6 +239,7 @@ impl Fixture {
             &mut state,
             &peer,
             Request::MintSurrogate {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 credential,
                 max_uses: reads,
@@ -270,6 +271,7 @@ impl Fixture {
             &mut self.state,
             &self.peer,
             Request::ReadIssue {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 surrogate: token,
                 repo: "o/r".into(),
@@ -291,6 +293,7 @@ impl Fixture {
             &mut self.state,
             &self.peer,
             Request::MintSurrogate {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 credential,
                 max_uses: 1,
@@ -462,6 +465,7 @@ fn a_teardown_leaves_no_sessions_no_surrogates_and_no_grants() {
         &mut fixture.state,
         &fixture.peer,
         Request::EndSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session: fixture.session,
         },
     );
@@ -563,6 +567,7 @@ fn a_hundred_brokered_reads_leave_zero_live_pins_after_teardown() {
         &mut fixture.state,
         &fixture.peer,
         Request::EndSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session: fixture.session,
         },
     );
@@ -632,6 +637,7 @@ fn a_token_minted_before_teardown_is_useless_after_it() {
         &mut fixture.state,
         &fixture.peer,
         Request::EndSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session: fixture.session,
         },
     );
@@ -640,6 +646,7 @@ fn a_token_minted_before_teardown_is_useless_after_it() {
         &mut fixture.state,
         &fixture.peer,
         Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session: fixture.session,
             surrogate: token,
             repo: "o/r".into(),
@@ -664,6 +671,7 @@ fn a_surrogate_is_spent_exactly_once() {
         &mut fixture.state,
         &fixture.peer,
         Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session: fixture.session,
             surrogate: token.clone(),
             repo: "o/r".into(),
@@ -679,6 +687,7 @@ fn a_surrogate_is_spent_exactly_once() {
         &mut fixture.state,
         &fixture.peer,
         Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session: fixture.session,
             surrogate: token,
             repo: "o/r".into(),

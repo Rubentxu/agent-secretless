@@ -187,7 +187,22 @@ impl BrokerIdentity {
 /// the unisolated one; a peer speaking protocol 7 does not know this verb
 /// exists, and a broker that answered its absence with something else would be
 /// inventing an operation it does not have.
-pub const PROTOCOL_VERSION: u16 = 10;
+/// The protocol version this build speaks.
+///
+/// **Every request carries it, and it is checked before anything else happens.**
+/// The version used to live only on `Ping` and `AgentInfo`, which made the
+/// handshake real for those two verbs and advisory for the other twenty-five:
+/// a client and a broker could disagree about what `CreateSession` meant and
+/// never find out, because nothing compared the two numbers before the broker
+/// evaluated a capability. `check_version` was the function that should have
+/// closed that and had no production caller at all — only its own tests.
+///
+/// So the field is on the wire for all twenty-seven variants and the check
+/// runs once, ahead of the dispatcher. That is why this is 11 and not 10: a
+/// request that decodes is a request that named its version, and a client that
+/// does not fails to decode rather than being answered under a reading of the
+/// protocol it never agreed to.
+pub const PROTOCOL_VERSION: u16 = 11;
 
 /// Hard ceiling on a single inbound message. Bounded allocation is required for
 /// any IPC that faces an untrusted peer (`docs/17-IMPLEMENTATION-BOOTSTRAP.md` §9).
@@ -218,7 +233,7 @@ pub enum Request {
     /// whether a session is possible would be circular.
     AgentInfo { protocol: u16 },
     /// Opens a bounded agent session.
-    CreateSession { workspace: String },
+    CreateSession { protocol: u16, workspace: String },
     /// Binds a public signing key to a live session (ADR-0019).
     ///
     /// The reason this exists is measured, not assumed: `SO_PEERCRED`
@@ -237,13 +252,17 @@ pub enum Request {
     /// the property that stops a second registration from silently
     /// re-pointing an already-issued session at another key.
     RegisterSessionKey {
+        protocol: u16,
         session: AgentSessionId,
         public_key_blob: Vec<u8>,
     },
     /// Closes a session and invalidates its grants.
-    EndSession { session: AgentSessionId },
+    EndSession {
+        protocol: u16,
+        session: AgentSessionId,
+    },
     /// Returns credential *metadata* only. Never values (ADR-0001).
-    ListCredentialMetadata,
+    ListCredentialMetadata { protocol: u16 },
     /// Runs a registered compatibility worker under the M10 isolation
     /// pipeline (ADR-0008, M10).
     ///
@@ -269,6 +288,7 @@ pub enum Request {
     /// `ISOLATED_PROCESS_EXPOSURE`, the compatibility fallback for a legacy
     /// tool that cannot use a surrogate — never the strong path.
     RunIsolated {
+        protocol: u16,
         /// The session this run is charged to. Required: an isolated worker
         /// that could not be revoked by ending a session would outlive the
         /// authority that authorised it.
@@ -307,6 +327,7 @@ pub enum Request {
     /// bytes to be materialised briefly in a zeroized buffer. They reach
     /// neither the vault, nor the inventory, nor a response, nor a log.
     CreateCredential {
+        protocol: u16,
         label: String,
         kind: CredentialKind,
         provider: String,
@@ -316,17 +337,22 @@ pub enum Request {
         secret: OpaqueSecret,
     },
     /// Deletes a credential record.
-    DeleteCredential { id: CredentialId },
+    DeleteCredential { protocol: u16, id: CredentialId },
     /// Evaluates a bounded authorization request without exposing secrets.
     Authorize {
+        protocol: u16,
         request: AuthorizationRequest,
         capability: Option<CapabilityId>,
         approval: Option<ApprovalId>,
     },
     /// Explains a decision without consuming grants or approvals.
-    ExplainAuthorization { request: AuthorizationRequest },
+    ExplainAuthorization {
+        protocol: u16,
+        request: AuthorizationRequest,
+    },
     /// Records an exact human approval for a bounded request.
     SubmitApproval {
+        protocol: u16,
         request: AuthorizationRequest,
         ttl_secs: u64,
     },
@@ -337,6 +363,7 @@ pub enum Request {
     /// pinned session, but the *operation* the surrogate will later stand in
     /// for is still evaluated by [`Request::Authorize`] at use time.
     MintSurrogate {
+        protocol: u16,
         session: AgentSessionId,
         /// The credential the surrogate will stand in for. The agent never
         /// learns the secret behind this id, and the surrogate is useless
@@ -350,6 +377,7 @@ pub enum Request {
     },
     /// Releases a surrogate before its natural expiry.
     RevokeSurrogate {
+        protocol: u16,
         session: AgentSessionId,
         surrogate: String,
     },
@@ -357,6 +385,7 @@ pub enum Request {
     /// the policy engine evaluates `github.issue.read` rather than a
     /// catch-all HTTP verb.
     ReadIssue {
+        protocol: u16,
         session: AgentSessionId,
         surrogate: String,
         /// `owner/repo`, validated before any byte leaves the process.
@@ -365,6 +394,7 @@ pub enum Request {
     },
     /// Semantic GitHub issue creation.
     CreateIssue {
+        protocol: u16,
         session: AgentSessionId,
         surrogate: String,
         repo: String,
@@ -373,6 +403,7 @@ pub enum Request {
     },
     /// Semantic GitHub release creation.
     CreateRelease {
+        protocol: u16,
         session: AgentSessionId,
         surrogate: String,
         repo: String,
@@ -406,6 +437,7 @@ pub enum Request {
     /// request: a session alone is not a credential, and the one that reaches
     /// the registry is derived from a session-bound token.
     PullManifest {
+        protocol: u16,
         session: AgentSessionId,
         surrogate: String,
         /// Selects a declared registry by equality. Never dialed, never
@@ -431,6 +463,7 @@ pub enum Request {
     /// digest that repository has ever published, and a policy rule that cannot
     /// tell the two apart cannot say which it meant.
     PullBlob {
+        protocol: u16,
         session: AgentSessionId,
         surrogate: String,
         registry: String,
@@ -456,6 +489,7 @@ pub enum Request {
     /// the operation is not, and a rule that permits one must not permit the
     /// other.
     PushManifest {
+        protocol: u16,
         session: AgentSessionId,
         surrogate: String,
         /// Selects a declared registry by equality. Never dialed.
@@ -480,6 +514,7 @@ pub enum Request {
     /// those three can disagree is a push that publishes content under an
     /// address it does not have.
     PushBlob {
+        protocol: u16,
         session: AgentSessionId,
         surrogate: String,
         registry: String,
@@ -505,6 +540,7 @@ pub enum Request {
     /// it liked, and SigV4 signs the host — so a request-supplied audience would
     /// make the signature mean nothing.
     AwsCallerIdentity {
+        protocol: u16,
         /// The session this call is charged to. Required for the same reason as
         /// every other session-bearing request: an AWS call that could not be
         /// revoked by ending a session would outlive the authority that
@@ -533,6 +569,7 @@ pub enum Request {
     /// same shape because the problem is the same shape: a derived credential
     /// the agent must not hold, and a provider identity it may ask about.
     OAuth2Identity {
+        protocol: u16,
         /// The session this call is charged to, for the reason every
         /// session-bearing request carries one: a derived identity the broker
         /// cannot revoke on `EndSession` would outlive the grant.
@@ -547,6 +584,7 @@ pub enum Request {
     /// this channel ships separately. The variant exists on the wire so the
     /// CLI can get a precise refusal instead of an unknown-method error.
     AuditQuery {
+        protocol: u16,
         /// Return only records newer than this many seconds.
         since_secs: u64,
     },
@@ -557,6 +595,7 @@ pub enum Request {
     /// (database, role) pair, so an agent cannot ask for a role it was not
     /// granted by phrasing the request differently (M6-R3).
     PostgresConnect {
+        protocol: u16,
         session: AgentSessionId,
         /// The canonical server name. This is the name the server certificate
         /// must match, so it is not merely a DNS hint.
@@ -575,6 +614,7 @@ pub enum Request {
     /// [`asv_domain::Action`], and evaluates policy *before* the statement
     /// reaches the server, so a denied verb never leaves the process.
     PostgresQuery {
+        protocol: u16,
         session: AgentSessionId,
         sql: String,
     },
@@ -583,7 +623,10 @@ pub enum Request {
     /// Revoke is a separate verb rather than a query because it must succeed
     /// even if policy would deny the current statement, and because the agent
     /// must be able to give up access without knowing a valid statement.
-    PostgresRevoke { session: AgentSessionId },
+    PostgresRevoke {
+        protocol: u16,
+        session: AgentSessionId,
+    },
 }
 
 /// Broker responses. Every variant is safe to return to an agent: none of them
@@ -1107,7 +1150,7 @@ impl Request {
             Request::CreateSession { .. } => "create_session",
             Request::RegisterSessionKey { .. } => "register_session_key",
             Request::EndSession { .. } => "end_session",
-            Request::ListCredentialMetadata => "list_credential_metadata",
+            Request::ListCredentialMetadata { .. } => "list_credential_metadata",
             Request::DeleteCredential { .. } => "delete_credential",
             Request::Authorize { .. } => "authorize",
             Request::ExplainAuthorization { .. } => "explain_authorization",
@@ -1133,6 +1176,45 @@ impl Request {
             Request::CreateCredential { .. } => "create_credential",
             Request::RunIsolated { .. } => "run_isolated",
             Request::AwsCallerIdentity { .. } => "aws_caller_identity",
+        }
+    }
+
+    /// The protocol version this request declared.
+    ///
+    /// Total over the enum rather than optional, and that is the point: a
+    /// function that could return `None` would be a function whose `None` the
+    /// caller has to handle, and the caller that does not handle it is how
+    /// twenty-five verbs ended up with no version gate at all. Every arm here
+    /// is a compile error if a future variant forgets the field.
+    pub fn protocol(&self) -> u16 {
+        match self {
+            Request::Ping { protocol }
+            | Request::AgentInfo { protocol }
+            | Request::CreateSession { protocol, .. }
+            | Request::RegisterSessionKey { protocol, .. }
+            | Request::EndSession { protocol, .. }
+            | Request::ListCredentialMetadata { protocol }
+            | Request::RunIsolated { protocol, .. }
+            | Request::CreateCredential { protocol, .. }
+            | Request::DeleteCredential { protocol, .. }
+            | Request::Authorize { protocol, .. }
+            | Request::ExplainAuthorization { protocol, .. }
+            | Request::SubmitApproval { protocol, .. }
+            | Request::MintSurrogate { protocol, .. }
+            | Request::RevokeSurrogate { protocol, .. }
+            | Request::ReadIssue { protocol, .. }
+            | Request::CreateIssue { protocol, .. }
+            | Request::CreateRelease { protocol, .. }
+            | Request::PullManifest { protocol, .. }
+            | Request::PullBlob { protocol, .. }
+            | Request::PushManifest { protocol, .. }
+            | Request::PushBlob { protocol, .. }
+            | Request::AwsCallerIdentity { protocol, .. }
+            | Request::OAuth2Identity { protocol, .. }
+            | Request::AuditQuery { protocol, .. }
+            | Request::PostgresConnect { protocol, .. }
+            | Request::PostgresQuery { protocol, .. }
+            | Request::PostgresRevoke { protocol, .. } => *protocol,
         }
     }
 }
@@ -1222,14 +1304,21 @@ pub fn encode_response(response: &Response) -> Result<Vec<u8>, ProtocolError> {
 }
 
 /// Rejects any request whose protocol version the broker does not implement.
+/// Rejects any request whose protocol version the broker does not implement.
+///
+/// Total, and called ahead of the dispatcher rather than inside two arms of it.
+/// The previous version matched only `Request::Ping`, so the check was real for
+/// one verb and absent for the rest — and had no production caller at all,
+/// being exercised only by the tests beside it. A total check that nothing
+/// calls is the same hole with better coverage, so the caller is the broker's
+/// `handle` and it runs before a single capability is evaluated.
 pub fn check_version(request: &Request) -> Result<(), ProtocolError> {
-    if let Request::Ping { protocol } = request {
-        if *protocol != PROTOCOL_VERSION {
-            return Err(ProtocolError::VersionMismatch {
-                client: *protocol,
-                broker: PROTOCOL_VERSION,
-            });
-        }
+    let client = request.protocol();
+    if client != PROTOCOL_VERSION {
+        return Err(ProtocolError::VersionMismatch {
+            client,
+            broker: PROTOCOL_VERSION,
+        });
     }
     Ok(())
 }
@@ -1276,7 +1365,9 @@ mod tests {
     /// A canary value placed in any field must never survive into a response.
     #[test]
     fn canary_in_request_never_reaches_a_response() {
-        let payload = format!(r#"{{"method":"create_session","workspace":"{CANARY}"}}"#);
+        let payload = format!(
+            r#"{{"method":"create_session","protocol":{PROTOCOL_VERSION},"workspace":"{CANARY}"}}"#
+        );
         let request = decode_request(payload.as_bytes()).expect("valid request");
         let response = match &request {
             Request::CreateSession { .. } => Response::SessionCreated {
@@ -1394,22 +1485,26 @@ mod tests {
         let credential = CredentialId::new();
         for request in [
             Request::MintSurrogate {
+                protocol: PROTOCOL_VERSION,
                 session,
                 credential,
                 max_uses: 2,
                 ttl_secs: 60,
             },
             Request::RevokeSurrogate {
+                protocol: PROTOCOL_VERSION,
                 session,
                 surrogate: "asv1_abc".into(),
             },
             Request::ReadIssue {
+                protocol: PROTOCOL_VERSION,
                 session,
                 surrogate: "asv1_abc".into(),
                 repo: "owner/repo".into(),
                 number: 7,
             },
             Request::CreateIssue {
+                protocol: PROTOCOL_VERSION,
                 session,
                 surrogate: "asv1_abc".into(),
                 repo: "owner/repo".into(),
@@ -1417,6 +1512,7 @@ mod tests {
                 body: "b".into(),
             },
             Request::CreateRelease {
+                protocol: PROTOCOL_VERSION,
                 session,
                 surrogate: "asv1_abc".into(),
                 repo: "owner/repo".into(),
@@ -1443,6 +1539,7 @@ mod tests {
         let session = AgentSessionId::new();
         for request in [
             Request::PostgresConnect {
+                protocol: PROTOCOL_VERSION,
                 session,
                 host: "pg.local.test".into(),
                 host_addr: "127.0.0.1".into(),
@@ -1451,10 +1548,14 @@ mod tests {
                 role: "app".into(),
             },
             Request::PostgresQuery {
+                protocol: PROTOCOL_VERSION,
                 session,
                 sql: "select 1".into(),
             },
-            Request::PostgresRevoke { session },
+            Request::PostgresRevoke {
+                protocol: PROTOCOL_VERSION,
+                session,
+            },
         ] {
             let json = serde_json::to_string(&request).expect("serializes");
             assert!(
@@ -1565,6 +1666,7 @@ mod tests {
         // controls has to be representable without a broker-side truncation
         // surprise, so a full-size request must still be a normal request.
         let request = Request::MintSurrogate {
+            protocol: PROTOCOL_VERSION,
             session: AgentSessionId::new(),
             credential: CredentialId::new(),
             max_uses: MAX_SURROGATE_USES,

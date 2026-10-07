@@ -401,6 +401,7 @@ impl Vertical {
             &mut self.state,
             &self.peer,
             Request::OAuth2Identity {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 credential: credential.to_string(),
             },
@@ -427,6 +428,7 @@ fn a_session_this_peer_does_not_own_is_refused_before_any_socket() {
         &mut vertical.state,
         &vertical.peer,
         Request::OAuth2Identity {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             // A real, well-formed id that was never created, so the refusal is
             // ownership rather than a parse error or a missing registration.
             session: AgentSessionId::new(),
@@ -480,6 +482,7 @@ fn ending_the_session_stops_further_oauth2_calls() {
         &mut vertical.state,
         &vertical.peer,
         Request::EndSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session: vertical.session,
         },
     );
@@ -1261,6 +1264,7 @@ fn the_advertised_capability_is_the_one_this_file_calls() {
     // operation, so an operator reading a log line can find the code.
     assert_eq!(
         Request::OAuth2Identity {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session: AgentSessionId::new(),
             credential: CRED.to_string(),
         }

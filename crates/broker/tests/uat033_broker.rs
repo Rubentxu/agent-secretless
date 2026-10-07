@@ -228,6 +228,7 @@ with_substrate!(
             &mut state,
             &peer,
             Request::PostgresConnect {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 host: substrate.name.clone(),
                 host_addr: substrate.address.to_string(),
@@ -249,6 +250,7 @@ with_substrate!(
             &mut state,
             &peer,
             Request::PostgresQuery {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 sql: "select 41 + 1".into(),
             },
@@ -262,7 +264,14 @@ with_substrate!(
         }
 
         // Revoke, and the answer must be an *observed* teardown.
-        let revoked = handle(&mut state, &peer, Request::PostgresRevoke { session });
+        let revoked = handle(
+            &mut state,
+            &peer,
+            Request::PostgresRevoke {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                session,
+            },
+        );
         assert_eq!(
             revoked,
             Response::PostgresRevoked {
@@ -293,6 +302,7 @@ with_substrate!(
             &mut state,
             &peer,
             Request::PostgresConnect {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 host: substrate.name.clone(),
                 host_addr: substrate.address.to_string(),
@@ -326,7 +336,14 @@ with_substrate!(
             "/proc reads returned nothing, so the check is vacuous"
         );
 
-        let _ = handle(&mut state, &peer, Request::PostgresRevoke { session });
+        let _ = handle(
+            &mut state,
+            &peer,
+            Request::PostgresRevoke {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                session,
+            },
+        );
     }
 );
 
@@ -344,6 +361,7 @@ with_substrate!(
             &mut state,
             &peer,
             Request::PostgresConnect {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 host: substrate.name.clone(),
                 host_addr: substrate.address.to_string(),
@@ -359,6 +377,7 @@ with_substrate!(
             &mut state,
             &peer,
             Request::PostgresConnect {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 host: substrate.name.clone(),
                 host_addr: substrate.address.to_string(),
@@ -372,7 +391,14 @@ with_substrate!(
             !rendered.contains(&substrate.password),
             "the response carried the credential: {rendered}"
         );
-        let _ = handle(&mut state, &peer, Request::PostgresRevoke { session });
+        let _ = handle(
+            &mut state,
+            &peer,
+            Request::PostgresRevoke {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                session,
+            },
+        );
     }
 );
 
@@ -388,6 +414,7 @@ with_substrate!(
             &mut state,
             &peer,
             Request::PostgresConnect {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 host: substrate.name.clone(),
                 host_addr: substrate.address.to_string(),
@@ -456,6 +483,7 @@ with_substrate!(
             &mut state,
             &peer,
             Request::PostgresConnect {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 host: substrate.name.clone(),
                 host_addr: substrate.address.to_string(),
@@ -475,6 +503,7 @@ with_substrate!(
             &mut state,
             &peer,
             Request::PostgresQuery {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 sql: "select 1".into(),
             },
@@ -494,6 +523,7 @@ with_substrate!(
             &mut state,
             &peer,
             Request::PostgresQuery {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 sql: format!("create table {table} (id int)"),
             },
@@ -516,6 +546,7 @@ with_substrate!(
             &mut state,
             &peer,
             Request::PostgresQuery {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 sql: format!(
                     "select count(*) from information_schema.tables where table_name = '{table}'"
@@ -560,6 +591,7 @@ with_substrate!(
                     &mut state,
                     &peer,
                     Request::PostgresConnect {
+                        protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                         session,
                         host: substrate.name.clone(),
                         host_addr: substrate.address.to_string(),
@@ -582,6 +614,7 @@ with_substrate!(
                 &mut state,
                 &peer,
                 Request::PostgresQuery {
+                    protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                     session,
                     sql: sql.to_string(),
                 },
@@ -623,6 +656,7 @@ with_substrate!(
                     &mut state,
                     &peer,
                     Request::PostgresConnect {
+                        protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                         session,
                         host: substrate.name.clone(),
                         host_addr: substrate.address.to_string(),
@@ -644,6 +678,7 @@ with_substrate!(
                     &mut state,
                     &peer,
                     Request::PostgresQuery {
+                        protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                         session,
                         sql: "select 1".into(),
                     },
@@ -666,6 +701,7 @@ with_substrate!(
                 &mut state,
                 &peer,
                 Request::PostgresQuery {
+                    protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                     session,
                     sql: sql.clone(),
                 },
@@ -689,7 +725,7 @@ with_substrate!(
         let probe = handle(
             &mut state,
             &peer,
-            Request::PostgresQuery {
+            Request::PostgresQuery { protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 sql: format!(
                     "select count(*) from information_schema.tables where table_name like '{prefix}%'"
@@ -728,6 +764,7 @@ with_substrate!(
                     &mut state,
                     &peer,
                     Request::PostgresConnect {
+                        protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                         session,
                         host: substrate.name.clone(),
                         host_addr: substrate.address.to_string(),
@@ -749,6 +786,7 @@ with_substrate!(
                     &mut state,
                     &peer,
                     Request::PostgresQuery {
+                        protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                         session,
                         sql: format!("create table {table} (id int)"),
                     },
@@ -775,6 +813,7 @@ with_substrate!(
                     &mut state,
                     &peer,
                     Request::PostgresQuery {
+                        protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                         session,
                         sql: format!("create table {second} (id int)"),
                     },
@@ -794,6 +833,7 @@ with_substrate!(
                     &mut state,
                     &peer,
                     Request::PostgresQuery {
+                        protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                         session,
                         sql: "select 1".into(),
                     },
@@ -845,6 +885,7 @@ with_substrate!(
             &mut state,
             &peer,
             Request::PostgresConnect {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 host: declared.clone(),
                 host_addr: substrate.address.to_string(),
@@ -874,6 +915,7 @@ with_substrate!(
             &mut state,
             &peer,
             Request::PostgresConnect {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 host: "not-the-substrate.example".to_string(),
                 host_addr: substrate.address.to_string(),

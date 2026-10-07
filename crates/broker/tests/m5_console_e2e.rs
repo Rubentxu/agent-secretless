@@ -159,6 +159,7 @@ fn add_grant_use_revoke() {
     let (created, raw) = roundtrip(
         &sock,
         &Request::CreateCredential {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             label: "prod-db".into(),
             kind: CredentialKind::DatabaseCredential,
             provider: "postgres".into(),
@@ -174,7 +175,12 @@ fn add_grant_use_revoke() {
 
     // The metadata list is what the console renders. It must carry the label
     // and not the value.
-    let (metadata, raw) = roundtrip(&sock, &Request::ListCredentialMetadata);
+    let (metadata, raw) = roundtrip(
+        &sock,
+        &Request::ListCredentialMetadata {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+        },
+    );
     assert_no_canary("ListCredentialMetadata", &raw);
     match metadata {
         Response::CredentialMetadata { entries } => {
@@ -199,6 +205,7 @@ fn add_grant_use_revoke() {
     let (session_resp, _) = roundtrip(
         &sock,
         &Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: "/tmp/project".into(),
         },
     );
@@ -237,6 +244,7 @@ fn add_grant_use_revoke() {
     let (decided, raw) = roundtrip(
         &sock,
         &Request::Authorize {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             request: request.clone(),
             capability: None,
             approval: None,
@@ -260,6 +268,7 @@ fn add_grant_use_revoke() {
     let (minted, raw) = roundtrip(
         &sock,
         &Request::MintSurrogate {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             credential: credential_id,
             max_uses: 2,
@@ -282,6 +291,7 @@ fn add_grant_use_revoke() {
     let (revoked, raw) = roundtrip(
         &sock,
         &Request::RevokeSurrogate {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate: surrogate.clone(),
         },
@@ -292,6 +302,7 @@ fn add_grant_use_revoke() {
     let (after, raw) = roundtrip(
         &sock,
         &Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate,
             repo: "routable-invalidation-target/nonexistent".into(),

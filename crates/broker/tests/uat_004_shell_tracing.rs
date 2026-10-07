@@ -214,6 +214,7 @@ fn a_tracing_script_cannot_dump_a_real_credential() {
     let credential_id = match roundtrip(
         &sock,
         &Request::CreateCredential {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             label: CREDENTIAL_LABEL.into(),
             kind: CredentialKind::BearerToken,
             provider: "github".into(),
@@ -363,7 +364,10 @@ python3 {probe}
     // `run_command` and this answers `SessionEnded` instead.
     match roundtrip(
         &sock,
-        &asv_ipc_protocol::Request::EndSession { session: resolved },
+        &asv_ipc_protocol::Request::EndSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            session: resolved,
+        },
     ) {
         asv_ipc_protocol::Response::Error {
             code: asv_ipc_protocol::ErrorCode::InvalidRequest,

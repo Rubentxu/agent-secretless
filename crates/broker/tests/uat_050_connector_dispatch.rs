@@ -103,6 +103,7 @@ fn m6_r1_a_postgres_request_routes_to_postgres() {
         &mut state,
         &peer,
         Request::PostgresConnect {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             host: "db.example".into(),
             host_addr: "127.0.0.1".into(),
@@ -142,6 +143,7 @@ fn m6_r1_an_http_request_naming_a_provider_does_not_route_to_postgres() {
         &mut state,
         &peer,
         Request::CreateRelease {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate: "asv_surrogate_not_a_real_one".into(),
             repo: "postgres".into(),
@@ -173,6 +175,7 @@ fn m6_r1_routing_follows_the_request_variant() {
         &mut pg_state,
         &peer,
         Request::PostgresConnect {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session: pg_session,
             host: "db.example".into(),
             host_addr: "127.0.0.1".into(),
@@ -188,6 +191,7 @@ fn m6_r1_routing_follows_the_request_variant() {
         &peer,
         // The repo carries the same host the PostgreSQL request used.
         Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session: http_session,
             surrogate: "asv_surrogate_not_a_real_one".into(),
             repo: "db.example".into(),

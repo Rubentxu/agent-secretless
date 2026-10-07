@@ -216,6 +216,7 @@ impl Fixture {
             &mut self.state,
             &self.peer,
             Request::MintSurrogate {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 credential,
                 max_uses,
@@ -234,6 +235,7 @@ impl Fixture {
             &mut self.state,
             &self.peer,
             Request::ReadIssue {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session: self.session,
                 surrogate: surrogate.to_string(),
                 repo: "o/r".into(),

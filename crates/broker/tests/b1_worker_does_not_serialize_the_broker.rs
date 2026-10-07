@@ -153,6 +153,7 @@ fn open_session(state: &BrokerState, peer: &WorkloadIdentity) -> AgentSessionId 
         state,
         peer,
         Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: "/repo".to_string(),
         },
     ) {
@@ -163,6 +164,7 @@ fn open_session(state: &BrokerState, peer: &WorkloadIdentity) -> AgentSessionId 
 
 fn run_request(session: AgentSessionId, worker: &str, timeout_ms: u64) -> Request {
     Request::RunIsolated {
+        protocol: asv_ipc_protocol::PROTOCOL_VERSION,
         session,
         worker: worker.to_string(),
         args: Vec::new(),
@@ -228,6 +230,7 @@ fn a_blocked_worker_does_not_delay_end_session() {
         &state,
         &observer,
         Request::EndSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session: other_session,
         },
     );
@@ -262,6 +265,7 @@ fn a_blocked_worker_does_not_delay_end_session() {
         &state,
         &observer,
         Request::EndSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session: other_session,
         },
     );

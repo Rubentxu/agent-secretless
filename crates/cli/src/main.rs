@@ -804,8 +804,13 @@ async fn main() -> std::io::Result<()> {
         Command::Status { .. } => Request::Ping {
             protocol: PROTOCOL_VERSION,
         },
-        Command::Session { workspace } => Request::CreateSession { workspace },
-        Command::Credentials { .. } => Request::ListCredentialMetadata,
+        Command::Session { workspace } => Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            workspace,
+        },
+        Command::Credentials { .. } => Request::ListCredentialMetadata {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+        },
         Command::AddCredential {
             label,
             kind,
@@ -860,6 +865,7 @@ async fn main() -> std::io::Result<()> {
                 std::process::exit(2);
             }
             Request::CreateCredential {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 label,
                 kind,
                 provider,
@@ -882,7 +888,10 @@ async fn main() -> std::io::Result<()> {
             // error carries no text), so nothing the operator typed comes back
             // out through a diagnostic.
             match CredentialId::from_wire(&id) {
-                Ok(id) => Request::DeleteCredential { id },
+                Ok(id) => Request::DeleteCredential {
+                    protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                    id,
+                },
                 Err(_) => {
                     eprintln!("asv: {id:?} is not a credential id; copy it from `asv credentials`");
                     std::process::exit(2);
@@ -897,7 +906,10 @@ async fn main() -> std::io::Result<()> {
                     std::process::exit(2);
                 }),
             };
-            Request::AuditQuery { since_secs }
+            Request::AuditQuery {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                since_secs,
+            }
         }
         Command::Run { .. } => unreachable!("run handled before broker IPC"),
         Command::RunIsolated { .. } => {
@@ -1345,6 +1357,7 @@ fn run_isolated(
     let session = match call(
         socket,
         &Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: std::env::current_dir()
                 .unwrap_or_default()
                 .to_string_lossy()
@@ -1362,6 +1375,7 @@ fn run_isolated(
     let outcome = call(
         socket,
         &Request::RunIsolated {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             worker: worker.to_string(),
             args: args.to_vec(),
@@ -1372,7 +1386,13 @@ fn run_isolated(
 
     // Ended before the result is reported, so a report that never arrives is
     // still bounded by the session's own lifetime.
-    let _ = call(socket, &Request::EndSession { session });
+    let _ = call(
+        socket,
+        &Request::EndSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            session,
+        },
+    );
     let response = outcome?;
 
     match &response {
@@ -1497,6 +1517,7 @@ fn run_github(socket: &std::path::Path, command: &GithubCommand) -> std::io::Res
     let session = match github_call(
         socket,
         &Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: std::env::current_dir()
                 .unwrap_or_default()
                 .to_string_lossy()
@@ -1518,6 +1539,7 @@ fn run_github(socket: &std::path::Path, command: &GithubCommand) -> std::io::Res
     let outcome = github_call(
         socket,
         &Request::MintSurrogate {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             credential,
             max_uses: 1,
@@ -1549,7 +1571,13 @@ fn run_github(socket: &std::path::Path, command: &GithubCommand) -> std::io::Res
     // completed read into "connection failed" would be a worse lie than
     // leaking the session. So the plain transport error is dropped and the
     // grant is left to its own expiry.
-    let _ = call(socket, &Request::EndSession { session });
+    let _ = call(
+        socket,
+        &Request::EndSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            session,
+        },
+    );
 
     let json = github_json_flag(command);
     match &response {
@@ -1611,6 +1639,7 @@ fn run_aws(socket: &std::path::Path, command: &AwsCommand) -> std::io::Result<()
     let session = match github_call(
         socket,
         &Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: std::env::current_dir()
                 .unwrap_or_default()
                 .to_string_lossy()
@@ -1628,6 +1657,7 @@ fn run_aws(socket: &std::path::Path, command: &AwsCommand) -> std::io::Result<()
     let response = github_call(
         socket,
         &Request::AwsCallerIdentity {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             credential: credential.clone(),
         },
@@ -1638,7 +1668,13 @@ fn run_aws(socket: &std::path::Path, command: &AwsCommand) -> std::io::Result<()
     // does not unmake the answer the broker already gave, and turning a
     // completed read into "connection failed" would be a worse lie than leaving
     // the grant to expire.
-    let _ = call(socket, &Request::EndSession { session });
+    let _ = call(
+        socket,
+        &Request::EndSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            session,
+        },
+    );
 
     match &response {
         Response::AwsCallerIdentity {
@@ -1930,7 +1966,12 @@ fn run_integrations_plan(
     let inventory = if no_vault {
         Vec::new()
     } else {
-        match call(socket, &Request::ListCredentialMetadata)? {
+        match call(
+            socket,
+            &Request::ListCredentialMetadata {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            },
+        )? {
             Response::CredentialMetadata { entries } => entries
                 .into_iter()
                 .map(|entry| asv_domain::CredentialMetadata {
@@ -2580,6 +2621,7 @@ fn run_registry(socket: &std::path::Path, command: &RegistryCommand) -> std::io:
     let session = match github_call(
         socket,
         &Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: std::env::current_dir()
                 .unwrap_or_default()
                 .to_string_lossy()
@@ -2597,6 +2639,7 @@ fn run_registry(socket: &std::path::Path, command: &RegistryCommand) -> std::io:
     let outcome = github_call(
         socket,
         &Request::MintSurrogate {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             credential,
             max_uses: 1,
@@ -2621,7 +2664,13 @@ fn run_registry(socket: &std::path::Path, command: &RegistryCommand) -> std::io:
     // close does not unmake bytes the broker already sent, and turning a
     // completed read into "connection failed" would be a worse lie than
     // leaving the grant to expire.
-    let _ = call(socket, &Request::EndSession { session });
+    let _ = call(
+        socket,
+        &Request::EndSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            session,
+        },
+    );
 
     let (body, digest, media_type) = match &response {
         Response::ManifestRead {
@@ -2717,6 +2766,7 @@ impl Selector<'_> {
     ) -> Request {
         match self {
             Selector::Reference(reference) => Request::PullManifest {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 surrogate,
                 registry: registry.clone(),
@@ -2724,6 +2774,7 @@ impl Selector<'_> {
                 reference: (*reference).clone(),
             },
             Selector::Digest(digest) => Request::PullBlob {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 surrogate,
                 registry: registry.clone(),
@@ -2846,6 +2897,7 @@ fn run_registry_push(socket: &std::path::Path, command: &RegistryCommand) -> std
     let session = match github_call(
         socket,
         &Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: std::env::current_dir()
                 .unwrap_or_default()
                 .to_string_lossy()
@@ -2863,6 +2915,7 @@ fn run_registry_push(socket: &std::path::Path, command: &RegistryCommand) -> std
     let outcome = github_call(
         socket,
         &Request::MintSurrogate {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             credential,
             max_uses: 1,
@@ -2876,6 +2929,7 @@ fn run_registry_push(socket: &std::path::Path, command: &RegistryCommand) -> std
     let request = match &outcome {
         Response::SurrogateMinted { surrogate, .. } => match reference {
             Some(reference) => Request::PushManifest {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 surrogate: surrogate.clone(),
                 registry: registry.clone(),
@@ -2884,6 +2938,7 @@ fn run_registry_push(socket: &std::path::Path, command: &RegistryCommand) -> std
                 manifest: bytes.clone(),
             },
             None => Request::PushBlob {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 surrogate: surrogate.clone(),
                 registry: registry.clone(),
@@ -2902,7 +2957,13 @@ fn run_registry_push(socket: &std::path::Path, command: &RegistryCommand) -> std
     let response = github_call(socket, &request);
 
     // Ended before the answer is reported, for the reason `run_registry` gives.
-    let _ = call(socket, &Request::EndSession { session });
+    let _ = call(
+        socket,
+        &Request::EndSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            session,
+        },
+    );
 
     match &response {
         Response::ManifestPushed {
@@ -2978,6 +3039,7 @@ fn run_oauth2(socket: &std::path::Path, command: &Oauth2Command) -> std::io::Res
     let session = match github_call(
         socket,
         &Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: std::env::current_dir()
                 .unwrap_or_default()
                 .to_string_lossy()
@@ -2995,6 +3057,7 @@ fn run_oauth2(socket: &std::path::Path, command: &Oauth2Command) -> std::io::Res
     let response = github_call(
         socket,
         &Request::OAuth2Identity {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             credential: credential.clone(),
         },
@@ -3002,7 +3065,13 @@ fn run_oauth2(socket: &std::path::Path, command: &Oauth2Command) -> std::io::Res
 
     // Ended before the answer is reported, for the reason `run_aws` gives: a
     // report that never arrives is still bounded by the session's own lifetime.
-    let _ = call(socket, &Request::EndSession { session });
+    let _ = call(
+        socket,
+        &Request::EndSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            session,
+        },
+    );
 
     match &response {
         Response::OAuth2Identity {
@@ -3123,6 +3192,7 @@ fn github_request(
 ) -> Request {
     match command {
         GithubCommand::Issue(GithubIssueCommand::View { repo, number, .. }) => Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate: surrogate.to_string(),
             repo: repo.clone(),
@@ -3130,6 +3200,7 @@ fn github_request(
         },
         GithubCommand::Issue(GithubIssueCommand::Create { repo, title, .. }) => {
             Request::CreateIssue {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 surrogate: surrogate.to_string(),
                 repo: repo.clone(),
@@ -3140,6 +3211,7 @@ fn github_request(
         GithubCommand::Release(GithubReleaseCommand::Create {
             repo, tag, name, ..
         }) => Request::CreateRelease {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate: surrogate.to_string(),
             repo: repo.clone(),
@@ -3177,6 +3249,7 @@ fn run_command(socket: &std::path::Path, command: Vec<String>) -> std::io::Resul
     let session = match call(
         socket,
         &Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: std::env::current_dir()
                 .unwrap_or_default()
                 .to_string_lossy()
@@ -3224,6 +3297,7 @@ fn run_command(socket: &std::path::Path, command: Vec<String>) -> std::io::Resul
     match call(
         socket,
         &Request::RegisterSessionKey {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             public_key_blob: agent.public_key_blob(),
         },
@@ -3311,7 +3385,13 @@ fn run_command(socket: &std::path::Path, command: Vec<String>) -> std::io::Resul
     // The session is closed before the agent is dropped, so a child that
     // outlived its own command cannot keep redeeming surrogates against a
     // session the operator believes has ended.
-    let _ = call(socket, &Request::EndSession { session });
+    let _ = call(
+        socket,
+        &Request::EndSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            session,
+        },
+    );
     drop(agent); // revoke and remove the socket before returning to the shell
     if let Some(code) = status.code() {
         std::process::exit(code);
@@ -3737,6 +3817,7 @@ mod tests {
     #[test]
     fn request_encoding_stays_within_the_protocol_bound() {
         let req = Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: "/home/user/project".into(),
         };
         let bytes = serde_json::to_vec(&req).expect("serializes");
@@ -3809,6 +3890,7 @@ mod tests {
     #[test]
     fn the_serialized_request_lives_in_a_buffer_that_zeroizes() {
         let request = Request::CreateCredential {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             label: "example".into(),
             kind: asv_domain::CredentialKind::ApiKey,
             provider: "example".into(),
@@ -4043,6 +4125,7 @@ fn run_integrations_adopt(
     let response = call(
         socket,
         &Request::CreateCredential {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             label: label.to_string(),
             // A registry token is a bearer token as far as the vault is
             // concerned; the registry it is for is the binding's business, and
@@ -4244,7 +4327,12 @@ fn run_integrations_execute(
     let inventory: Vec<asv_domain::CredentialMetadata> = if no_vault {
         Vec::new()
     } else {
-        match call(socket, &Request::ListCredentialMetadata) {
+        match call(
+            socket,
+            &Request::ListCredentialMetadata {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            },
+        ) {
             Ok(Response::CredentialMetadata { entries }) => entries
                 .into_iter()
                 .map(|entry| asv_domain::CredentialMetadata {
@@ -4370,6 +4458,7 @@ fn run_integrations_execute(
         None => match call(
             socket,
             &Request::CreateSession {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 workspace: workspace.to_string(),
             },
         ) {
@@ -4575,7 +4664,13 @@ fn authorize_over_ipc(
             peer_uid: unsafe { libc::geteuid() },
         },
     };
-    match call(socket, &Request::ExplainAuthorization { request }) {
+    match call(
+        socket,
+        &Request::ExplainAuthorization {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            request,
+        },
+    ) {
         Ok(Response::Authorization { explanation }) => {
             match explanation.decision {
                 asv_domain::Decision::Allow => asv_integrations::AuthorizationVerdict::Permit {

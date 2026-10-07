@@ -281,6 +281,7 @@ impl Broker {
             &mut self.state,
             &self.peer,
             Request::DeleteCredential {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 id: asv_domain::CredentialId::from_wire(id).expect("canonical wire form"),
             },
         )

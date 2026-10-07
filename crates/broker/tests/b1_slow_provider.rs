@@ -283,6 +283,7 @@ fn stalling_vertical() -> Vertical {
         &state,
         &peer,
         Request::MintSurrogate {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             credential: CredentialId::from_wire(CRED).expect("canonical wire form"),
             max_uses: 4,
@@ -334,6 +335,7 @@ fn a_slow_provider_does_not_delay_another_session() {
     puller.pin_pidfd().expect("pin this test's own process");
     let (tx, rx) = std::sync::mpsc::channel();
     let request = Request::PullManifest {
+        protocol: asv_ipc_protocol::PROTOCOL_VERSION,
         session,
         surrogate,
         registry: NAME.to_string(),
@@ -360,6 +362,7 @@ fn a_slow_provider_does_not_delay_another_session() {
         &state,
         &newcomer,
         Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: "/another/repo".to_string(),
         },
     );

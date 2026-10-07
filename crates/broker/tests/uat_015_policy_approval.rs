@@ -89,6 +89,7 @@ fn the_protected_push_blocks_until_the_operator_approves_it() {
         &mut state,
         &operator,
         Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: "/repo".into(),
         },
     ) {
@@ -102,6 +103,7 @@ fn the_protected_push_blocks_until_the_operator_approves_it() {
         &mut state,
         &operator,
         Request::Authorize {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             request: request.clone(),
             capability: None,
             approval: None,
@@ -124,6 +126,7 @@ fn the_protected_push_blocks_until_the_operator_approves_it() {
         &mut state,
         &operator,
         Request::SubmitApproval {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             request: request.clone(),
             ttl_secs: 60,
         },
@@ -144,6 +147,7 @@ fn the_protected_push_blocks_until_the_operator_approves_it() {
         &mut state,
         &operator,
         Request::Authorize {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             request: request.clone(),
             capability: None,
             approval: Some(approval.id),
@@ -163,6 +167,7 @@ fn the_protected_push_blocks_until_the_operator_approves_it() {
         &mut state,
         &operator,
         Request::Authorize {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             request: request.clone(),
             capability: None,
             approval: Some(approval.id),
@@ -195,6 +200,7 @@ fn an_approval_is_spent_only_on_the_request_it_describes() {
         &mut state,
         &operator,
         Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: "/repo".into(),
         },
     ) {
@@ -211,6 +217,7 @@ fn an_approval_is_spent_only_on_the_request_it_describes() {
         &mut state,
         &operator,
         Request::SubmitApproval {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             request: other,
             ttl_secs: 60,
         },
@@ -223,6 +230,7 @@ fn an_approval_is_spent_only_on_the_request_it_describes() {
         &mut state,
         &operator,
         Request::Authorize {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             request: protected_push(session, operator.credentials.uid),
             capability: None,
             approval: Some(other_approval.id),
@@ -254,6 +262,7 @@ fn a_peer_that_is_not_enrolled_can_neither_approve_nor_read_audit() {
         &mut state,
         &stranger,
         Request::SubmitApproval {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             request: protected_push(asv_domain::AgentSessionId::new(), stranger.credentials.uid),
             ttl_secs: 60,
         },
@@ -265,7 +274,14 @@ fn a_peer_that_is_not_enrolled_can_neither_approve_nor_read_audit() {
         other => panic!("an unenrolled peer minted an approval: {other:?}"),
     }
 
-    match handle(&mut state, &stranger, Request::AuditQuery { since_secs: 0 }) {
+    match handle(
+        &mut state,
+        &stranger,
+        Request::AuditQuery {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            since_secs: 0,
+        },
+    ) {
         Response::Error { code, .. } => assert_eq!(code, asv_ipc_protocol::ErrorCode::Denied),
         other => panic!("an unenrolled peer read the audit log: {other:?}"),
     }

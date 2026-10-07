@@ -175,6 +175,7 @@ fn a_surrogate_minted_from_a_database_credential_cannot_reach_github() {
     let credential_id = match roundtrip(
         &sock,
         &Request::CreateCredential {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             label: "h2-subject".into(),
             kind: CredentialKind::DatabaseCredential,
             provider: "postgres".into(),
@@ -190,6 +191,7 @@ fn a_surrogate_minted_from_a_database_credential_cannot_reach_github() {
     let session = match roundtrip(
         &sock,
         &Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: "/tmp/project".into(),
         },
     ) {
@@ -204,6 +206,7 @@ fn a_surrogate_minted_from_a_database_credential_cannot_reach_github() {
     match roundtrip(
         &sock,
         &Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate: "not-a-real-surrogate".into(),
             repo: "routable-bypass-target/nonexistent".into(),
@@ -239,6 +242,7 @@ fn a_surrogate_minted_from_a_database_credential_cannot_reach_github() {
     match roundtrip(
         &sock,
         &Request::Authorize {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             request,
             capability: None,
             approval: None,
@@ -255,6 +259,7 @@ fn a_surrogate_minted_from_a_database_credential_cannot_reach_github() {
     let surrogate = match roundtrip(
         &sock,
         &Request::MintSurrogate {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             credential: credential_id,
             max_uses: 2,
@@ -269,6 +274,7 @@ fn a_surrogate_minted_from_a_database_credential_cannot_reach_github() {
     let answer = roundtrip(
         &sock,
         &Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate: surrogate.clone(),
             repo: "routable-bypass-target/nonexistent".into(),
@@ -308,6 +314,7 @@ fn a_surrogate_minted_from_a_database_credential_cannot_reach_github() {
     let second = roundtrip(
         &sock,
         &Request::ReadIssue {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
             surrogate: surrogate.clone(),
             repo: "routable-bypass-target/nonexistent".into(),

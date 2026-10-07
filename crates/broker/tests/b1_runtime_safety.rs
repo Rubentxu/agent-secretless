@@ -217,6 +217,7 @@ fn a_peer_that_has_written_nothing_does_not_delay_another_agent() {
     let (response, elapsed) = round_trip(
         &fixture.sock,
         &Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             workspace: fixture.dir.display().to_string(),
         },
         CONCURRENT_ANSWER,
