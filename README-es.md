@@ -17,14 +17,14 @@ agente ──(sustituto / socket)──▶ broker ──(credencial real)──�
 > **Estado: pre-1.0, en v0.36.0. Certificado en este árbol por la fila R11; la
 > release aún no se ha publicado, y los gates lo dicen.**
 >
-> El workspace compila y hay **2049 tests enumerados**. Con `cargo test`, 2048
+> El workspace compila y hay **2050 tests enumerados**. Con `cargo test`, 2049
 > se ejecutan y pasan y 1 queda fuera de las compilaciones de depuración por
 > construcción: el presupuesto de latencia p95 lleva
 > `#[cfg_attr(debug_assertions, ignore)]`, porque un presupuesto de latencia
 > medido contra ed25519 en depuración es una afirmación sobre
 > `debug_assertions`, no sobre el producto. Ese test se afirma con `--release`,
 > y por eso la corrida en release de abajo — con los dos filtros `--skip` que
-> documenta — ejecuta 2047 de ellos. Medido en el host de certificación sobre
+> documenta — ejecuta 2048 de ellos. Medido en el host de certificación sobre
 > este árbol, ese presupuesto pasa con **p95=5332us frente a 6000us** — 11% de
 > margen, sobre un Xeon E5-2682 v4. Revisiones anteriores de este fichero
 > afirmaban 1490us; la cifra nunca se volvió a derivar y la fila había dejado de
@@ -226,19 +226,26 @@ permisos de fichero. Es una carencia registrada para cerrar antes de 1.0.
 cargo build --release --workspace
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# esperado: passed=2047 failed=0 ignored=0
+# esperado: passed=2048 failed=0 ignored=0
 ```
 
-2047 y no 2049 porque el comando de arriba se salta dos: `uat_028` levanta un
+2048 y no 2050 porque el comando de arriba se salta dos: `uat_028` levanta un
 `sshd` real y necesita un host donde correr, y el presupuesto p95 se afirma por
 separado en `--release` para que el inicio rápido siga siendo rápido. Los dos
-saltos se cuentan como filtrados, no como ignorados, así que 2047 + 2
-filtrados son los 2049 enumerados.
+saltos se cuentan como filtrados, no como ignorados, así que 2048 + 2
+filtrados son los 2050 enumerados.
 
-Medido en el host de certificación sobre este árbol: depuración 110 bloques /
-2048 pasadas / 0 fallidas / 1 ignorada / 0 filtradas; release 114 bloques /
-2047 pasadas / 0 fallidas / 0 ignoradas / 2 filtradas. Ambos enumeran 2049. Los dos números no
-son variantes de una misma medición — la corrida de depuración no lleva ningún
+Los dos perfiles se *midieron* por última vez en la certificación de `5873aa4`,
+que enumeraba 2049: depuración 114 bloques / 2048 pasadas / 0 fallidas /
+1 ignorada / 0 filtradas; release 114 bloques / 2047 pasadas / 0 fallidas /
+0 ignoradas / 2 filtradas. Ese recibo se cita en lugar de renumerarse, porque
+se tomó sobre un árbol distinto y fingir lo contrario es precisamente el fallo
+que esta sección existe para evitar. La aritmética de arriba se vuelve a derivar
+de la enumeración viva en cada corrida; la cifra de p95 es el único número de
+aquí que es una medición y no una identidad.
+
+Los dos números del recibo citado no son variantes de una misma medición — la
+corrida de depuración no lleva ningún
 `--skip` y la de release lleva dos, y la fila p95 queda `ignore` en depuración
 y se afirma en release.
 

@@ -335,6 +335,50 @@ fn a_protocol_mismatch_fails_closed() {
     }
 }
 
+/// The mismatch message names both sides, because `asv agent discover --json`
+/// is documented as the only command an agent needs.
+///
+/// It used to read *"Upgrade so both come from the same release"* and stop
+/// there. That sentence tells an agent what to do and withholds the one fact
+/// that decides how — which release the broker is on — so the agent has to run
+/// `doctor` to obtain it, and `doctor` is exactly the extra command the
+/// discovery contract says it should not need. The remedy without the number is
+/// a half-answer.
+///
+/// Asserted on the *message*, not on a link: there is no upgrade relation to
+/// assert yet, and inventing one whose argv is not a real `asv` command is the
+/// fiction `crates/cli/src/agent/relations.rs` exists to prevent. See
+/// `every_operational_relation_parses_as_a_real_command`.
+#[test]
+fn a_protocol_mismatch_names_both_versions() {
+    let dir = TempTree::new("mismatch-versions");
+    let socket = dir.sub("broker.sock");
+    let broker_protocol = asv_ipc_protocol::PROTOCOL_VERSION.wrapping_add(5);
+    spawn_broker(&socket, broker_protocol);
+
+    let discovery = discover(&socket, true);
+    let value: serde_json::Value =
+        serde_json::from_str(&discovery.to_envelope().to_json()).unwrap();
+    let message = value["error"]["message"].as_str().unwrap();
+
+    assert!(
+        message.contains(&format!("protocol v{broker_protocol}")),
+        "the message does not name the protocol the broker actually speaks: {message}"
+    );
+    assert!(
+        message.contains(&format!("protocol v{}", asv_ipc_protocol::PROTOCOL_VERSION)),
+        "the message does not name the protocol this build speaks: {message}"
+    );
+    assert!(
+        message.contains("Upgrade"),
+        "the message states a mismatch without saying what to do about it: {message}"
+    );
+    assert!(
+        message.contains("Nothing was changed"),
+        "the message stopped promising that the discovery was read-only: {message}"
+    );
+}
+
 /// The schema string is what an unknown consumer refuses on, so it is pinned
 /// here as well as in `schema.rs` — this is the document DX2 promises.
 #[test]

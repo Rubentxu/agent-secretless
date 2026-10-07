@@ -17,13 +17,13 @@ agent ──(surrogate / socket)──▶ broker ──(real credential)──�
 > **Status: pre-1.0, at v0.36.0. Certified on this tree by the R11 row; the
 > release has not been published yet, and the gates say so.**
 >
-> The workspace compiles and **2049 tests are enumerated**. Under `cargo test`,
-> 2048 of them run and pass and 1 is gated out of debug builds by construction:
+> The workspace compiles and **2050 tests are enumerated**. Under `cargo test`,
+> 2049 of them run and pass and 1 is gated out of debug builds by construction:
 > the p95 latency budget carries `#[cfg_attr(debug_assertions, ignore)]`,
 > because a latency budget measured against debug ed25519 is a statement about
 > `debug_assertions` rather than about the product. It is asserted under
 > `--release`, which is why the release run below — carrying the two `--skip`
-> filters it documents — executes 2047 of them. Measured on the certification
+> filters it documents — executes 2048 of them. Measured on the certification
 > host at this tree, that budget passes at **p95=5332us against 6000us** — 11%
 > headroom, on a Xeon E5-2682 v4. Earlier revisions of this file claimed
 > 1490us; the figure was never re-derived and the row above had stopped being a
@@ -217,21 +217,28 @@ permissions alone. That is a recorded gap to close before 1.0.
 cargo build --release --workspace
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# expected: passed=2047 failed=0 ignored=0
+# expected: passed=2048 failed=0 ignored=0
 ```
 
-2047 rather than 2049 because the command above skips two of them: `uat_028`
+2048 rather than 2050 because the command above skips two of them: `uat_028`
 starts a real `sshd` and needs a host to run it, and the p95 budget is asserted
 separately in `--release` so the quick start stays a quick start. The two
-skips are reported as filtered, not as ignored, so 2047 + 2 filtered is the
-2049 enumerated.
+skips are reported as filtered, not as ignored, so 2048 + 2 filtered is the
+2050 enumerated.
 
-Measured on the certification host at this tree: debug 114 blocks / 2048
-passed / 0 failed / 1 ignored / 0 filtered; release 114 blocks / 2047 passed /
-0 failed / 0 ignored / 2 filtered. Both enumerate 2049. The two numbers are not
-variants of one measurement — the debug run carries no `--skip` and the release
-run carries two, and the p95 row is `ignore`d in debug and asserted in
-release, which is exactly the 2048 - 2047 the two profiles differ by. The
+The two profiles were last *measured* on the certification of `5873aa4`, which
+enumerated 2049: debug 114 blocks / 2048 passed / 0 failed / 1 ignored / 0
+filtered; release 114 blocks / 2047 passed / 0 failed / 0 ignored / 2 filtered.
+That receipt is quoted rather than renumbered, because it was taken on a
+different tree and pretending otherwise is the failure this section exists to
+prevent. The arithmetic above is re-derived from the live enumeration every
+run; the p95 figure below is the one number here that is a measurement rather
+than an identity.
+
+The two numbers in the quoted receipt are not variants of one measurement — the
+debug run carries no `--skip` and the release run carries two, and the p95 row
+is `ignore`d in debug and asserted in release, which is exactly the
+2048 - 2047 the two profiles differ by. The
 identity `enumerated == passed + failed + ignored + filtered` is now checked by
 the `test-count arithmetic` gate rather than left to a reader.
 

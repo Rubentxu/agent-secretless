@@ -199,7 +199,7 @@ impl Discovery {
         if let Some(code) = &self.code {
             envelope.error = Some(crate::agent::schema::AgentError {
                 code: code.clone(),
-                message: message_for(code, self.broker_reachable).to_string(),
+                message: message_for(code, self.broker_reachable, self.broker.as_ref()),
             });
         }
 
@@ -244,13 +244,12 @@ impl Discovery {
         let mut out = format!("asv agent discover — {}\n\n", self.status.as_str());
 
         match (&self.code, self.broker_reachable) {
-            (Some(code), false) => {
+            (Some(code), reachable) => {
                 out.push_str(&format!("{code}\n"));
-                out.push_str(&format!("  {}\n\n", message_for(code, false)));
-            }
-            (Some(code), true) => {
-                out.push_str(&format!("{code}\n"));
-                out.push_str(&format!("  {}\n\n", message_for(code, true)));
+                out.push_str(&format!(
+                    "  {}\n\n",
+                    message_for(code, reachable, self.broker.as_ref())
+                ));
             }
             (None, _) => {}
         }
@@ -312,26 +311,50 @@ fn capability_supports(rel: AgentRel, capabilities: &CapabilityReport) -> bool {
 }
 
 /// Prose for a code. `message` is for humans; `code` is the contract.
-fn message_for(code: &str, reachable: bool) -> &'static str {
+///
+/// Returns `String` rather than `&'static str` because one code has to name a
+/// number. `PROTOCOL_MISMATCH` used to say *"Upgrade so both come from the same
+/// release"* without saying which release the broker is on, so an agent handed
+/// that sentence had to run `doctor` to learn the single fact that decides what
+/// to do next. A failure that names the remedy without the number is a
+/// half-answer, and `asv agent discover --json` is documented as the only thing
+/// an agent needs.
+fn message_for(code: &str, reachable: bool, broker: Option<&BrokerFacts>) -> String {
     match code {
         code::BROKER_UNAVAILABLE => {
             "the broker is not answering. The installation may be complete and the \
              service stopped; `asv doctor` says which."
+                .into()
         }
         code::SETUP_REQUIRED => {
             "this installation has not been set up. `asv setup` creates the runtime \
              layout, the vault and the service."
+                .into()
         }
-        code::PROTOCOL_MISMATCH => {
-            "a broker answered that this CLI does not speak to. Upgrade so both come \
-             from the same release. Nothing was changed."
-        }
+        code::PROTOCOL_MISMATCH => match broker {
+            Some(b) => format!(
+                "a broker answered that this CLI does not speak to: it speaks protocol \
+                 v{} and product {}, this build speaks protocol v{}. Upgrade so both \
+                 come from the same release. Nothing was changed.",
+                b.protocol,
+                b.product_version,
+                asv_ipc_protocol::PROTOCOL_VERSION
+            ),
+            // A broker that answered but did not describe itself leaves no version
+            // to name. The remedy is unchanged; only the number is absent, and it
+            // is absent because it was never told, not because it was withheld.
+            None => "a broker answered that this CLI does not speak to, but did not \
+                     say which protocol it speaks. Upgrade so both come from the \
+                     same release. Nothing was changed."
+                .into(),
+        },
         code::SCHEMA_UNSUPPORTED => {
             "this build does not serve the asv.agent/v1 schema. Refusing to describe \
              itself against a contract it does not implement."
+                .into()
         }
-        _ if reachable => "the broker answered in a way this build cannot use.",
-        _ => "the broker could not be asked.",
+        _ if reachable => "the broker answered in a way this build cannot use.".into(),
+        _ => "the broker could not be asked.".into(),
     }
 }
 
