@@ -119,6 +119,98 @@ If eBPF feature ships:
 
 Every supported integration has one of the defined posture labels. No documentation or UI implies `EXEC_ISOLATED`/raw env is equivalent to secretless proxy/signing.
 
+## Laws — registered invariants
+
+These are not gates and they are not test names. They are the properties the
+B1 block established by measurement, written so that a future change can be
+checked against them rather than re-derived. Each names the failure it exists
+to prevent, and each is falsifiable by a mutation that is named with it.
+
+### AUDIT-LIVENESS
+
+> An isolated operation does not hold the audit lock for its own lifetime.
+
+The audit chain is where every brokered request ends, so it is shared by every
+connection. A lock held across a child's life is therefore a lock every other
+agent queues behind: measured, ending an unrelated session while a 9-second
+worker ran took **8.77 seconds**.
+
+`worker::spawn` locks per record and releases immediately. Each `append` stays
+atomic against other writers; what it no longer is, is atomic against the child,
+which was never why it was taken.
+
+Three properties follow and all three are rows, and none of them may be deleted
+in a refactor:
+
+| Property | Row |
+|---|---|
+| a long worker does not delay `EndSession` | `a_blocked_worker_does_not_delay_end_session` |
+| concurrent requests still produce one valid chain | `concurrent_requests_still_produce_one_valid_audit_chain` |
+| a poisoned chain denies an isolated run before the child exists | `a_poisoned_audit_chain_denies_an_isolated_run` |
+
+The third is the one that was rewritten. Asserting the refusal is not enough:
+`handle`'s own trailing append also hits a poisoned mutex and returns the same
+refusal, so a response-shaped assertion passes against a build that spawned the
+worker anyway. The row observes a file the child writes, because that is the
+only observable the broker cannot mask.
+
+### WORKER-LIFETIME
+
+> A requested timeout can only reduce the ceiling. It can never raise it.
+
+```text
+effective = min(requested ?? DEFAULT_WORKER_TIMEOUT, DEFAULT_WORKER_TIMEOUT)
+```
+
+```text
+requested < ceiling  -> requested
+requested = ceiling  -> ceiling
+requested > ceiling  -> ceiling
+missing              -> ceiling
+```
+
+The cap is what lets the default be short, so it has to be a ceiling and not a
+starting point. Before this law the code read `unwrap_or(DEFAULT)`, which
+supplies a default and bounds nothing: a client asking for ten minutes against a
+ten-second cap got **30 seconds** and finished normally.
+
+The row measures the whole of `handle` — signal, grace, kill, reap and cleanup
+included — and requires the observed wall clock to stay within the ceiling plus a
+reaping allowance. Limiting the `wait` and limiting the observable life are
+different claims, and only the second one is the law.
+
+### PROTOCOL-ADMISSION
+
+> No incompatible request reaches the dispatcher, and none produces an effect.
+
+Two cases, deliberately different:
+
+```text
+protocol = 10   -> VersionMismatch, after decode, before any capability
+no field        -> decode failure; no Request exists, so nothing can dispatch
+```
+
+`protocol` is a required field on every variant with no serde default. A legacy
+client does not get smoothed into a current one, because that default would have
+made the failure mode invisible rather than absent.
+
+**The part that is easy to get wrong: a correct response does not prove the
+absence of effects.** A gate placed after the dispatcher answers `VersionMismatch`
+and has already created the session, bound the key and written the credential.
+So the law is about state, and the rows assert on state:
+
+| Observable | Row |
+|---|---|
+| grants — no key is bound | `a_refused_request_binds_nothing` |
+| credential inventory — nothing is written, in memory or on disk | `an_incompatible_protocol_moves_no_credential_inventory` |
+| sessions — no session is created | structural: `handle` takes a `Request`, not bytes, so a document that fails to decode has no value a handler could have been handed |
+
+Both state rows were rewritten during this block after passing against the very
+mutation they were meant to catch. The inventory one passed because a default
+broker refuses `CreateCredential` anyway, so "the inventory did not move" was
+evidence about a refusal rather than about a protocol; it needed a real vault and
+an enrolled principal before it could fail.
+
 ## R11 — Full certification
 
 Before final release:

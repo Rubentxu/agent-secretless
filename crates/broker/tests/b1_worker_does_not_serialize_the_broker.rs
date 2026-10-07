@@ -65,6 +65,7 @@ use asv_broker::worker::DEFAULT_WORKER_TIMEOUT;
 use asv_broker::{handle, BrokerState};
 use asv_domain::AgentSessionId;
 use asv_identity::{PeerCredentials, WorkloadIdentity};
+use asv_ipc_protocol::PROTOCOL_VERSION;
 use asv_ipc_protocol::{ErrorCode, Request, Response};
 
 /// How long the second agent may wait while the worker is still running.
@@ -347,4 +348,173 @@ fn a_caller_cannot_raise_the_worker_lifetime_cap() {
              credential."
         ),
     }
+}
+
+/// **A poisoned audit chain refuses an isolated run, and the worker does not run.**
+///
+/// The third of the three properties this block has to keep alive. The first
+/// (`a_blocked_worker_does_not_delay_end_session`) is about a healthy chain
+/// under load; this one is about an unhealthy one.
+///
+/// "Unrecorded" is the load-bearing word: a broker that spawns a process and
+/// then fails to write the record has produced exactly the state the audit
+/// chain exists to rule out. So the check has to happen *before* the child
+/// exists, and it does — `AuditWriter::is_writable` runs ahead of the spawn.
+///
+/// **Why a file and not the response.** The first version of this row asserted
+/// only that the answer was the poisoned-chain refusal, and it passed against a
+/// build with the pre-flight check switched off. The reason is worth recording:
+/// `handle`'s own trailing append also hits the poisoned mutex and returns the
+/// same refusal, so the trailing append masks whatever the dispatcher did. A
+/// refusal observed at the response is therefore evidence about the *last*
+/// thing that touched the chain, not about the worker. The marker file is the
+/// only observable that survives that masking, because it is written by the
+/// child rather than by the broker.
+#[test]
+fn a_poisoned_audit_chain_denies_an_isolated_run() {
+    require_userns("a_poisoned_audit_chain_denies_an_isolated_run");
+
+    let dir = std::env::temp_dir().join(format!("asv-poisoned-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create the marker dir");
+    let marker = dir.join("ran");
+
+    let peer = pinned_peer();
+    let state = Arc::new(BrokerState {
+        workers: Arc::new(WorkerRegistry::new(vec![marker_template(&dir, &marker)])),
+        ..BrokerState::default()
+    });
+    let session = open_session(&state, &peer);
+
+    // The control. It has to actually run, or "the marker is absent" below is
+    // evidence about a template that never works.
+    let ran = handle(&state, &peer, run_request(session, "marker", 5_000));
+    assert!(
+        matches!(ran, Response::IsolatedResult { .. }),
+        "the control must run a worker, or this row proves nothing: {ran:?}"
+    );
+    assert!(
+        marker.exists(),
+        "the control's worker did not write its marker, so the assertion below \
+         would pass for a template that cannot run rather than for a chain that \
+         refused"
+    );
+    let _ = std::fs::remove_file(&marker);
+
+    // Poison the chain the only way a mutex can be poisoned: a thread panics
+    // while holding it.
+    let chain = state.audit.clone();
+    let _ = std::thread::spawn(move || {
+        let _guard = chain.lock().expect("unpoisoned to start with");
+        panic!("poison the audit chain on purpose");
+    })
+    .join();
+
+    let refused = handle(&state, &peer, run_request(session, "marker", 5_000));
+    match &refused {
+        Response::Error { code, message } => {
+            assert_eq!(
+                *code,
+                ErrorCode::Upstream,
+                "a poisoned chain is an upstream failure, not a denial: {message}"
+            );
+            assert!(
+                message.contains("poisoned"),
+                "the refusal must say why, because an operator reading the audit \
+                 chain needs to know nothing ran: {message}"
+            );
+        }
+        other => panic!(
+            "a worker ran on a poisoned audit chain and the broker answered \
+             {other:?}. A process was handed a credential and no record of it \
+             exists."
+        ),
+    }
+    assert!(
+        !marker.exists(),
+        "the broker refused on the poisoned chain and ran the worker anyway: \
+         {} exists. A process was spawned with nothing recorded, which is the \
+         one outcome an audit chain exists to make impossible.",
+        marker.display()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A worker whose only effect is a file the test can see.
+fn marker_template(dir: &std::path::Path, marker: &std::path::Path) -> WorkerTemplate {
+    WorkerTemplate {
+        name: "marker".into(),
+        binary: "/bin/sh".into(),
+        arguments: vec!["-c".into(), format!("printf ran > {}", marker.display())],
+        secret_injection: SecretInjectionPlan::None,
+        egress_policy: EgressPolicy::Deny,
+        // The write allowance is the point: the child has to be able to leave a
+        // trace the broker cannot fake and cannot mask.
+        landlock_profile: LandlockProfile {
+            allowed_read: vec![dir.to_path_buf()],
+            allowed_write: vec![dir.to_path_buf()],
+        },
+        seccomp_profile: SeccompProfile::ClosedAllowList,
+        redactor: Redactor::empty(),
+    }
+}
+
+/// **Concurrent requests still produce one valid chain.**
+///
+/// The second of the three. The first says a long worker does not hold the
+/// lock; that is only half of what a chain needs. The other half is that
+/// taking the lock per record did not turn the chain into a sequence of
+/// unrelated fragments — so this drives many agents at once and asks the chain
+/// to verify itself afterwards.
+///
+/// `verify` is the whole chain's hash linkage, so a pass is a statement about
+/// every link and not about the count. The count is asserted too, because a
+/// chain that verified because it only contains one record would be a quieter
+/// version of the same bug.
+#[test]
+fn concurrent_requests_still_produce_one_valid_audit_chain() {
+    const AGENTS: usize = 8;
+    const REQUESTS_EACH: usize = 12;
+
+    let state = Arc::new(BrokerState::default());
+
+    let mut threads = Vec::with_capacity(AGENTS);
+    for _ in 0..AGENTS {
+        let state = Arc::clone(&state);
+        threads.push(std::thread::spawn(move || {
+            let peer = pinned_peer();
+            for _ in 0..REQUESTS_EACH {
+                // `Ping` at the live version: refused nowhere, audited once,
+                // and cheap enough that the contention is on the chain itself
+                // rather than on whatever the verb does.
+                let response = handle(
+                    &state,
+                    &peer,
+                    Request::Ping {
+                        protocol: PROTOCOL_VERSION,
+                    },
+                );
+                assert!(
+                    matches!(response, Response::Pong { .. }),
+                    "a live ping must succeed for this row to measure the chain: {response:?}"
+                );
+            }
+        }));
+    }
+    for thread in threads {
+        thread.join().expect("no agent thread may panic");
+    }
+
+    let chain = state.audit.lock().expect("not poisoned by a clean run");
+    chain
+        .verify()
+        .unwrap_or_else(|break_| panic!("the audit chain broke under concurrency: {break_:?}"));
+    assert_eq!(
+        chain.query(0).len(),
+        AGENTS * REQUESTS_EACH,
+        "every request appends exactly one record; a different count means a \
+         record was dropped or doubled, which is the failure a verifying chain \
+         would not catch on its own"
+    );
 }

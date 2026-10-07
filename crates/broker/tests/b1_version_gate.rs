@@ -31,10 +31,15 @@
 //! version and requires that they stop being version errors — without it, a
 //! broker that refused everything for a different reason would pass.
 
-use asv_broker::{handle, BrokerState};
+use asv_broker::admission::{self, Enrolment};
+use asv_broker::{handle, BrokerState, VaultSecretPort, VaultWritePort};
+use std::sync::Arc;
+
 use asv_domain::{AgentSessionId, CredentialId, CredentialKind};
 use asv_identity::{PeerCredentials, WorkloadIdentity};
 use asv_ipc_protocol::{decode_request, ErrorCode, Request, Response, PROTOCOL_VERSION};
+use asv_vault::{KdfParams, VaultStore};
+use secrecy::SecretString;
 
 /// A version no client of this build would speak.
 const FOREIGN: u16 = 3;
@@ -336,5 +341,166 @@ fn a_refused_request_binds_nothing() {
             .is_none(),
         "the broker refused the request and bound the key anyway. The response \
          says the version did not match, and the store says the grant exists."
+    );
+}
+
+/// **A request with no version cannot become a request at all.**
+///
+/// The second way a client can disagree about the protocol, and the one that is
+/// easy to leave implicit.
+///
+/// A client built against protocol 10 does not send `protocol: 10` — the field
+/// does not exist in its vocabulary, so it sends nothing, and the document does
+/// not decode. That is a *different* outcome from sending a version the broker
+/// does not speak, and the difference is deliberate:
+///
+/// ```text
+/// protocol = 10   -> VersionMismatch, after decode, before any capability
+/// no field        -> decode failure, and no Request exists to dispatch
+/// ```
+///
+/// The chosen reading is that a missing version is malformed transport input
+/// and fails closed, rather than being smoothed into a legacy client by a
+/// `serde(default)`. A default would have made this row green by allowing
+/// precisely the document that must not be accepted, so the absence of one is
+/// the property under test and is asserted as such.
+///
+/// The zero-effects half is structural rather than observed, and the reasoning
+/// is worth stating because it is what makes this row mean anything: `handle`
+/// takes a `Request`, not bytes. A document that fails to decode never becomes
+/// a `Request`, so there is no value a handler could have been handed. That is
+/// stronger than counting rows after the fact — it is the reason no domain
+/// state can move, rather than a report that none did.
+#[test]
+fn a_request_with_no_version_never_becomes_a_request() {
+    for payload in [
+        &br#"{"method":"create_session","workspace":"/repo"}"#[..],
+        &br#"{"method":"run_isolated","session":"00000000-0000-4000-8000-000000000000","worker":"x"}"#[..],
+        &br#"{"method":"ping"}"#[..],
+        &br#"{"method":"pull_manifest","session":"00000000-0000-4000-8000-000000000000"}"#[..],
+    ] {
+        let error = decode_request(payload)
+            .expect_err("a document with no protocol must not decode");
+        assert!(
+            matches!(error, asv_ipc_protocol::ProtocolError::Malformed(_)),
+            "a versionless document must fail as malformed transport input and \\
+             never as a version mismatch: there is no number to disagree about. \\
+             Got {error:?} for {}",
+            String::from_utf8_lossy(payload)
+        );
+    }
+}
+
+/// **An incompatible protocol moves no inventory.**
+///
+/// The third observable the zero-effects law names, next to grants
+/// (`a_refused_request_binds_nothing`) and sessions.
+///
+/// `CreateCredential` is the verb to use because the vault inventory is
+/// readable through a public field and because a default broker *cannot*
+/// distinguish the two failure modes: with no vault open it refuses the create
+/// anyway, so a row written against `BrokerState::default()` passes against a
+/// build whose gate sits after the dispatcher. It passed, in fact, on exactly
+/// that mutation before this fixture replaced it. So the state here is a real
+/// vault with this test binary enrolled, and the row opens with the control
+/// that proves the create succeeds at the right protocol — otherwise "the
+/// inventory did not move" would be evidence about a refusal, not about a
+/// protocol.
+#[test]
+fn an_incompatible_protocol_moves_no_credential_inventory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("vault.asv");
+    let passphrase = || SecretString::from("b1-version-gate".to_string());
+    let store = VaultStore::create(&path, &passphrase(), KdfParams::fast_for_tests())
+        .expect("create the vault");
+    let key = Arc::new(store.header().unlock(&passphrase()).expect("unlock"));
+    let mut state = BrokerState::default();
+    asv_broker::inventory::load(&state, &store);
+    let store = Arc::new(std::sync::Mutex::new(store));
+    state.vault_writer = Some(Arc::new(VaultWritePort::new(
+        Arc::clone(&store),
+        Arc::clone(&key),
+    )));
+    state.secrets = Some(Arc::new(VaultSecretPort::new(
+        Arc::clone(&store),
+        Arc::clone(&key),
+    )));
+    // The real executable is enrolled, digested from bytes on disk, so the
+    // admitted case is a real admission rather than a bypass.
+    let exe =
+        std::fs::canonicalize(std::env::current_exe().expect("current_exe")).expect("canonical");
+    let bytes = std::fs::read(&exe).expect("read the test binary");
+    state.control_plane = Enrolment::empty().enrol(exe, admission::sha256(&bytes));
+
+    let peer = peer();
+
+    // The control: at this build's own protocol, the credential is admitted and
+    // the inventory moves. Without it the assertion below is vacuous.
+    let admitted = handle(
+        &state,
+        &peer,
+        Request::CreateCredential {
+            protocol: PROTOCOL_VERSION,
+            label: "control".into(),
+            kind: CredentialKind::BearerToken,
+            provider: "p".into(),
+            account: "a".into(),
+            secret: asv_ipc_protocol::OpaqueSecret::new(b"control-value".to_vec()),
+        },
+    );
+    assert!(
+        matches!(admitted, Response::CredentialCreated { .. }),
+        "the control must create a credential, or this row measures a refusal \
+         rather than a protocol: {admitted:?}"
+    );
+    let after_control = state.credentials.lock().expect("not poisoned").len();
+    assert_eq!(
+        after_control, 1,
+        "the control's credential is not in the inventory, so the inventory \
+         cannot be the observable this row needs"
+    );
+
+    let refused = handle(
+        &state,
+        &peer,
+        Request::CreateCredential {
+            protocol: FOREIGN,
+            label: "should-not-exist".into(),
+            kind: CredentialKind::GenericSecret,
+            provider: "p".into(),
+            account: "a".into(),
+            secret: asv_ipc_protocol::OpaqueSecret::new(b"v".to_vec()),
+        },
+    );
+    assert!(
+        matches!(
+            refused,
+            Response::Error {
+                code: ErrorCode::VersionMismatch,
+                ..
+            }
+        ),
+        "expected a version mismatch, got {refused:?}"
+    );
+
+    let after_refusal = state.credentials.lock().expect("not poisoned").len();
+    assert_eq!(
+        after_refusal, after_control,
+        "the broker refused the credential and wrote it anyway: the inventory \
+         went from {after_control} to {after_refusal}. A record the operator's \
+         own inventory denies having created is the failure this row exists to \
+         catch."
+    );
+
+    // And on the vault itself, not only the in-memory projection: a refusal
+    // that reached the writer would leave a record the process can no longer
+    // account for.
+    let reopened = VaultStore::open(&path, &passphrase()).expect("reopen the vault");
+    assert!(
+        !reopened
+            .list()
+            .iter()
+            .any(|m| m.label == "should-not-exist"),
+        "the refused credential reached the vault on disk"
     );
 }
