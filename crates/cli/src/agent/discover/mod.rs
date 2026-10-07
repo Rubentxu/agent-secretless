@@ -243,15 +243,18 @@ impl Discovery {
     pub fn render_human(&self) -> String {
         let mut out = format!("asv agent discover — {}\n\n", self.status.as_str());
 
-        match (&self.code, self.broker_reachable) {
-            (Some(code), reachable) => {
-                out.push_str(&format!("{code}\n"));
-                out.push_str(&format!(
-                    "  {}\n\n",
-                    message_for(code, reachable, self.broker.as_ref())
-                ));
-            }
-            (None, _) => {}
+        // `if let`, not a `match` with one arm and an empty one. The `match`
+        // was introduced with the `Some`/`None` pair when this rendered nothing
+        // at all for a missing code, and clippy has said so ever since. The
+        // baseline held the debt at 263 and this commit took it to 264, which
+        // the ratchet refuses — correctly, since a new warning is not inherited
+        // debt, it is one this branch wrote.
+        if let Some(code) = &self.code {
+            out.push_str(&format!("{code}\n"));
+            out.push_str(&format!(
+                "  {}\n\n",
+                message_for(code, self.broker_reachable, self.broker.as_ref())
+            ));
         }
 
         out.push_str(&format!(
