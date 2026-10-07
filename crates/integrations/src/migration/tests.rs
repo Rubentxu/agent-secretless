@@ -433,3 +433,168 @@ fn the_posture_is_carried_rather_than_inferred_and_never_upgraded() {
 }
 
 // ------------------------------------------------------- the compile-time law
+
+/// A fresh state names an adoption and nothing else.
+///
+/// The absence of both proofs is the property: a state that began with them
+/// filled in would let `prove` be skipped by writing the file by hand, and the
+/// whole point of splitting prove from apply is that one act of typing cannot
+/// satisfy both.
+#[test]
+fn a_new_state_proves_nothing_yet() {
+    let state = state();
+    assert!(!state.is_complete());
+    assert!(state.positive.is_none());
+    assert!(state.negative.is_none());
+}
+
+#[test]
+fn an_empty_report_is_refused_by_both_recorders() {
+    assert!(matches!(
+        state().record_positive("   "),
+        Err(ProofError::NewPathNotWorking { .. })
+    ));
+    assert!(matches!(
+        state().record_negative("   "),
+        Err(ProofError::BypassStillWorks { .. })
+    ));
+}
+
+/// **The hole this split had to not open.** A state carrying only the positive
+/// proof is the state a hand-written file would produce if it wanted to skip
+/// the negative test. It must not reach a scrubbable value.
+#[test]
+fn a_positive_proof_without_the_negative_one_refuses_to_replay() {
+    let half = state()
+        .record_positive("npm resolved a package through the projection")
+        .unwrap();
+    assert!(!half.is_complete());
+    let error = Adoption::resume(&half, "an operator", &half.plan_digest())
+        .expect_err("a state with no negative proof must not be replayable");
+    assert!(
+        matches!(error, ProofError::MalformedState { .. }),
+        "the refusal must name a state that cannot be replayed, not a failed \
+         verification: {error}"
+    );
+}
+
+#[test]
+fn a_negative_proof_without_the_positive_one_refuses_to_replay() {
+    let half = state()
+        .record_negative("the old path returned 401")
+        .unwrap();
+    assert!(!half.is_complete());
+    assert!(matches!(
+        Adoption::resume(&half, "an operator", &half.plan_digest()),
+        Err(ProofError::MalformedState { .. })
+    ));
+}
+
+#[test]
+fn a_state_with_neither_proof_refuses_to_replay() {
+    assert!(matches!(
+        Adoption::resume(&state(), "an operator", &state().plan_digest()),
+        Err(ProofError::MalformedState { .. })
+    ));
+}
+
+/// The approval still has to be over **this** plan, after the round trip
+/// through a file. A digest that survives serialisation unchanged is the whole
+/// reason the comparison happens here rather than at prove time.
+#[test]
+fn an_approval_over_a_different_plan_still_refuses_after_the_round_trip() {
+    let complete = complete_state();
+    let text = serde_json::to_string(&complete).expect("serialise");
+    let restored: MigrationState = serde_json::from_str(&text).expect("deserialise");
+    assert!(
+        matches!(
+            Adoption::resume(&restored, "an operator", "a-digest-nobody-computed"),
+            Err(ProofError::ApprovalDigestMismatch { .. })
+        ),
+        "a scrub gated on an approval for a different plan is the failure the \
+         digest exists to prevent"
+    );
+}
+
+#[test]
+fn nobody_claiming_the_approval_still_refuses_after_the_round_trip() {
+    let complete = complete_state();
+    let restored: MigrationState =
+        serde_json::from_str(&serde_json::to_string(&complete).unwrap()).unwrap();
+    assert!(matches!(
+        Adoption::resume(&restored, "  ", &restored.plan_digest()),
+        Err(ProofError::NoActor)
+    ));
+}
+
+/// The one path `apply` allows, and it ends at `Scrubbed` — whose only
+/// remaining method is the rescan and then `complete`.
+#[test]
+fn a_complete_state_replays_to_a_scrubbable_value_and_no_further() {
+    let complete = complete_state();
+    let restored: MigrationState =
+        serde_json::from_str(&serde_json::to_string(&complete).unwrap()).unwrap();
+    let scrubbed =
+        Adoption::resume(&restored, "an operator", &restored.plan_digest()).expect("replays");
+    let receipt = scrubbed
+        .rescan("the original .npmrc was rescanned and holds no credential")
+        .complete()
+        .into_receipt();
+    assert_eq!(receipt.schema, MigrationState::SCHEMA);
+    assert_eq!(receipt.plan_digest, restored.plan_digest());
+    assert!(
+        receipt.posture.contains("STRONG_SECRETLESS"),
+        "the receipt carries the posture that was proved, never a widened one: {:?}",
+        receipt.posture
+    );
+}
+
+/// A credential id this build cannot parse is a state problem, and saying so
+/// as `WrongCredential` would put it inside a security check's receipt.
+#[test]
+fn an_unparseable_credential_id_is_a_malformed_state_not_a_wrong_credential() {
+    let mut broken = complete_state();
+    broken.storage.id = "not-a-credential-id".to_string();
+    assert!(matches!(
+        Adoption::resume(&broken, "an operator", &broken.plan_digest()),
+        Err(ProofError::MalformedState { .. })
+    ));
+}
+
+/// A file carrying fields the schema does not know is refused rather than
+/// ignored, so a typo in a hand-written state cannot quietly drop a proof.
+#[test]
+fn an_unknown_field_in_a_persisted_state_is_refused() {
+    let complete = complete_state();
+    let mut text = serde_json::to_value(&complete).expect("serialise");
+    text["negative_proof"] = serde_json::json!("smuggled in");
+    assert!(
+        serde_json::from_value::<MigrationState>(text).is_err(),
+        "deny_unknown_fields exists so a misspelled key cannot read as absent"
+    );
+}
+
+// --- fixtures -------------------------------------------------------------
+
+fn state() -> MigrationState {
+    let r = receipt();
+    let storage = StorageFacts {
+        id: r.credential.to_wire(),
+        label: "npm-registry".to_owned(),
+        exportability: asv_domain::Exportability::NonExportable,
+    };
+    MigrationState::new(
+        r,
+        storage,
+        Posture::StrongSecretless,
+        "wrote a .npmrc naming the relay the broker published",
+    )
+}
+
+fn complete_state() -> MigrationState {
+    state()
+        .record_positive("npm resolved a package through the projection")
+        .expect("a non-empty report is a positive proof")
+        .record_negative("the old path was refused with 401 once the surrogate was gone")
+        .expect("a non-empty report is a negative proof")
+}

@@ -296,6 +296,15 @@ pub enum ProofError {
         /// What the probe reported.
         detail: String,
     },
+    /// The persisted state could not be replayed.
+    ///
+    /// Its own variant rather than one borrowed from a proof: a state that does
+    /// not parse is not a failed *verification*, and reporting it as one would
+    /// put a migration's data problem inside the receipt of a security check.
+    MalformedState {
+        /// What was wrong with it.
+        detail: String,
+    },
     /// The approval names a different plan than this migration carries.
     ApprovalDigestMismatch {
         /// Digest the approval was computed over.
@@ -314,6 +323,11 @@ impl fmt::Display for ProofError {
                 f,
                 "the broker confirmed credential {proven}, and this migration \
                  adopted {expected}; storage was proven for something else"
+            ),
+            ProofError::MalformedState { detail } => write!(
+                f,
+                "this migration's persisted state cannot be replayed, so it has \
+                 not proved what a scrub needs proved: {detail}"
             ),
             ProofError::NewPathNotWorking { detail } => write!(
                 f,
@@ -685,6 +699,23 @@ mod tests;
 /// "you cannot build an `Approved` without the three proofs" is a program that
 /// fails to compile, checked on every `cargo test`, rather than a sentence.
 ///
+/// Splitting `prove` from `apply` puts a file between them, and a file is the
+/// one thing that can reconstruct a state without running the constructor that
+/// produces it. So the durable artefact holds **facts**, and none of the
+/// machine derives `Deserialize`:
+///
+/// ```compile_fail
+/// # use asv_integrations::migration::PositivelyVerified;
+/// // There is no way to read a position back out of a file. A caller that
+/// // could would hold `PositivelyVerified` — and therefore `BypassVerified`,
+/// // `Approved` and `scrub` — without the positive proof ever having run.
+/// let state: PositivelyVerified = serde_json::from_str("{}").unwrap();
+/// ```
+///
+/// The facts do serialise: [`MigrationState`] is the thing that crosses the
+/// process boundary, and [`Adoption::resume`] is the only route from it back to
+/// a proof — by running the same constructors in the same order.
+/// ///
 /// A note on what is deliberately **not** here, because two earlier attempts at
 /// it compiled and both looked convincing. `let x: Approved = unreachable!()`
 /// type-checks: `unreachable!()` is of type `!`, which coerces to every type.
@@ -756,3 +787,189 @@ mod tests;
 /// ```
 #[allow(dead_code)]
 const ORDERING_IS_A_COMPILE_ERROR: () = ();
+
+// ---------------------------------------------------------------------------
+// The durable artefact
+// ---------------------------------------------------------------------------
+
+/// What the broker said it holds, in the shape a file can carry.
+///
+/// A copy rather than `StorageProof` itself: `StorageProof` deliberately has no
+/// `Deserialize`, and giving it one would let a caller build a verified storage
+/// fact out of a file. The value of the ordering law is that it cannot be
+/// reconstructed around the type system, so this type holds **strings**, and
+/// [`Adoption::resume`] is the only thing that turns them back into proofs —
+/// by running the same constructors, in the same order, with the same checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageFacts {
+    /// The credential's wire id, as the broker minted it.
+    pub id: String,
+    /// The operator's label for it. Never a value.
+    pub label: String,
+    /// How the broker holds it.
+    pub exportability: asv_domain::Exportability,
+}
+
+/// The migration state a `prove` run writes and an `apply` run reads.
+///
+/// **It can be incomplete, and that is fine.** What it must not be is a way to
+/// *skip* a step: [`Adoption::resume`] refuses at the first proof that is
+/// absent, because each state in this module can only be built from the one
+/// before it. Persisting facts is safe. Persisting *positions* would not be,
+/// which is why no state-machine type here derives `Deserialize`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationState {
+    /// `asv.integrations.migration/v1`.
+    pub schema: String,
+    /// The adoption this migration continues.
+    pub receipt: crate::AdoptReceipt,
+    /// What the broker answered about storage.
+    pub storage: StorageFacts,
+    /// How strong the materialised path is.
+    pub posture: Posture,
+    /// A line naming what was projected, for the receipt.
+    pub projection_detail: String,
+    /// The positive proof: what the tool reported when it was exercised
+    /// through the new path. `None` until it has actually reported something.
+    pub positive: Option<String>,
+    /// The negative proof: what the probe reported when it confirmed the old
+    /// path is dead. `None` until it has actually reported something.
+    pub negative: Option<String>,
+}
+
+impl MigrationState {
+    /// `asv.integrations.migration/v1`.
+    pub const SCHEMA: &'static str = "asv.integrations.migration/v1";
+
+    /// The state a migration starts in: adopted, and nothing proved yet.
+    ///
+    /// No positive or negative proof, on purpose. A state that started with
+    /// proofs already in it would let `prove` be skipped by writing the file by
+    /// hand, and the point of splitting `prove` from `apply` is that the two
+    /// cannot both be satisfied by one act of typing.
+    pub fn new(
+        receipt: crate::AdoptReceipt,
+        storage: StorageFacts,
+        posture: Posture,
+        projection_detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: Self::SCHEMA.to_owned(),
+            receipt,
+            storage,
+            posture,
+            projection_detail: projection_detail.into(),
+            positive: None,
+            negative: None,
+        }
+    }
+
+    /// Records the positive proof, refusing an empty one.
+    pub fn record_positive(self, report: impl Into<String>) -> Result<Self, ProofError> {
+        let report = report.into();
+        if report.trim().is_empty() {
+            return Err(ProofError::NewPathNotWorking {
+                detail: "the tool reported nothing, which is not evidence that \
+                         it worked"
+                    .to_string(),
+            });
+        }
+        Ok(Self {
+            positive: Some(report),
+            ..self
+        })
+    }
+
+    /// Records the negative proof, refusing an empty one.
+    pub fn record_negative(self, report: impl Into<String>) -> Result<Self, ProofError> {
+        let report = report.into();
+        if report.trim().is_empty() {
+            return Err(ProofError::BypassStillWorks {
+                detail: "the probe reported nothing, which is not evidence \
+                         that the old path is gone"
+                    .to_string(),
+            });
+        }
+        Ok(Self {
+            negative: Some(report),
+            ..self
+        })
+    }
+
+    /// Whether both proofs are present. **Necessary, not sufficient**: a
+    /// complete state still has to replay through every constructor.
+    pub fn is_complete(&self) -> bool {
+        self.positive.is_some() && self.negative.is_some()
+    }
+
+    /// The plan digest an approval has to name.
+    pub fn plan_digest(&self) -> String {
+        self.receipt.plan_digest()
+    }
+}
+
+impl Adoption {
+    /// Replays a persisted state through the same gates, and returns the value
+    /// whose only remaining method is `scrub`.
+    ///
+    /// This is the whole of `apply`, and it is one function rather than a handful
+    /// of commands precisely so that no path reaches `Approved` without going
+    /// through all four constructors. Every refusal below is the same refusal
+    /// the live chain makes — an absent proof fails here for the same reason
+    /// `project_and_verify` refuses an empty report — so a hand-written state
+    /// file cannot buy a weaker migration than a run one.
+    ///
+    /// ## What the caller still owes
+    ///
+    /// `Scrubbed::rescan` takes what the rescan found, as a string, because the
+    /// rescan happens *after* this returns and this function has no file to look
+    /// at. That is the one link in the chain still an assertion rather than a
+    /// measurement, and it is named here rather than left for a reader to assume
+    /// otherwise.
+    pub fn resume(
+        state: &MigrationState,
+        actor: &str,
+        approved_plan_digest: &str,
+    ) -> Result<Scrubbed, ProofError> {
+        let id = crate::CredentialId::from_wire(&state.storage.id).map_err(|e| {
+            ProofError::MalformedState {
+                detail: format!("the persisted credential id is not one this build accepts: {e}"),
+            }
+        })?;
+
+        let adoption = Adoption::new(state.receipt.clone());
+        let in_vault = adoption.verify_storage(StorageProof::from_broker(
+            id,
+            state.storage.label.clone(),
+            state.storage.exportability,
+        ))?;
+
+        let positive = state
+            .positive
+            .as_deref()
+            .ok_or_else(|| ProofError::MalformedState {
+                detail: "this state carries no positive proof, so the new path was never \
+                         exercised; run `asv integrations migrate npm prove` first"
+                    .to_string(),
+            })?;
+        let verified = in_vault.project_and_verify(
+            Projection::new(state.posture, state.projection_detail.clone()),
+            positive,
+        )?;
+
+        let negative = state
+            .negative
+            .as_deref()
+            .ok_or_else(|| ProofError::MalformedState {
+                detail: "this state carries no negative proof, so nothing established that \
+                         the old path stopped working; run the prove step first"
+                    .to_string(),
+            })?;
+        let bypassed = verified.verify_bypass(negative)?;
+
+        let approved = bypassed.approve(actor, approved_plan_digest)?;
+        Ok(approved.scrub())
+    }
+}
