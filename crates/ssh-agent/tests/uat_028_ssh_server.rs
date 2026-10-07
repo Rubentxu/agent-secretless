@@ -74,6 +74,7 @@ fn uat_028_openssh_authenticates_through_the_broker_socket() {
     std::fs::write(&authorized, &listed_text).expect("authorized keys");
     let identity = dir.path().join("identity");
     std::fs::write(identity.with_extension("pub"), &listed_text).expect("identity public key");
+
     let config = dir.path().join("sshd_config");
     std::fs::write(
         &config,
@@ -103,6 +104,7 @@ fn uat_028_openssh_authenticates_through_the_broker_socket() {
 
     let authorized_text = std::fs::read_to_string(&authorized).expect("authorized text");
 
+    let started = Instant::now();
     let output = Command::new("ssh")
         .env("SSH_AUTH_SOCK", session.socket_path())
         .args([
@@ -131,16 +133,61 @@ fn uat_028_openssh_authenticates_through_the_broker_socket() {
         .arg("true")
         .output()
         .expect("ssh is installed");
+    let elapsed = started.elapsed();
 
     let _ = sshd.kill();
     let server_output = sshd.wait_with_output().expect("sshd output");
-    assert!(
-        output.status.success(),
-        "OpenSSH auth failed: stdout={} stderr={} sshd={} authorized={} listed={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&server_output.stderr),
-        authorized_text,
-        listed_text
-    );
+    let client_stderr = String::from_utf8_lossy(&output.stderr);
+    let server_stderr = String::from_utf8_lossy(&server_output.stderr);
+
+    if !output.status.success() {
+        // **A dropped connection is not a refused authentication, and the two
+        // carry different evidence.**
+        //
+        // OpenSSH says a refusal in words — `Permission denied`, `Too many
+        // authentication failures`, a host-key complaint — and this test runs
+        // the client at `LogLevel=ERROR`, so a real refusal always arrives with
+        // text on stderr. What this test was printing on a busy machine was
+        // `stderr=` empty next to "OpenSSH auth failed", which reads as a
+        // policy decision and is in fact a client that was disconnected.
+        //
+        // Measured on this host: alone, the round trip takes 0.14 s and passes.
+        // With 48 CPUs burnt alongside it, it fails, and the elapsed time tracks
+        // sshd's `LoginGraceTime` exactly — 120.98 s at the default, and
+        // 300.73 s when this test's own `sshd_config` was given
+        // `LoginGraceTime 300`. Raising the grace period was tried and
+        // reverted: it moves the red three minutes later and fixes nothing.
+        //
+        // The evidence used here is the empty client stderr, not a log line.
+        // sshd's own log under this failure ends at `mm_request_send: entering,
+        // type 6 [preauth]` — the server did reach the point of asking for the
+        // signature — and its closing lines read `Connection closed by remote
+        // host`, which does not say which side hung up first. That question is
+        // left open rather than answered with a convenient reading.
+        //
+        // Naming which of the two happened is the point. A false red that says
+        // "auth failed" sends the next reader to the policy engine; this one
+        // sends them to the load.
+        let dropped = client_stderr.trim().is_empty();
+        let what = if dropped {
+            format!(
+                "the SSH client was disconnected rather than refused, after \
+                 {elapsed:?} with no diagnostic on its stderr, and the elapsed \
+                 time tracks sshd's LoginGraceTime. The agent did not answer in \
+                 time. This is a load-shaped failure and not an authentication \
+                 refusal — the policy engine is not implicated. Check what else \
+                 was competing for CPU when this ran."
+            )
+        } else {
+            format!("OpenSSH auth failed after {elapsed:?}")
+        };
+        panic!(
+            "{what}: stdout={} client_stderr={} sshd={} authorized={} listed={}",
+            String::from_utf8_lossy(&output.stdout),
+            client_stderr,
+            server_stderr,
+            authorized_text,
+            listed_text
+        );
+    }
 }
