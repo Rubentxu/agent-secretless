@@ -64,23 +64,34 @@ INJECTIONS = [
         # is untested.
         "secret-in-ipc-response",
         "crates/broker/src/lib.rs",
-        """        Request::CreateSession { workspace } => {
-            let id = state.sessions.create(workspace, peer);
-            Response::SessionCreated { session: id }
+        """        Request::CreateSession { workspace, .. } => {
+            let id = sessions!(state).create(workspace, peer);
+            Response::SessionCreated {
+                session: id,
+                surrogates: mint_session_surrogates(state, id, peer),
+            }
         }""",
-        """        Request::CreateSession { workspace } => {
-            state.sessions.create(workspace.clone(), peer);
+        # Still calls `mint_session_surrogates`, and still binds `id`. Dropping
+        # either leaves `mint_session_surrogates` and SESSION_SURROGATE_TTL_SECS
+        # dead, and this script builds with `-D warnings`, so an injection that
+        # leaks by omission fails to compile and is reported as an invalid
+        # injection rather than a caught one. The leak here is the response
+        # body, which is what this entry is for; the log entry above is the one
+        # that has to leave everything else alive.
+        """        Request::CreateSession { workspace, .. } => {
+            let id = sessions!(state).create(workspace.clone(), peer);
+            let surrogates = mint_session_surrogates(state, id, peer);
             Response::Error {
                 code: ErrorCode::InvalidRequest,
-                message: format!("session opened for {workspace}"),
+                message: format!("session opened for {workspace} surrogates={}", surrogates.len()),
             }
         }""",
     ),
     (
         "secret-in-cli-output",
         "crates/cli/src/main.rs",
-        "Command::Session { workspace } => Request::CreateSession { workspace },",
-        "Command::Session { workspace } => {\n                eprintln!(\"debug workspace={workspace}\");\n                Request::CreateSession { workspace }\n            }",
+        "Command::Session { workspace } => Request::CreateSession {\n            protocol: asv_ipc_protocol::PROTOCOL_VERSION,\n            workspace,\n        },",
+        "Command::Session { workspace } => {\n                eprintln!(\"debug workspace={workspace}\");\n                Request::CreateSession {\n                    protocol: asv_ipc_protocol::PROTOCOL_VERSION,\n                    workspace,\n                }\n            }",
     ),
     (
         # M1: the vault tool reveals the stored secret. This is the crudest
