@@ -203,7 +203,7 @@ es una suposición:
 # el verificador es obligatorio: el instalador no sigue sin él
 cargo install rsign2          # o el gestor de paquetes de tu distribución
 curl -LsSf https://raw.githubusercontent.com/Rubentxu/agent-secretless/main/scripts/install.sh \
-  | sh -s -- --version 0.36.1 --prefix "$HOME/.local"
+  | sh -s -- --version 0.37.0 --prefix "$HOME/.local"
 ```
 
 El instalador exige que `sha256.sum` lleve una firma minisign válida antes de
