@@ -1788,6 +1788,55 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
             Response::CredentialDeleted { id }
         }
 
+        Request::VerifyStorage { id, .. } => {
+            // Admission first, for the same reason the delete verb puts it
+            // there: a refusal computed before `id` is read cannot become an
+            // existence probe. An unadmitted peer asking about a credential
+            // that exists and one that does not receives byte-identical
+            // answers, so this verb discloses nothing about the inventory to
+            // anyone the broker has not admitted.
+            if let Err(denial) =
+                admission::admit_control_plane(peer, &state.control_plane, &admission::ProcFs)
+            {
+                return Response::Error {
+                    code: ErrorCode::Denied,
+                    message: format!("storage verification refused: {denial}"),
+                };
+            }
+
+            // The inventory, not the vault file. The inventory is loaded from
+            // the vault at startup (`inventory::load`, called from `main.rs`),
+            // so a credential imported by an earlier broker process is answerable
+            // here — which is the case that matters, because `adopt` and `migrate`
+            // are separate commands and usually separate processes.
+            //
+            // Answering from the inventory rather than re-reading the file is
+            // also what keeps this cheap enough to sit in front of a scrub: no
+            // unlock, no decryption, nothing that could touch a secret.
+            let found = credentials!(state)
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| (c.label.clone(), c.exportability));
+
+            match found {
+                Some((label, exportability)) => Response::StorageVerified {
+                    id,
+                    label,
+                    exportability,
+                },
+                // Reported, not swallowed, and only to a caller admission has
+                // already accepted — the same disclosure boundary the delete
+                // verb draws. Answering `StorageVerified` for a credential that
+                // is not there would be the worst possible answer: this
+                // response is what §10 step 1 rests on, and a false positive
+                // here authorises destroying the original.
+                None => Response::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: "no such credential in the vault".into(),
+                },
+            }
+        }
+
         Request::Authorize {
             mut request,
             capability,
@@ -5704,6 +5753,114 @@ mod tests {
                 );
             }
             other => panic!("expected metadata, got {other:?}"),
+        }
+    }
+
+    /// §10 step 1, the happy path: an admitted peer asks about a credential the
+    /// broker holds, and is told so with facts rather than a verdict.
+    ///
+    /// Asserting on the *fields* rather than on a "verified" string is the
+    /// point. The migration step downstream has to write a sentence into a
+    /// receipt that a person reads before allowing a file to be destroyed, and
+    /// the only safe way to carry that answer across the wire is as the facts
+    /// themselves.
+    #[test]
+    fn an_admitted_peer_is_told_what_the_broker_still_holds() {
+        let (_dir, _path, state, id) = wired_vault();
+        let peer = admitted_peer();
+
+        let response = handle(
+            &state,
+            &peer,
+            Request::VerifyStorage {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                id,
+            },
+        );
+
+        match response {
+            Response::StorageVerified {
+                id: answered,
+                label,
+                exportability,
+            } => {
+                assert_eq!(answered, id, "the broker answered about another credential");
+                assert!(
+                    !label.is_empty(),
+                    "an empty label proves nothing about which one"
+                );
+                // Named so a change to the vault's own default shows up here
+                // rather than in a migration receipt nobody is reading.
+                let _ = exportability;
+            }
+            other => panic!("expected the storage to be confirmed, got {other:?}"),
+        }
+    }
+
+    /// The refusal that matters most. §10's step 1 sits in front of destroying a
+    /// file, so answering "yes" for a credential that is not there would
+    /// authorise exactly the destruction the step exists to prevent.
+    #[test]
+    fn storage_is_not_confirmed_for_a_credential_that_is_not_there() {
+        let (_dir, _path, state, _id) = wired_vault();
+        let peer = admitted_peer();
+        let absent = asv_domain::CredentialId::new();
+
+        let response = handle(
+            &state,
+            &peer,
+            Request::VerifyStorage {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                id: absent,
+            },
+        );
+
+        match response {
+            Response::StorageVerified { .. } => {
+                panic!("the broker confirmed storage for a credential it does not hold")
+            }
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
+                assert!(message.contains("no such credential"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// The anti-oracle property, and the reason admission sits before the id is
+    /// read. An unadmitted peer must get the *same* answer whether or not the
+    /// credential exists — if the two differed, this verb would tell a stranger
+    /// what is in the vault, one guess at a time.
+    #[test]
+    fn an_unadmitted_peer_cannot_tell_a_credential_from_its_absence() {
+        let (_dir, _path, state, id) = wired_vault();
+        // `peer()` is built by `from_peer` and is therefore never admitted.
+        let stranger = peer();
+
+        let existing = handle(
+            &state,
+            &stranger,
+            Request::VerifyStorage {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                id,
+            },
+        );
+        let absent = handle(
+            &state,
+            &stranger,
+            Request::VerifyStorage {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                id: asv_domain::CredentialId::new(),
+            },
+        );
+
+        assert_eq!(
+            existing, absent,
+            "the two answers differ, so this verb is an existence oracle for strangers"
+        );
+        match existing {
+            Response::Error { code, .. } => assert_eq!(code, ErrorCode::Denied),
+            other => panic!("an unadmitted peer was answered, not refused: {other:?}"),
         }
     }
 

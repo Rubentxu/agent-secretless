@@ -47,7 +47,7 @@
 //! # What "impossible" means here, precisely
 //!
 //! **At compile time, for this crate's API.** [`Approved::scrub`] cannot be
-//! reached without having held [`Adopted`], [`Projected`],
+//! reached without having held [`Adoption`], [`InVault`],
 //! [`PositivelyVerified`] and [`BypassVerified`] in turn, because each is
 //! produced only by the method on the previous one, and each of those methods
 //! takes the evidence it records rather than a `bool`.
@@ -57,6 +57,25 @@
 //! AAT-CW-014 through 018. This module makes the *ordering* a type error; it
 //! does not make the evidence true, and the module says so where a reader would
 //! otherwise assume it does.
+//!
+//! # Why step 1 is a storage proof and not a comparison
+//!
+//! §10's first step is "verify ASV storage". An earlier version of this module
+//! took two attestations — what the import recorded and what the vault answered
+//! — and compared them, because a digest of the credential was refused for the
+//! reason `npm.rs` gives three times: *a digest of one extracted value is an
+//! oracle for that value, and `_auth` is base64 of `user:password`.* That
+//! reasoning holds, and it left the step with nothing it could actually ask for.
+//!
+//! So the step asks the question the vault can answer without touching a value:
+//! **does the broker still hold this credential, and may this principal read
+//! it?** That is the broker's `VerifyStorage` verb, and the answer is a set of
+//! facts the broker produces over the socket as a peer it admitted — not a
+//! string the caller supplies twice. This crate does not depend on the
+//! protocol, so the proof is built from plain `asv-domain` facts and it is the
+//! caller's job to have obtained them from the broker; see [`StorageProof`] for
+//! what that does and does not establish, including the part of §10 it
+//! deliberately does not cover.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -115,43 +134,95 @@ impl fmt::Display for Posture {
 
 // ---------------------------------------------------------------- the proofs
 
-/// Evidence that the vault holds the credential that was imported.
+/// What the broker said when asked whether it still holds the credential.
 ///
-/// Private fields on purpose: the only way to hold one is to have run
-/// [`Adoption::verify_vault`], which compares two attestations. A caller that
-/// wants this proof has to do the check.
+/// **This is a fact about storage and authority, and that is all it is.** No
+/// field here is derived from the credential's value, and none can be: a digest
+/// of one extracted value is an oracle for that value, and an `_auth`
+/// credential is base64 of `user:password`, low-entropy enough to confirm a
+/// guess. `npm.rs` says so three times; this is the fourth place it is obeyed.
+///
+/// # What it establishes
+///
+/// The broker, having admitted the caller as a control-plane peer, found a
+/// credential with this id in the vault. That is the whole of §10's first step
+/// as the vault can answer it, and it is not nothing: it catches a vault that
+/// was never written, a credential that was deleted or rotated away, and an id
+/// that was never the one adopted.
+///
+/// # What it does not establish
+///
+/// - **Not that the stored value equals the imported one.** No comparison
+///   happened, for the reason above. Nothing downstream may let this receipt
+///   imply otherwise.
+/// - **Not the audience binding.** The vault's credential record has no
+///   audience field — `CreateCredential` carries label, kind, provider, account
+///   and the secret, and nothing else — so an audience question could only be
+///   answered from a document the caller brought, which would make this the
+///   operator attesting their own import. Putting audience in the inventory is
+///   its own change with its own place in the plan.
+/// - **Not that anybody checked.** A proof of the *shape* is constructible
+///   outside the broker, because Rust cannot stop a caller building a struct.
+///   What the product guarantees is structural and narrower: no command path
+///   obtains one except by asking the broker, and with no broker there is no
+///   proof, therefore no `Approved`, therefore no scrub. That property is a
+///   test, not a type.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Verification {
-    /// What the import recorded, or what the vault returned. Both are the same
-    /// kind of thing — see [`Adoption::verify_vault`] for why neither is a
-    /// digest this crate is willing to compute.
-    attested: String,
+pub struct StorageProof {
+    id: crate::CredentialId,
+    label: String,
+    exportability: asv_domain::Exportability,
 }
 
-/// Why §10's first step is expressed in attestations and not digests.
-///
-/// This is not a stylistic choice and the crate has already decided it, three
-/// times, in `npm.rs`: *"a digest of one extracted value is an oracle for that
-/// value, and `_auth` is base64 of `user:password`, which is low-entropy enough
-/// to confirm a guess."* A `sha256` of an `_auth` credential is the credential,
-/// for anyone willing to guess a password.
-///
-/// So the comparison this step performs must be over something that is **not**
-/// guessable from the value. An attestation — computed under a key the vault
-/// holds and never emits — has that property; a plain digest does not. This
-/// crate will not mint one, and [`Adoption::verify_vault`] therefore takes the
-/// attestation as given rather than deriving it.
-///
-/// The consequence is stated rather than hidden: **this module cannot verify the
-/// vault on its own.** It can refuse a mismatch and it can refuse to accept a
-/// missing attestation, but the attestation has to come from the component that
-/// holds the key. A row that passed here would be a row about nothing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttestationMismatch {
-    /// What was presented as the import's attestation.
-    presented: String,
-    /// What the vault says.
-    answered: String,
+impl StorageProof {
+    /// Builds the proof from what the broker answered.
+    ///
+    /// The arguments are `asv-domain` types rather than a protocol response
+    /// because this crate does not depend on the IPC protocol, and adding that
+    /// dependency so a struct could be built one function call earlier would
+    /// be the wrong trade. The consequence is stated in the type's
+    /// documentation and repeated by the command: **whoever calls this owes
+    /// the reader the statement that the facts came from the broker.**
+    pub fn from_broker(
+        id: crate::CredentialId,
+        label: impl Into<String>,
+        exportability: asv_domain::Exportability,
+    ) -> Self {
+        Self {
+            id,
+            label: label.into(),
+            exportability,
+        }
+    }
+
+    /// The credential the broker confirmed it holds.
+    pub fn id(&self) -> &crate::CredentialId {
+        &self.id
+    }
+
+    /// The operator's label for it. Never a value.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// How the broker holds it.
+    pub fn exportability(&self) -> asv_domain::Exportability {
+        self.exportability
+    }
+
+    /// One line naming exactly what was proved, for the receipt.
+    ///
+    /// Phrased as what it is rather than what it might suggest: the receipt is
+    /// read by people deciding whether a file may be destroyed, and a sentence
+    /// that said "vault verified" would be read as more than this is.
+    pub fn report(&self) -> String {
+        format!(
+            "the broker holds credential {} (label {:?}, exportability {:?}), as \
+             answered over the socket; this is storage and authority only, not \
+             a comparison of the stored value against the imported one",
+            self.id, self.label, self.exportability,
+        )
+    }
 }
 
 /// Evidence that the old path no longer works — the negative test that catches
@@ -203,20 +274,18 @@ pub struct PositiveProof {
 /// over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProofError {
-    /// The vault's attestation differs from the one recorded at import.
-    ValueDiffers {
-        /// The import's attestation, as presented. Not a secret: it is not a
-        /// function of the value.
-        presented: String,
-        /// What the vault answered with.
-        answered: String,
-    },
-    /// One side of the comparison was empty.
+    /// The broker confirmed a credential that is not the one this migration
+    /// adopted.
     ///
-    /// Its own variant because an empty attestation must not compare equal to
-    /// another empty attestation. Two blanks are not a match; they are the
-    /// absence of the check, and §10 wants the check.
-    NoAttestation,
+    /// Its own variant because this is the one real check step 1 can make
+    /// without a digest: ids are not secrets, and a receipt that answered for
+    /// a different credential would otherwise carry this migration's name.
+    WrongCredential {
+        /// The credential the adopt receipt says was imported.
+        expected: String,
+        /// The credential the broker confirmed it holds.
+        proven: String,
+    },
     /// The new path did not work, so there is no reason to destroy the old one.
     NewPathNotWorking {
         /// What the tool reported, verbatim. Never the credential.
@@ -241,18 +310,10 @@ pub enum ProofError {
 impl fmt::Display for ProofError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ProofError::ValueDiffers {
-                presented,
-                answered,
-            } => write!(
+            ProofError::WrongCredential { expected, proven } => write!(
                 f,
-                "the vault answered {answered} where the import presented \
-                 {presented}; this is not the credential that was adopted"
-            ),
-            ProofError::NoAttestation => write!(
-                f,
-                "an attestation was missing, and two absent attestations are \
-                 not a match: they are the absence of the check"
+                "the broker confirmed credential {proven}, and this migration \
+                 adopted {expected}; storage was proven for something else"
             ),
             ProofError::NewPathNotWorking { detail } => write!(
                 f,
@@ -307,7 +368,7 @@ pub struct Projected {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositivelyVerified {
     projected: Projected,
-    vault: Verification,
+    storage: StorageProof,
     proof: PositiveProof,
 }
 
@@ -384,39 +445,28 @@ impl Adoption {
         &self.receipt
     }
 
-    /// §10 step 1: prove the vault holds what was imported.
+    /// §10 step 1: the broker confirms it still holds what was imported.
     ///
-    /// Both arguments are **attestations** produced by whichever component holds
-    /// the key — never digests of the value. See [`AttestationMismatch`] for
-    /// why this crate refuses to compute one, which is a decision it already
-    /// makes in `npm.rs` and `npm/tests.rs`.
+    /// One check, and it is a real one: **the credential the broker confirmed is
+    /// the credential this migration adopted.** Ids are not secrets, so comparing
+    /// them costs nothing, and a proof that answered for a different credential
+    /// would otherwise go on to authorise destroying a file over the wrong
+    /// evidence.
     ///
-    /// The check here is a comparison and nothing more: this function does not
-    /// know what a correct attestation looks like, only that these two must
-    /// agree, which is the claim §10 makes. A caller that passes the same
-    /// string twice has asserted the attestation rather than computed it, and
-    /// the component that computed it is the one accountable for that.
-    pub fn verify_vault(
-        self,
-        import_attestation: impl Into<String>,
-        retrieved_attestation: impl Into<String>,
-    ) -> Result<InVault, ProofError> {
-        let presented = import_attestation.into();
-        let answered = retrieved_attestation.into();
-        if presented.trim().is_empty() || answered.trim().is_empty() {
-            return Err(ProofError::NoAttestation);
-        }
-        if presented != answered {
-            return Err(ProofError::ValueDiffers {
-                presented,
-                answered,
+    /// What is deliberately absent is any comparison of the credential's value.
+    /// [`StorageProof`] gives the reason and the rest of what this does not
+    /// prove, and the refusal is not a gap to be filled later by a digest: a
+    /// digest of one extracted value is an oracle for that value.
+    pub fn verify_storage(self, proof: StorageProof) -> Result<InVault, ProofError> {
+        if proof.id != self.receipt.credential {
+            return Err(ProofError::WrongCredential {
+                expected: self.receipt.credential.to_string(),
+                proven: proof.id.to_string(),
             });
         }
         Ok(InVault {
             adoption: self,
-            vault: Verification {
-                attested: presented,
-            },
+            storage: proof,
         })
     }
 }
@@ -429,7 +479,7 @@ impl Adoption {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InVault {
     adoption: Adoption,
-    vault: Verification,
+    storage: StorageProof,
 }
 
 impl InVault {
@@ -458,7 +508,7 @@ impl InVault {
                 adoption: self.adoption,
                 projection,
             },
-            vault: self.vault,
+            storage: self.storage,
             proof: PositiveProof {
                 tool_report: report,
             },
@@ -674,12 +724,26 @@ mod tests;
 /// ```
 ///
 /// ```compile_fail
-/// # use asv_integrations::migration::Verification;
-/// // The proofs cannot be fabricated: `Verification`'s fields are private.
-/// let forged = Verification {
-///     attested: "attest:v1:9f2c".to_string(),
+/// # use asv_integrations::migration::InVault;
+/// // Nor can a storage proof be forged into the state that unlocks the rest of
+/// // the chain: `InVault`'s fields are private and only `Adoption::verify_storage`
+/// // produces one.
+/// let forged = InVault {
+///     adoption: todo!(),
+///     storage: todo!(),
 /// };
 /// ```
+///
+/// **An earlier version of this row built a `Verification`**, a struct with
+/// private fields and no public constructor, and it looked like a strong
+/// claim. It was replaced when step 1 became a broker-answered fact set,
+/// because `StorageProof` *does* have a constructor — `from_broker` — and so
+/// no compile-time claim about forging it survives. Leaving the old row in
+/// place would have been the quiet failure this repository exists to prevent:
+/// a `compile_fail` doctest naming a type that no longer exists fails to
+/// compile for that reason alone, and would have gone on passing whether or
+/// not the ordering law held. The claim that replaced it is the one that is
+/// actually true, and it is about the state rather than the evidence.
 ///
 /// ```compile_fail
 /// # use asv_integrations::migration::NegativeVerification;

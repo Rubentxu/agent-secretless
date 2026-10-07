@@ -338,6 +338,30 @@ pub enum Request {
     },
     /// Deletes a credential record.
     DeleteCredential { protocol: u16, id: CredentialId },
+
+    /// Doc 04 §10 step 1: does the vault still hold what `adopt` put there?
+    ///
+    /// This asks about **storage and authority**, never about value. There is
+    /// no digest of a credential in this request and none may be added to it:
+    /// a digest of one extracted value is an oracle for that value, and an
+    /// `_auth` credential is base64 of `user:password`, low-entropy enough to
+    /// confirm a guess. `npm.rs` states that three times; this is the fourth
+    /// place it is honoured, and the reason the answer below is a set of facts
+    /// rather than a comparison.
+    ///
+    /// **It does not verify the audience binding, and must not be read as
+    /// doing so.** The vault's `CredentialMetadata` has no audience field:
+    /// `CreateCredential` above carries label, kind, provider, account and the
+    /// secret, and nothing else. An audience-bound question could therefore
+    /// only be answered from a document the caller supplied, which would make
+    /// this the operator attesting their own import — precisely the thing §10
+    /// requires somebody else to check before the original is destroyed.
+    ///
+    /// Putting audience in the inventory is a real change to the credential
+    /// record and it has its own place in the plan. Until it lands, this verb
+    /// proves storage and says so, and the migration receipt is written to
+    /// match: it claims what was proved here and not one word more.
+    VerifyStorage { protocol: u16, id: CredentialId },
     /// Evaluates a bounded authorization request without exposing secrets.
     Authorize {
         protocol: u16,
@@ -719,6 +743,24 @@ pub enum Response {
     },
     CredentialDeleted {
         id: CredentialId,
+    },
+    /// The broker answered [`Request::VerifyStorage`]: it holds this credential
+    /// and the calling principal is entitled to read it.
+    ///
+    /// Every field is something the caller could already see from an inventory
+    /// listing. That is the point, not a shortfall: the value of this response
+    /// is that the **broker** said it, over the socket, as a peer the broker
+    /// admitted — not that the numbers are secret.
+    ///
+    /// What it does not say, and what nothing downstream may let it imply: that
+    /// the stored bytes are the bytes `adopt` imported. No comparison happened
+    /// here, because computing one would need a digest of a credential value.
+    /// See the request's documentation for why that is refused rather than
+    /// deferred.
+    StorageVerified {
+        id: CredentialId,
+        label: String,
+        exportability: Exportability,
     },
     /// A credential was planted in the vault and is now mintable.
     ///
@@ -1152,6 +1194,10 @@ impl Request {
             Request::EndSession { .. } => "end_session",
             Request::ListCredentialMetadata { .. } => "list_credential_metadata",
             Request::DeleteCredential { .. } => "delete_credential",
+            // Named separately rather than folded into a credential verb: §10
+            // step 1 is a gate a human later relies on, and an audit log that
+            // called it something else would make the gate untraceable.
+            Request::VerifyStorage { .. } => "verify_storage",
             Request::Authorize { .. } => "authorize",
             Request::ExplainAuthorization { .. } => "explain_authorization",
             Request::SubmitApproval { .. } => "submit_approval",
@@ -1197,6 +1243,7 @@ impl Request {
             | Request::RunIsolated { protocol, .. }
             | Request::CreateCredential { protocol, .. }
             | Request::DeleteCredential { protocol, .. }
+            | Request::VerifyStorage { protocol, .. }
             | Request::Authorize { protocol, .. }
             | Request::ExplainAuthorization { protocol, .. }
             | Request::SubmitApproval { protocol, .. }

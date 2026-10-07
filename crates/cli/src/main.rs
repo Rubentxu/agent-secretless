@@ -1016,6 +1016,7 @@ pub fn response_kind(response: &Response) -> &'static str {
         Response::SessionKeyRegistered { .. } => "SessionKeyRegistered",
         Response::CredentialMetadata { .. } => "CredentialMetadata",
         Response::CredentialDeleted { .. } => "CredentialDeleted",
+        Response::StorageVerified { .. } => "StorageVerified",
         Response::CredentialCreated { .. } => "CredentialCreated",
         Response::Authorization { .. } => "Authorization",
         Response::ApprovalIssued { .. } => "ApprovalIssued",
@@ -3627,6 +3628,18 @@ fn print_response(response: &Response) {
             }
         }
         Response::CredentialDeleted { id } => println!("credential {id} deleted"),
+        // Phrased as what the broker said rather than as a verdict. "verified"
+        // on its own reads as more than this is: no comparison of the stored
+        // value against anything happened here, and an operator skimming this
+        // line is deciding whether a file may be destroyed.
+        Response::StorageVerified {
+            id,
+            label,
+            exportability,
+        } => {
+            println!("the broker holds credential {id} ({label}, {exportability:?})");
+            println!("  storage and authority only — no comparison of the stored value");
+        }
         Response::CredentialCreated { id, label } => {
             // The id and the label the operator supplied. Never the secret: it
             // was read from stdin, sent once, and is not echoed back by a

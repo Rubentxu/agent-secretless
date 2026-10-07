@@ -23,12 +23,31 @@ use crate::npm::AuthField;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-/// Attestations, not digests: see `migration::AttestationMismatch` for why this
-/// crate will not hash a credential value. These are opaque strings a vault
-/// would produce under a key it holds.
-const IMPORTED: &str = "attest:v1:9f2c";
-const RETRIEVED: &str = "attest:v1:9f2c";
-const OTHER: &str = "attest:v1:0000";
+/// An `Adoption` and a storage proof that belongs to *it*.
+///
+/// Bound together on purpose. An earlier version of these rows built the proof
+/// and the receipt from separate calls, so the ids differed and every one of
+/// them failed with `WrongCredential` — which is the check working, not the
+/// tests being wrong. The two values are one fact in reality: the broker
+/// answered about the credential this migration adopted.
+fn adoption_with_proof() -> (Adoption, StorageProof) {
+    let r = receipt();
+    let p = StorageProof::from_broker(
+        r.credential,
+        "npm-registry",
+        asv_domain::Exportability::NonExportable,
+    );
+    (Adoption::new(r), p)
+}
+
+/// A standalone proof, for rows that only inspect what it reports.
+fn proof() -> StorageProof {
+    StorageProof::from_broker(
+        receipt().credential,
+        "npm-registry",
+        asv_domain::Exportability::NonExportable,
+    )
+}
 
 /// A real `.npmrc` in a real temp directory, fingerprinted by the real policy.
 ///
@@ -110,10 +129,10 @@ impl Adoption {
 /// passes, the rows below are testing refusals rather than a pipeline that
 /// happens to be stuck.
 fn completed() -> MigrationReceipt {
-    let adoption = Adoption::new(receipt());
+    let (adoption, proof) = adoption_with_proof();
     let digest = adoption.digest_for_tests();
     adoption
-        .verify_vault(IMPORTED, RETRIEVED)
+        .verify_storage(proof)
         .expect("the vault attests to what was imported")
         .project_and_verify(
             Projection::new(Posture::StrongSecretless, "surrogate config + ASV proxy"),
@@ -133,56 +152,63 @@ fn completed() -> MigrationReceipt {
 // ------------------------------------------------------------ the refusals
 
 #[test]
-fn a_vault_answering_with_a_different_attestation_is_refused_and_says_so() {
-    let error = Adoption::new(receipt())
-        .verify_vault(IMPORTED, OTHER)
-        .expect_err("a different attestation must not pass");
+fn a_proof_for_another_credential_is_refused_and_names_both() {
+    // The one check §10 step 1 can actually make without touching a value: the
+    // credential the broker confirmed is the credential this migration adopted.
+    // Ids are not secrets, so this costs nothing — and a proof answering for
+    // something else would otherwise go on to authorise destroying a file over
+    // the wrong evidence.
+    let adopted = receipt();
+    // Captured before the receipt is moved: the refusal has to name it, and
+    // reading a field out of a moved value would not compile.
+    let expected = adopted.credential.to_string();
+    let other = StorageProof::from_broker(
+        asv_domain::CredentialId::new(),
+        "some-other-credential",
+        asv_domain::Exportability::NonExportable,
+    );
+    let proven = other.id().to_string();
 
-    // The refusal names both sides. A message that only said "verification
-    // failed" would leave an operator unable to tell a migrated vault from a
-    // stale one.
+    let error = Adoption::new(adopted)
+        .verify_storage(other)
+        .expect_err("storage proven for another credential must not pass");
+
     assert_eq!(
         error,
-        ProofError::ValueDiffers {
-            presented: IMPORTED.to_string(),
-            answered: OTHER.to_string(),
+        ProofError::WrongCredential {
+            expected: expected.clone(),
+            proven: proven.clone(),
         }
     );
+    // The refusal names both sides, because "verification failed" would leave
+    // an operator unable to tell a migrated vault from a mismatched one.
     let text = error.to_string();
-    assert!(text.contains(OTHER), "{text}");
-    assert!(text.contains(IMPORTED), "{text}");
+    assert!(text.contains(proven.as_str()), "{text}");
+    assert!(text.contains(expected.as_str()), "{text}");
 }
 
 #[test]
-fn two_absent_attestations_are_not_a_match() {
-    // The failure mode this row exists for: a comparison that treats "" == ""
-    // as a pass. §10 wants the check performed, and an implementation that
-    // compares two empty strings has performed nothing while reporting that it
-    // did.
-    let error = Adoption::new(receipt())
-        .verify_vault("", "")
-        .expect_err("two absent attestations are not evidence");
-
-    assert_eq!(error, ProofError::NoAttestation);
+fn the_proof_report_says_storage_and_not_value_equality() {
+    // The report lands in a receipt that people read before allowing a file to
+    // be destroyed. If it said "vault verified" it would be read as more than
+    // it is, so the wording is itself under test.
+    let text = proof().report();
+    assert!(text.contains("storage and authority only"), "{text}");
     assert!(
-        error.to_string().contains("the absence of the check"),
-        "{error}"
+        text.contains("not a comparison of the stored value"),
+        "{text}"
     );
-
-    assert_eq!(
-        Adoption::new(receipt())
-            .verify_vault(IMPORTED, "")
-            .expect_err("a missing answer is not a match"),
-        ProofError::NoAttestation
-    );
+    // And it must never carry anything derived from the credential itself.
+    assert!(!text.contains("token-value"), "{text}");
 }
 
 #[test]
 fn a_tool_that_reports_nothing_has_not_reported_that_it_worked() {
     // Silence is not success. Without this the pipeline would accept a tool
     // that produced no output at all and call the new path verified.
-    let error = Adoption::new(receipt())
-        .verify_vault(IMPORTED, RETRIEVED)
+    let (adoption, proof) = adoption_with_proof();
+    let error = adoption
+        .verify_storage(proof)
         .expect("stored")
         .project_and_verify(
             Projection::new(Posture::StrongSecretless, "projection"),
@@ -201,8 +227,9 @@ fn a_tool_that_reports_nothing_has_not_reported_that_it_worked() {
 fn a_probe_that_reports_nothing_has_not_proved_the_old_path_is_dead() {
     // The step that separates a migration from a copy. An empty probe report
     // must not reach `Approved`, because reaching it is what unlocks a scrub.
-    let error = Adoption::new(receipt())
-        .verify_vault(IMPORTED, RETRIEVED)
+    let (adoption, proof) = adoption_with_proof();
+    let error = adoption
+        .verify_storage(proof)
         .expect("stored")
         .project_and_verify(
             Projection::new(Posture::StrongSecretless, "projection"),
@@ -223,11 +250,11 @@ fn a_probe_that_reports_nothing_has_not_proved_the_old_path_is_dead() {
 
 #[test]
 fn an_approval_over_a_different_plan_does_not_open_this_scrub() {
-    let adoption = Adoption::new(receipt());
+    let (adoption, proof) = adoption_with_proof();
     let real = adoption.digest_for_tests();
 
     let error = adoption
-        .verify_vault(IMPORTED, RETRIEVED)
+        .verify_storage(proof)
         .expect("stored")
         .project_and_verify(
             Projection::new(Posture::ShortLivedExposure, "ephemeral config"),
@@ -255,11 +282,11 @@ fn an_approval_over_a_different_plan_does_not_open_this_scrub() {
 
 #[test]
 fn nobody_is_not_an_approval() {
-    let adoption = Adoption::new(receipt());
+    let (adoption, proof) = adoption_with_proof();
     let digest = adoption.digest_for_tests();
 
     let error = adoption
-        .verify_vault(IMPORTED, RETRIEVED)
+        .verify_storage(proof)
         .expect("stored")
         .project_and_verify(
             Projection::new(Posture::StrongSecretless, "projection"),
@@ -348,7 +375,7 @@ fn the_plan_digest_covers_the_metadata_it_claims_to_cover() {
     // A digest is only worth anything if it changes when what it covers
     // changes. This one claims to cover the file, the fingerprint, the audience
     // and the credential id, so moving any of them has to move it.
-    let adoption = Adoption::new(receipt());
+    let (adoption, _proof) = adoption_with_proof();
     let base = adoption.digest_for_tests();
     assert!(base.starts_with("sha256:"), "{base}");
 
@@ -383,10 +410,10 @@ fn the_posture_is_carried_rather_than_inferred_and_never_upgraded() {
     // real static credential in a file that lives a few milliseconds is still
     // an exposure. The receipt has no way to turn it into STRONG_SECRETLESS,
     // because it copies the posture rather than computing one from anything.
-    let adoption = Adoption::new(receipt());
+    let (adoption, proof) = adoption_with_proof();
     let digest = adoption.digest_for_tests();
     let migration = adoption
-        .verify_vault(IMPORTED, RETRIEVED)
+        .verify_storage(proof)
         .expect("stored")
         .project_and_verify(
             Projection::new(Posture::RawProcessExposure, "ephemeral config, real token"),
