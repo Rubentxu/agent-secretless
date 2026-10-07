@@ -150,6 +150,66 @@ def check_install_path_is_user_writable(dist: dict) -> None:
         )
 
 
+def check_installer_sources_name_one_repository() -> None:
+    """The two installer entry points must name the same repository.
+
+    `scripts/install.sh` is the wrapper the README documents, and it is also the
+    file that fetches `install.py` when it is piped and has no sibling to run.
+    That means it now names a repository itself, in a URL of its own, while
+    `scripts/install.py` keeps naming the one it downloads releases from.
+
+    Two spellings of one repository is two places to forget, and the failure is
+    silent in the worst way available: the wrapper fetches an installer from one
+    project and that installer installs from another, or — more likely and more
+    boring — somebody renames or forks the repository, fixes the download URL
+    because it is the one that visibly breaks, and the fetch keeps resolving to
+    the old location. Nothing fails. A person gets an installer.
+    """
+    wrapper = ROOT / "scripts" / "install.sh"
+    installer = ROOT / "scripts" / "install.py"
+    if not wrapper.is_file() or not installer.is_file():
+        fail("scripts/install.sh and scripts/install.py must both exist for the "
+             "installer to have an entry point at all.")
+        return
+
+    wrapper_match = re.search(
+        r'^RAW_BASE="([^"]+)"', wrapper.read_text(encoding="utf-8"), re.M)
+    if not wrapper_match:
+        fail("scripts/install.sh declares no RAW_BASE=\"...\" literal. The piped "
+             "path fetches install.py from that URL, so it is the wrapper's only "
+             "record of where this repository lives.")
+        return
+
+    installer_match = re.search(
+        r'^DEFAULT_BASE_URL\s*=\s*"([^"]+)"',
+        installer.read_text(encoding="utf-8"), re.M)
+    if not installer_match:
+        fail("scripts/install.py declares no DEFAULT_BASE_URL literal, so there "
+             "is nothing to compare the wrapper's RAW_BASE against.")
+        return
+
+    raw = wrapper_match.group(1)
+    base = installer_match.group(1)
+
+    raw_repo = re.match(r"https://raw\.githubusercontent\.com/([^/]+/[^/]+)", raw)
+    base_repo = re.match(r"https://github\.com/([^/]+/[^/]+)/", base)
+    if not raw_repo:
+        fail(f"scripts/install.sh RAW_BASE is {raw!r}, which is not a "
+             f"raw.githubusercontent.com/<owner>/<repo> location.")
+    if not base_repo:
+        fail(f"scripts/install.py DEFAULT_BASE_URL is {base!r}, which is not a "
+             f"github.com/<owner>/<repo>/... release download location.")
+    if raw_repo and base_repo and raw_repo.group(1) != base_repo.group(1):
+        fail(
+            f"the two installer entry points disagree about which repository "
+            f"this is: scripts/install.sh fetches install.py from "
+            f"{raw_repo.group(1)!r}, and scripts/install.py downloads releases "
+            f"from {base_repo.group(1)!r}. An installer fetched from one project "
+            f"that installs from another is not a mistake anyone notices until "
+            f"somebody runs it."
+        )
+
+
 def known_packages() -> set[str]:
     """Every `name` a crate in the workspace declares.
 
@@ -433,6 +493,7 @@ def main(argv: list[str] | None = None) -> int:
         check_install_path_is_user_writable(dist)
         check_unit_agrees_with_manifest(distribution_manifest(), dist)
     check_component_sets(distribution_manifest())
+    check_installer_sources_name_one_repository()
 
     if failures:
         print("release config check FAILED:", file=sys.stderr)

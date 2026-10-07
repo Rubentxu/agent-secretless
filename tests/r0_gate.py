@@ -8,10 +8,18 @@ a status cell to decide whether a milestone is done, because a status cell is
 exactly the kind of claim that goes stale quietly.
 
     R0.1  the roadmap authority says what the product actually is
+    R0.1b main, the tags and the remote describe one tree
     R0.2  a clean install verifies a signed release, and every provenance
           violation is a refusal with nothing written
+    R0.2b the command the README gives installs, in an empty HOME
     R0.3  the official skill is published, and the cross-repo contract is green
+    R0.3b a stale protocol offers the agent a relation it can actually run
     R0.4  the work landed in atomic commits and the tree is clean
+
+The `b` rows exist because the four above cannot go red when a release changes.
+They were all green while `install.py` had never once completed an install and
+while `main` was eight commits ahead of the remote; a campaign from a past block
+is evidence about the past.
 
 # Why there is no SKIP
 
@@ -33,6 +41,7 @@ gate, applied here first: a requirement that cannot run has not been met.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -341,13 +350,202 @@ def r0_4_atomic_history() -> None:
            + ", ".join(f"{c}={s[:12]}" for c, s in sorted(landed.items())))
 
 
+# ------------------------------------------------- R0.1b / R0.2b / R0.3b
+#
+# The four rows above re-derive a past campaign. They are worth keeping and they
+# are not the block's exit criteria: none of them can go red because a release
+# was published, and a green that cannot go red is not evidence about the
+# product. The three rows below measure the conditions R0 actually names, from
+# the repository, from the published release, and from the surface an agent
+# reads.
+#
+# They were added after the repairs, and they are why this gate does not go 4/4
+# the moment the tree is clean: R0.2b is red until a release exists that the
+# documented command can install, and R0.3b is red because no upgrade relation
+# exists. Both were true while the four rows above were green.
+
+
+def workspace_version() -> str | None:
+    """The version the workspace declares, read rather than remembered."""
+    m = re.search(r'^version\s*=\s*"([^"]+)"',
+                  (REPO / "Cargo.toml").read_text(encoding="utf-8"), re.M)
+    return m.group(1) if m else None
+
+
+def r0_1b_repository_authority() -> None:
+    """`main`, the tags and the remote describe one tree.
+
+    `scripts/check-release-authority.py` owns the four rows; this gate requires
+    them and refuses to let the block close while that script is red or cannot
+    run. `UNKNOWN` in that script is its own state with a non-zero exit for the
+    same reason `UNAVAILABLE` is one here.
+    """
+    script = REPO / "scripts" / "check-release-authority.py"
+    if not script.is_file():
+        record("R0.1b repository and release authority", FAIL,
+               f"{script.relative_to(REPO)} does not exist; nothing enforces that "
+               f"a release names a commit on this branch")
+        return
+
+    code, out = run([sys.executable, str(script)])
+    if code == 127:
+        record("R0.1b repository and release authority", UNAVAILABLE,
+               "the authority gate could not be started")
+        return
+    if code != 0:
+        tail = [ln for ln in out.strip().splitlines() if ln.strip()][-6:]
+        record("R0.1b repository and release authority", FAIL,
+               f"exit {code}: " + " | ".join(tail))
+        return
+    m = re.search(r"(\d+) passed, (\d+) failed, (\d+) unknown", out)
+    if not m:
+        record("R0.1b repository and release authority", FAIL,
+               f"the authority gate produced no summary (exit {code})")
+        return
+    passed, failed, unknown = (int(m.group(i)) for i in (1, 2, 3))
+    record("R0.1b repository and release authority", PASS,
+           f"{passed} rows, {failed} failed, {unknown} unknown: every release tag "
+           f"annotated and an ancestor of the branch, present on the remote "
+           f"annotated and peeling to the same commit, and `origin/main` "
+           f"contains every release commit")
+
+
+def r0_2b_documented_install() -> None:
+    """The command the README gives installs, in an empty HOME.
+
+    `scripts/check-documented-install.py` reads the install command out of the
+    document and runs it, in the version the document pins. That is the subject
+    R0.2 names and nothing else measures: six consecutive releases shipped an
+    installer that refused its own archive, and four gates were green, because
+    every one of them exercised a component instead of the command.
+    """
+    script = REPO / "scripts" / "check-documented-install.py"
+    if not script.is_file():
+        record("R0.2b documented install", FAIL,
+               f"{script.relative_to(REPO)} does not exist; nothing runs the "
+               f"command the document tells a person to type")
+        return
+
+    version = workspace_version()
+    if not version:
+        record("R0.2b documented install", FAIL,
+               "the workspace Cargo.toml declares no version to install")
+        return
+
+    code, out = run([sys.executable, str(script), "--version", version])
+    if code == 127:
+        record("R0.2b documented install", UNAVAILABLE,
+               "the documented-install gate could not be started")
+        return
+
+    counts = re.search(r"^(\d+) passed, (\d+) failed$", out, re.M)
+    if not counts:
+        record("R0.2b documented install", FAIL,
+               f"the gate produced no summary (exit {code})")
+        return
+    passed, failed = int(counts.group(1)), int(counts.group(2))
+
+    # `re.findall` with two groups yields (group1, group2), so the state is the
+    # first element and the row name the second. Building the dict the other way
+    # round keys it by PASS/FAIL, and then every row looks green and the gate
+    # reports "all rows hold" on the same output that just failed one.
+    rows = {name: state for state, name in
+            re.findall(r"^\s+(PASS|FAIL)\s+(D\d[^\n]*)$", out, re.M)}
+    if failed or code != 0:
+        failing = sorted(n for n, s in rows.items() if s == "FAIL")
+        record("R0.2b documented install", FAIL,
+               f"{passed} of {passed + failed} D-rows hold at {version}; failing: "
+               f"{failing or '(none named)'}. Until these hold, the command the "
+               f"document gives has not completed an install from a published "
+               f"release")
+        return
+    record("R0.2b documented install", PASS,
+           f"D-rows all hold at {version}: the documented command is a real "
+           f"pipeline, its script is reachable, it completes in an empty HOME, "
+           f"and the binary it leaves behind reports the pinned version")
+
+
+def r0_3b_upgrade_relation() -> None:
+    """A protocol mismatch offers the agent a relation it can actually run.
+
+    Measured on the surface an agent reads — `asv capabilities --json`, which
+    returns the static relation set even when no broker is reachable — rather
+    than on the source that declares it. That list is what `PROTOCOL_MISMATCH`
+    could have pointed an agent at.
+
+    It is red, and it is left red. The repair the row implies — publish
+    `asv://rels/upgrade` pointing at the installer — is not available without a
+    fiction this codebase forbids: `every_operational_relation_parses_as_a_real_command`
+    runs the real clap parser over every published relation, so a relation
+    naming `install.sh` has no `asv` argv to parse. Closing this row means
+    either shipping a real `asv upgrade` verb or amending that invariant, and
+    both are decisions rather than repairs.
+    """
+    target = os.environ.get("CARGO_TARGET_DIR") or ""
+    binary = (Path(target) if target else None)
+    if binary is None:
+        code, out = run(["cargo", "metadata", "--format-version", "1", "--no-deps",
+                         "--manifest-path", str(REPO / "Cargo.toml")], timeout=300)
+        # Guarded rather than trusted: a `cargo metadata` that exits zero having
+        # printed something else used to take this gate down with a traceback,
+        # and a gate that crashes reports nothing at all — which is the one
+        # outcome that cannot be told apart from a row that was never run.
+        try:
+            binary = Path(json.loads(out)["target_directory"])
+        except (ValueError, KeyError, TypeError):
+            record("R0.3b protocol mismatch offers a runnable relation", UNAVAILABLE,
+                   f"cargo did not report a target directory (exit {code}); the "
+                   f"relation surface an agent reads could not be asked")
+            return
+    asv = binary / "debug" / "asv"
+    if not asv.is_file():
+        record("R0.3b protocol mismatch offers a runnable relation", UNAVAILABLE,
+               f"no built asv at {asv}; the relation surface an agent reads "
+               f"could not be asked")
+        return
+
+    code, out = run([str(asv), "capabilities", "--json",
+                     "--socket", str(REPO / "target" / "r0-gate-absent.sock")],
+                    timeout=300)
+    # A non-zero exit is not a failure here. With no broker reachable the
+    # envelope reports `status: blocked` and exits 1 — which is the correct
+    # answer to the question it was asked — while still publishing the static
+    # relation set, which is the thing this row needs. Treating the exit code
+    # as the verdict reported the absence of a broker as the absence of a
+    # relation, which are not the same claim.
+    try:
+        relations = json.loads(out)["data"]["relations"]
+    except (ValueError, KeyError, TypeError):
+        record("R0.3b protocol mismatch offers a runnable relation", FAIL,
+               f"the capabilities envelope carried no relation list to read "
+               f"(exit {code}); last output: "
+               f"{out.strip().splitlines()[-1] if out.strip() else '(none)'}")
+        return
+
+    recovery = [r for r in relations
+                if "upgrade" in r or "recover" in r or "repair" in r]
+    if not recovery:
+        record("R0.3b protocol mismatch offers a runnable relation", FAIL,
+               f"a stale protocol fails with a message naming both versions and "
+               f"no relation to act on. The static relation set is "
+               f"{relations} — none of them upgrades or recovers, and no "
+               f"`asv upgrade` verb exists to publish one honestly")
+        return
+    record("R0.3b protocol mismatch offers a runnable relation", PASS,
+           f"the published relations include {recovery}, so the remedy "
+           f"`PROTOCOL_MISMATCH` describes is one an agent can run")
+
+
 # -------------------------------------------------------------------- main
 
 def main() -> int:
     print("R0 exit gate — truthfulness, distribution, skill\n")
     r0_1_roadmap_authority()
+    r0_1b_repository_authority()
     r0_2_installer_provenance()
+    r0_2b_documented_install()
     r0_3_published_skill()
+    r0_3b_upgrade_relation()
     r0_4_atomic_history()
 
     print()

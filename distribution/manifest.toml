@@ -23,12 +23,27 @@
 schema = "asv.distribution/v1"
 product = "agent-secretless"
 
-# How the core archive is named. The version is substituted at build time from
-# the workspace Cargo.toml; it is not written here, because a second copy of
-# the version is a second thing to forget. `tests/distribution_bundle.py` fails
-# if this pattern and the built artifact name disagree.
+# How the core archive is named.
+#
+# The version is not in this name, and that is a measurement rather than a
+# preference. `dist` does not emit a versioned artifact name: it emits
+# `agent-secretless-<target>.tar.zst`, and it has done so for every release ever
+# published — v0.31.0 through v0.36.0 all carry the version-free name as their
+# asset. This declaration said otherwise, and `scripts/install.py` builds its
+# download URL from it, so the documented install path asked for a file that has
+# never existed on any release. Aligning the declaration with what the build
+# makes changes no published URL; the other direction would have changed all of
+# them at once.
+#
+# `tests/distribution_bundle.py` now reads this pattern and the names
+# `dist-manifest.json` lists, and fails when no filling of it produces a name
+# the build made. That row is what keeps this comment from becoming fiction
+# again.
+#
+# `{target}` is the only slot, and it is the one thing this file cannot know:
+# the target is the machine's platform, not the product's declaration.
 archive_format = "tar.zst"
-archive_name = "agent-secretless-v{version}-{target}.tar.zst"
+archive_name = "agent-secretless-{target}.tar.zst"
 
 # The install root a user-local installation produces. `bin` is on PATH,
 # `libexec` is not — that difference is the whole reason `asv-brokerd` lives

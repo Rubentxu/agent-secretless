@@ -596,8 +596,28 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         pattern = manifest["archive_name"]
-        archive_name = pattern.replace("{version}", args.version).replace(
-            "{target}", target)
+        archive_name = pattern.replace("{target}", target)
+
+        # A slot this installer does not fill is not a name, it is a 404 with a
+        # plausible spelling — the URL is built and the transfer is spent before
+        # anything can say the declaration was wrong. So the declaration is
+        # checked here, where the message can name the slot it could not expand.
+        #
+        # There was a `{version}` slot here for the whole life of this file, and
+        # substituting it into a name the build never made is what kept every
+        # install failing. A future slot should be added here, not silently
+        # shipped as literal braces in a URL.
+        unfilled = sorted(set(re.findall(r"\{(\w+)\}", archive_name)))
+        if unfilled:
+            fail(
+                f"the manifest declares archive_name = {pattern!r}, and this "
+                f"installer cannot fill {', '.join(unfilled)}. After the target "
+                f"is substituted the name is still {archive_name!r}. Every slot "
+                f"in that declaration needs a substitution in this file, and "
+                f"a name this installer cannot expand is a download that 404s."
+            )
+            return 1
+
         archive = work / archive_name
         checksums_file = work / CHECKSUM_AUTHORITY
         signature_file = work / f"{CHECKSUM_AUTHORITY}{SIGNATURE_SUFFIX}"
@@ -605,7 +625,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.from_dir:
             found = source / archive_name
             if not found.exists():
-                available = sorted(p.name for p in source.glob("agent-secretless-v*"))
+                # The glob matches the published family, not one spelling of it.
+                # It was `agent-secretless-v*`, which assumed the versioned name
+                # this installer no longer asks for, so the diagnostic offered
+                # by a wrong archive name listed nothing at all.
+                available = sorted(
+                    p.name for p in source.glob("agent-secretless-*")
+                    if p.is_file()
+                )
                 fail(
                     f"{archive_name} is not in {source}. "
                     f"Available: {', '.join(available) or 'nothing'}"

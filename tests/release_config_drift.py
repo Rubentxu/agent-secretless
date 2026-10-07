@@ -102,14 +102,35 @@ on_path = false
 """
 
 
+GOOD_INSTALL_SH = """#!/bin/sh
+set -eu
+RAW_BASE="https://raw.githubusercontent.com/Rubentxu/agent-secretless"
+exec python3 "$here/install.py" "$@"
+"""
+
+GOOD_INSTALL_PY = '''#!/usr/bin/env python3
+DEFAULT_BASE_URL = "https://github.com/Rubentxu/agent-secretless/releases/download"
+'''
+
+
 def make_tree(tmp: Path, *, dist_toml: str | None = None, unit: str | None = None,
               crates: dict[str, str] | None = None, root_cargo: str | None = None,
               dist_package: str | None = DIST_PACKAGE,
-              dist_manifest: str | None = DIST_MANIFEST) -> Path:
+              dist_manifest: str | None = DIST_MANIFEST,
+              install_sh: str | None = GOOD_INSTALL_SH,
+              install_py: str | None = GOOD_INSTALL_PY) -> Path:
     """A minimal tree with the same shape the guard reads.
 
     Built from literals rather than copied from the repository so a case cannot
     accidentally inherit the very configuration it is supposed to break.
+
+    The two installer entry points are here for the same reason. `scripts/install.sh`
+    fetches `install.py` from a URL of its own when it is piped, and the guard
+    compares that URL against the one `install.py` downloads releases from — so a
+    fixture without them fails every positive case for a reason that has nothing
+    to do with what those cases were written to exercise. That happened the first
+    time the rule was added, and 4 of 25 cases went red on the guard's new error
+    rather than on the drift it was checking for.
     """
     root = tmp
     if dist_toml is not None:
@@ -123,6 +144,11 @@ def make_tree(tmp: Path, *, dist_toml: str | None = None, unit: str | None = Non
     if dist_manifest is not None:
         (root / "distribution").mkdir(parents=True, exist_ok=True)
         (root / "distribution" / "manifest.toml").write_text(dist_manifest)
+    (root / "scripts").mkdir(parents=True, exist_ok=True)
+    if install_sh is not None:
+        (root / "scripts" / "install.sh").write_text(install_sh)
+    if install_py is not None:
+        (root / "scripts" / "install.py").write_text(install_py)
     for name, manifest in (crates or DEFAULT_CRATES).items():
         path = root / "crates" / name / "Cargo.toml"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -319,6 +345,42 @@ def main() -> int:
     # 11. Absence of configuration entirely — the state this repository was in.
     case("no dist-workspace.toml at all fails", expect_pass=False,
          unit=GOOD_UNIT, crates=DEFAULT_CRATES)
+
+    # 12. One repository, two spellings.
+    #
+    # `scripts/install.sh` fetches `install.py` from a URL of its own when it is
+    # piped, and `install.py` downloads releases from another. They agree today
+    # and nothing held them there: the wrapper did not have a URL until the piped
+    # install path was repaired, and the moment it got one the repository had two
+    # sources of truth for where it lives.
+    #
+    # The failure this catches is silent on purpose. A wrapper that fetches an
+    # installer from one project while that installer installs from another does
+    # not crash; it works, for everybody, right up until somebody renames or
+    # forks and fixes the URL that visibly breaks.
+    case("the wrapper fetching install.py from another repository fails",
+         expect_pass=False,
+         dist_toml=GOOD_DIST, unit=GOOD_UNIT, crates=DEFAULT_CRATES,
+         install_sh=GOOD_INSTALL_SH.replace(
+             "raw.githubusercontent.com/Rubentxu/agent-secretless",
+             "raw.githubusercontent.com/someone-else/agent-secretless"))
+    case("a wrapper that names no RAW_BASE fails", expect_pass=False,
+         dist_toml=GOOD_DIST, unit=GOOD_UNIT, crates=DEFAULT_CRATES,
+         install_sh=GOOD_INSTALL_SH.replace('RAW_BASE="https://raw', "# RAW_BASE=https://raw"))
+    case("an installer that names no DEFAULT_BASE_URL fails", expect_pass=False,
+         dist_toml=GOOD_DIST, unit=GOOD_UNIT, crates=DEFAULT_CRATES,
+         install_py="# nothing to compare the wrapper against\n")
+    case("a RAW_BASE that is not a raw.githubusercontent location fails",
+         expect_pass=False,
+         dist_toml=GOOD_DIST, unit=GOOD_UNIT, crates=DEFAULT_CRATES,
+         install_sh=GOOD_INSTALL_SH.replace(
+             "https://raw.githubusercontent.com/Rubentxu/agent-secretless",
+             "https://example.invalid/agent-secretless"))
+    # The positive control for this rule specifically, not just "a correct
+    # configuration passes" somewhere above: two spellings of one repository have
+    # to be accepted, or the guard is only ever able to say no.
+    case("two spellings of one repository agree", expect_pass=True,
+         dist_toml=GOOD_DIST, unit=GOOD_UNIT, crates=DEFAULT_CRATES)
 
     print(f"\n{PASS}/{PASS + FAIL} behaviours confirmed")
     return 1 if FAIL else 0

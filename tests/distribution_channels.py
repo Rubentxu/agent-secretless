@@ -66,6 +66,30 @@ TARGET = "x86_64-unknown-linux-gnu"
 CHECKSUM_AUTHORITY = "sha256.sum"
 SIGNATURE_SUFFIX = ".minisig"
 
+
+def archive_name_for(manifest: dict) -> str:
+    """The archive name this manifest declares, with every slot filled.
+
+    Every consumer in this file derives the name from the manifest. It used to
+    write the name out by hand in two places — once when checking the digest the
+    install record carries, once when opening the archive to contaminate it —
+    while a third read the manifest. So this file built its archive at the
+    declared name and then went looking for it under a different one, and both
+    spellings agreed with each other and disagreed with `scripts/install.py`.
+
+    That is the defect `distribution_bundle.py`'s `check_declared_archive_name`
+    now measures at the build boundary, and this function is the same property
+    held locally: one declaration, one expansion, no second copy to forget.
+    """
+    name = manifest["archive_name"].replace("{version}", VERSION).replace(
+        "{target}", TARGET)
+    if "{" in name:
+        raise AssertionError(
+            f"archive_name {manifest['archive_name']!r} still contains an "
+            f"unfilled slot after substitution: {name!r}"
+        )
+    return name
+
 _failures: list[str] = []
 _passes = 0
 
@@ -144,6 +168,19 @@ def shipped_names() -> list[str]:
     return [c["name"] for c in manifest["component"] if c.get("shipped")]
 
 
+def read_manifest() -> dict:
+    """The manifest this test builds its release from.
+
+    Read once, from the one file that declares the product boundary. A caller
+    that names the archive after reading it somewhere else is reintroducing the
+    second copy `archive_name_for` exists to remove.
+    """
+    import tomllib
+
+    with MANIFEST.open("rb") as fh:
+        return tomllib.load(fh)
+
+
 def build_release(dest: Path) -> Path:
     """A release directory with a real archive and a real checksums.txt.
 
@@ -151,11 +188,9 @@ def build_release(dest: Path) -> Path:
     the installer is fed what a release would contain rather than a placeholder
     whose size or shape could hide a defect.
     """
-    import tomllib
+    manifest = read_manifest()
 
     dest.mkdir(parents=True, exist_ok=True)
-    with MANIFEST.open("rb") as fh:
-        manifest = tomllib.load(fh)
 
     staging = dest / "staging"
     if staging.exists():
@@ -169,9 +204,7 @@ def build_release(dest: Path) -> Path:
         shutil.copy2(binary, target)
         os.chmod(target, 0o755)
 
-    archive_name = manifest["archive_name"].replace(
-        "{version}", VERSION).replace("{target}", TARGET)
-    archive = dest / archive_name
+    archive = dest / archive_name_for(manifest)
     with tarfile.open(archive, "w:zst") as tar:
         for comp in manifest["component"]:
             if not comp.get("shipped"):
@@ -282,6 +315,77 @@ def test_no_toolchain_is_reachable() -> None:
               f"{script.relative_to(REPO)} cannot invoke a toolchain")
 
 
+def test_the_documented_entry_point_is_the_one_that_works() -> None:
+    """`scripts/install.sh` piped on stdin, the way the README says to run it.
+
+    Every other test in this file calls `scripts/install.py` directly, and that
+    was true of `scripts/install.sh` as well. So the one entry point a person is
+    told to use had never been run by anything, and it could not have been: a
+    script read from stdin has `$0` set to the *shell*, so `dirname -- "$0"` is
+    the current directory and the wrapper went looking for `$PWD/install.py`,
+    which is never there. `./scripts/install.sh` kept working throughout, which
+    is why nothing noticed — the path that works was not the path in the
+    document.
+
+    The download of `install.py` is stubbed by putting a `curl` first on PATH
+    that copies the repository's own file whatever URL it is handed. That keeps
+    the row hermetic — what is under test is *which file the wrapper decides to
+    run*, not whether GitHub answers — and it is what lets the piped branch be
+    exercised at all, since the wrapper resolves a sibling only when it has one.
+
+    `cwd` is an empty temporary directory rather than the repository. The
+    wrapper decides between the two branches by asking whether `$0` is a file,
+    and in a directory with no `sh` in it the answer is reliably no.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        release = tmp / "release"
+        build_release(release)
+        prefix = tmp / "target"
+        empty = tmp / "empty"
+        empty.mkdir()
+
+        stub = tmp / "stub"
+        stub.mkdir()
+        fake_curl = stub / "curl"
+        fake_curl.write_text(
+            "#!/bin/sh\n"
+            "# Test stub: hands back this repository's own install.py whatever\n"
+            "# URL is asked for, so the piped branch can be exercised offline.\n"
+            'out=""\n'
+            "while [ $# -gt 0 ]; do\n"
+            '  case "$1" in\n'
+            '    -o) out="$2"; shift 2 ;;\n'
+            "    *) shift ;;\n"
+            "  esac\n"
+            "done\n"
+            f'cp "{INSTALL_PY}" "$out"\n'
+        )
+        os.chmod(fake_curl, 0o755)
+
+        env = dict(os.environ)
+        env.pop("ASV_INSTALLER", None)
+        env["PATH"] = f"{stub}{os.pathsep}{env['PATH']}"
+        _, public = test_keypair()
+
+        with INSTALL_SH.open(encoding="utf-8") as script:
+            result = subprocess.run(
+                ["sh", "-s", "--",
+                 "--version", VERSION, "--prefix", str(prefix),
+                 "--from-dir", str(release), "--no-setup",
+                 "--trusted-key", str(public)],
+                stdin=script, cwd=empty, capture_output=True, text=True, env=env)
+
+        check(result.returncode == 0,
+              "the command the README documents, piped on stdin, installs"
+              + (f" (exit {result.returncode}: "
+                 f"{(result.stderr or result.stdout or '').strip()[-300:]})"
+                 if result.returncode else ""))
+        binary = prefix / "bin" / "asv"
+        check(binary.is_file(),
+              f"the documented pipe put the binary where it promises ({binary})")
+
+
 def test_both_channels_install_the_same_bytes() -> None:
     """The exit test. Two entry points, two prefixes, one product."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -348,8 +452,8 @@ def test_each_channel_names_itself_in_the_record() -> None:
                   f"the {via} record declares the schema the CLI reads")
             check(record["version"] == VERSION,
                   f"the {via} record names the installed version")
-            check(record.get("archive_sha256") == sha256(release / (
-                f"agent-secretless-v{VERSION}-{TARGET}.tar.zst")),
+            check(record.get("archive_sha256") == sha256(
+                release / archive_name_for(read_manifest())),
                 f"the {via} record carries the verified archive digest")
 
 
@@ -396,13 +500,17 @@ def test_an_archive_with_an_undeclared_binary_is_refused() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         release = tmp / "release"
-        build_release(release)
+        archive = build_release(release)
         prefix = tmp / "target"
 
         # Build a second archive that also carries a harness binary, and point
         # checksums.txt at it so integrity verification passes. Only the
         # manifest comparison can catch this one.
-        archive = release / f"agent-secretless-v{VERSION}-{TARGET}.tar.zst"
+        #
+        # `build_release` returns the archive it packed, so this opens the file
+        # that exists. It used to rebuild the name from a literal, which meant a
+        # change to `archive_name` made this test fail with a missing file rather
+        # than with the contamination it exists to demonstrate.
         staging = tmp / "staging2"
         staging.mkdir()
         with tarfile.open(archive) as src:
@@ -507,6 +615,8 @@ def main() -> int:
     try:
         print("-- the installer cannot build")
         test_no_toolchain_is_reachable()
+        print("\n-- the documented entry point, piped the way the README says")
+        test_the_documented_entry_point_is_the_one_that_works()
         print("\n-- both channels, same bytes")
         test_both_channels_install_the_same_bytes()
         print("\n-- each channel names itself")
