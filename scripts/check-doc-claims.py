@@ -105,6 +105,24 @@ README_CLAIM = re.compile(r"(?<![A-Za-z0-9_])(\d+)\s+tests\b", re.IGNORECASE)
 # matching the word inside an identifier, and the `v` is required so a bare
 # "protocol 4" in prose is not read as a version claim.
 PROTOCOL_CLAIM = re.compile(r"(?:protocol|protocolo)\s+v(\d+)\b", re.IGNORECASE)
+# The version a documented install command pins: `--version 0.36.0`.
+#
+# This one existed as a claim for every release from v0.31.0 onward and no
+# check read it. `check_protocol_claims` covers the *protocol* number, which
+# is a different constant in a different crate, so a README could name the
+# right protocol and the wrong release and pass every gate in the pipeline.
+#
+# The cost was concrete rather than theoretical: on the v0.36.0 tree both
+# READMEs told a reader to install `0.35.0` from `main`, so the documented
+# install of the current release fetched the previous one. It survived the
+# release certification because the certification counted tests and read the
+# protocol constant — neither of which can see which version an install line
+# names.
+#
+# Three components, so `--version 11` (a protocol) and `--version 0.36` (a
+# partial product version) are both outside the claim rather than compared
+# against the workspace version and reported as drift.
+INSTALL_VERSION_CLAIM = re.compile(r"--version\s+(\d+\.\d+\.\d+)\b")
 # The quick-start arithmetic: `passed=865 failed=0 ignored=1`.
 PASSED_CLAIM = re.compile(r"(?:passed|pasaron|aprobados)[=:]\s*(\d+)", re.IGNORECASE)
 IGNORED_CLAIM = re.compile(r"ignored[=:]\s*(\d+)", re.IGNORECASE)
@@ -214,6 +232,59 @@ def check_protocol_claims(failures: list[str]) -> None:
             if int(claimed) != observed:
                 failures.append(
                     f"{readme.name} states protocol v{claimed}, the broker speaks v{observed}"
+                )
+
+
+def workspace_manifest() -> Path:
+    return REPO / "Cargo.toml"
+
+
+def workspace_version() -> str | None:
+    """The release version, read the way cargo reads it.
+
+    A regex rather than a TOML parse, and the first `version` in the file, for
+    the same reason `protocol_version` does it: the root manifest is a
+    workspace whose member tables carry versions of their own, and cargo takes
+    the one at the top.
+    """
+    manifest = workspace_manifest()
+    if not manifest.is_file():
+        return None
+    match = re.search(
+        r'^version\s*=\s*"([^"]+)"', manifest.read_text(encoding="utf-8"), re.M
+    )
+    return match.group(1) if match else None
+
+
+def check_install_version_claims(failures: list[str]) -> None:
+    """A documented install command must pin the version this tree releases.
+
+    The claim is only read from a command line that passes `--version` to a
+    shell script, which is the shape both READMEs use. A prose mention of a
+    version is not a claim about what a reader would install, so this does not
+    try to catch one.
+
+    A README that pins no version is left alone rather than failed: the check
+    guards a claim that is present, and refusing a document because it stopped
+    making the claim would punish the removal of the very thing that goes
+    stale. That asymmetry is deliberate — the failure mode being guarded is a
+    *wrong* version, not an absent one.
+    """
+    observed = workspace_version()
+    if observed is None:
+        failures.append(
+            f"could not read a version from {workspace_manifest().name}; refusing to "
+            f"pass an install-version claim that cannot be checked"
+        )
+        return
+    for readme in readmes():
+        text = readme.read_text(encoding="utf-8")
+        for claimed in INSTALL_VERSION_CLAIM.findall(text):
+            if claimed != observed:
+                failures.append(
+                    f"{readme.name} tells a reader to install {claimed}, and this "
+                    f"tree releases {observed}. The documented install of the "
+                    f"current release fetches a different one."
                 )
 
 
@@ -378,6 +449,7 @@ def main() -> int:
     failures: list[str] = []
     checks = [
         ("protocol version", check_protocol_claims),
+        ("install version", check_install_version_claims),
         ("suite size", check_suite_claims),
         ("spec-pack inventory", check_pack_inventory),
         ("status not in README", check_no_status_in_readme),
@@ -404,9 +476,9 @@ def main() -> int:
         return 1
 
     print(
-        f"document claims consistent: protocol version, suite size, spec-pack "
-        f"inventory, status placement, and the state vocabulary on "
-        f"{vocabulary_rows} milestone rows"
+        f"document claims consistent: protocol version, install version, suite "
+        f"size, spec-pack inventory, status placement, and the state vocabulary "
+        f"on {vocabulary_rows} milestone rows"
     )
     return 0
 

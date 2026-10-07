@@ -69,11 +69,24 @@ for name in "${ARCHIVES[@]}"; do
   # three sources of variance the original archive carried; zstd -T1
   # removes thread-count scheduling from the compression. Level 19 is
   # fixed: the same bytes through the same level are the same output.
+  #
+  # `--transform 's|^\./||'` is load-bearing and was missing. Tarring `.` from
+  # inside the staging directory writes every member as `./name`, and dist
+  # writes them as `name` — so the repack added a path component to every entry
+  # in the archive. The shell installer runs `tar xf … --strip-components 1`,
+  # which strips one component, so with the extra `./` it stripped the wrong one
+  # and left the binaries one directory deeper than the `mv "$_dir/asv"` it then
+  # runs: the install died with `mv: cannot stat …/asv`.
+  #
+  # Measured on v0.36.0, which shipped that archive: every release from v0.31.0
+  # onward failed to install this way. `tests/distribution_bundle.py` was green
+  # through all of it — it checks the *set* of components in the archive, and the
+  # set was correct; only the depth was wrong, and nothing looked at depth.
   stage="$WORK/${name%.tar.zst}"
   mkdir -p "$stage"
   tar --zstd -xf "$archive" -C "$stage"
   (cd "$stage" && tar --sort=name --mtime="@$EPOCH" --owner=0 --group=0 \
-      --numeric-owner -cf - .) \
+      --numeric-owner --transform 's|^\./||' -cf - .) \
     | zstd -q -T1 -19 -o "$WORK/$name.new"
 
   if cmp -s "$archive" "$WORK/$name.new"; then
@@ -148,7 +161,7 @@ for name in "${SRC_ARCHIVES[@]}"; do
   mkdir -p "$stage"
   tar -xzf "$archive" -C "$stage"
   (cd "$stage" && tar --sort=name --mtime="@$EPOCH" --owner=0 --group=0 \
-      --numeric-owner -cf - .) \
+      --numeric-owner --transform 's|^\./||' -cf - .) \
     | gzip -n -9 > "$WORK/$name.new"
 
   new_digest="$(sha256sum "$WORK/$name.new" | cut -d' ' -f1)"
@@ -192,7 +205,7 @@ for name in "${ARCHIVES[@]}"; do
   mkdir -p "$stage"
   tar --zstd -xf "$DISTRIB/$name" -C "$stage"
   (cd "$stage" && tar --sort=name --mtime="@$EPOCH" --owner=0 --group=0 \
-      --numeric-owner -cf - .) \
+      --numeric-owner --transform 's|^\./||' -cf - .) \
     | zstd -q -T1 -19 -o "$WORK/check.tar.zst"
   cmp "$DISTRIB/$name" "$WORK/check.tar.zst" \
     || { echo "normalize-release: self-check FAILED for $name — normalization is not deterministic" >&2; exit 1; }

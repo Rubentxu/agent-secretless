@@ -38,6 +38,11 @@ REPO = Path(__file__).resolve().parent.parent
 GUARD = REPO / "scripts" / "check-doc-claims.py"
 
 PROTOCOL_VERSION = 4
+# The workspace version the synthetic tree releases. Distinct from
+# PROTOCOL_VERSION on purpose: the two checks read two different constants, and
+# a fixture where they happened to be equal would not notice a guard that read
+# the wrong one.
+WORKSPACE_VERSION = "0.36.0"
 ENUMERATED = 866
 PASSED = 865
 IGNORED = 1
@@ -102,12 +107,20 @@ def build_tree(root: Path) -> dict[str, Path]:
         f"pub const PROTOCOL_VERSION: u16 = {PROTOCOL_VERSION};\n", encoding="utf-8"
     )
 
+    (root / "Cargo.toml").write_text(
+        f'[workspace]\nmembers = []\n\n[package]\nname = "fixture"\n'
+        f'version = "{WORKSPACE_VERSION}"\n',
+        encoding="utf-8",
+    )
+
     readme = (
         f"# ASV\n\n"
         f"The broker speaks protocol v{PROTOCOL_VERSION}.\n\n"
         f"There are {ENUMERATED} tests.\n\n"
         f"```bash\ncargo test --workspace --release\n"
         f"# expected: passed={PASSED} failed=0 ignored={IGNORED}\n```\n\n"
+        f"```bash\ncurl -LsSf https://example.invalid/install.sh \\\n"
+        f"  | sh -s -- --version {WORKSPACE_VERSION} --prefix \"$HOME/.local\"\n```\n\n"
         f"The pack holds {DOC_COUNT} documents and {ADR_COUNT} ADRs.\n"
     )
     (root / "README.md").write_text(readme, encoding="utf-8")
@@ -122,6 +135,7 @@ def build_tree(root: Path) -> dict[str, Path]:
         "gates": docs / "16-SECURITY-RELEASE-GATES.md",
         "roadmap": docs / "15-ROADMAP.md",
         "ipc": ipc / "lib.rs",
+        "cargo": root / "Cargo.toml",
     }
 
 
@@ -139,6 +153,7 @@ def run_checks(tree: dict[str, Path], stub_names: list[str] | None = None):
     failures: list[str] = []
     try:
         guard.check_protocol_claims(failures)
+        guard.check_install_version_claims(failures)
         guard.check_suite_claims(failures)
         guard.check_pack_inventory(failures)
         guard.check_no_status_in_readme(failures)
@@ -214,6 +229,78 @@ def main() -> int:
             # The message quotes the captured number, not the word that
             # preceded it, so it reads "protocol v2" in either language.
             must_contain="protocol v2",
+        )
+    )
+
+    # 3. The drift v0.36.0 shipped: both READMEs told a reader to install
+    #    0.35.0 on a tree releasing 0.36.0, and every gate passed. The
+    #    protocol check could not see it — different constant, different crate —
+    #    and no check read the version at all.
+    results.append(
+        case(
+            "a stale install version is caught in the English README",
+            expect_pass=False,
+            mutate=lambda t: t["readme"].write_text(
+                t["readme"].read_text(encoding="utf-8").replace(
+                    f"--version {WORKSPACE_VERSION}", "--version 0.35.0"
+                ),
+                encoding="utf-8",
+            ),
+            must_contain="tells a reader to install 0.35.0",
+        )
+    )
+
+    # 4. Same claim, other language — the same reason case 2 exists.
+    results.append(
+        case(
+            "a stale install version is caught in the Spanish README",
+            expect_pass=False,
+            mutate=lambda t: t["readme_es"].write_text(
+                t["readme_es"].read_text(encoding="utf-8").replace(
+                    f"--version {WORKSPACE_VERSION}", "--version 0.35.0"
+                ),
+                encoding="utf-8",
+            ),
+            must_contain="tells a reader to install 0.35.0",
+        )
+    )
+
+    # 5. The guard reads the workspace manifest, not a number written down a
+    #    second time. If it compared against the protocol constant it would be
+    #    satisfied by a README that said `--version 11`; here the manifest moves
+    #    and the correct README goes red, which is the direction that matters —
+    #    the release version changed and the document did not.
+    results.append(
+        case(
+            "the guard reads the workspace manifest, not the protocol constant",
+            expect_pass=False,
+            mutate=lambda t: t["cargo"].write_text(
+                t["cargo"].read_text(encoding="utf-8").replace(
+                    f'version = "{WORKSPACE_VERSION}"', 'version = "0.37.0"'
+                ),
+                encoding="utf-8",
+            ),
+            must_contain=f"this tree releases 0.37.0",
+        )
+    )
+
+    # 6. The asymmetry, stated as a row so it stays deliberate. A README that
+    #    pins no version makes no claim, and failing it would punish the removal
+    #    of exactly the thing that goes stale. The guarded failure mode is a
+    #    *wrong* version, not an absent one.
+    results.append(
+        case(
+            "a README that pins no install version is not failed",
+            expect_pass=True,
+            mutate=lambda t: t["readme"].write_text(
+                re.sub(
+                    r"curl -LsSf.*?\$HOME/\.local\"\n",
+                    "",
+                    t["readme"].read_text(encoding="utf-8"),
+                    flags=re.S,
+                ),
+                encoding="utf-8",
+            ),
         )
     )
 

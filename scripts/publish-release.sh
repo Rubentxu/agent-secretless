@@ -97,15 +97,82 @@ if [[ ! -f "${DISTRIB}/manifest.toml" ]]; then
   exit 1
 fi
 
+# The install line in the release notes used to carry a hand-typed asset name.
+#
+# v0.36.0 is the release that proves what that costs. The notes said
+# `curl ... /download/v0.36.0/asv-cli-installer.sh | sh`, dist had produced
+# `agent-secretless-installer.sh`, and the URL was a 404 — so the official
+# install instruction for a published release did not install anything. The
+# name was correct when it was written, which is exactly why nothing noticed:
+# a hand-typed name can be right twice in a row and wrong the third time, and
+# no gate compared it with the manifest.
+#
+# So the name is read from `dist-manifest.json` — the same file the upload
+# list was built from — and the check is that it is the *one* installer the
+# manifest declares. A second installer artifact makes this fail rather than
+# pick one, because "the install line names an installer" is not the claim
+# being made; "it names the installer this release actually ships" is.
+INSTALLER_NAME="$(python3 - "${DISTRIB}/dist-manifest.json" <<'PY'
+import json, sys, pathlib
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
+artifacts = manifest.get("artifacts", {})
+names = sorted(a["name"] for a in artifacts.values()
+               if isinstance(a, dict) and a.get("kind") == "installer")
+if len(names) != 1:
+    sys.exit(f"publish-release: expected exactly one artifact of kind "
+             f"'installer' in the manifest, found {len(names)}: {names}. The "
+             f"install line in the release notes must name the installer this "
+             f"release ships, and there is no way to choose between two.")
+print(names[0])
+PY
+)" || exit 1
+
+# The same reasoning applies to where the download comes from. The notes had
+# the repository slug typed out as well, lowercase, and nothing checked it
+# against the remote this release is actually cut from.
+REPO_SLUG="$(python3 - <<'PY'
+import re, subprocess, sys
+url = subprocess.run(["git", "config", "--get", "remote.origin.url"],
+                     capture_output=True, text=True).stdout.strip()
+# `[:/]` covers an https URL and an scp-style `git@host:owner/repo`, and the
+# non-greedy `[^/:]+` with an optional `.git` is what strips the suffix.
+#
+# The sed this replaced looked correct and was not: with `.*[:/]+` greedy in
+# front of it, `(\.git)?$` never got the chance to match, and the release URL
+# came out as `.../agent-secretless.git/releases/...`, which 404s. It was only
+# caught because the rewritten URL was fetched and asked for its status code
+# rather than read and believed — the same rule this release violated twice
+# already, in the asset name and in the README.
+m = re.search(r"[:/]([^/:]+/[^/:]+?)(?:\.git)?$", url) if url else None
+if not m:
+    sys.exit("publish-release: could not read an owner/repo slug from "
+             "remote.origin.url. The install line in the release notes must "
+             "point at the repository this release was cut from, and that "
+             "cannot be typed out by hand.")
+print(m.group(1))
+PY
+)" || exit 1
+
 # Uploading to a Release that already exists appends to it. `gh` does not
 # refuse on its own, and the result is a release whose artifact list is a mix
 # of two builds with one tag, which is exactly the state
 # verify-release-artifacts.py cannot detect afterwards.
+#
+# The install line is resolved *before* this refusal, and repeated in it. That
+# ordering is the fix for a repair being impossible: v0.36.0 shipped notes
+# naming an asset that 404s, and the person repairing it cannot see what the
+# script would publish, because this check exits first and the dry run below is
+# unreachable once a release exists. Both of the two things the notes got wrong
+# — the repository slug and the installer name — are pure derivations with no
+# side effects, so computing them costs nothing and makes the refusal carry
+# the line to check against.
 if gh release view "$TAG" >/dev/null 2>&1; then
   echo "publish-release: a GitHub Release for ${TAG} already exists." >&2
   echo "  Either this is a re-run of a publish that succeeded, or someone else" >&2
   echo "  released this tag. Both need a human; refusing." >&2
   echo "  To see what is there:  gh release view ${TAG}" >&2
+  echo "  The install line this script derives for ${TAG}:" >&2
+  echo "    curl -LsSf https://github.com/${REPO_SLUG}/releases/download/${TAG}/${INSTALLER_NAME} | sh" >&2
   exit 1
 fi
 
@@ -166,6 +233,7 @@ if [[ ${#ASSETS[@]} -eq 0 ]]; then
   exit 1
 fi
 
+
 if [[ $CONFIRM -ne 1 ]]; then
   DRAFT_NOTE=""
   [[ $DRAFT -eq 1 ]] && DRAFT_NOTE=" (as a draft)"
@@ -177,11 +245,18 @@ EOF
   printf '  %s\n' "${ASSETS[@]}"
   cat <<EOF
 
+and the release notes would tell a reader to install with:
+
+    curl -LsSf https://github.com/${REPO_SLUG}/releases/download/${TAG}/${INSTALLER_NAME} | sh
+
 Re-run with --confirm to actually publish${DRAFT_NOTE}.
 
 The assets above come from dist-manifest.json, not from a directory listing,
 so a stale file left over from a previous build cannot be uploaded by
-accident.
+accident. The install line is printed rather than assembled silently because
+the repository slug and the installer name are the two things in the notes
+that v0.36.0 got wrong, and both are now derived — the point of showing them
+is that a reader can fetch the URL and see a 200 rather than trust it.
 EOF
   exit 0
 fi
@@ -198,7 +273,7 @@ Binaries, checksums and installers for ${TAG}.
 
 Install the CLI:
 
-    curl -LsSf https://github.com/rubentxu/agent-secretless/releases/download/${TAG}/asv-cli-installer.sh | sh
+    curl -LsSf https://github.com/${REPO_SLUG}/releases/download/${TAG}/${INSTALLER_NAME} | sh
 
 The broker is a separate install — it is a daemon, not a command you run, and
 it needs a systemd user unit. See the README, "Installing".

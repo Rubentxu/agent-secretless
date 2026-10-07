@@ -26,9 +26,12 @@ Run: python3 scripts/verify-release-artifacts.py
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -117,6 +120,173 @@ def check_checksums_match_the_bytes() -> None:
             )
 
 
+def installer_path(manifest: dict) -> Path | None:
+    """The installer dist generated, found by `kind` rather than by name.
+
+    A hardcoded installer name is what made the v0.36.0 release notes point at
+    an asset that does not exist, so the name is read the same way every other
+    fact here is read: from the manifest.
+    """
+    names = [
+        a["name"]
+        for a in manifest.get("artifacts", {}).values()
+        if isinstance(a, dict) and a.get("kind") == "installer"
+    ]
+    if len(names) != 1:
+        return None
+    return DISTRIB / names[0]
+
+
+def installer_blocks(text: str) -> dict[str, dict[str, str]]:
+    """The installer's per-artifact constants, keyed by artifact name.
+
+    dist writes one `case` arm per archive, each setting `_checksum_value` and
+    `_bins`. Both are read from the file rather than assumed, so a change in
+    what dist names things moves this check instead of silently passing it.
+    """
+    opener = re.compile(r'^\s*"(?P<name>[^"]+\.tar\.(?:zst|gz|xz))"\)\s*$')
+    blocks: dict[str, dict[str, str]] = {}
+    current: str | None = None
+    for line in text.splitlines():
+        match = opener.match(line)
+        if match:
+            current = match.group("name")
+            blocks.setdefault(current, {})
+            continue
+        # `;;` ends the arm. Without this the walk runs on past the `case` into
+        # the updater section, where dist assigns `_bins="$_bins $APP_NAME-update"`
+        # to a local rather than to an archive — and that literal overwrites the
+        # artifact's real binary list, which turns this check into a report about
+        # a shell variable instead of about the release.
+        if line.strip().endswith(";;"):
+            current = None
+            continue
+        if current is None:
+            continue
+        for key in ("_checksum_value", "_bins"):
+            found = re.match(rf'^\s*{re.escape(key)}="([^"]*)"\s*$', line)
+            if found:
+                blocks[current][key] = found.group(1)
+    return blocks
+
+
+def digest_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def check_installer_checksums_match_the_bytes(manifest: dict) -> None:
+    """The digest the installer verifies against must be the archive's digest.
+
+    Every checksum gate in this train compared checksums against files in
+    `target/distrib`, and none of them opened the installer — so the one place a
+    user's first command compares a number was never compared at all.
+
+    The `normalize` stage is what breaks it: it repacks the archives so they are
+    byte-reproducible, which changes their digests, and dist had already written
+    the pre-normalization digest into the installer. Measured across published
+    releases, v0.31.0 through v0.36.0 each ship an installer that refuses its own
+    artifact with `ERROR: checksum mismatch`.
+    """
+    installer = installer_path(manifest)
+    if installer is None or not installer.is_file():
+        fail(
+            "the manifest declares no single installer artifact on disk. A "
+            "release whose documented install path does not exist is not a "
+            "release nobody can install; it is a release that cannot be "
+            "installed at all."
+        )
+        return
+
+    blocks = installer_blocks(installer.read_text(encoding="utf-8"))
+    if not blocks:
+        fail(
+            f"{installer.name} contains no artifact checksum block, so there is "
+            f"nothing to verify and the installer's own verification cannot be "
+            f"checked. Refusing to pass it."
+        )
+        return
+
+    for name, values in sorted(blocks.items()):
+        archive = DISTRIB / name
+        if not archive.is_file():
+            fail(f"{installer.name} verifies {name}, which was not built")
+            continue
+        claimed = values.get("_checksum_value")
+        actual = digest_of(archive)
+        if claimed != actual:
+            fail(
+                f"{installer.name} refuses its own release: it verifies {name} "
+                f"against {claimed}, and those bytes hash to {actual}. A user "
+                f"following the documented install gets ERROR: checksum "
+                f"mismatch. Normalization rewrote the archive after dist baked "
+                f"this digest; run scripts/repair-installer-checksums.py."
+            )
+
+
+def check_installer_can_reach_the_binaries(manifest: dict) -> None:
+    """Unpack each archive the way the installer does, and require the binaries.
+
+    This is the check `tests/distribution_bundle.py` cannot be. That suite
+    confirms the right *set* of components is in the archive and passed 21/21 on
+    an archive whose install path was broken. The defect was never the set: it
+    was the path *depth*. `normalize` repacked with `tar -cf - .` from inside
+    the staging directory, writing every member as `./name` and so adding a
+    component to every entry. The installer runs `tar xf … --strip-components
+    1`, stripped the wrong component, and looked for the binaries one directory
+    too low.
+
+    So the property under test is not "the archive contains asv". It is "the
+    command line in the installer, applied to this archive, leaves the binaries
+    where the installer then looks". Replaying the installer's own two commands
+    is what makes this falsifiable rather than a guess about tar's behaviour.
+    """
+    installer = installer_path(manifest)
+    if installer is None or not installer.is_file():
+        # Already reported by the checksum check; one cause, one complaint.
+        return
+
+    blocks = installer_blocks(installer.read_text(encoding="utf-8"))
+    for name, values in sorted(blocks.items()):
+        archive = DISTRIB / name
+        if not archive.is_file():
+            continue
+        bins = values.get("_bins", "").split()
+        if not bins:
+            fail(f"{installer.name} declares no binaries for {name}")
+            continue
+        with tempfile.TemporaryDirectory() as tmp:
+            # The same two commands the installer runs, in the same order, with
+            # the mode given as separate options: `tar --zstd xf …` is not
+            # accepted by every tar, and a check that fails because of how it
+            # spelled its own argument reports a defect that is not there.
+            tar = ["tar", "-x", "--no-same-owner", "--strip-components", "1",
+                   "-f", str(archive), "-C", tmp]
+            if name.endswith(".zst"):
+                tar.insert(1, "--zstd")
+            unpack = subprocess.run(tar, capture_output=True, text=True)
+            if unpack.returncode != 0:
+                fail(
+                    f"the installer's own unpack of {name} failed:\n"
+                    f"{unpack.stdout}{unpack.stderr}"
+                )
+                continue
+            root = Path(tmp)
+            missing = [b for b in bins if not (root / b).is_file()]
+            if missing:
+                top = sorted(p.name for p in root.iterdir())
+                fail(
+                    f"the installer's unpack of {name} leaves {missing} out of "
+                    f"reach: after `tar xf --strip-components 1` the top level "
+                    f"is {top}, not the binaries the installer then moves. Every "
+                    f"member in this archive is one path component deeper than "
+                    f"the installer expects."
+                )
+
+
 def check_manifest_matches_the_tag(manifest: dict) -> None:
     """dist announced a tag; the tag on disk has to be the one dist is naming.
 
@@ -155,6 +325,8 @@ def main() -> int:
 
     checked = check_everything_promised_exists(manifest)
     check_checksums_match_the_bytes()
+    check_installer_checksums_match_the_bytes(manifest)
+    check_installer_can_reach_the_binaries(manifest)
     check_manifest_matches_the_tag(manifest)
 
     if failures:
@@ -166,7 +338,8 @@ def main() -> int:
     apps = [r.get("app_name") for r in manifest.get("releases", [])]
     print(
         f"release artifacts ok: {checked} artifacts across {len(apps)} apps "
-        f"({', '.join(apps)}), every checksum verified against its bytes"
+        f"({', '.join(apps)}), every checksum verified against its bytes, and "
+        f"the installer's own unpack of each archive reaches the binaries"
     )
     return 0
 

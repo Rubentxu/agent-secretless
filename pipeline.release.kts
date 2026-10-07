@@ -91,6 +91,39 @@ pipeline {
             sh("dist manifest --output-format=json --artifacts=all > target/distrib/dist-manifest.json.tmp && mv target/distrib/dist-manifest.json.tmp target/distrib/dist-manifest.json")
         }
 
+        // Make the archives byte-reproducible before anything pins them:
+        // dist embeds packaging-time mtimes (measured, backlog
+        // bl-bl-01M3YN9BHE000387XAKRC47X00; SOURCE_DATE_EPOCH is ignored),
+        // so the archives are repacked deterministically against the
+        // release commit's timestamp, with checksums and sha256.sum kept
+        // coherent.
+        //
+        // This stage used to run *after* verify-artifacts, so the gate
+        // verified bytes that this stage then replaced — its own comment
+        // claimed "Verify-artifacts then checks the normalized bytes",
+        // which the stage order made false. The order is now normalize,
+        // repair, then verify, so what the gate checks is what gets signed
+        // and published.
+        stage("normalize") {
+            sh("scripts/normalize-release-archives.sh")
+            // dist bakes each archive's sha256 into the installer, at build
+            // time. Normalization rewrote the archive afterwards, so that
+            // constant describes bytes the release does not ship and every
+            // install dies at `ERROR: checksum mismatch`. Six consecutive
+            // releases (v0.31.0 … v0.36.0) shipped exactly that, and every
+            // checksum gate passed, because they all compared checksums against
+            // files in target/distrib and none of them opened the installer.
+            //
+            // It runs here rather than inside normalize because normalize's
+            // declared touchpoints are the archive, its sidecar and its
+            // sha256.sum line — adding a fourth silently to a script whose
+            // header enumerates three is how the omission happened in the first
+            // place. As its own stage it is visible in the run, and
+            // verify-release-artifacts.py checks the result rather than
+            // trusting the stage to have done its job.
+            sh("python3 scripts/repair-installer-checksums.py")
+        }
+
         // The artifacts are only worth uploading if they are internally
         // consistent, and "consistent" here means three separate things that
         // can each be wrong on their own: every archive the manifest promises
@@ -106,16 +139,6 @@ pipeline {
             // right binaries plus one forbidden one has perfect checksums.
             sh("python3 packaging/stage-bundle.py --check")
             sh("python3 tests/distribution_bundle.py")
-        }
-
-        // Make the archives byte-reproducible before anything pins them:
-        // dist embeds packaging-time mtimes (measured, backlog
-        // bl-bl-01M3YN9BHE000387XAKRC47X00; SOURCE_DATE_EPOCH is ignored),
-        // so the archives are repacked deterministically against the
-        // release commit's timestamp, with checksums and sha256.sum kept
-        // coherent. Verify-artifacts then checks the normalized bytes.
-        stage("normalize") {
-            sh("scripts/normalize-release-archives.sh")
         }
 
         // The product boundary has to be inside the signed authority before the
