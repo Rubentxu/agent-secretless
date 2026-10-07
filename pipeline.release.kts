@@ -49,6 +49,22 @@ pipeline {
             // buys the statement "R0 is closed" backed by the same evidence
             // that closed it.
             sh("python3 tests/r0_gate.py")
+            // R0.1 on its own, over every release rather than the one being cut.
+            //
+            // `r0_gate.py` above answers "is the roadmap honest"; this answers
+            // "does any published release name a commit outside the branch, or a
+            // tag that is not annotated, or a tag the remote disagrees with".
+            // It held on 2026-10-07 — 53 release tags, all annotated, all
+            // ancestors of `main` — but nothing was reading it, so it was a
+            // sentence rather than a property. Each of its four rows has a
+            // falsification in tests/release_authority_drift.py, including two
+            // that need a real remote and get a local bare repository over
+            // `file://` rather than a network.
+            //
+            // It is here, in preflight, for the same reason the skill check is:
+            // a release that discovers at the publish stage that its own tag is
+            // untrustworthy has already created a Release other people can fetch.
+            sh("python3 scripts/check-release-authority.py")
             // `dist plan` is the exact same code path the release CI would
             // run, minus the compilation. It resolves the tag, the targets
             // and the artifact list from the real configuration, so a
