@@ -49,6 +49,7 @@ use std::path::Path;
 
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
 use crate::fingerprint::{Drift, FileFingerprint, FingerprintPolicy};
@@ -299,6 +300,32 @@ pub enum PendingStep {
     ScrubAndRescan,
 }
 
+impl PendingStep {
+    /// §10's steps after the import, in order.
+    ///
+    /// One list, so that the receipt's `outstanding` and any receipt written at
+    /// the end of a migration agree about what the sequence *is*. Two
+    /// hand-written lists is how they stop agreeing.
+    pub const ALL: [PendingStep; 5] = [
+        PendingStep::VerifyVault,
+        PendingStep::VerifyNewIntegration,
+        PendingStep::NegativeBypassTest,
+        PendingStep::HumanApproval,
+        PendingStep::ScrubAndRescan,
+    ];
+
+    /// The snake_case spelling, which is also the serialized form.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PendingStep::VerifyVault => "verify_vault",
+            PendingStep::VerifyNewIntegration => "verify_new_integration",
+            PendingStep::NegativeBypassTest => "negative_bypass_test",
+            PendingStep::HumanApproval => "human_approval",
+            PendingStep::ScrubAndRescan => "scrub_and_rescan",
+        }
+    }
+}
+
 /// `asv.integrations.adopt/v1`.
 ///
 /// A third schema, distinct from both the discovery and the plan: this document
@@ -307,6 +334,7 @@ pub const ADOPT_SCHEMA: &str = "asv.integrations.adopt/v1";
 
 impl AdoptReceipt {
     /// Wraps a completed import with this build's schema.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         selector: AdoptSelector,
         credential: crate::CredentialId,
@@ -328,14 +356,43 @@ impl AdoptReceipt {
             // §10 in order. Written out rather than derived, because the whole
             // value of the field is that it is the list a reader can check the
             // product against.
-            outstanding: vec![
-                PendingStep::VerifyVault,
-                PendingStep::VerifyNewIntegration,
-                PendingStep::NegativeBypassTest,
-                PendingStep::HumanApproval,
-                PendingStep::ScrubAndRescan,
-            ],
+            outstanding: PendingStep::ALL.to_vec(),
         }
+    }
+
+    /// A digest over everything the approval must cover.
+    ///
+    /// §10's "human approval" is a step a CLI cannot take on the operator's
+    /// behalf, and an approval is only an approval *of something*. This is that
+    /// something: the file it came from, the credential it went to, the
+    /// audience it is bound to and the value that was imported. An operator
+    /// approving this digest has approved the migration that produced it, and
+    /// an approval carried over from a different plan cannot open this scrub.
+    ///
+    /// Derived rather than stored, because a stored digest can go stale the
+    /// same way any other field can; this one cannot, and the two are not the
+    /// same guarantee.
+    ///
+    /// Deliberately over metadata only. It includes `source_fingerprint.digest`,
+    /// which is a digest of the *file* and is safe by the argument
+    /// `npm.rs` gives: confirming a guess against it means guessing every byte
+    /// of the file. It does **not** include a digest of the credential value,
+    /// because a digest of one extracted value is an oracle for that value and
+    /// `_auth` is base64 of `user:password`. See the "What this crate will not
+    /// emit" section of `npm.rs`.
+    pub fn plan_digest(&self) -> String {
+        let mut material = String::new();
+        material.push_str(self.schema.as_str());
+        material.push('\n');
+        material.push('\n');
+        material.push_str(&self.source_file);
+        material.push('\n');
+        material.push_str(self.source_fingerprint.digest.as_str());
+        material.push('\n');
+        material.push_str(&self.audience);
+        material.push('\n');
+        material.push_str(self.credential.to_wire().as_str());
+        format!("sha256:{:x}", Sha256::digest(material.as_bytes()))
     }
 }
 

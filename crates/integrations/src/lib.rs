@@ -72,6 +72,7 @@ pub mod execute;
 pub mod fingerprint;
 pub mod gradle;
 pub mod maven;
+pub mod migration;
 pub mod npm;
 pub mod plan;
 pub mod registry_audience;
