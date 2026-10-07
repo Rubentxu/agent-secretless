@@ -245,5 +245,30 @@ pipeline {
         stage("spec-gates") {
             sh("python3 tools/check-gates.py")
         }
+
+        // Everything R0 built, run on every change instead of when somebody
+        // remembers.
+        //
+        // These four were hermetic, green and absent from this file. `r0_gate`
+        // was worse — the whole block's exit gate, run by hand and by nothing
+        // else — and a gate that runs only in the one place nobody looks is the
+        // same object as no gate at all. That is the sentence this repository
+        // already writes about its own checks, and it applied to itself.
+        //
+        // Only the hermetic four are here. `scripts/check-documented-install.py`
+        // and `tests/r0_gate.py` are deliberately absent and that is a measured
+        // gap, not an oversight: the first installs from a published release and
+        // the second delegates to it, so neither can be green until v0.37.0
+        // exists, and adding a permanently red stage would stop the run rather
+        // than guard anything. They are listed in the roadmap row for R0 and are
+        // the reason R0 is not closed.
+        stage("truthfulness") {
+            timeout(time = 45, unit = "MINUTES") {
+                sh("python3 tests/provenance_falsification.py")
+                sh("python3 tests/release_authority_drift.py")
+                sh("python3 tests/documented_install_drift.py")
+                sh("python3 tests/r0_gate_drift.py")
+            }
+        }
     }
 }
