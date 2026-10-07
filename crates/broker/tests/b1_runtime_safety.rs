@@ -65,7 +65,6 @@ struct Fixture {
     dir: PathBuf,
     sock: PathBuf,
     _vault: PathBuf,
-
 }
 
 struct Broker(Child);
@@ -191,8 +190,12 @@ fn round_trip(sock: &PathBuf, request: &Request, budget: Duration) -> (Response,
         read > 0,
         "the broker closed the connection without answering within {budget:?}"
     );
-    let response: Response = serde_json::from_slice(&buf[..read])
-        .unwrap_or_else(|e| panic!("the broker answered with something undecodable: {e}; {response:?}", response = String::from_utf8_lossy(&buf[..read])));
+    let response: Response = serde_json::from_slice(&buf[..read]).unwrap_or_else(|e| {
+        panic!(
+            "the broker answered with something undecodable: {e}; {response:?}",
+            response = String::from_utf8_lossy(&buf[..read])
+        )
+    });
     (response, elapsed)
 }
 
