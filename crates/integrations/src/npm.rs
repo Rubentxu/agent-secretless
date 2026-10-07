@@ -21,6 +21,62 @@
 //! contrast, because confirming a guess against it means guessing every byte of
 //! the file including the secret.
 //!
+//! # Two behaviours of npm itself, measured rather than read
+//!
+//! [`project`](crate::project) writes a `.npmrc` that npm will actually load.
+//! Everything it knows about npm's spelling was measured against npm 11.12.1 on
+//! this host, by pointing it at a local origin and reading the headers that
+//! arrive. Both facts below are the reason that module looks the way it does,
+//! and neither is a matter of taste.
+//!
+//! ## 1. An unscoped token is refused outright
+//!
+//! ```text
+//! npm error code ERR_INVALID_AUTH
+//! npm error Invalid auth configuration found: `_authToken` must be renamed to
+//! npm error //127.0.0.1:40933/:_authToken` in user config
+//! ```
+//!
+//! A projection writing a bare `_authToken` therefore produces a file npm
+//! declines to load — the same shape of defect as pointing `https-proxy` at a
+//! port nothing binds: a configuration that looks finished and fails before it
+//! sends anything. The token is written scoped, to the **registry** and never
+//! to the relay, because npm matches the scope against the `registry=` URL
+//! while the proxy sits at a different address, and a scope on the socket would
+//! hand the credential to whatever else reached that port.
+//!
+//! ## 2. npm sends the bearer on its first request
+//!
+//! Given the scoped spelling, npm emits
+//!
+//! ```text
+//! authorization: Bearer //<token>
+//! ```
+//!
+//! on the **first** request, with no preceding 401 challenge. That is the
+//! whole reason the surrogate premise holds: the broker's relay
+//! (`replace_bearer_token`) rewrites a bearer the client has already sent and
+//! refuses to forward a request that carries none. Had npm waited to be
+//! challenged, nothing this crate writes could have made npm secretless.
+//!
+//! ## Re-deriving them
+//!
+//! ```text
+//! npm view probe --registry http:////127.0.0.1:PORT
+//!     --userconfig <a .npmrc holding a scoped _authToken>
+//! ```
+//!
+//! against an origin that logs its request headers. Assert on the **header**,
+//! never on npm's exit status: with an unscoped token npm exits 1 and prints
+//! `ERR_INVALID_AUTH` without making a request at all, so a check written
+//! against the exit code would read that refusal as a network failure.
+//!
+//! What remains unmeasured is whether the header rides through a CONNECT
+//! tunnel. The synthetic proxy used to ask that question failed three times
+//! and never produced a captured request, so the honest answer is that it is
+//! unknown — and the test that would settle it is the vertical itself, npm
+//! traversing the session shim, rather than a laboratory proxy.
+//!
 //! # What is deliberately not read
 //!
 //! - **No interpolation.** npm expands `${NPM_TOKEN}` from the environment. This
