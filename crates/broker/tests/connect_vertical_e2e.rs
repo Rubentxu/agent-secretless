@@ -2300,3 +2300,149 @@ fn a_terminated_broker_ends_its_tunnels_by_shutdown_and_says_so() {
 
     drop(session);
 }
+
+/// The real `npm`, through the whole path.
+///
+/// `curl` already proves the relay substitutes a bearer the client sends. This
+/// proves the claim the product actually makes: that **npm**, the tool an
+/// operator names, is secretless through the same path — no `curl` vocabulary,
+/// no `-H` flag invented for the test.
+///
+/// Three things have to line up and none of them is obvious:
+///
+/// 1. npm sends its token **scoped** and refuses an unscoped one
+///    (`ERR_INVALID_AUTH`), so the file is written inside the session rather
+///    than beside it — the surrogate only exists in that environment;
+/// 2. `asv run` publishes the relay through `HTTPS_PROXY`, and npm honours it
+///    without being told anything about ASV;
+/// 3. npm must accept the tunnel's TLS at all — which it does: with the
+///    `NODE_EXTRA_CA_CERTS` anchor removed this test failed at
+///    `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, having already reached the relay.
+///
+/// ## `--strict-ssl=false`, and what it costs
+///
+/// It is off, on purpose, and the reason is a property of the **fixture**: the
+/// CA that `SessionCa` mints is not one node accepts, which is why the `curl`
+/// vertical beside this one has always used `-k` and never verified anything
+/// either. TLS verification of the destination is B5's subject and is not what
+/// this test is about.
+///
+/// What the flag cannot weaken is the property under test. npm still presents
+/// only its surrogate, the broker still has to redeem it, and the destination
+/// still has to receive the real credential — none of which is a TLS decision.
+/// Saying so is the point; a test that quietly turned verification off and left
+/// the reader to assume otherwise would be the worse artefact.
+///
+/// The file is written with `printf` rather than `npm config set`, because the
+/// shape under test is the one `project npm` emits, byte for byte.
+///
+/// ## What is asserted, and what is not
+///
+/// Asserted: the origin received at least one request, and **every** request it
+/// received carried the real credential — which is the negative claim in a form
+/// that does not need the test to know the surrogate's value.
+///
+/// Not asserted: npm's exit status. The fixture origin answers whatever it
+/// answers, and whether that satisfies `npm view` is a property of the fixture's
+/// body rather than of the secretless property under test.
+#[test]
+fn npm_whose_surrogate_the_broker_swaps_reaches_the_origin_as_the_real_credential() {
+    let npm = require_npm();
+    let ca = SessionCa::new("npm-vertical-roots", 37, Duration::from_secs(3600));
+    let f = Fixture::new_tls("npm-vertical", &ca, true);
+    let variable = f.surrogate_env_name();
+    // `build` wrote this file and handed it to `--connect-roots`; the same bytes
+    // have to reach node, or npm would be verifying against a different trust
+    // decision than the broker is.
+    let anchors = f.dir.join("roots.pem");
+    assert!(
+        anchors.exists(),
+        "the fixture wrote no anchor file, so npm and the broker would not be \
+         checking the same CA: {}",
+        anchors.display()
+    );
+
+    let npmrc = f.dir.join("session.npmrc");
+    // `${{{variable}}}` rather than `${variable}`: the shell expands that one,
+    // because the surrogate only exists inside the session's environment. Rust
+    // format! sees `${{` as a literal `${`, substitutes the variable name, and
+    // closes with a literal `}`.
+    let script = format!(
+        "set -e; \
+         printf 'registry=https://{HOST}:{PORT}\n//{HOST}:{PORT}/:_authToken=%s\n' \
+             \"${{{variable}}}\" > {NPMRC}; \
+         {NPM_BIN} view probe \
+             --registry https://{HOST}:{PORT} \
+             --userconfig {NPMRC} \
+             --cache {CACHE} \
+             --fetch-timeout 30000 \
+             --strict-ssl=false",
+        variable = variable,
+        PORT = f.origin.port,
+        HOST = FIXTURE_HOST,
+        NPMRC = npmrc.display(),
+        CACHE = f.dir.join("npmcache").display(),
+        NPM_BIN = npm.display(),
+    );
+
+    let out = Command::new(cargo_bin("asv"))
+        .arg("--socket")
+        .arg(&f.sock)
+        .arg("run")
+        .arg("sh")
+        .arg("-c")
+        .arg(&script)
+        .env("NODE_EXTRA_CA_CERTS", &anchors)
+        .output()
+        .expect("run the npm session");
+
+    assert!(
+        f.origin.wait_for_requests(1),
+        "npm never got a request to the origin. npm said:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let seen = f.origin.saw();
+    assert!(
+        seen.contains(REAL),
+        "the destination did not receive the real credential, so nothing was substituted:\n{seen}"
+    );
+    assert_eq!(
+        f.origin.request_count(),
+        f.origin.real_credential_requests(),
+        "a request reached the destination without the real credential in it, which is a \
+         tunnel that forwarded a surrogate upstream:\n{seen}"
+    );
+
+    // The audit chain, for the reason the curl vertical reads it: the
+    // substitution is a fact an operator can verify after the fact, and a chain
+    // that names the family but never the credential must not be mistaken for
+    // one that did.
+    let chain = std::fs::read_to_string(&f.audit).expect("read the durable audit chain");
+    assert!(
+        !chain.contains(REAL),
+        "the real credential reached the audit chain:\n{chain}"
+    );
+}
+
+/// The npm binary, or a failure that says what is missing.
+///
+/// **A refusal, not a skip.** npm is a required tool for this repository: the
+/// vertical claims npm is secretless, and a suite that quietly passed without
+/// npm would make that claim while never running it — the exact shape this
+/// project keeps refusing. `UNAVAILABLE_SUBSTRATE` is a state a *requirement*
+/// may end in; it is not what a gate does.
+fn require_npm() -> PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("npm");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    panic!(
+        "npm is not on PATH. It is a required tool for this repository: the npm vertical \
+         cannot run without it, and this test fails rather than passing without it."
+    );
+}
