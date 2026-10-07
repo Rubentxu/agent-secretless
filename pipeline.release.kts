@@ -186,5 +186,30 @@ pipeline {
         stage("publish") {
             sh("scripts/publish-release.sh")
         }
+
+        // The documented install, run as the document writes it.
+        //
+        // This is the last stage because it is the only one that consumes the
+        // published Release rather than the local build, so before publish it
+        // would be testing the previous release and calling it this one.
+        //
+        // It exists because five defects in one cycle had the same shape — a
+        // gate exercised a component and the command a person actually types
+        // was executed by nothing. Six releases shipped an installer that
+        // refused its own archive, and `scripts/install.sh` cannot be run by
+        // pipe at all because it locates `install.py` through `$0`, which is
+        // `sh` when the script arrives on stdin. The 46-check provenance
+        // campaign invoked `install.py` directly with its own fixtures and
+        // never noticed.
+        //
+        // It reads the command out of README.md rather than being handed one.
+        // A gate that hardcodes the command it runs is a gate about the
+        // hardcoded command, and when the README moves the gate would go on
+        // testing yesterday's entry point.
+        stage("documented-install") {
+            timeout(time = 30, unit = "MINUTES") {
+                sh("python3 scripts/check-documented-install.py")
+            }
+        }
     }
 }
