@@ -108,19 +108,47 @@ fn uat_028_openssh_authenticates_through_the_broker_socket() {
     )
     .expect("sshd config");
 
+    // **sshd's transcript goes to a file, and that is load-bearing.**
+    //
+    // This used to be `.stderr(Stdio::piped())`, drained with
+    // `wait_with_output()` *after* the client returned. At `LogLevel DEBUG3`
+    // sshd writes 18 094 bytes for a single connection, and the default pipe
+    // buffer on this host is 8 192 — so sshd filled the pipe and blocked
+    // writing to it, partway through the key exchange, while the only code
+    // that would have read it sat waiting for the client to return. The client
+    // waited for a key-exchange reply that could not be produced, sshd's
+    // `LoginGraceTime` expired, and the run took exactly as long as that grace.
+    //
+    // Measured, both arms of the same A/B with everything else held constant:
+    //
+    //   stderr = pipe : 0 passed, 6 hung  (~21 s each)
+    //   stderr = file : 6 passed, 0 hung  (~0.10 s each)
+    //
+    // It looked like a load problem, then like an sshd problem on this host,
+    // then like the readiness probe. A stock sshd driven from a shell completes
+    // the key exchange 4 times out of 4, and the probe made no difference
+    // (loop 0/6 against single 1/6). The fault was in this harness the whole
+    // time, and it was the one descriptor nobody was reading.
+    //
+    // A file never applies backpressure, so sshd is never blocked by how much
+    // it wants to say — which is the property this test was silently depending
+    // on and did not have.
+    let sshd_log = dir.path().join("sshd.log");
     let mut sshd = Command::new("/usr/sbin/sshd")
         .args(["-D", "-e", "-f"])
         .arg(&config)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(
+            std::fs::File::create(&sshd_log).expect("open the sshd log"),
+        ))
         .spawn()
         .expect("sshd is installed");
     if !wait_for_port(port, Duration::from_secs(5)) {
         let _ = sshd.kill();
-        let output = sshd.wait_with_output().expect("sshd diagnostics");
+        let _ = sshd.wait();
         panic!(
             "sshd did not listen: {}",
-            String::from_utf8_lossy(&output.stderr)
+            std::fs::read_to_string(&sshd_log).unwrap_or_default()
         );
     }
 
@@ -158,9 +186,9 @@ fn uat_028_openssh_authenticates_through_the_broker_socket() {
     let elapsed = started.elapsed();
 
     let _ = sshd.kill();
-    let server_output = sshd.wait_with_output().expect("sshd output");
+    let _ = sshd.wait();
+    let server_stderr = std::fs::read_to_string(&sshd_log).expect("read the sshd transcript back");
     let client_stderr = String::from_utf8_lossy(&output.stderr);
-    let server_stderr = String::from_utf8_lossy(&server_output.stderr);
 
     if !output.status.success() {
         // **A dropped connection is not a refused authentication, and the two
