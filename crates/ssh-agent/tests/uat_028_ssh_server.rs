@@ -21,6 +21,28 @@ fn wait_for_port(port: u16, deadline: Duration) -> bool {
     false
 }
 
+/// The machine's load at the moment of failure, folded into the message.
+///
+/// Written because the previous version of that message told the reader to go
+/// and find out what had been competing for CPU — which is a chore performed
+/// after the evidence has already been thrown away, on a machine that has
+/// since run something else. Reading `/proc/loadavg` at the failure is one
+/// syscall and turns the message into evidence rather than a to-do.
+///
+/// Absent, or unreadable, it contributes nothing: a machine without
+/// `/proc/loadavg` gets a shorter message, not a broken one.
+fn loadavg_line() -> String {
+    let Ok(raw) = std::fs::read_to_string("/proc/loadavg") else {
+        return String::new();
+    };
+    match raw.split_whitespace().collect::<Vec<_>>()[..3] {
+        [one, five, fifteen] => format!(
+            " At the time of the failure the machine reported loadavg {one}/{five}/{fifteen}."
+        ),
+        _ => String::new(),
+    }
+}
+
 #[test]
 fn uat_028_openssh_authenticates_through_the_broker_socket() {
     let dir = tempdir().expect("tempdir");
@@ -150,36 +172,50 @@ fn uat_028_openssh_authenticates_through_the_broker_socket() {
         // text on stderr. What this test was printing on a busy machine was
         // `stderr=` empty next to "OpenSSH auth failed", which reads as a
         // policy decision and is in fact a client that was disconnected.
+        // Naming which of the two happened is the point: a false red that says
+        // "auth failed" sends the next reader to the policy engine.
         //
-        // Measured on this host: alone, the round trip takes 0.14 s and passes.
-        // With 48 CPUs burnt alongside it, it fails, and the elapsed time tracks
-        // sshd's `LoginGraceTime` exactly — 120.98 s at the default, and
-        // 300.73 s when this test's own `sshd_config` was given
-        // `LoginGraceTime 300`. Raising the grace period was tried and
-        // reverted: it moves the red three minutes later and fixes nothing.
+        // **What this failure is NOT.** An earlier version of this message
+        // called it "a load-shaped failure" and told the reader to go and check
+        // what was competing for CPU. That was asserted, not measured, and it
+        // is wrong — measured here:
         //
-        // The evidence used here is the empty client stderr, not a log line.
-        // sshd's own log under this failure ends at `mm_request_send: entering,
-        // type 6 [preauth]` — the server did reach the point of asking for the
-        // signature — and its closing lines read `Connection closed by remote
-        // host`, which does not say which side hung up first. That question is
-        // left open rather than answered with a convenient reading.
+        //   attempt 1: hung  60s+ at loadavg 12.11
+        //   attempt 2: hung  60s+ at loadavg 13.85
+        //   attempt 3: PASS     143ms at loadavg 24.81
         //
-        // Naming which of the two happened is the point. A false red that says
-        // "auth failed" sends the next reader to the policy engine; this one
-        // sends them to the load.
+        // It fails at *lower* load and passes at *higher* load, three attempts
+        // back to back on a 64-core host. A variable that moves the wrong way
+        // is not the variable. Separately, `cargo test` runs test binaries one
+        // at a time and this binary holds exactly one test, so the suite cannot
+        // be starving it either — `--test-threads` cannot reach this test.
+        //
+        // So the cause is not isolated, and this message now says that instead
+        // of naming a cause. Attributing it to the machine was the same defect
+        // one layer down: a confident wrong answer sends the next reader
+        // somewhere that is not where the fault is.
+        //
+        // What is established: elapsed tracks sshd's `LoginGraceTime` exactly
+        // (120.98 s at the default, 300.73 s at `LoginGraceTime 300`), the
+        // client says nothing, and sshd's log ends at
+        // `mm_request_send: entering, type 6 [preauth]` — the server did reach
+        // the point of asking for the signature. Its closing lines read
+        // `Connection closed by remote host`, which does not say which side
+        // hung up first. That question is left open rather than answered with
+        // a convenient reading.
         let dropped = client_stderr.trim().is_empty();
+        let load = loadavg_line();
         let what = if dropped {
             format!(
                 "the SSH client was disconnected rather than refused, after \
                  {elapsed:?} with no diagnostic on its stderr, and the elapsed \
-                 time tracks sshd's LoginGraceTime. The agent did not answer in \
-                 time. This is a load-shaped failure and not an authentication \
-                 refusal — the policy engine is not implicated. Check what else \
-                 was competing for CPU when this ran."
+                 time tracks sshd's LoginGraceTime. The policy engine is not \
+                 implicated: a refusal would have said so in words. The cause \
+                 is not established — in particular this is NOT known to be \
+                 load, which has been observed to move the wrong way.{load}"
             )
         } else {
-            format!("OpenSSH auth failed after {elapsed:?}")
+            format!("OpenSSH auth failed after {elapsed:?}{load}")
         };
         panic!(
             "{what}: stdout={} client_stderr={} sshd={} authorized={} listed={}",
