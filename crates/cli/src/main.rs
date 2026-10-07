@@ -430,6 +430,45 @@ enum IntegrationsCommand {
         #[arg(long, value_name = "PATH")]
         from_plan: Option<String>,
     },
+    /// Write an npm configuration that routes npm through the broker, R3.
+    ///
+    /// The step that makes `STRONG_SECRETLESS / Why::Brokered` a claim about
+    /// something an operator can act on: `plan` offers that posture for a bound
+    /// npm credential, and until a file existed that routed npm through the
+    /// relay there was no way to take it.
+    ///
+    /// **It writes a surrogate, not nothing.** The relay substitutes a bearer
+    /// token the client has already sent, so a configuration with no auth field
+    /// produces tunnels the broker refuses to forward. What goes in
+    /// `_authToken` is the surrogate `asv run` already minted for this session —
+    /// one use, session-scoped, useless off this machine — and never the
+    /// registry token.
+    ///
+    /// Must run inside the `asv run` that will carry the tunnel. The surrogate
+    /// is redeemed in the session that minted it, so one minted here could never
+    /// be redeemed by anything, and writing it would produce a configuration
+    /// that looks finished and authenticates nothing.
+    Project {
+        /// The tool family.
+        #[arg(value_name = "FAMILY")]
+        family: String,
+        /// Emit the `asv.integrations.projection/v1` receipt instead of prose.
+        #[arg(long)]
+        json: bool,
+        /// The file to write. Defaults to the user-level `.npmrc`.
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
+        /// Home directory, used to find the default file.
+        #[arg(long, value_name = "DIR")]
+        home: Option<String>,
+        /// The registry npm will be pointed at, canonicalised.
+        #[arg(long, value_name = "AUDIENCE")]
+        audience: String,
+        /// The label `asv run` stored the credential under, which is what names
+        /// its surrogate.
+        #[arg(long, value_name = "LABEL")]
+        label: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1826,6 +1865,22 @@ fn run_integrations(
             label,
             allow_symlink_root.as_deref(),
             from_plan.as_deref(),
+        ),
+        IntegrationsCommand::Project {
+            family,
+            json,
+            file,
+            home,
+            audience,
+            label,
+        } => run_integrations_project(
+            socket,
+            family,
+            *json,
+            file.as_deref(),
+            home.as_deref(),
+            audience,
+            label,
         ),
     }
 }
@@ -4191,6 +4246,172 @@ fn run_integrations_adopt(
         );
     } else {
         print_adopt_prose(&receipt);
+    }
+    Ok(())
+}
+
+/// Writes the npm configuration that routes npm through the broker.
+///
+/// Three refusals, and every one of them exists because writing the file anyway
+/// would produce a configuration that *looks* finished and does not work:
+///
+/// - no `ASV_SESSION_ID` — the surrogate would be minted against a session
+///   this process opens and drops, and `redeem_for` refuses `WrongSession` for
+///   anything but the session that minted it, so no tunnel could ever carry it;
+/// - no `ASV_SURROGATE_<LABEL>` — the label names the credential, and a
+///   surrogate for a different credential would authenticate as the wrong
+///   identity rather than as none;
+/// - no `connect_listen` — the broker was started without `--connect-listen`,
+///   so there is no relay on this machine and `https-proxy` would name a port
+///   nothing is listening on.
+///
+/// The surrogate is read from the environment and never minted, never printed,
+/// and never logged. The receipt names the file, the registry and the relay, and
+/// says how long the file stays useful.
+fn run_integrations_project(
+    socket: &std::path::Path,
+    family: &str,
+    json: bool,
+    file: Option<&str>,
+    home: Option<&str>,
+    audience: &str,
+    label: &str,
+) -> std::io::Result<()> {
+    use asv_integrations::{NpmProjection, RegistryAudience};
+
+    if family != "npm" {
+        eprintln!(
+            "asv: no projection for {family:?}; this build knows `npm`. Adding one is a module \
+             in asv-integrations and one match arm here."
+        );
+        std::process::exit(1);
+    }
+
+    let fail = |kind: &str, message: String| -> ! {
+        if json {
+            let failure = serde_json::json!({
+                "schema": asv_integrations::PROJECTION_SCHEMA,
+                "family": family,
+                "kind": kind,
+                "error": message,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&failure).unwrap_or_default()
+            );
+        } else {
+            eprintln!("asv: {message}");
+        }
+        std::process::exit(1)
+    };
+
+    let audience = match RegistryAudience::parse(audience) {
+        Ok(audience) => audience,
+        Err(error) => fail("unusable_audience", format!("{error}")),
+    };
+
+    let session = match std::env::var("ASV_SESSION_ID") {
+        Ok(session) if !session.is_empty() => session,
+        _ => fail(
+            "no_session",
+            "ASV_SESSION_ID is not set, so this is not running inside `asv run`. A surrogate is \
+             redeemed in the session that minted it, and one minted here could never be \
+             redeemed by anything — writing it would produce a configuration that looks \
+             finished and authenticates nothing. Run this inside `asv run`."
+                .to_string(),
+        ),
+    };
+    let _ = session;
+
+    let variable = format!("ASV_SURROGATE_{}", env_name_for_label(label));
+    let surrogate = match std::env::var(&variable) {
+        Ok(surrogate) if !surrogate.is_empty() => surrogate,
+        _ => fail(
+            "no_surrogate",
+            format!(
+                "{variable} is not set. `asv run` mints one surrogate per credential and names it \
+                 after the credential's label; a surrogate for a different credential would \
+                 authenticate as the wrong identity rather than as none. Check the label with \
+                 `asv vault list`."
+            ),
+        ),
+    };
+
+    let facts = crate::ipc::fetch_broker_facts(socket);
+    let connect = facts
+        .as_ref()
+        .and_then(|facts| facts.connect_listen.clone())
+        .unwrap_or_else(|| {
+            fail(
+                "no_relay",
+                "this broker publishes no CONNECT address, so there is no relay to route npm \
+                 through. It was started without `--connect-listen`; a projection naming a port \
+                 nothing listens on is a configuration that fails at the first request."
+                    .to_string(),
+            )
+        });
+    let endpoint = format!("http://{connect}");
+
+    let projection = match NpmProjection::new(&audience, &endpoint, &surrogate) {
+        Ok(projection) => projection,
+        Err(error) => fail("unusable_endpoint", error.to_string()),
+    };
+
+    let path = match file {
+        Some(file) => std::path::PathBuf::from(file),
+        None => {
+            let home = match home {
+                Some(home) => std::path::PathBuf::from(home),
+                None => match std::env::var_os("HOME") {
+                    Some(home) => std::path::PathBuf::from(home),
+                    None => fail(
+                        "no_home",
+                        "HOME is not set, so the configuration cannot be located; pass --file or \
+                         --home"
+                            .to_string(),
+                    ),
+                },
+            };
+            home.join(".npmrc")
+        }
+    };
+
+    if let Err(error) = asv_integrations::project::write(&path, &projection) {
+        fail(
+            match error {
+                asv_integrations::ProjectionError::AlreadyCarriesCredential { .. } => {
+                    "already_carries_credential"
+                }
+                _ => "not_written",
+            },
+            error.to_string(),
+        );
+    }
+
+    if json {
+        let receipt = serde_json::json!({
+            "schema": asv_integrations::PROJECTION_SCHEMA,
+            "family": family,
+            "file": path.to_string_lossy(),
+            "registry": projection.registry(),
+            "relay": projection.proxy(),
+            "carries_credential": false,
+            "holds_surrogate": true,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&receipt).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "wrote {}\n  registry  {}\n  relay     {}\n\nThe file holds no registry token: \
+             `_authToken` is a surrogate bound to this session, redeemed by the broker and \
+             replaced on the way upstream. It stops working when the session ends, and npm must \
+             run inside that same `asv run`.",
+            path.display(),
+            projection.registry(),
+            projection.proxy(),
+        );
     }
     Ok(())
 }
