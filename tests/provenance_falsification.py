@@ -159,17 +159,26 @@ class Release:
         decompressed is refused by the decompressor whatever the provenance
         checks say, which is how the first version of this campaign ended up
         proving nothing.
+
+        Components are carried at the root of the wrapper directory `dist` puts
+        every bundle in, not at their `install_as` paths. It used to pack them
+        at `install_as`, which agreed with `scripts/install.py` by construction
+        and so could not observe that the two disagreed with every artifact the
+        build pipeline has ever produced.
         """
         drop = drop or set()
+        wrapper = f"agent-secretless-{TARGET}"
         with tarfile.open(self.archive, "w:zst") as tar:
             for comp in self.manifest["component"]:
                 if not comp.get("shipped") or comp["name"] in drop:
                     continue
-                info = tarfile.TarInfo(comp["install_as"])
+                info = tarfile.TarInfo(f"{wrapper}/{comp['name']}")
                 info.size, info.mode = len(body), 0o755
                 tar.addfile(info, io.BytesIO(body))
             for name, payload in (extra or {}).items():
-                info = tarfile.TarInfo(name)
+                # Callers name the member by its component name; the wrapper
+                # directory is this method's business, not theirs.
+                info = tarfile.TarInfo(f"{wrapper}/{name}")
                 info.size, info.mode = len(payload), 0o755
                 tar.addfile(info, io.BytesIO(payload))
 
@@ -252,7 +261,7 @@ MUTATIONS: dict[str, tuple[tuple[str, str], ...]] = {
     "contents-check-removed": (
         (
             "        files = check_contents(staging, manifest)\n",
-            "        files = {c[\"name\"]: staging / c[\"install_as\"]\n"
+            "        files = {c[\"name\"]: staging / c[\"name\"]\n"
             "                 for c in shipped_components(manifest)}\n",
         ),
     ),
@@ -394,7 +403,7 @@ def build_missing_required_binary(r: Release) -> None:
 
 
 def build_forbidden_binary(r: Release) -> None:
-    r.ship(extra={"bin/asv-vault-tool": EVIL})
+    r.ship(extra={"asv-vault-tool": EVIL})
 
 
 # -------------------------------------------------------------------- the run

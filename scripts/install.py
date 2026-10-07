@@ -81,7 +81,7 @@ import tarfile
 import tempfile
 import urllib.request
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 REPO = Path(__file__).resolve().parent.parent
 INSTALL_SH = REPO / "scripts" / "install.sh"
@@ -407,35 +407,83 @@ def extract(archive: Path, dest: Path) -> None:
     product ever produces, so encountering one means the archive is not the
     archive — and `tarfile` is happy to follow a symlink out of the tree if
     asked to.
+
+    `dist` wraps every bundle in a directory named for the target — the
+    installer dist generates strips it with `--strip-components 1`, and so does
+    this, because an installer that did not would install into
+    `<prefix>/agent-secretless-x86_64-unknown-linux-gnu/asv` and look for the
+    binary in a place the product never put one.
+
+    It did not, for the whole life of this file. `tests/distribution_channels.py`
+    manufactured its own archives with no wrapper directory, so the fixture
+    agreed with the installer by construction and the divergence could not be
+    observed by anything in the repository.
     """
     with tarfile.open(archive, "r:*") as tar:
+        members: list[tarfile.TarInfo] = []
         for member in tar.getmembers():
             if member.issym() or member.islnk() or member.isdev():
                 fail(f"{archive.name} contains a link or device: {member.name}")
                 return
-            target = (dest / member.name).resolve()
-            if not str(target).startswith(str(dest.resolve()) + os.sep) and target != dest.resolve():
-                fail(f"{archive.name} contains a path outside the archive: {member.name}")
-                return
-        tar.extractall(dest, filter="data")
+            stripped = strip_wrapper(member.name)
+            if stripped is None:
+                continue
+            member.name = stripped
+            if not member.isdir():
+                target = (dest / stripped).resolve()
+                if not str(target).startswith(str(dest.resolve()) + os.sep):
+                    fail(f"{archive.name} contains a path outside the "
+                         f"archive: {stripped}")
+                    return
+            members.append(member)
+        tar.extractall(dest, members=members, filter="data")
+
+
+# `dist` wraps a bundle in one directory named for the target. The installer it
+# generates strips exactly that component, so this one strips it too rather than
+# measuring how many components it happens to be today.
+WRAPPER_COMPONENTS = 1
+
+
+def strip_wrapper(name: str) -> str | None:
+    """The member path with `dist`'s wrapper directory removed.
+
+    Returns None for members that are the wrapper directory itself and have
+    nothing left once it is gone — the `.` that `tar -cf - .` writes, and the
+    target-named directory. Those are dropped rather than extracted, because a
+    member named `` after stripping is a member with no path in it.
+    """
+    parts = [p for p in PurePosixPath(name).parts if p not in (".", "")]
+    if len(parts) <= WRAPPER_COMPONENTS:
+        return None
+    return str(PurePosixPath(*parts[WRAPPER_COMPONENTS:]))
 
 
 def check_contents(root: Path, manifest: dict) -> dict[str, Path]:
-    """The archive holds the declared set, and nothing else.
+    """The archive holds the declared set, and nothing else that can run.
 
-    Both directions. An archive missing a component installs a product that
-    cannot start its own broker, and an archive carrying an extra executable
-    hands a user a binary the project has explicitly classified as not theirs
-    — which is the `asv-vault-tool` failure this whole manifest exists to
-    prevent, reappearing at the other end of the download.
+    A component is carried at the **root** of the bundle, by name. That is what
+    `dist build` produces and what the installer dist generates reads; it is not
+    what `install_as` says, and `install_as` is not about the archive. It is the
+    destination — `place` copies each component to `<prefix>/<install_as>` — and
+    this function used to read the same field as though it named the component's
+    position inside the bundle, which is a different thing entirely. The two
+    readings cannot both be right, and the one this file acted on had never
+    agreed with a single artifact the build pipeline produced.
+
+    The undeclared-member check stays, narrowed to what it was actually for.
+    `dist` puts `LICENSE` and `README.md` in every bundle; neither is a
+    component and neither can execute, so refusing the bundle over them would
+    make this installer unable to install any release at all. An undeclared
+    **executable** is still refused — that is the `asv-vault-tool` failure this
+    manifest exists to prevent, reappearing at the other end of the download.
     """
     expected: dict[str, Path] = {}
     for comp in shipped_components(manifest):
-        rel = comp["install_as"]
-        if not rel:
+        if not comp.get("install_as"):
             fail(f"component {comp['name']} is shipped but declares no install_as")
             continue
-        expected[comp["name"]] = root / rel
+        expected[comp["name"]] = root / comp["name"]
 
     found = {
         p.name: p
@@ -443,15 +491,28 @@ def check_contents(root: Path, manifest: dict) -> dict[str, Path]:
         if p.is_file() and p.name != RECORD_FILE
     }
     for name, path in expected.items():
-        if not path.exists():
-            fail(f"the archive does not contain {name} at {path.name}")
-    for name in found:
-        if name not in {p.name for p in expected.values()}:
+        if not path.is_file():
             fail(
-                f"the archive contains {name}, which no shipped component "
-                f"declares. A bundle that carries undeclared executables is "
-                f"the failure this manifest exists to prevent."
+                f"the archive does not contain {name} at the root of the "
+                f"bundle. `dist` carries each binary at the top level and the "
+                f"installer it generates reads them there; a component found "
+                f"at {path} instead means this archive was not built by "
+                f"`dist build`."
             )
+    for name, path in sorted(found.items()):
+        if name in expected:
+            continue
+        if os.access(path, os.X_OK):
+            fail(
+                f"the archive contains the executable {name}, which no shipped "
+                f"component declares. A bundle that carries undeclared "
+                f"executables is the failure this manifest exists to prevent, "
+                f"and it arrives here as something a user could run."
+            )
+        else:
+            # Dist ships the licence and the readme in every bundle. Naming them
+            # would be noise; refusing them would make this installer unusable.
+            note(f"bundle carries the non-component file {name}")
     return expected
 
 

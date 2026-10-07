@@ -91,7 +91,22 @@ def archive_name_for(manifest: dict) -> str:
     return name
 
 _failures: list[str] = []
+_unavailable: list[str] = []
 _passes = 0
+
+
+def unavailable(message: str) -> None:
+    """A condition this suite could not measure on this machine.
+
+    Its own state, and not a pass. The suite's other forty-one rows are all
+    hermetic, which is what makes them cheap and is also what hid a defect for
+    the whole life of the file: every one of them agrees with `install.py`
+    because they were built to. The row that measures the artifact the pipeline
+    produced is the one that cannot run everywhere, and a condition that cannot
+    run has not been met — it is reported here so it cannot be read as green.
+    """
+    _unavailable.append(message)
+    print(f"  unav {message}")
 
 # A throwaway signing key for this suite, generated once.
 #
@@ -195,21 +210,32 @@ def build_release(dest: Path) -> Path:
     staging = dest / "staging"
     if staging.exists():
         shutil.rmtree(staging)
+
+    # `dist build` carries each binary at the top level of a directory named for
+    # the target, and adds the licence and the readme beside them. This packs
+    # the same shape, because the whole point of this suite is to agree with
+    # what the pipeline produces — and for its whole life it packed binaries at
+    # their *install_as* paths with no wrapper directory, so it agreed with
+    # `scripts/install.py` by construction and could not observe that the two
+    # disagreed with every artifact the build has ever produced.
+    bundle = staging / f"agent-secretless-{TARGET}"
+    bundle.mkdir(parents=True)
     for comp in manifest["component"]:
         if not comp.get("shipped"):
             continue
-        target = staging / comp["install_as"]
-        target.parent.mkdir(parents=True, exist_ok=True)
-        binary = _find_binary(comp["crate"], comp["name"])
-        shutil.copy2(binary, target)
+        target = bundle / comp["name"]
+        shutil.copy2(_find_binary(comp["crate"], comp["name"]), target)
         os.chmod(target, 0o755)
+    for extra in ("LICENSE", "README.md"):
+        source = REPO / extra
+        if source.is_file():
+            shutil.copy2(source, bundle / extra)
 
     archive = dest / archive_name_for(manifest)
     with tarfile.open(archive, "w:zst") as tar:
-        for comp in manifest["component"]:
-            if not comp.get("shipped"):
-                continue
-            tar.add(staging / comp["install_as"], arcname=comp["install_as"])
+        for member in sorted(bundle.rglob("*")):
+            tar.add(member,
+                    arcname=str(member.relative_to(staging)))
     shutil.rmtree(staging)
 
     # A release publishes its manifest next to the archive, and the installer
@@ -386,6 +412,82 @@ def test_the_documented_entry_point_is_the_one_that_works() -> None:
               f"the documented pipe put the binary where it promises ({binary})")
 
 
+DISTRIB = REPO / "target" / "distrib"
+
+
+def test_the_artifact_the_pipeline_produced_installs() -> None:
+    """The bundle `dist build` actually made, installed by the real installer.
+
+    Every other row in this file builds its own release out of the binaries in
+    the cargo target directory and packs it to suit `scripts/install.py`. That
+    is what a hermetic suite is for, and it is also why this suite agreed with
+    the installer on every point for as long as it existed: both sides were
+    written to the same imagined bundle, and neither was ever compared with the
+    one the build pipeline emits.
+
+    They are not the same. `dist` wraps a bundle in a directory named for the
+    target, carries each binary at the top level rather than at its
+    `install_as` path, and adds `LICENSE` and `README.md`. `install.py` stripped
+    nothing, read `install_as` as a position inside the archive, and refused any
+    member no component declared — so it refused every artifact the pipeline has
+    ever produced, on three counts at once.
+
+    So this row runs the real thing against the real directory, with no fixture
+    anywhere in it. When `target/distrib` does not hold a built release — a
+    clean checkout, or a run that has not reached `dist build` — the condition
+    is reported UNAVAILABLE, which is its own state and not a pass. A gate that
+    reports nothing because it had nothing to measure is the failure this block
+    has been about.
+    """
+    archive = DISTRIB / f"agent-secretless-{TARGET}.tar.zst"
+    if not archive.is_file() or not (DISTRIB / "manifest.toml").is_file():
+        unavailable(
+            "the artifact the pipeline produced is not in target/distrib, so "
+            "the real bundle was not measured; run `dist build` and the release "
+            "pipeline to exercise this row"
+        )
+        return
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        prefix = tmp / "target"
+        env = dict(os.environ)
+        env.pop("ASV_INSTALLER", None)
+
+        # No `--trusted-key` and no test keypair: this artifact is signed with
+        # the project's real release key, and the point of the row is that the
+        # installer accepts a release signed by the key it ships with. Handing
+        # it a throwaway key here would make it a different claim.
+        result = subprocess.run(
+            [sys.executable, str(INSTALL_PY),
+             "--version", "0.37.0", "--prefix", str(prefix),
+             "--from-dir", str(DISTRIB), "--no-setup"],
+            capture_output=True, text=True, env=env, timeout=600)
+
+        check(result.returncode == 0,
+              "the artifact the pipeline produced installs"
+              + ("" if result.returncode == 0 else
+                 f" (exit {result.returncode}: "
+                 f"{(result.stderr or result.stdout or '').strip()[-300:]})"))
+
+        manifest = read_manifest()
+        for comp in manifest["component"]:
+            if not comp.get("shipped"):
+                continue
+            landed = prefix / comp["install_as"]
+            check(landed.is_file(),
+                  f"the real bundle put {comp['name']} at {comp['install_as']}")
+            if landed.is_file():
+                check(os.access(landed, os.X_OK),
+                      f"{comp['name']} is executable where it was placed")
+
+        # The bundle carries a licence and a readme. Neither is a component and
+        # neither can run, so an installer that refused them would refuse every
+        # release this project has ever built.
+        check(not (prefix / "LICENSE").exists(),
+              "the non-component files are not placed into the install root")
+
+
 def test_both_channels_install_the_same_bytes() -> None:
     """The exit test. Two entry points, two prefixes, one product."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -515,11 +617,16 @@ def test_an_archive_with_an_undeclared_binary_is_refused() -> None:
         staging.mkdir()
         with tarfile.open(archive) as src:
             src.extractall(staging)
-        (staging / "bin" / "asv-vault-tool").write_text("#!/bin/sh\nexit 0\n")
-        os.chmod(staging / "bin" / "asv-vault-tool", 0o755)
+        # The harness binary is dropped beside the declared ones, at the root of
+        # the bundle, because that is where the declared ones are and an
+        # installer that checked a different directory would not be looking at
+        # the same archive this test builds.
+        bundle = staging / f"agent-secretless-{TARGET}"
+        (bundle / "asv-vault-tool").write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(bundle / "asv-vault-tool", 0o755)
         with tarfile.open(archive, "w:zst") as out:
-            out.add(staging / "bin", arcname="bin")
-            out.add(staging / "libexec", arcname="libexec")
+            for member in sorted(staging.rglob("*")):
+                out.add(member, arcname=str(member.relative_to(staging)))
         write_checksums(release)
 
         r = run_installer(prefix, release, "installer")
@@ -617,6 +724,8 @@ def main() -> int:
         test_no_toolchain_is_reachable()
         print("\n-- the documented entry point, piped the way the README says")
         test_the_documented_entry_point_is_the_one_that_works()
+        print("\n-- the artifact the pipeline actually produced")
+        test_the_artifact_the_pipeline_produced_installs()
         print("\n-- both channels, same bytes")
         test_both_channels_install_the_same_bytes()
         print("\n-- each channel names itself")
@@ -632,9 +741,12 @@ def main() -> int:
     finally:
         cleanup_keys()
 
-    print(f"\n{_passes} checks passed, {len(_failures)} failed")
+    print(f"\n{_passes} checks passed, {len(_failures)} failed, "
+          f"{len(_unavailable)} unavailable")
     for f in _failures:
         print(f"  FAILED: {f}")
+    for u in _unavailable:
+        print(f"  NOT MEASURED: {u}")
     return 1 if _failures else 0
 
 
