@@ -307,9 +307,9 @@ fn the_projection_names_the_relay_the_broker_published_and_carries_no_registry_t
         "{written}"
     );
     assert!(
-        written.contains(&format!("_authToken={surrogate}\n")),
-        "npm sends no Authorization header without it and the relay substitutes only a bearer \
-         that is already there: {written}"
+        written.contains(&format!("//{REGISTRY}/:_authToken={surrogate}\n")),
+        "npm refuses an unscoped _authToken outright (ERR_INVALID_AUTH), so writing one here \
+         would produce a file npm cannot load: {written}"
     );
     assert!(
         !written.contains(REAL),
@@ -346,7 +346,10 @@ fn a_second_run_refreshes_its_own_surrogate_rather_than_refusing_its_own_output(
 
     let written = std::fs::read_to_string(&npmrc).expect("read back");
     assert!(written.contains(&format!("https-proxy=http://{relay}\n")));
-    assert!(written.contains("_authToken=surrogate-two\n"), "{written}");
+    assert!(
+        written.contains(&format!("//{REGISTRY}/:_authToken=surrogate-two\n")),
+        "{written}"
+    );
     assert!(!written.contains("surrogate-one"), "the stale one is gone");
 }
 
@@ -355,7 +358,10 @@ fn a_configuration_holding_someone_elses_token_is_refused_and_survives_intact() 
     let dir = tempfile::tempdir().expect("tempdir");
     let (_broker, sock, _relay) = broker_with_a_published_relay(dir.path());
     let npmrc = dir.path().join(".npmrc");
-    let original = format!("registry=https://{REGISTRY}\n_authToken=the-real-one\n");
+    // Scoped, because that is the only spelling npm accepts: an unscoped
+    // `_authToken` is refused with ERR_INVALID_AUTH, so no operator's file
+    // would ever hold one.
+    let original = format!("registry=https://{REGISTRY}\n//{REGISTRY}/:_authToken=the-real-one\n");
     std::fs::write(&npmrc, &original).expect("seed a foreign credential");
 
     let out = project(&sock, &npmrc, "session-under-test", "surrogate-one");

@@ -148,6 +148,7 @@ impl std::error::Error for ProjectionError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NpmProjection {
     registry: String,
+    authority: String,
     proxy: String,
     surrogate: String,
 }
@@ -192,6 +193,7 @@ impl NpmProjection {
         }
         Ok(Self {
             registry: registry.url(),
+            authority: registry.to_string(),
             proxy: endpoint.to_string(),
             surrogate: surrogate.to_string(),
         })
@@ -203,18 +205,42 @@ impl NpmProjection {
     /// means, so a reader who opens the file does not have to take our word for
     /// it from a different document — and so nobody treats the file as a place
     /// a registry token belongs.
+    ///
+    /// ## The token is written **scoped**, and that is measured, not styled
+    ///
+    /// npm 11.12.1 refuses an unscoped `_authToken` outright:
+    ///
+    /// ```text
+    /// npm error code ERR_INVALID_AUTH
+    /// npm error Invalid auth configuration found: `_authToken` must be
+    /// npm error renamed to `//127.0.0.1:40933/:_authToken` in user config
+    /// ```
+    ///
+    /// An unscoped form is not a matter of taste here — it is a file npm will
+    /// not load at all, so a projection writing one produces a configuration
+    /// that looks finished and fails before it sends anything. The same npm,
+    /// given the scoped spelling, sends `authorization: Bearer <surrogate>` on
+    /// its first request, which is exactly the bearer `replace_bearer_token`
+    /// rewrites.
+    ///
+    /// The scope is keyed to the **registry**, not to the relay: npm matched
+    /// `//127.0.0.1:40933/:_authToken` against `registry=http://127.0.0.1:40933`.
     pub fn render(&self) -> String {
         format!(
             "{MARKER}\n\
-             # No registry token is in this file. `_authToken` below is a surrogate the\n\
-             # broker minted for this session: the relay redeems it and substitutes the\n\
-             # real credential on the way upstream, which is what makes the posture\n\
+             # No registry token is in this file. The scoped token below is a surrogate\n\
+             # the broker minted for this session: the relay redeems it and substitutes\n\
+             # the real credential on the way upstream, which is what makes the posture\n\
              # STRONG_SECRETLESS rather than a claim about it. It is bound to the session\n\
              # that minted it and stops working when that session ends.\n\
+             #\n\
+             # The token is scoped to the registry because npm refuses an unscoped\n\
+             # _authToken outright (ERR_INVALID_AUTH); the scope is what makes it a\n\
+             # credential for this registry and nothing else.\n\
              registry={}\n\
-             https-proxy={}\n\
-             _authToken={}\n",
-            self.registry, self.proxy, self.surrogate
+             //{}/:_authToken={}\n\
+             https-proxy={}\n",
+            self.registry, self.authority, self.surrogate, self.proxy
         )
     }
 
@@ -231,8 +257,18 @@ impl NpmProjection {
 
 /// Which credential fields a configuration sets, if any.
 ///
-/// Exposed because the refusal is worth asserting directly and the check is
-/// three lines that belong next to the field list rather than inside the write.
+/// ## The scope prefix is stripped, and that is a safety property
+///
+/// npm scopes a credential to a registry as `//host[:port]/:_authToken`, so the
+/// key of such a line is `//host[:port]/:_authToken` and not `_authToken`. An
+/// earlier version of this function compared the raw key, which meant a file
+/// holding a **scoped real token** reported no credentials at all — and
+/// [`write`], which trusts this answer, would then have overwritten it without
+/// a word. The guard that exists to stop a projection destroying a credential
+/// was blind to the only spelling npm now accepts.
+///
+/// The prefix is only stripped from a key that begins `//`, so a key that
+/// merely contains a colon is not silently reinterpreted.
 pub fn credential_fields(contents: &str) -> Vec<String> {
     let mut found = Vec::new();
     for line in contents.lines() {
@@ -244,6 +280,13 @@ pub fn credential_fields(contents: &str) -> Vec<String> {
             continue;
         };
         let key = key.trim();
+        let key = if key.starts_with("//") {
+            // `//host/:_authToken` -> `_authToken`. `rsplit_once` rather than
+            // `split_once` so a host carrying a port keeps its field name.
+            key.rsplit_once(':').map_or(key, |(_scope, field)| field)
+        } else {
+            key
+        };
         if AUTH_FIELDS.contains(&key) {
             found.push(key.to_string());
         }
@@ -303,7 +346,12 @@ mod tests {
             .expect("loopback")
             .render();
         assert!(
-            rendered.contains("_authToken=sur-1\n"),
+            rendered.contains("//registry.npmjs.org/:_authToken=sur-1\n"),
+            "npm refuses an unscoped _authToken outright (ERR_INVALID_AUTH), so a projection \
+             writing one produces a file npm will not load: {rendered}"
+        );
+        assert!(
+            rendered.contains("https-proxy=http://127.0.0.1:8080\n"),
             "npm sends no Authorization header without it, and the relay substitutes only a \
              bearer that is already there: {rendered}"
         );
@@ -331,6 +379,14 @@ mod tests {
         let rendered = projection.render();
         assert!(rendered.contains("registry=https://registry.npmjs.org\n"));
         assert!(rendered.contains("https-proxy=http://127.0.0.1:8080\n"));
+        // The scope is keyed to the registry, never to the relay: npm matched a
+        // scoped token against the registry URL, not against the proxy URL.
+        assert!(
+            rendered.contains("//registry.npmjs.org/:_authToken="),
+            "scoping the token to the relay would hand the credential to whatever else that \
+             socket reaches: {rendered}"
+        );
+        assert!(!rendered.contains("//127.0.0.1:8080/:_authToken="));
     }
 
     #[test]
@@ -383,6 +439,62 @@ mod tests {
             "an empty _authToken produces a tunnel the broker refuses and an npm error that \
              names the registry instead of this decision"
         );
+    }
+
+    /// The defect this file had. A scoped token is the only spelling npm
+    /// accepts, and the raw key of such a line carries the scope, which matched
+    /// nothing — so `write` would have overwritten a file holding a real
+    /// credential without refusing.
+    #[test]
+    fn a_scoped_credential_is_recognised_rather_than_blind_to() {
+        let scoped = "registry=https://registry.npmjs.org\n\
+                      //registry.npmjs.org/:_authToken=the-real-one\n";
+        assert_eq!(
+            credential_fields(scoped),
+            vec!["_authToken".to_string()],
+            "npm only accepts the scoped spelling, so an unrecognised scope is an \
+             unguarded overwrite of somebody's registry token"
+        );
+    }
+
+    #[test]
+    fn a_port_in_the_scope_does_not_eat_the_field_name() {
+        let scoped = "//127.0.0.1:8080/:_authToken=t\n//127.0.0.1:8080/:username=u\n";
+        assert_eq!(
+            credential_fields(scoped),
+            vec!["_authToken".to_string(), "username".to_string()]
+        );
+    }
+
+    #[test]
+    fn writing_over_a_scoped_foreign_token_is_refused_and_survives_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(".npmrc");
+        let original = "registry=https://registry.npmjs.org\n\
+                       //registry.npmjs.org/:_authToken=the-real-one\n";
+        std::fs::write(&path, original).expect("seed");
+
+        let projection =
+            NpmProjection::new(&registry(), "http://127.0.0.1:8080", "sur-1").expect("loopback");
+        assert_eq!(
+            write(&path, &projection),
+            Err(ProjectionError::AlreadyCarriesCredential {
+                fields: vec!["_authToken".to_string()]
+            }),
+            "npm's only accepted spelling was the one this guard could not see"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("still there"),
+            original,
+            "a refused write must leave the original byte for byte"
+        );
+    }
+
+    /// A key that merely contains a colon is not a scope and must not be
+    /// reinterpreted as one.
+    #[test]
+    fn a_colon_in_an_unscoped_key_is_not_read_as_a_scope() {
+        assert!(credential_fields("weird:key=value\n").is_empty());
     }
 
     #[test]
