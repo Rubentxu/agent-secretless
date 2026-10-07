@@ -190,29 +190,48 @@ fn uat_028_openssh_authenticates_through_the_broker_socket() {
         // at a time and this binary holds exactly one test, so the suite cannot
         // be starving it either — `--test-threads` cannot reach this test.
         //
-        // So the cause is not isolated, and this message now says that instead
-        // of naming a cause. Attributing it to the machine was the same defect
-        // one layer down: a confident wrong answer sends the next reader
-        // somewhere that is not where the fault is.
+        // So the message now localises the stall rather than attributing it.
+        // Attributing it to the machine was the same defect one layer down: a
+        // confident wrong answer sends the next reader somewhere that is not
+        // where the fault is.
         //
-        // What is established: elapsed tracks sshd's `LoginGraceTime` exactly
-        // (120.98 s at the default, 300.73 s at `LoginGraceTime 300`), the
-        // client says nothing, and sshd's log ends at
-        // `mm_request_send: entering, type 6 [preauth]` — the server did reach
-        // the point of asking for the signature. Its closing lines read
-        // `Connection closed by remote host`, which does not say which side
-        // hung up first. That question is left open rather than answered with
-        // a convenient reading.
+        // **Where it actually stops, read from both sides at DEBUG3.** This is
+        // measured, and it moves the failure well clear of the product:
+        //
+        //   client: `send packet: type 30` (ECDH_INIT sent)
+        //           `expecting SSH2_MSG_KEX_ECDH_REPLY`
+        //   server: `receive packet: type 30` / `SSH2_MSG_KEX_ECDH_INIT received`
+        //           `mm_sshkey_sign: entering`
+        //           `mm_request_send: entering, type 6`   ← and then nothing
+        //
+        // The client is waiting for the key-exchange reply. The server cannot
+        // build that reply until its privileged monitor signs the host key, and
+        // the monitor does not answer. Both sides are therefore still in the
+        // key exchange: **this is before `userauth`**, so the agent, the
+        // `authorized_keys` file and the broker are never reached. Confirmed
+        // independently: while it hangs, the client holds exactly one socket —
+        // its TCP connection to sshd — and the agent's own socket has no
+        // established peer, because the client never opened it.
+        //
+        // So the property this test exists to prove — that OpenSSH can
+        // authenticate through the broker socket without holding a private key
+        // — is not what failed. What failed is sshd's monitor on this host, and
+        // why it stalls is still not established.
         let dropped = client_stderr.trim().is_empty();
         let load = loadavg_line();
         let what = if dropped {
             format!(
                 "the SSH client was disconnected rather than refused, after \
                  {elapsed:?} with no diagnostic on its stderr, and the elapsed \
-                 time tracks sshd's LoginGraceTime. The policy engine is not \
-                 implicated: a refusal would have said so in words. The cause \
-                 is not established — in particular this is NOT known to be \
-                 load, which has been observed to move the wrong way.{load}"
+                 time tracks sshd's LoginGraceTime. This is NOT an \
+                 authentication failure: read at DEBUG3 from both sides, the \
+                 client is waiting for SSH2_MSG_KEX_ECDH_REPLY and the server \
+                 is stuck at mm_sshkey_sign asking its monitor to sign the host \
+                 key, so the session never reaches userauth. The agent, the \
+                 authorized_keys file and the broker are not involved, and \
+                 neither is the policy engine. Why the monitor stalls on this \
+                 host is not established, and it is not known to be load, which \
+                 has been observed to move the wrong way.{load}"
             )
         } else {
             format!("OpenSSH auth failed after {elapsed:?}{load}")
