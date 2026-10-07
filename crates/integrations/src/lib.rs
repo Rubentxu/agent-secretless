@@ -77,6 +77,7 @@ pub mod npm;
 pub mod plan;
 pub mod project;
 pub mod registry_audience;
+pub mod scrub;
 pub mod tool;
 
 pub use adopt::{
@@ -95,8 +96,11 @@ pub use plan::{
     PlanBindingError, PlanEntry, PlanError, Posture, Selector, Strategy, UnboundReason, Why,
     PLAN_SCHEMA,
 };
-pub use project::{credential_fields, write, NpmProjection, ProjectionError, PROJECTION_SCHEMA};
+pub use project::{
+    credential_fields, write, NpmProjection, NpmScrub, ProjectionError, PROJECTION_SCHEMA,
+};
 pub use registry_audience::{RegistryAudience, RegistryAudienceError};
+pub use scrub::{ScrubError, ScrubReport, ScrubSource};
 pub use tool::{resolve_tool, CandidateOutcome, PathCandidate, ToolResolution, MAX_TOOL_BYTES};
 
 // `adopt` names a vault credential in its receipt, so the handle type belongs

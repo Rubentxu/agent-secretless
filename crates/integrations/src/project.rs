@@ -42,6 +42,7 @@
 use std::path::Path;
 
 use crate::registry_audience::RegistryAudience;
+use crate::scrub::{ScrubError, ScrubReport, ScrubSource};
 
 /// `asv.integrations.projection/v1`.
 ///
@@ -572,5 +573,223 @@ mod tests {
             mode, 0o600,
             "a world-readable npmrc is one nobody asked for"
         );
+    }
+
+    // --- the scrub ------------------------------------------------------
+
+    fn npmrc_with(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(".npmrc");
+        std::fs::write(&path, contents).expect("seed");
+        (dir, path)
+    }
+
+    #[test]
+    fn the_scrub_removes_the_credential_and_nothing_else() {
+        let (_d, path) = npmrc_with(
+            "registry=https://registry.npmjs.org\n\
+             //registry.npmjs.org/:_authToken=npm_the_real_one\n\
+             fetch-retries=2\n",
+        );
+        let report = NpmScrub.scrub(&path).expect("scrub");
+        assert_eq!(report.removed, vec!["_authToken".to_string()]);
+        assert_eq!(report.lines_before, 3);
+        assert_eq!(report.lines_after, 2);
+
+        let left = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            !left.contains("npm_the_real_one"),
+            "the credential survived a scrub that reported success: {left}"
+        );
+        assert!(left.contains("registry=https://registry.npmjs.org"));
+        assert!(
+            left.contains("fetch-retries=2"),
+            "an unrelated setting moved: {left}"
+        );
+    }
+
+    #[test]
+    fn the_scrub_removes_every_spelling_at_once() {
+        let (_d, path) = npmrc_with(
+            "registry=r\n\
+             //r/:_authToken=t\n\
+             _auth=dXNlcjpwYXNz\n\
+             username=u\n\
+             _password=p\n",
+        );
+        let report = NpmScrub.scrub(&path).expect("scrub");
+        assert_eq!(
+            report.removed,
+            vec![
+                "_auth".to_string(),
+                "_authToken".to_string(),
+                "_password".to_string(),
+                "username".to_string(),
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "registry=r\n"
+        );
+    }
+
+    /// A scrub that removes nothing has proved nothing. Closing a migration
+    /// against a file that was never carrying a credential would report success
+    /// for either the wrong file or an already-migrated one.
+    #[test]
+    fn a_file_with_no_credential_is_refused_rather_than_scrubbed() {
+        let (_d, path) = npmrc_with("registry=https://registry.npmjs.org\nfetch-retries=2\n");
+        assert_eq!(
+            NpmScrub.scrub(&path),
+            Err(ScrubError::NothingToScrub {
+                path: path.to_string_lossy().into_owned(),
+            }),
+            "removing nothing must not read as a completed scrub"
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("still there")
+                .contains("fetch-retries"),
+            "a refused scrub must leave the file exactly as it was"
+        );
+    }
+
+    /// This is the irreversible half, so the file it lands on has to be the
+    /// file the operator was shown.
+    #[test]
+    fn a_symlinked_configuration_is_refused_rather_than_followed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real.npmrc");
+        let link = dir.path().join(".npmrc");
+        std::fs::write(&real, "registry=r\n//r/:_authToken=t\n").expect("seed");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        assert!(
+            matches!(
+                NpmScrub.scrub(&link),
+                Err(ScrubError::SymlinkedConfiguration { .. })
+            ),
+            "following a symlink here would scrub a file the operator never saw"
+        );
+        assert!(
+            std::fs::read_to_string(&real)
+                .expect("still there")
+                .contains(":_authToken=t"),
+            "the file behind the link must be untouched"
+        );
+    }
+
+    /// The report names fields, never values — a receipt quoting the token would
+    /// put it back into the log it was removed from.
+    #[test]
+    fn the_report_names_the_field_and_never_the_value() {
+        let (_d, path) = npmrc_with("registry=r\n//r/:_authToken=the-secret-value\n");
+        let report = NpmScrub.scrub(&path).expect("scrub");
+        let rendered = format!("{report:?}");
+        assert!(rendered.contains("_authToken"), "{rendered}");
+        assert!(
+            !rendered.contains("the-secret-value"),
+            "the scrub report carried the value it removed: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_scrubbed_file_is_still_only_readable_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(".npmrc");
+        std::fs::write(&path, "registry=r\n//r/:_authToken=t\n").expect("seed");
+        NpmScrub.scrub(&path).expect("scrub");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The scrub
+// ---------------------------------------------------------------------------
+
+/// Removes every credential field from an npm configuration.
+///
+/// **The missing half of `Scrubbed::scrub()`.** That method is a state
+/// transition and has always been one — it says a scrub is *permitted*. Until
+/// this existed, nothing in the workspace performed one, while
+/// `MigrationReceipt::source_file` described the file as "now scrubbed". A
+/// receipt claiming a scrub no code carries out is the same defect as a plan
+/// claiming `STRONG_SECRETLESS` with nothing behind it.
+///
+/// ## Why it is a unit struct
+///
+/// npm needs no configuration to be scrubbed: the credential fields are fixed
+/// and `AUTH_FIELDS` names them. A later family that has to be told *which*
+/// files it owns should take that in its own constructor rather than widen this
+/// one for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NpmScrub;
+
+impl ScrubSource for NpmScrub {
+    fn scrub(&self, path: &Path) -> Result<ScrubReport, ScrubError> {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let existing =
+            std::fs::symlink_metadata(path).map_err(|e| ScrubError::Io(e.to_string()))?;
+        if existing.file_type().is_symlink() {
+            return Err(ScrubError::SymlinkedConfiguration {
+                path: path.to_string_lossy().into_owned(),
+            });
+        }
+        let contents = std::fs::read_to_string(path).map_err(|e| ScrubError::Io(e.to_string()))?;
+
+        let mut removed: Vec<String> = Vec::new();
+        let mut kept: Vec<&str> = Vec::new();
+        for line in contents.lines() {
+            let key = line.split_once('=').map(|(key, _)| key.trim());
+            let scoped = key
+                .filter(|k| k.starts_with("//"))
+                .and_then(|k| k.rsplit_once(':').map(|(_scope, field)| field));
+            let plain = key.filter(|k| !k.starts_with("//"));
+            if let Some(name) = scoped.or(plain) {
+                if AUTH_FIELDS.contains(&name) {
+                    removed.push(name.to_string());
+                    continue;
+                }
+            }
+            kept.push(line);
+        }
+        removed.sort();
+        removed.dedup();
+
+        if removed.is_empty() {
+            return Err(ScrubError::NothingToScrub {
+                path: path.to_string_lossy().into_owned(),
+            });
+        }
+
+        let lines_before = contents.lines().count();
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| ScrubError::Io(e.to_string()))?;
+        for line in &kept {
+            writeln!(file, "{line}").map_err(|e| ScrubError::Io(e.to_string()))?;
+        }
+        // `OpenOptions::mode` only applies when the file is **created**, and a
+        // configuration being scrubbed already exists — so without this the scrub
+        // would leave the file at whatever mode it had, and a world-readable
+        // `.npmrc` would stay world-readable after the credential left it. The
+        // `.mode(0o600)` above is still right for the create case; this covers the
+        // one that actually happens.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| ScrubError::Io(e.to_string()))?;
+        let _ = file.sync_all();
+
+        Ok(ScrubReport {
+            removed,
+            lines_before,
+            lines_after: kept.len(),
+        })
     }
 }
