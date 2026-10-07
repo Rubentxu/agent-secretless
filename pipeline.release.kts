@@ -43,13 +43,23 @@ pipeline {
             // fetch.
             sh("if [ ! -d ../agent-skill/skills/agent-secretless ]; then git clone --depth 1 https://github.com/Rubentxu/agent-skill.git ../agent-skill; fi")
             sh("python3 tests/skill_contract.py")
-            // R0's own exit gate. It re-derives all four of R0's conditions
-            // from the repository rather than reading a status cell, and it
-            // runs the provenance campaign, so it costs about a minute and
-            // buys the statement "R0 is closed" backed by the same evidence
-            // that closed it.
-            sh("python3 tests/r0_gate.py")
-            // R0.1 on its own, over every release rather than the one being cut.
+            // R0's own exit gate is NOT here. It was, from `539d1f1` onward, and
+            // it made this file unable to reach its own publish stage:
+            //
+            //     stage preflight, step preflight/sh-4, shell exited with code 1
+            //     RunFinished outcome=failure
+            //
+            // Two of its eight rows cannot be true before publish. R0.2b runs
+            // `check-documented-install.py --version <workspace version>`, so it
+            // demands that the release being cut already exist and already
+            // install — which is what the publish stage does. R0.4b demands that
+            // target/distrib was built from HEAD, and `dist build` has not run
+            // yet. The gate is the release's exit criterion, not its entry
+            // condition, and putting it in preflight made the train refuse to
+            // start the thing that would satisfy it.
+            //
+            // What stays here is the part of R0 that *is* an entry condition:
+            // R0.1b, over every release rather than the one being cut.
             //
             // `r0_gate.py` above answers "is the roadmap honest"; this answers
             // "does any published release name a commit outside the branch, or a
@@ -223,6 +233,34 @@ pipeline {
         stage("documented-install") {
             timeout(time = 30, unit = "MINUTES") {
                 sh("python3 scripts/check-documented-install.py")
+            }
+        }
+
+        // R0's exit gate, last, where its rows can finally be true.
+        //
+        // It re-derives all eight of R0's conditions from the repository rather
+        // than reading a status cell, and it runs the provenance campaign, so it
+        // costs about a minute and buys the statement "R0 is closed" backed by
+        // the same evidence that closed it.
+        //
+        // It runs here rather than in preflight because two of its rows are
+        // statements about the release this run produces. R0.2b installs the
+        // workspace version from the published Release, and R0.4b requires
+        // target/distrib to have been built from this HEAD — both are facts that
+        // only exist once publish and build have happened. From preflight the
+        // gate was not strict, it was unsatisfiable: it read as "do not cut a
+        // release until R0 is closed" and was in fact "do not cut a release
+        // until the release has been cut".
+        //
+        // It is expected to stay red while R0.3b is red, and that is the honest
+        // reading rather than a gate left broken: R0.3b says a stale protocol
+        // offers no runnable relation, no upgrade verb exists to publish one
+        // honestly, and R0 is not closed until that is not true. This stage
+        // going red at the end says so, and it does so *after* the assets are
+        // up as a draft rather than before anything leaves the machine.
+        stage("r0-exit-gate") {
+            timeout(time = 30, unit = "MINUTES") {
+                sh("python3 tests/r0_gate.py")
             }
         }
     }
