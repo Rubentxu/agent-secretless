@@ -536,6 +536,54 @@ def r0_3b_upgrade_relation() -> None:
            f"`PROTOCOL_MISMATCH` describes is one an agent can run")
 
 
+def r0_4b_artifacts_come_from_this_tree() -> None:
+    """The built artifacts name the commit they were built from, and it is this one.
+
+    R0.4 names this property and nothing measured it, because nothing recorded
+    it: `dist-manifest.json` carries no commit, and file mtimes are a proxy that
+    a fresh checkout resets. So "the artifacts were produced from the SHA being
+    certified" was a sentence in a document.
+
+    The build stage now writes `target/distrib/build-commit.txt`, and this row
+    compares it against HEAD. A build left behind by an earlier commit goes red
+    here rather than being certified by whoever reads the roadmap next.
+
+    No record means UNAVAILABLE, not a pass: a clean checkout has no build, and
+    "there are no artifacts" is not evidence that the ones that would be
+    published are current.
+    """
+    # Not named `record`: that is the module-level reporting function,
+    # and a local of that name shadows it into a TypeError on the first
+    # report — which is the one path this row takes on a clean checkout.
+    built_from = REPO / "target" / "distrib" / "build-commit.txt"
+    if not built_from.is_file():
+        record("R0.4b artifacts name the commit they were built from", UNAVAILABLE,
+               f"{built_from.relative_to(REPO)} does not exist; nothing records which "
+               f"commit these artifacts came from, so the condition could not "
+               f"be measured")
+        return
+
+    recorded = built_from.read_text(encoding="utf-8").strip()
+    code, out = run(["git", "rev-parse", "HEAD"])
+    head = out.strip()
+    if code != 0 or len(head) != 40:
+        record("R0.4b artifacts name the commit they were built from", UNAVAILABLE,
+               f"git could not say what HEAD is (exit {code})")
+        return
+
+    if recorded != head:
+        record("R0.4b artifacts name the commit they were built from", FAIL,
+               f"the artifacts in target/distrib were built from {recorded[:12]}, "
+               f"and HEAD is {head[:12]}. A build left behind by an earlier "
+               f"commit is not evidence about this one; re-run the release "
+               f"pipeline before treating it as a certification")
+        return
+    record("R0.4b artifacts name the commit they were built from", PASS,
+           f"the artifacts in target/distrib record {recorded[:12]}, which is "
+           f"HEAD. Whether the tree is clean is R0.4's claim and not this row's, "
+           f"so it is not asserted here")
+
+
 # -------------------------------------------------------------------- main
 
 def main() -> int:
@@ -547,6 +595,7 @@ def main() -> int:
     r0_3_published_skill()
     r0_3b_upgrade_relation()
     r0_4_atomic_history()
+    r0_4b_artifacts_come_from_this_tree()
 
     print()
     failed = [n for n, s, _ in _results if s == FAIL]

@@ -105,6 +105,20 @@ pipeline {
             // defect class the publish script's own header describes.
             sh("mkdir -p target/distrib")
             sh("dist manifest --output-format=json --artifacts=all > target/distrib/dist-manifest.json.tmp && mv target/distrib/dist-manifest.json.tmp target/distrib/dist-manifest.json")
+            // The commit these bytes were built from, recorded.
+            //
+            // R0.4 says the artifacts come from the SHA being certified, and
+            // nothing measured it, because nothing recorded it: `dist` writes no
+            // commit into `dist-manifest.json`, and file mtimes are a proxy that
+            // a fresh checkout or a `git checkout` resets. So "built from this
+            // tree" was an assertion in a document and not a fact anyone could
+            // check — the same shape as the six-release installer defect, with
+            // the claim on our side instead of the build's.
+            //
+            // Written after `dist build` because that empties target/distrib. It
+            // is a local build record and is not published: it is evidence for
+            // R0.4, not an artifact of the release.
+            sh("git rev-parse HEAD > target/distrib/build-commit.txt")
         }
 
         // Make the archives byte-reproducible before anything pins them:
