@@ -14,7 +14,7 @@ use asv_broker::isolated_exec::{
     EgressPolicy, LandlockProfile, Redactor, SeccompProfile, SecretInjectionPlan, WorkerRegistry,
     WorkerTemplate,
 };
-use asv_broker::worker::{spawn, SecretProvider, SpawnError, SpawnOptions};
+use asv_broker::worker::{spawn, AuditWriter, SecretProvider, SpawnError, SpawnOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -118,11 +118,16 @@ fn deny_template(name: &str, binary: &str, args: &[&str]) -> WorkerTemplate {
 #[test]
 fn uat_040_unregistered_name_is_refused_and_audited() {
     let r = WorkerRegistry::new(vec![deny_template("kubectl-worker", "/bin/true", &[])]);
-    let mut audit = AuditLog::new(16);
-    let err = spawn(&r, "bash", SpawnOptions::default(), &mut audit)
-        .expect_err("arbitrary binaries are refused before any exec");
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
+    let err = spawn(
+        &r,
+        "bash",
+        SpawnOptions::default(),
+        &AuditWriter::new(&audit),
+    )
+    .expect_err("arbitrary binaries are refused before any exec");
     assert!(matches!(err, SpawnError::UnknownWorker(ref n) if n == "bash"));
-    let recs = audit.query(0);
+    let recs = audit.lock().expect("not poisoned").query(0);
     assert_eq!(recs.len(), 1, "the refusal itself is audit evidence");
     match &recs[0].event {
         asv_ipc_protocol::AuditEventDto::WorkerSpawned {
@@ -147,9 +152,14 @@ fn uat_040_allow_policy_is_refused_not_downgraded() {
     let mut t = deny_template("net-worker", "/bin/true", &[]);
     t.egress_policy = EgressPolicy::Allow(vec![ep]);
     let r = WorkerRegistry::new(vec![t]);
-    let mut audit = AuditLog::new(16);
-    let err = spawn(&r, "net-worker", SpawnOptions::default(), &mut audit)
-        .expect_err("an Allow policy without the M9 bridge is a lie; refuse it");
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
+    let err = spawn(
+        &r,
+        "net-worker",
+        SpawnOptions::default(),
+        &AuditWriter::new(&audit),
+    )
+    .expect_err("an Allow policy without the M9 bridge is a lie; refuse it");
     assert!(matches!(err, SpawnError::EgressAllowUnsupported));
 }
 
@@ -167,8 +177,14 @@ fn uat_040_deny_worker_sees_only_loopback_and_cannot_reach_out() {
         ],
     );
     let r = WorkerRegistry::new(vec![t]);
-    let mut audit = AuditLog::new(16);
-    let run = spawn(&r, "net-probe", completion_opts(), &mut audit).expect("run");
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
+    let run = spawn(
+        &r,
+        "net-probe",
+        completion_opts(),
+        &AuditWriter::new(&audit),
+    )
+    .expect("run");
     let out = String::from_utf8_lossy(&run.stdout_redacted);
     assert_eq!(run.exit_code, Some(0));
     // In the fresh netns the only interface is the downed lo.
@@ -203,19 +219,20 @@ fn uat_040_pre_exec_isolation_failure_is_classified_and_audited() {
     seccompiler::apply_filter(&program).expect("install current-thread filter");
 
     let registry = WorkerRegistry::new(vec![deny_template("blocked-isolation", "/bin/true", &[])]);
-    let mut audit = AuditLog::new(16);
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
     let error = spawn(
         &registry,
         "blocked-isolation",
         SpawnOptions::default(),
-        &mut audit,
+        &AuditWriter::new(&audit),
     )
     .expect_err("a namespace setup failure must prevent exec");
     assert!(
         matches!(error, SpawnError::IsolationUnavailable),
         "{error:?}"
     );
-    match &audit.query(0)[0].event {
+    let recs = audit.lock().expect("not poisoned").query(0);
+    match &recs[0].event {
         asv_ipc_protocol::AuditEventDto::WorkerSpawned { outcome, .. } => {
             assert_eq!(outcome, "error");
         }
@@ -244,12 +261,12 @@ fn uat_040_exec_failure_without_hook_marker_remains_io_error() {
         &[],
     );
     let registry = WorkerRegistry::new(vec![template]);
-    let mut audit = AuditLog::new(16);
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
     let error = spawn(
         &registry,
         "invalid-exec",
         SpawnOptions::default(),
-        &mut audit,
+        &AuditWriter::new(&audit),
     )
     .expect_err("an invalid executable image must fail exec");
     assert!(matches!(error, SpawnError::Io(_)), "{error:?}");
@@ -271,12 +288,12 @@ fn uat_040_env_injection_reaches_child_only() {
         name: "ASV_T".into(),
     };
     let r = WorkerRegistry::new(vec![t]);
-    let mut audit = AuditLog::new(16);
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
     let run = spawn(
         &r,
         "env-worker",
         completion_opts_with_secret(Box::new(|| b"sekrit".to_vec())),
-        &mut audit,
+        &AuditWriter::new(&audit),
     )
     .expect("run");
     assert_eq!(run.exit_code, Some(0));
@@ -326,13 +343,13 @@ fn uat_040_file_injection_is_refused_and_leaves_nothing_on_the_host() {
         allowed_write: vec![],
     };
     let r = WorkerRegistry::new(vec![t]);
-    let mut audit = AuditLog::new(16);
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
 
     let err = spawn(
         &r,
         "file-worker",
         completion_opts_with_secret(Box::new(|| b"file-secret".to_vec())),
-        &mut audit,
+        &AuditWriter::new(&audit),
     )
     .expect_err("a File plan must be refused, not served");
 
@@ -354,7 +371,7 @@ fn uat_040_file_injection_is_refused_and_leaves_nothing_on_the_host() {
     );
 
     // And the refusal is on the record, naming the plan it refused.
-    let recs = audit.query(0);
+    let recs = audit.lock().expect("not poisoned").query(0);
     match &recs[0].event {
         asv_ipc_protocol::AuditEventDto::WorkerSpawned {
             outcome, injection, ..
@@ -393,8 +410,14 @@ fn uat_040_landlock_profile_denies_unlisted_paths() {
         allowed_write: vec![],
     };
     let r = WorkerRegistry::new(vec![t]);
-    let mut audit = AuditLog::new(16);
-    let run = spawn(&r, "ll-worker", completion_opts(), &mut audit).expect("run");
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
+    let run = spawn(
+        &r,
+        "ll-worker",
+        completion_opts(),
+        &AuditWriter::new(&audit),
+    )
+    .expect("run");
     let out = String::from_utf8_lossy(&run.stdout_redacted);
     let err = String::from_utf8_lossy(&run.stderr_redacted);
     assert_eq!(run.exit_code, Some(0), "{out} | stderr: {err}");
@@ -430,9 +453,14 @@ fn uat_040_read_allow_does_not_grant_execute() {
         allowed_write: vec![],
     };
     let r = WorkerRegistry::new(vec![t]);
-    let mut audit = AuditLog::new(16);
-    let run = spawn(&r, "read-only-worker", completion_opts(), &mut audit)
-        .expect("run under read-only profile");
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
+    let run = spawn(
+        &r,
+        "read-only-worker",
+        completion_opts(),
+        &AuditWriter::new(&audit),
+    )
+    .expect("run under read-only profile");
     let out = String::from_utf8_lossy(&run.stdout_redacted);
     assert_eq!(run.exit_code, Some(0), "{out}");
     assert!(
@@ -462,9 +490,14 @@ fn uat_040_large_stdout_and_stderr_are_drained_concurrently() {
         ],
     );
     let r = WorkerRegistry::new(vec![t]);
-    let mut audit = AuditLog::new(16);
-    let run = spawn(&r, "chatty-worker", completion_opts(), &mut audit)
-        .expect("large output must not deadlock");
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
+    let run = spawn(
+        &r,
+        "chatty-worker",
+        completion_opts(),
+        &AuditWriter::new(&audit),
+    )
+    .expect("large output must not deadlock");
     assert_eq!(run.exit_code, Some(0));
     assert_eq!(run.stdout_redacted.len(), 131072);
     assert_eq!(run.stderr_redacted.len(), 131072);
@@ -493,8 +526,14 @@ fn uat_040_seccomp_bite_kills_worker_calling_bpf() {
         ],
     );
     let r = WorkerRegistry::new(vec![t]);
-    let mut audit = AuditLog::new(16);
-    let run = spawn(&r, "bite-worker", completion_opts(), &mut audit).expect("run");
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
+    let run = spawn(
+        &r,
+        "bite-worker",
+        completion_opts(),
+        &AuditWriter::new(&audit),
+    )
+    .expect("run");
     // The worker main thread must die from SIGSYS before bpf(2) returns.
     assert_eq!(
         run.outcome,
@@ -510,7 +549,7 @@ fn uat_040_runaway_worker_is_killed_at_timeout() {
     require_userns("uat_040_runaway_worker_is_killed_at_timeout");
     let t = deny_template("sleeper", "/bin/sleep", &["30"]);
     let r = WorkerRegistry::new(vec![t]);
-    let mut audit = AuditLog::new(16);
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
     let started = std::time::Instant::now();
     let err = spawn(
         &r,
@@ -520,7 +559,7 @@ fn uat_040_runaway_worker_is_killed_at_timeout() {
             timeout: Some(std::time::Duration::from_millis(700)),
             ..Default::default()
         },
-        &mut audit,
+        &AuditWriter::new(&audit),
     )
     .expect_err("a runaway worker is killed, not adopted");
     assert!(matches!(err, SpawnError::Timeout(_)));
@@ -528,7 +567,8 @@ fn uat_040_runaway_worker_is_killed_at_timeout() {
         started.elapsed() < std::time::Duration::from_secs(5),
         "the kill must happen at the timeout, not at the child's leisure"
     );
-    match &audit.query(0)[0].event {
+    let recs = audit.lock().expect("not poisoned").query(0);
+    match &recs[0].event {
         asv_ipc_protocol::AuditEventDto::WorkerSpawned { outcome, .. } => {
             assert_eq!(outcome, "timeout");
         }
@@ -555,12 +595,12 @@ fn uat_040_secret_in_stdout_is_redacted_transformed_is_not() {
     };
     t.redactor = Redactor::new([b"topsecret".to_vec()]);
     let r = WorkerRegistry::new(vec![t]);
-    let mut audit = AuditLog::new(16);
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
     let run = spawn(
         &r,
         "leaky",
         completion_opts_with_secret(Box::new(|| b"topsecret".to_vec())),
-        &mut audit,
+        &AuditWriter::new(&audit),
     )
     .expect("run");
     let out = String::from_utf8_lossy(&run.stdout_redacted);
@@ -579,7 +619,8 @@ fn uat_040_secret_in_stdout_is_redacted_transformed_is_not() {
         b64.contains("dG9wc2VjcmV0"),
         "transformed leak is out of the redactor's reach by design (UAT-022): {out}"
     );
-    match &audit.query(0)[0].event {
+    let recs = audit.lock().expect("not poisoned").query(0);
+    match &recs[0].event {
         asv_ipc_protocol::AuditEventDto::WorkerSpawned { posture, .. } => {
             assert_eq!(posture, "ISOLATED_PROCESS_EXPOSURE");
         }
@@ -594,11 +635,17 @@ fn uat_040_completed_run_is_audited_with_metadata_only() {
     require_userns("uat_040_completed_run_is_audited_with_metadata_only");
     let t = deny_template("ok-worker", "/bin/true", &[]);
     let r = WorkerRegistry::new(vec![t]);
-    let mut audit = AuditLog::new(16);
-    let run = spawn(&r, "ok-worker", completion_opts(), &mut audit).expect("run");
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
+    let run = spawn(
+        &r,
+        "ok-worker",
+        completion_opts(),
+        &AuditWriter::new(&audit),
+    )
+    .expect("run");
     assert_eq!(run.exit_code, Some(0));
     assert!(run.duration < std::time::Duration::from_secs(10));
-    let recs = audit.query(0);
+    let recs = audit.lock().expect("not poisoned").query(0);
     assert_eq!(recs.len(), 1);
     let serialized = serde_json::to_string(&recs[0].event).expect("dto json");
     assert!(
@@ -623,7 +670,7 @@ fn uat_040_completed_run_is_audited_with_metadata_only() {
         other => panic!("unexpected audit variant: {other:?}"),
     }
     // And the durable chain still verifies with worker frames in it.
-    assert_eq!(audit.verify(), Ok(()));
+    assert_eq!(audit.lock().expect("not poisoned").verify(), Ok(()));
 }
 
 #[test]
@@ -633,11 +680,20 @@ fn uat_040_missing_binary_refusal_is_audited() {
         "/nonexistent/asv-binary-probe",
         &[],
     )]);
-    let mut audit = AuditLog::new(16);
-    let err = spawn(&r, "ghost", SpawnOptions::default(), &mut audit)
-        .expect_err("a registry entry pointing nowhere is an install-time bug");
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
+    let err = spawn(
+        &r,
+        "ghost",
+        SpawnOptions::default(),
+        &AuditWriter::new(&audit),
+    )
+    .expect_err("a registry entry pointing nowhere is an install-time bug");
     assert!(
         matches!(err, SpawnError::BinaryMissing(p) if *p == *Path::new("/nonexistent/asv-binary-probe"))
     );
-    assert_eq!(audit.query(0).len(), 1, "refusals are evidence too");
+    assert_eq!(
+        audit.lock().expect("not poisoned").query(0).len(),
+        1,
+        "refusals are evidence too"
+    );
 }

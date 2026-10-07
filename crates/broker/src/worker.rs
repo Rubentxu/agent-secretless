@@ -279,6 +279,41 @@ fn read_bounded<R: std::io::Read>(pipe: &mut R, limit: usize) -> std::io::Result
     })
 }
 
+/// The audit chain, borrowed for the length of one run.
+///
+/// This type exists because of a measured stall. `spawn` used to take a
+/// `&mut AuditLog` that its caller had obtained from `Mutex::lock` and held
+/// until the child exited — and the audit chain is where *every* brokered
+/// request ends, because `handle` appends one record per request on its way
+/// out. A lock held across a worker run was therefore a lock every other
+/// agent's request queued behind, and a worker that took thirty seconds made
+/// every other agent wait thirty seconds. Measured, not argued: ending an
+/// unrelated session while a 9s worker ran took 8.77s.
+///
+/// So the lock is taken per record and released immediately. Each `append` is
+/// still atomic against other writers; what it no longer is is atomic against
+/// the child, which is the part that was never the point of taking it.
+pub struct AuditWriter<'a> {
+    chain: &'a std::sync::Mutex<AuditLog>,
+}
+
+impl<'a> AuditWriter<'a> {
+    pub fn new(chain: &'a std::sync::Mutex<AuditLog>) -> Self {
+        Self { chain }
+    }
+
+    /// Whether the chain can be written to at all, asked **before** anything
+    /// is executed.
+    ///
+    /// Separate from [`AuditWriter::record`] because the two answer different
+    /// questions. This one gates execution: a broker that cannot record must
+    /// not start a worker. Once a child exists there is no refusal available,
+    /// so `record` cannot fail the run and does not pretend to.
+    pub fn is_writable(&self) -> bool {
+        self.chain.lock().is_ok()
+    }
+}
+
 /// Spawn a registered worker through the isolation pipeline and wait
 /// for it. Appends exactly one audit record on every terminal path
 /// (including refusals) — M10R-R6.
@@ -286,7 +321,7 @@ pub fn spawn(
     registry: &WorkerRegistry,
     name: &str,
     opts: SpawnOptions,
-    audit: &mut AuditLog,
+    audit: &AuditWriter<'_>,
 ) -> Result<WorkerRun, SpawnError> {
     let started = Instant::now();
     let template = match registry.get(name) {
@@ -508,7 +543,20 @@ pub fn spawn(
         std::thread::spawn(move || read_bounded(&mut pipe, limits.max_stderr_bytes))
     });
 
-    let timeout = opts.timeout.unwrap_or(DEFAULT_WORKER_TIMEOUT);
+    // The runtime's own ceiling, and the only one.
+    //
+    // The caller's value is a request to shorten this, not to raise it — the
+    // comment on the `timeout_ms` arm in `lib.rs` says so, and this line is
+    // what makes it true. It used to read `opts.timeout.unwrap_or(DEFAULT)`,
+    // which supplies the default when the caller sends nothing and bounds
+    // nothing when the caller sends a large number: a client asking for a
+    // ten-minute worker against a ten-second cap got its ten minutes, and the
+    // run finished at 30s having simply outlived the cap nobody applied. The
+    // cap is what lets the default be short, so the cap has to be a ceiling
+    // and not a starting point.
+    let timeout = opts.timeout.map_or(DEFAULT_WORKER_TIMEOUT, |requested| {
+        requested.min(DEFAULT_WORKER_TIMEOUT)
+    });
     let waited = wait_with_timeout(&mut child, timeout);
     let duration = started.elapsed();
 
@@ -837,7 +885,7 @@ fn zeroize_buf(buf: &mut [u8]) {
 
 /// One metadata-only audit record per terminal path (M10R-R6, D7).
 fn audit_worker(
-    audit: &mut AuditLog,
+    audit: &AuditWriter<'_>,
     worker: &str,
     template: Option<&WorkerTemplate>,
     plan: Option<&SecretInjectionPlan>,
@@ -854,18 +902,31 @@ fn audit_worker(
     let (bytes_stdout, bytes_stderr, output_limit_hit) = output
         .map(|(out, err, hit)| (Some(out), Some(err), Some(hit)))
         .unwrap_or((None, None, None));
-    audit.append(
-        AuditEventDto::WorkerSpawned {
-            worker: worker.to_string(),
-            egress: egress.to_string(),
-            injection: injection.to_string(),
-            posture: POSTURE_LABEL.to_string(),
-            outcome: outcome.to_string(),
-            exit_code,
-            bytes_stdout,
-            bytes_stderr,
-            output_limit_hit,
-        },
+    let event = AuditEventDto::WorkerSpawned {
+        worker: worker.to_string(),
+        egress: egress.to_string(),
+        injection: injection.to_string(),
+        posture: POSTURE_LABEL.to_string(),
+        outcome: outcome.to_string(),
+        exit_code,
+        bytes_stdout,
+        bytes_stderr,
+        output_limit_hit,
+    };
+    // The lock is held for this one append and no longer — see `AuditWriter`.
+    //
+    // A poisoned chain loses this record rather than failing the run. That is a
+    // deliberate trade, and the reasoning is the same one that removed the
+    // long hold: by the time a record is due a child exists and there is no
+    // refusal left to give, so the only two outcomes on offer are "drop one
+    // record in a chain that is already broken" and "freeze every agent in the
+    // broker until this child exits". A caller can check the chain is writable
+    // before starting a run, which is where refusing actually belongs.
+    let Ok(mut log) = audit.chain.lock() else {
+        return;
+    };
+    log.append(
+        event,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -921,11 +982,16 @@ mod tests {
     #[test]
     fn unknown_worker_is_refused_and_audited() {
         let r = WorkerRegistry::new(vec![template("kubectl-worker", "/bin/true")]);
-        let mut audit = AuditLog::new(16);
-        let err = spawn(&r, "bash", SpawnOptions::default(), &mut audit)
-            .expect_err("unregistered name must be refused");
+        let audit = std::sync::Mutex::new(AuditLog::new(16));
+        let err = spawn(
+            &r,
+            "bash",
+            SpawnOptions::default(),
+            &AuditWriter::new(&audit),
+        )
+        .expect_err("unregistered name must be refused");
         assert!(matches!(err, SpawnError::UnknownWorker(n) if n == "bash"));
-        let recs = audit.query(0);
+        let recs = audit.lock().expect("not poisoned").query(0);
         assert_eq!(recs.len(), 1);
         match &recs[0].event {
             AuditEventDto::WorkerSpawned {
@@ -941,9 +1007,14 @@ mod tests {
     #[test]
     fn missing_binary_is_refused_before_spawn() {
         let r = WorkerRegistry::new(vec![template("ghost", "/nonexistent/asv-bin")]);
-        let mut audit = AuditLog::new(16);
-        let err = spawn(&r, "ghost", SpawnOptions::default(), &mut audit)
-            .expect_err("missing binary must be refused");
+        let audit = std::sync::Mutex::new(AuditLog::new(16));
+        let err = spawn(
+            &r,
+            "ghost",
+            SpawnOptions::default(),
+            &AuditWriter::new(&audit),
+        )
+        .expect_err("missing binary must be refused");
         assert!(matches!(err, SpawnError::BinaryMissing(_)));
     }
 
@@ -952,9 +1023,14 @@ mod tests {
         let mut t = template("net-worker", "/bin/true");
         t.egress_policy = EgressPolicy::Allow(vec![endpoint("api.example.com")]);
         let r = WorkerRegistry::new(vec![t]);
-        let mut audit = AuditLog::new(16);
-        let err = spawn(&r, "net-worker", SpawnOptions::default(), &mut audit)
-            .expect_err("Allow policy must be refused until M9 lands");
+        let audit = std::sync::Mutex::new(AuditLog::new(16));
+        let err = spawn(
+            &r,
+            "net-worker",
+            SpawnOptions::default(),
+            &AuditWriter::new(&audit),
+        )
+        .expect_err("Allow policy must be refused until M9 lands");
         assert!(matches!(err, SpawnError::EgressAllowUnsupported));
     }
 
@@ -966,12 +1042,17 @@ mod tests {
         let mut t = template("debug-worker", "/bin/true");
         t.seccomp_profile = SeccompProfile::PassThrough;
         let r = WorkerRegistry::new(vec![t]);
-        let mut audit = AuditLog::new(16);
-        let err = spawn(&r, "debug-worker", SpawnOptions::default(), &mut audit)
-            .expect_err("a debug-only seccomp profile must be refused");
+        let audit = std::sync::Mutex::new(AuditLog::new(16));
+        let err = spawn(
+            &r,
+            "debug-worker",
+            SpawnOptions::default(),
+            &AuditWriter::new(&audit),
+        )
+        .expect_err("a debug-only seccomp profile must be refused");
         assert!(matches!(err, SpawnError::SeccompProfileNotProduction));
         // Nothing was executed, and the refusal is auditable.
-        let recs = audit.query(0);
+        let recs = audit.lock().expect("not poisoned").query(0);
         assert_eq!(recs.len(), 1);
         match &recs[0].event {
             AuditEventDto::WorkerSpawned {
@@ -989,13 +1070,18 @@ mod tests {
         let mut t = template("env-worker", "/bin/true");
         t.secret_injection = SecretInjectionPlan::EnvVar { name: "T".into() };
         let r = WorkerRegistry::new(vec![t]);
-        let mut audit = AuditLog::new(16);
-        let err = spawn(&r, "env-worker", SpawnOptions::default(), &mut audit)
-            .expect_err("env plan without provider must be refused");
+        let audit = std::sync::Mutex::new(AuditLog::new(16));
+        let err = spawn(
+            &r,
+            "env-worker",
+            SpawnOptions::default(),
+            &AuditWriter::new(&audit),
+        )
+        .expect_err("env plan without provider must be refused");
         assert!(matches!(err, SpawnError::InjectionMismatch(_)));
 
         let r2 = WorkerRegistry::new(vec![template("plain", "/bin/true")]);
-        let mut audit2 = AuditLog::new(16);
+        let audit2 = std::sync::Mutex::new(AuditLog::new(16));
         let err2 = spawn(
             &r2,
             "plain",
@@ -1004,7 +1090,7 @@ mod tests {
                 timeout: None,
                 ..Default::default()
             },
-            &mut audit2,
+            &AuditWriter::new(&audit2),
         )
         .expect_err("provider without plan must be refused");
         assert!(matches!(err2, SpawnError::InjectionMismatch(_)));
@@ -1025,7 +1111,7 @@ mod tests {
         let mut t = template("chatty", "/usr/bin/yes");
         t.arguments = vec![];
         let r = WorkerRegistry::new(vec![t]);
-        let mut audit = AuditLog::new(16);
+        let audit = std::sync::Mutex::new(AuditLog::new(16));
         let lifetime = Duration::from_secs(30);
         let run = spawn(
             &r,
@@ -1039,7 +1125,7 @@ mod tests {
                     max_total_bytes: 128 * 1024,
                 },
             },
-            &mut audit,
+            &AuditWriter::new(&audit),
         )
         .expect("a capped run is a run, not a spawn failure");
 
@@ -1070,7 +1156,7 @@ mod tests {
             "bytes_stdout must report what was said, not what was kept"
         );
 
-        let recs = audit.query(0);
+        let recs = audit.lock().expect("not poisoned").query(0);
         match &recs[0].event {
             AuditEventDto::WorkerSpawned {
                 outcome,
@@ -1092,7 +1178,7 @@ mod tests {
         // everything unconditionally would pass: `limit_hit` would be true
         // forever and "the bound works" would mean nothing.
         let r = WorkerRegistry::new(vec![template("quiet", "/bin/echo")]);
-        let mut audit = AuditLog::new(16);
+        let audit = std::sync::Mutex::new(AuditLog::new(16));
         let run = spawn(
             &r,
             "quiet",
@@ -1105,7 +1191,7 @@ mod tests {
                     max_total_bytes: 128 * 1024,
                 },
             },
-            &mut audit,
+            &AuditWriter::new(&audit),
         )
         .expect("a quiet worker runs");
         assert_eq!(run.outcome, RunOutcome::Completed);

@@ -2039,16 +2039,23 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                 t.arguments.extend(args.iter().cloned());
             }
 
+            // The chain is checked for writability *before* the spawn and the guard is
+            // dropped on the spot. It used to be held until `spawn` returned,
+            // which is the length of the child's whole life, and `handle`
+            // appends a record for every request on the way out — so that one
+            // hold was a global stall. A worker running for nine seconds made
+            // another agent's EndSession take 8.77s, measured.
             let audit = state.audit.clone();
-            let Ok(mut guard) = audit.lock() else {
+            if !crate::worker::AuditWriter::new(&audit).is_writable() {
                 return Response::Error {
                     code: ErrorCode::Upstream,
                     message: "audit log is poisoned; refusing to run an isolated worker unrecorded"
                         .into(),
                 };
-            };
+            }
+            let audit = crate::worker::AuditWriter::new(&audit);
 
-            match crate::worker::spawn(&view, &worker, opts, &mut guard) {
+            match crate::worker::spawn(&view, &worker, opts, &audit) {
                 Ok(run) => {
                     // The streams returned are already the redactor's output.
                     // The broker never holds the raw pipe, so there is no path
