@@ -153,6 +153,25 @@ print(m.group(1))
 PY
 )" || exit 1
 
+# The tag has to be right before a Release is created against it, and this
+# script is runnable on its own.
+#
+# v0.35.0 is what that costs. The release notes named a tag, `gh release
+# create` created it implicitly as a lightweight ref against the remote default
+# branch — which had not been pushed since v0.32.0 — and the published tag named
+# a commit from three releases earlier. The artifacts were fine; the commit the
+# tag named was not, and the tag was the only thing anyone would have read.
+#
+# `release-tag-check.sh` is the check for exactly that: annotated, on HEAD, and
+# pushed. It was already in `pipeline.release.kts`, which is why the *pipeline*
+# was protected and this *script* was not — the hole was the standalone
+# invocation, and a hole reachable by the obvious command is reachable.
+if ! scripts/release-tag-check.sh; then
+  echo "publish-release: refusing to create a Release against a tag that is not" >&2
+  echo "  annotated, on HEAD and pushed. See the errors above." >&2
+  exit 1
+fi
+
 # Uploading to a Release that already exists appends to it. `gh` does not
 # refuse on its own, and the result is a release whose artifact list is a mix
 # of two builds with one tag, which is exactly the state
