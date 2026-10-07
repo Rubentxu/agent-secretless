@@ -38,7 +38,9 @@ Run: python3 tests/distribution_bundle.py
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -324,9 +326,93 @@ def main() -> int:
     print()
     report("a contaminated archive is detected", *falsify_contaminated_archive(manifest))
 
+    # 12. The row this file's own header claims it has.
+    #
+    # `distribution/manifest.toml` says: "tests/distribution_bundle.py fails if
+    # this pattern and the built artifact name disagree." It did not. The word
+    # `archive_name` did not appear in this file at all, so the declared pattern
+    # and the name dist actually produced could differ indefinitely — and they
+    # have, for every release ever published.
+    #
+    #     declared : agent-secretless-v{version}-{target}.tar.zst
+    #     produced : agent-secretless-x86_64-unknown-linux-gnu.tar.zst
+    #
+    # `scripts/install.py` builds its download URL from the declared pattern, so
+    # it has asked for a file that has never existed and has never completed an
+    # install. Every case above passed anyway, because each of them packs its
+    # own archive *at the declared name* — the fixture defines the name into
+    # existence and then verifies the file it just wrote.
+    print()
+    report("the declared archive name is a name a build produces",
+           *check_declared_archive_name(manifest))
+
     print()
     print(f"{PASS}/{PASS + FAIL} behaviours confirmed")
     return 1 if FAIL else 0
+
+
+def check_declared_archive_name(manifest: dict) -> tuple[bool, str]:
+    """The pattern the installer builds its URL from must resolve to a real file.
+
+    Read against `dist-manifest.json` rather than a directory listing, for the
+    reason every other check here is: a glob would find a stale archive from a
+    previous build and call a broken declaration whole.
+    """
+    pattern = manifest.get("archive_name")
+    if not pattern:
+        return False, (
+            "the manifest declares no archive_name, so scripts/install.py has "
+            "nothing to build its download URL from and raises instead"
+        )
+
+    json_manifest = REPO / "target" / "distrib" / "dist-manifest.json"
+    if not json_manifest.is_file():
+        return False, (
+            f"{json_manifest.relative_to(REPO)} is missing. Run `dist build && "
+            f"dist manifest` first: this row compares the declared name with "
+            f"what the build produced, and a build that did not run has "
+            f"produced nothing to compare against."
+        )
+
+    produced = sorted(
+        name for release in json.loads(json_manifest.read_text()).get("releases", [])
+        for name in release.get("artifacts", [])
+        if name.endswith((".tar.zst", ".tar.gz", ".tar.xz"))
+    )
+    if not produced:
+        return False, "the manifest lists no archives at all"
+
+    # Whether the declaration can produce a real name is asked as a shape, not
+    # as a substitution.
+    #
+    # The first version expanded `{version}` and `{target}` to a literal `X` and
+    # compared strings, which is wrong twice: it does not check the real triple,
+    # and it made the row red even when the names did agree — a row that cannot
+    # go green is not a row. Reading dist's targets from `packaging/dist.toml`
+    # does not work either; it does not declare them, dist infers them.
+    #
+    # So the pattern becomes a regex with each slot as `.+?` and the names the
+    # build produced decide. That is not circular: it never assumes what the
+    # slots expand to, only that a name the build made can be produced by some
+    # filling of the declaration.
+    slot = re.compile(r"\\\{[^}]+\\\}")
+    rx = re.compile("^" + slot.sub(".+?", re.escape(pattern)
+                                  .replace(re.escape(slot.pattern), slot.pattern)) + "$")
+    matched = [n for n in produced if rx.match(n)]
+    if matched:
+        return True, (
+            f"the declared pattern {pattern!r} can produce {matched[0]}, which "
+            f"this build made"
+        )
+
+    return False, (
+        f"the manifest declares archive_name = {pattern!r}, and no archive this "
+        f"build produced can come from it: the build made {produced}. "
+        f"scripts/install.py builds its download URL from the declaration, so it "
+        f"asks for a file that does not exist and no install completes. This "
+        f"file's header says it fails on exactly this; until now it never "
+        f"mentioned archive_name at all."
+    )
 
 
 def falsify_contaminated_archive(manifest: dict) -> tuple[bool, str]:
