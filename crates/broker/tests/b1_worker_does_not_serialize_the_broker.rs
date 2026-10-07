@@ -251,6 +251,31 @@ fn a_blocked_worker_does_not_delay_end_session() {
         "the worker had already finished before EndSession answered, so this row \
          proved only that a broker with nothing to wait for is responsive."
     );
+    // And the revocation itself, not only the answer. `SessionEnded` is a
+    // response shape; it is not evidence the store changed. A broker that
+    // answered promptly and revoked nothing would satisfy everything above,
+    // which is the DoD criterion "revocation works under load" failing in the
+    // way a timing assertion cannot see. Ending it a second time is therefore
+    // the probe: a session that was really ended is gone, and its owner gets
+    // the same refusal they would get for revoking twice.
+    let repeated = handle(
+        &state,
+        &observer,
+        Request::EndSession {
+            session: other_session,
+        },
+    );
+    assert!(
+        matches!(
+            repeated,
+            Response::Error {
+                code: ErrorCode::InvalidRequest,
+                ..
+            }
+        ),
+        "the first EndSession answered SessionEnded and the session is still \
+         there to be ended again: {repeated:?}. The answer was not a revocation."
+    );
 
     worker.join().expect("the run thread must not panic");
 }
