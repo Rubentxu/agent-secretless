@@ -469,6 +469,115 @@ enum IntegrationsCommand {
         #[arg(long, value_name = "LABEL")]
         label: String,
     },
+    /// Finish a migration: prove the new path, then remove the old one.
+    ///
+    /// `adopt` moved a credential into the vault and stopped there, deliberately,
+    /// because doc 04 §10 puts four things in front of a scrub. This is the rest
+    /// of §10, and it is split in two because the split is what makes it
+    /// possible to obey it: `prove` writes the projection to a file of its own,
+    /// exercises npm through the broker, and persists what it observed; `apply`
+    /// replays that file through every gate in order and only then removes the
+    /// original.
+    ///
+    /// **The original is not touched by `prove`.** The projection goes to a
+    /// separate file because a projection that replaced a credential-bearing
+    /// configuration would be the scrub, and the scrub is the irreversible half.
+    /// If it cannot be undone, it does not belong next to a proof that has not
+    /// happened yet.
+    Migrate {
+        /// The tool family.
+        #[arg(value_name = "FAMILY")]
+        family: String,
+        #[command(subcommand)]
+        command: MigrateCommand,
+    },
+}
+
+/// The two halves of a migration, in the order §10 puts them.
+#[derive(Subcommand)]
+enum MigrateCommand {
+    /// Prove the new path works, and the old one no longer does.
+    ///
+    /// Reads the `asv.integrations.adopt/v1` receipt of an import rather than
+    /// performing one — importing twice would put two credentials in the vault
+    /// and prove nothing about the first.
+    ///
+    /// Three things are measured, and each one is measured by the thing it is
+    /// about rather than by this command's opinion: the broker is asked over the
+    /// socket whether it still holds the adopted credential, the real `npm`
+    /// binary is run against the projection, and the same `npm` is run against a
+    /// credential-stripped copy of the original and has to fail.
+    ///
+    /// What it writes is the projection, and — to `--state` — the facts a later
+    /// `apply` replays. Nothing is scrubbed here, and nothing here can be.
+    Prove {
+        /// The `asv.integrations.adopt/v1` receipt this migration continues.
+        ///
+        /// **Required, and refused rather than defaulted.** Every fact this
+        /// command records — the credential, the audience, the file the
+        /// credential came from — comes from that document, and a `prove` with
+        /// no receipt to continue would have to invent all three.
+        #[arg(long, value_name = "PATH")]
+        adopt: Option<String>,
+        /// The original configuration. Defaults to the file the receipt names.
+        ///
+        /// Naming a different file is refused: the approval a later `apply`
+        /// carries is a digest over the file the receipt names, and a proof
+        /// gathered about one file cannot open a scrub of another.
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
+        /// Home directory, used to find the defaults for `--projection` and
+        /// `--state`.
+        #[arg(long, value_name = "DIR")]
+        home: Option<String>,
+        /// Where the projection is written. Defaults to `<home>/.npmrc.asv`.
+        ///
+        /// **Never the original.** Writing the projection over the original
+        /// would replace a registry credential with a surrogate without a proof,
+        /// a human or a scrub, and this command refuses it.
+        #[arg(long, value_name = "PATH")]
+        projection: Option<String>,
+        /// The registry to project for. Defaults to the receipt's audience.
+        #[arg(long, value_name = "AUDIENCE")]
+        audience: Option<String>,
+        /// The label whose surrogate to write. Defaults to the receipt's label.
+        #[arg(long, value_name = "LABEL")]
+        label: Option<String>,
+        /// Where the migration state is persisted. Defaults to
+        /// `<home>/.asv-npm-migration.json`.
+        #[arg(long, value_name = "PATH")]
+        state: Option<String>,
+        /// Emit the `asv.integrations.migration/v1` state instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Approve, scrub the original, rescan it, and write the receipt.
+    ///
+    /// Reads the state a `prove` left, replays it through the same four gates in
+    /// the same order, and only then removes the credential from the file the
+    /// receipt names. `--approve` is a digest, so an approval given over one
+    /// plan cannot open another's scrub.
+    Apply {
+        /// The migration state a `prove` wrote. Defaults to
+        /// `<home>/.asv-npm-migration.json`.
+        #[arg(long, value_name = "PATH")]
+        state: Option<String>,
+        /// Who approves removing the original.
+        #[arg(long, value_name = "WHO")]
+        actor: String,
+        /// The plan digest being approved, as `prove` printed it.
+        #[arg(long, value_name = "DIGEST")]
+        approve: String,
+        /// The original configuration. Defaults to the file the state names.
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
+        /// Home directory, used to find the default state file.
+        #[arg(long, value_name = "DIR")]
+        home: Option<String>,
+        /// Emit the `asv.integrations.migration/v1` receipt instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1882,6 +1991,9 @@ fn run_integrations(
             audience,
             label,
         ),
+        IntegrationsCommand::Migrate { family, command } => {
+            run_integrations_migrate(socket, family, command)
+        }
     }
 }
 
@@ -4048,6 +4160,546 @@ mod tests {
              legitimately begin with whitespace and `trim()` would corrupt it"
         );
     }
+
+    // ------------------------------------------------------------------
+    // `integrations migrate`
+    //
+    // Every row below runs without a broker, without npm and without a
+    // network. **What they are for is the shape, not the machine**: they hold
+    // that `prove` refuses a run it cannot ground in a receipt, that the
+    // persisted state is built by hand out of facts rather than read back out
+    // of a state type, and that the four gates still refuse in order when the
+    // order is replayed from that file. What npm itself does through the relay
+    // is AAT-CW-016's subject and cannot be faked here — a row that mocked npm
+    // and called itself a positive proof would be the failure this repository
+    // exists to prevent.
+    // ------------------------------------------------------------------
+
+    /// A receipt on disk, written by hand as `adopt --json` writes it.
+    ///
+    /// Hand-built rather than produced by an import, because the import needs a
+    /// broker and this row is about what this command *reads*: the document is
+    /// the contract, and a fixture that came out of the producer would go green
+    /// the day the producer changed.
+    fn adopt_receipt_for(source: &std::path::Path, credential: CredentialId) -> String {
+        let receipt = asv_integrations::AdoptReceipt::new(
+            asv_integrations::AdoptSelector {
+                file: source.to_string_lossy().into_owned(),
+                audience: "registry.example.test".to_string(),
+                field: asv_integrations::npm::AuthField::AuthToken,
+            },
+            credential,
+            "npm-registry".to_string(),
+            "registry.example.test".to_string(),
+            [
+                asv_integrations::Operation::Read,
+                asv_integrations::Operation::Publish,
+            ]
+            .into_iter()
+            .collect(),
+            source.to_string_lossy().into_owned(),
+            fingerprint_of(source),
+        );
+        serde_json::to_string_pretty(&receipt).expect("the receipt serialises")
+    }
+
+    /// The fingerprint the real policy produces for a real file.
+    ///
+    /// Measured rather than hand-built, because a digest invented here would
+    /// let a change to `FileFingerprint` go unnoticed — and the plan digest an
+    /// approval carries is computed over this one field.
+    fn fingerprint_of(path: &std::path::Path) -> asv_integrations::FileFingerprint {
+        asv_integrations::FingerprintPolicy::strict()
+            .fingerprint(path)
+            .expect("the fixture is a readable regular file")
+    }
+
+    /// A `.npmrc` holding a credential, at the mode npm's own reader accepts.
+    fn npmrc_with(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join(".npmrc");
+        std::fs::write(
+            &path,
+            "registry=https://registry.example.test\n\
+             //registry.example.test/:_authToken=npm_value_that_must_never_be_printed\n\
+             fetch-retries=2\n",
+        )
+        .expect("seed");
+        path
+    }
+
+    /// The adopt receipt this command reads, parsed back.
+    #[test]
+    fn an_adopt_receipt_on_disk_is_parsed_into_the_receipt_the_migration_continues() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let npmrc = npmrc_with(dir.path());
+        let id = CredentialId::new();
+        let adopt = dir.path().join("adopt.json");
+        std::fs::write(&adopt, adopt_receipt_for(&npmrc, id)).expect("write");
+
+        let receipt = read_adopt_receipt(&adopt).expect("the receipt this migration continues");
+        assert_eq!(
+            receipt.credential, id,
+            "the id is what the vault call is made for"
+        );
+        assert_eq!(receipt.audience, "registry.example.test");
+        assert_eq!(receipt.source_file, npmrc.to_string_lossy());
+        let digest = receipt.plan_digest();
+        assert!(
+            digest.starts_with("sha256:") && digest.len() == 71,
+            "the approval carries this string, so its spelling is the contract: {digest}"
+        );
+        assert_eq!(
+            digest,
+            read_adopt_receipt(&adopt)
+                .expect("second read")
+                .plan_digest(),
+            "the digest an approval carries has to be computable from what reaches `apply`, \
+             which is the document on disk and not the struct in memory"
+        );
+    }
+
+    /// A document that is not an adopt receipt is refused, and the refusal says
+    /// which schema it wanted.
+    ///
+    /// The failure this guards is a `--adopt` pointed at a plan or a state file:
+    /// both are JSON, and both parse far enough to produce a plausible-looking
+    /// migration about a file nobody imported anything into.
+    #[test]
+    fn a_document_that_is_not_an_adopt_receipt_is_refused_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, r#"{"schema":"asv.integrations.migration/v1"}"#).expect("write");
+
+        let refusal = read_adopt_receipt(&path).expect_err("a plan is not an import");
+        assert_eq!(refusal.kind, "not_an_adopt_receipt");
+        assert!(
+            refusal.message.contains(asv_integrations::ADOPT_SCHEMA),
+            "the refusal has to name the document it wanted: {}",
+            refusal.message
+        );
+    }
+
+    /// No `--adopt` is refused rather than defaulted.
+    ///
+    /// Everything `prove` records — the credential, the audience, the file the
+    /// value came from — comes out of that document. A `prove` that ran without
+    /// one would have to invent all three, and a migration about an invented
+    /// file is a migration about the wrong file.
+    #[test]
+    fn prove_without_an_adopt_receipt_is_refused_rather_than_inventing_one() {
+        let refusal = resolve_prove_inputs(None, None, Some("/tmp"), None, None, None, None)
+            .expect_err("nothing to continue");
+        assert_eq!(refusal.kind, "no_adopt_receipt");
+        assert!(
+            refusal.message.contains("--adopt") && refusal.message.contains("adopt npm"),
+            "the refusal has to say how to produce one: {}",
+            refusal.message
+        );
+    }
+
+    /// The paths `prove` will act on, resolved from a receipt and nothing else.
+    ///
+    /// This is the row that pins the defaults, because they are the difference
+    /// between a projection that never touches the credential and one that
+    /// overwrites it.
+    #[test]
+    fn the_flags_resolve_to_a_projection_beside_the_original_and_never_on_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let npmrc = npmrc_with(dir.path());
+        let adopt = dir.path().join("adopt.json");
+        std::fs::write(&adopt, adopt_receipt_for(&npmrc, CredentialId::new())).expect("write");
+        let home = dir.path().to_string_lossy().into_owned();
+
+        let inputs = resolve_prove_inputs(
+            Some(&adopt.to_string_lossy()),
+            None,
+            Some(&home),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("a receipt, a home and nothing else is enough");
+
+        assert_eq!(inputs.original, npmrc, "the receipt names the original");
+        assert_eq!(inputs.projection, dir.path().join(DEFAULT_PROJECTION_FILE));
+        assert_ne!(
+            inputs.projection, inputs.original,
+            "the default projection is a file of its own"
+        );
+        assert_eq!(inputs.state, dir.path().join(DEFAULT_STATE_FILE));
+        assert_eq!(
+            inputs.audience, "registry.example.test",
+            "the audience comes from the receipt, not from a flag the operator retypes"
+        );
+        assert_eq!(inputs.label, "npm-registry");
+    }
+
+    /// The projection may not be written over the credential it would replace.
+    ///
+    /// This is the whole of the "separate file" decision, in one row. The
+    /// projection carries a session-scoped surrogate; the original carries the
+    /// registry credential; writing the first where the second is would leave
+    /// an operator with a file that works and an import nobody can undo, before
+    /// a single proof has run.
+    #[test]
+    fn a_projection_path_that_resolves_to_the_original_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let npmrc = npmrc_with(dir.path());
+        let adopt = dir.path().join("adopt.json");
+        std::fs::write(&adopt, adopt_receipt_for(&npmrc, CredentialId::new())).expect("write");
+        let adopt_arg = adopt.to_string_lossy().into_owned();
+
+        for projection in [
+            // The same spelling.
+            npmrc.to_string_lossy().into_owned(),
+            // The same file, reached through `.`.
+            dir.path().join("./.npmrc").to_string_lossy().into_owned(),
+            // The same file, reached through a symlinked home.
+            {
+                let link = dir.path().join("link");
+                std::os::unix::fs::symlink(dir.path(), &link).expect("symlink");
+                link.join(".npmrc").to_string_lossy().into_owned()
+            },
+        ] {
+            let refusal = resolve_prove_inputs(
+                Some(&adopt_arg),
+                None,
+                Some(&dir.path().to_string_lossy()),
+                Some(&projection),
+                None,
+                None,
+                None,
+            )
+            .expect_err("writing the surrogate over the credential is the scrub");
+            assert_eq!(
+                refusal.kind, "projection_over_the_original",
+                "{projection} names the file the credential is in"
+            );
+            assert!(
+                refusal.message.contains("approval"),
+                "the refusal has to say what is being skipped: {}",
+                refusal.message
+            );
+        }
+    }
+
+    /// A state is facts, assembled by hand — never a state machine read back.
+    ///
+    /// No state-machine type in `migration` derives `Deserialize`, on purpose:
+    /// a file that could produce a `PositivelyVerified` would produce an
+    /// `Approved` with it, and `scrub` with that. So the document carries facts
+    /// and the rows below hold that those facts survive a round trip and that
+    /// the proofs in them are what a later `apply` replays.
+    #[test]
+    fn a_migration_state_is_rebuilt_from_facts_and_survives_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let npmrc = npmrc_with(dir.path());
+        let adopt = dir.path().join("adopt.json");
+        let id = CredentialId::new();
+        std::fs::write(&adopt, adopt_receipt_for(&npmrc, id)).expect("write");
+        let receipt = read_adopt_receipt(&adopt).expect("receipt");
+
+        let state = asv_integrations::migration::MigrationState::new(
+            receipt,
+            asv_integrations::migration::StorageFacts {
+                id: id.to_wire(),
+                label: "npm-registry".to_string(),
+                exportability: asv_domain::Exportability::NonExportable,
+            },
+            asv_integrations::migration::Posture::StrongSecretless,
+            "projection at /home/u/.npmrc.asv",
+        )
+        .record_positive("npm whoami against the projection exited 0")
+        .expect("a non-empty positive proof is recorded")
+        .record_negative(
+            "contrastive probe over one operation against one relay: the projection exited 0 while \
+             the copy of the original exited 1",
+        )
+        .expect("a non-empty negative proof is recorded");
+
+        let path = dir.path().join(DEFAULT_STATE_FILE);
+        write_migration_state(&path, &state).expect("write the state");
+
+        let replayed = read_migration_state(&path).expect("read the state back");
+        assert_eq!(replayed, state);
+        assert!(replayed.is_complete());
+        assert_eq!(replayed.plan_digest(), state.plan_digest());
+        assert_eq!(
+            replayed.storage.id,
+            id.to_wire(),
+            "`apply` replays the storage proof through `CredentialId::from_wire`, so the wire \
+             spelling has to be the one this build accepts"
+        );
+    }
+
+    /// A state without both proofs cannot open a scrub, whatever else it says.
+    ///
+    /// The refusal comes from `Adoption::resume`, which is the point: `apply`
+    /// does not get to decide that one proof is enough, because the same
+    /// constructors a live run goes through are the ones that read the file.
+    #[test]
+    fn a_state_without_both_proofs_is_refused_by_the_resume_that_would_replay_it() {
+        use asv_integrations::migration::{Adoption, MigrationState, Posture, StorageFacts};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let npmrc = npmrc_with(dir.path());
+        let adopt = dir.path().join("adopt.json");
+        let id = CredentialId::new();
+        std::fs::write(&adopt, adopt_receipt_for(&npmrc, id)).expect("write");
+        let receipt = read_adopt_receipt(&adopt).expect("receipt");
+        let digest = receipt.plan_digest();
+
+        let fresh = |positive: Option<&str>, negative: Option<&str>| {
+            let state = MigrationState::new(
+                receipt.clone(),
+                StorageFacts {
+                    id: id.to_wire(),
+                    label: "npm-registry".to_string(),
+                    exportability: asv_domain::Exportability::NonExportable,
+                },
+                Posture::StrongSecretless,
+                "projection at /home/u/.npmrc.asv",
+            );
+            let state = match positive {
+                Some(report) => state.record_positive(report).expect("recorded"),
+                None => state,
+            };
+            match negative {
+                Some(report) => state.record_negative(report).expect("recorded"),
+                None => state,
+            }
+        };
+
+        for (name, state) in [
+            ("no positive proof", fresh(None, Some("the copy exited 1"))),
+            ("no negative proof", fresh(Some("npm exited 0"), None)),
+            ("neither proof", fresh(None, None)),
+        ] {
+            let error = Adoption::resume(&state, "an-operator", &digest)
+                .expect_err("a state without both proofs has no scrub");
+            assert!(
+                matches!(
+                    error,
+                    asv_integrations::migration::ProofError::MalformedState { .. }
+                ),
+                "{name}: a missing proof is a state that cannot be replayed, not a failed \
+                 verification: {error}"
+            );
+            assert!(
+                error.to_string().contains("prove"),
+                "{name}: the refusal has to say which command produces the missing proof: {error}"
+            );
+            assert!(
+                !state.is_complete(),
+                "{name}: a state missing either proof must not report itself complete"
+            );
+        }
+    }
+
+    /// An approval over a different plan opens nothing.
+    ///
+    /// The digest is what makes an approval an approval *of this migration*:
+    /// this file, this credential, this audience. One that does not match is
+    /// refused with both digests named, because the operator's next question is
+    /// always "which one was it, then".
+    #[test]
+    fn an_approval_over_another_plan_is_refused_with_both_digests_named() {
+        use asv_integrations::migration::{
+            Adoption, MigrationState, Posture, ProofError, StorageFacts,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let npmrc = npmrc_with(dir.path());
+        let adopt = dir.path().join("adopt.json");
+        let id = CredentialId::new();
+        std::fs::write(&adopt, adopt_receipt_for(&npmrc, id)).expect("write");
+        let receipt = read_adopt_receipt(&adopt).expect("receipt");
+
+        let state = MigrationState::new(
+            receipt.clone(),
+            StorageFacts {
+                id: id.to_wire(),
+                label: "npm-registry".to_string(),
+                exportability: asv_domain::Exportability::NonExportable,
+            },
+            Posture::StrongSecretless,
+            "projection at /home/u/.npmrc.asv",
+        )
+        .record_positive("npm whoami against the projection exited 0")
+        .expect("recorded")
+        .record_negative("the same npm against the scrubbed copy exited 1")
+        .expect("recorded");
+
+        let wrong = format!("sha256:{}", "a".repeat(64));
+        let error = Adoption::resume(&state, "an-operator", &wrong)
+            .expect_err("an approval over another plan opens nothing");
+        assert!(matches!(error, ProofError::ApprovalDigestMismatch { .. }));
+        assert!(
+            matches!(proof_error_kind(&error), "approval_digest_mismatch"),
+            "a consumer branches on the kind, not on the prose"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&wrong) && message.contains(&receipt.plan_digest()),
+            "both digests have to be named or the operator cannot tell which plan they approved: \
+             {message}"
+        );
+    }
+
+    /// `apply` may only be pointed at the file the receipt names.
+    ///
+    /// The approval is a digest over that path, so a `--file` naming another
+    /// configuration would have an operator approving the destruction of a file
+    /// no proof was ever gathered about.
+    #[test]
+    fn a_file_that_is_not_the_one_the_receipt_names_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let npmrc = npmrc_with(dir.path());
+        let adopt = dir.path().join("adopt.json");
+        std::fs::write(&adopt, adopt_receipt_for(&npmrc, CredentialId::new())).expect("write");
+        let receipt = read_adopt_receipt(&adopt).expect("receipt");
+        let elsewhere = dir.path().join("other.npmrc");
+        std::fs::write(&elsewhere, "registry=https://registry.example.test\n").expect("seed");
+
+        assert_eq!(
+            original_path(None, &receipt).expect("the receipt names it"),
+            npmrc
+        );
+        assert_eq!(
+            original_path(Some(&npmrc.to_string_lossy()), &receipt).expect("the same file"),
+            npmrc
+        );
+        let refusal = original_path(Some(&elsewhere.to_string_lossy()), &receipt)
+            .expect_err("a different file is a different migration");
+        assert_eq!(refusal.kind, "file_mismatch");
+        assert!(
+            refusal.message.contains(npmrc.to_string_lossy().as_ref()),
+            "the refusal names the file the approval actually covers: {}",
+            refusal.message
+        );
+    }
+
+    /// An audience or a label that disagrees with the receipt is refused.
+    #[test]
+    fn an_audience_or_label_that_disagrees_with_the_receipt_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let npmrc = npmrc_with(dir.path());
+        let adopt = dir.path().join("adopt.json");
+        std::fs::write(&adopt, adopt_receipt_for(&npmrc, CredentialId::new())).expect("write");
+        let adopt_arg = adopt.to_string_lossy().into_owned();
+        let home = dir.path().to_string_lossy().into_owned();
+
+        let refusal = resolve_prove_inputs(
+            Some(&adopt_arg),
+            None,
+            Some(&home),
+            None,
+            Some("registry.npmjs.org"),
+            None,
+            None,
+        )
+        .expect_err("another registry is another migration");
+        assert_eq!(refusal.kind, "audience_mismatch");
+
+        let refusal = resolve_prove_inputs(
+            Some(&adopt_arg),
+            None,
+            Some(&home),
+            None,
+            None,
+            Some("some-other-credential"),
+            None,
+        )
+        .expect_err("another label names another surrogate");
+        assert_eq!(refusal.kind, "label_mismatch");
+
+        // Confirming what the receipt says is allowed, because a script that
+        // passes the same value twice should not be refused for it.
+        resolve_prove_inputs(
+            Some(&adopt_arg),
+            None,
+            Some(&home),
+            None,
+            Some("registry.example.test"),
+            Some("npm-registry"),
+            None,
+        )
+        .expect("the same values, restated");
+    }
+
+    /// The text of an npm run is trimmed, cut and redacted before anything
+    /// durable sees it.
+    ///
+    /// Three properties in one row because they are one property: **a receipt
+    /// is not a log, and it is not a place a bearer belongs.** The surrogate in
+    /// the projection is a credential in every sense that matters — it is what
+    /// the client presents — so an npm that echoed its configuration back would
+    /// otherwise put a session credential into a file that outlives the session.
+    #[test]
+    fn npm_output_is_redacted_truncated_and_reduced_to_a_line() {
+        let surrogate = "sur-abc123";
+        let echoed =
+            format!("npm error reading config: //registry.example.test/:_authToken={surrogate}");
+        let excerpt = npm_excerpt(&echoed, surrogate);
+        assert!(
+            !excerpt.contains(surrogate),
+            "the surrogate is a bearer; a receipt that carries it outlives the session that \
+             could use it: {excerpt}"
+        );
+        assert!(excerpt.contains("<surrogate redacted>"), "{excerpt}");
+
+        assert_eq!(npm_excerpt("", surrogate), "");
+        assert_eq!(npm_excerpt("\n  \n", surrogate), "");
+        assert_eq!(
+            npm_excerpt("\n\nnpm error code E401\nmore detail\n", surrogate),
+            "npm error code E401",
+            "the first line names the failure; the rest is npm's own log"
+        );
+        let long = "x".repeat(NPM_EXCERPT_CHARS + 50);
+        let cut = npm_excerpt(&long, surrogate);
+        assert!(
+            cut.chars().count() <= NPM_EXCERPT_CHARS + 1,
+            "a receipt is not a log: {} characters",
+            cut.chars().count()
+        );
+    }
+
+    /// The reports a proof carries never quote what was proved.
+    #[test]
+    fn the_reports_name_the_exit_status_and_nothing_else() {
+        let failed = NpmOutcome {
+            code: Some(1),
+            stdout: String::new(),
+            stderr: "npm error code E401".to_string(),
+        };
+        assert_eq!(exit_spelling(&failed), "1 (failure)");
+        assert!(describe_outcome(&failed).contains("E401"));
+
+        let killed = NpmOutcome {
+            code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        assert!(
+            !killed.succeeded(),
+            "a process killed by a signal did not work, and `None` is not a pass"
+        );
+        assert!(exit_spelling(&killed).contains("signal"));
+
+        let report = positive_report(
+            &NpmOutcome {
+                code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            std::path::Path::new("/home/u/.npmrc.asv"),
+        );
+        assert!(
+            !report.trim().is_empty(),
+            "`project_and_verify` refuses an empty report, and a refusal there would describe \
+             nothing about npm"
+        );
+        assert!(report.contains("/home/u/.npmrc.asv"), "{report}");
+    }
 }
 
 /// R3's `adopt`: move one selector's value into the vault.
@@ -4414,6 +5066,1259 @@ fn run_integrations_project(
         );
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration: the rest of doc 04 §10
+// ---------------------------------------------------------------------------
+
+/// The default file the projection is written to, when `--projection` is not
+/// given.
+///
+/// A name of its own rather than `.npmrc`, because a projection that replaced
+/// `.npmrc` would be the scrub — see [`refuse_projection_over_the_original`].
+const DEFAULT_PROJECTION_FILE: &str = ".npmrc.asv";
+/// The default migration state, when `--state` is not given. Beside the
+/// configuration it is about, so an operator looking for it is already in the
+/// right place.
+const DEFAULT_STATE_FILE: &str = ".asv-npm-migration.json";
+/// How much of an npm run a receipt is willing to carry. Long enough to name
+/// the failure; short enough that a receipt is not a log.
+const NPM_EXCERPT_CHARS: usize = 300;
+
+/// A refusal, with the word a consumer branches on beside the sentence an
+/// operator acts on.
+///
+/// The same shape `adopt` and `project` use: a stable kind for the JSON path
+/// and prose that says what happened and what to do next.
+#[derive(Debug)]
+struct MigrateRefusal {
+    kind: &'static str,
+    message: String,
+}
+
+impl MigrateRefusal {
+    fn new(kind: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+/// What `prove` needs from its flags and from one JSON document, resolved
+/// before a socket is opened, a file is written or a process is run.
+///
+/// Split out so every refusal below is reachable without a broker, without npm
+/// and without a network. These are the checks that decide **which files** this
+/// migration is about, and a migration about the wrong file is one that scrubs
+/// the wrong file.
+#[derive(Debug)]
+struct ProveInputs {
+    receipt: asv_integrations::AdoptReceipt,
+    /// The configuration still holding the credential. **Never written by
+    /// `prove`.**
+    original: PathBuf,
+    /// Where the surrogate configuration goes.
+    projection: PathBuf,
+    /// Where the facts a later `apply` replays are persisted.
+    state: PathBuf,
+    audience: String,
+    label: String,
+}
+
+/// What one `npm` invocation reported.
+///
+/// Kept as code and captured text rather than a pass/fail boolean, because the
+/// whole point of the report is that a reader can see what the tool said.
+struct NpmOutcome {
+    code: Option<i32>,
+    /// Already redacted: see [`npm_excerpt`].
+    stdout: String,
+    /// Already redacted: see [`npm_excerpt`].
+    stderr: String,
+}
+
+impl NpmOutcome {
+    fn succeeded(&self) -> bool {
+        self.code == Some(0)
+    }
+}
+
+fn run_integrations_migrate(
+    socket: &std::path::Path,
+    family: &str,
+    command: &MigrateCommand,
+) -> std::io::Result<()> {
+    match command {
+        MigrateCommand::Prove {
+            adopt,
+            file,
+            home,
+            projection,
+            audience,
+            label,
+            state,
+            json,
+        } => run_integrations_migrate_prove(
+            socket,
+            family,
+            adopt.as_deref(),
+            file.as_deref(),
+            home.as_deref(),
+            projection.as_deref(),
+            audience.as_deref(),
+            label.as_deref(),
+            state.as_deref(),
+            *json,
+        ),
+        MigrateCommand::Apply {
+            state,
+            actor,
+            approve,
+            file,
+            home,
+            json,
+        } => run_integrations_migrate_apply(
+            family,
+            state.as_deref(),
+            actor,
+            approve,
+            file.as_deref(),
+            home.as_deref(),
+            *json,
+        ),
+    }
+}
+
+/// §10's first half: measure the new path, measure that the old one is gone,
+/// and persist what was measured.
+///
+/// ## What it does, in the order §10 puts it
+///
+/// 1. asks the broker, **over the socket**, whether it still holds the adopted
+///    credential (`VerifyStorage` — the only source of a storage fact this
+///    command will accept);
+/// 2. writes the projection to a file of its own, and refuses to write it over
+///    the original;
+/// 3. runs the real `npm` against that file and requires it to work;
+/// 4. copies the original, scrubs the credential out of **the copy** with
+///    `NpmScrub`, runs the same `npm` against the copy and requires it to fail;
+/// 5. writes the facts to `--state`, from which `apply` replays the same gates.
+///
+/// ## What the original is for
+///
+/// Nothing. The `.npmrc` with the credential in it is read (to copy it) and
+/// never written. The projection is refused a path that resolves to that same
+/// file, because overwriting it *is* the scrub, and a scrub here would happen
+/// with no positive proof, no negative one and no human.
+///
+/// ## Which relay npm is pointed at, and what that does not prove
+///
+/// npm is pointed at **this session's** relay — the `HTTPS_PROXY` `asv run`
+/// exports — and not at the `https-proxy` line the projection carries. The
+/// reason is ADR-0019: the broker's CONNECT listener refuses a tunnel whose
+/// client proved nothing, and the only party that can produce that proof is the
+/// session's shim. So the probe measures what it can measure honestly — *the
+/// surrogate in this file authenticates npm through the broker, and the broker
+/// substitutes* — and says in the persisted state that the projection's own
+/// routing line was not exercised. A reader must not take the positive proof
+/// for a statement about that line.
+///
+/// The argument list is the flag set, one parameter each, which is what stops
+/// two callers from remembering two different orders. `run_integrations_execute`
+/// above takes the same allowance for the same reason.
+#[allow(clippy::too_many_arguments)]
+fn run_integrations_migrate_prove(
+    socket: &std::path::Path,
+    family: &str,
+    adopt: Option<&str>,
+    file: Option<&str>,
+    home: Option<&str>,
+    projection: Option<&str>,
+    audience: Option<&str>,
+    label: Option<&str>,
+    state: Option<&str>,
+    json: bool,
+) -> std::io::Result<()> {
+    use asv_integrations::migration::{MigrationState, Posture, StorageFacts};
+    use asv_integrations::{NpmProjection, RegistryAudience};
+
+    refuse_unknown_family(family);
+
+    let fail = |kind: &str, message: String| -> ! {
+        if json {
+            let failure = serde_json::json!({
+                "schema": asv_integrations::migration::MIGRATION_SCHEMA,
+                "family": family,
+                "kind": kind,
+                "error": message,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&failure).unwrap_or_default()
+            );
+        } else {
+            eprintln!("asv: {message}");
+        }
+        std::process::exit(1)
+    };
+
+    let inputs = match resolve_prove_inputs(adopt, file, home, projection, audience, label, state) {
+        Ok(inputs) => inputs,
+        Err(refusal) => fail(refusal.kind, refusal.message),
+    };
+
+    let audience_value = match RegistryAudience::parse(&inputs.audience) {
+        Ok(value) => value,
+        Err(error) => fail("unusable_audience", format!("{error}")),
+    };
+
+    // Same three refusals `project` makes, for the same reasons: a surrogate
+    // minted here could never be redeemed, a surrogate for another credential
+    // would authenticate as the wrong identity, and a projection naming a port
+    // nothing listens on fails at the first request.
+    let session = match std::env::var("ASV_SESSION_ID") {
+        Ok(session) if !session.is_empty() => session,
+        _ => fail(
+            "no_session",
+            "ASV_SESSION_ID is not set, so this is not running inside `asv run`. A surrogate is \
+             redeemed in the session that minted it, and one minted here could never be \
+             redeemed by anything — writing it would produce a configuration that looks \
+             finished and authenticates nothing. Run this inside `asv run`."
+                .to_string(),
+        ),
+    };
+    let _ = session;
+
+    let variable = format!("ASV_SURROGATE_{}", env_name_for_label(&inputs.label));
+    let surrogate = match std::env::var(&variable) {
+        Ok(surrogate) if !surrogate.is_empty() => surrogate,
+        _ => fail(
+            "no_surrogate",
+            format!(
+                "{variable} is not set. `asv run` mints one surrogate per credential and names it \
+                 after the credential's label; a surrogate for a different credential would \
+                 authenticate as the wrong identity rather than as none. Check the label with \
+                 `asv vault list`."
+            ),
+        ),
+    };
+
+    // The relay npm will be exercised through. Validated with the same function
+    // that validates a projection's endpoint rather than by restating its rule
+    // here: the requirement is http-or-https on loopback, and an inherited
+    // `HTTPS_PROXY` pointing off this machine would carry the surrogate's bearer
+    // and the request to somebody else.
+    let relay = match std::env::var("HTTPS_PROXY")
+        .ok()
+        .filter(|proxy| !proxy.trim().is_empty())
+        .or_else(|| {
+            std::env::var("https_proxy")
+                .ok()
+                .filter(|p| !p.trim().is_empty())
+        }) {
+        Some(relay) => relay,
+        None => fail(
+            "no_relay",
+            "neither HTTPS_PROXY nor https_proxy is set, so there is no relay to exercise npm \
+             through. `asv run` publishes this session's relay under those names; run this \
+             inside `asv run`. It is not pointed at the broker's CONNECT listener directly, \
+             because that listener refuses a tunnel whose client presented no session proof."
+                .to_string(),
+        ),
+    };
+    if let Err(error) = NpmProjection::new(&audience_value, &relay, &surrogate) {
+        fail("unusable_relay", format!("{error}"));
+    }
+
+    // §10 step 1, before anything is written: the broker still holds what was
+    // imported. A proof gathered against a vault that has since lost the
+    // credential is not a proof about this migration, and this is the cheapest
+    // moment to find out.
+    let storage = match verify_storage_over_ipc(socket, &inputs.receipt.credential) {
+        Ok(storage) => storage,
+        Err(message) => fail("storage_unproven", message),
+    };
+
+    let npm = match npm_binary() {
+        Ok(npm) => npm,
+        Err(refusal) => fail(refusal.kind, refusal.message),
+    };
+
+    let facts = crate::ipc::fetch_broker_facts(socket);
+    let connect = facts
+        .as_ref()
+        .and_then(|facts| facts.connect_listen.clone())
+        .unwrap_or_else(|| {
+            fail(
+                "no_relay_address",
+                "this broker publishes no CONNECT address, so the projection would name a port \
+                 nothing is listening on. It was started without `--connect-listen`."
+                    .to_string(),
+            )
+        });
+    let endpoint = format!("http://{connect}");
+
+    let projection = match NpmProjection::new(&audience_value, &endpoint, &surrogate) {
+        Ok(projection) => projection,
+        Err(error) => fail("unusable_endpoint", error.to_string()),
+    };
+    if let Err(error) = asv_integrations::project::write(&inputs.projection, &projection) {
+        fail(
+            match error {
+                asv_integrations::ProjectionError::AlreadyCarriesCredential { .. } => {
+                    "already_carries_credential"
+                }
+                _ => "not_written",
+            },
+            error.to_string(),
+        );
+    }
+
+    // npm's cache is pointed at a directory of its own, next to the projection.
+    // A shared cache would answer the negative probe out of whatever the
+    // positive one fetched, and a probe that cannot fail proves nothing.
+    let scratch = match inputs
+        .projection
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        Some(parent) => parent.to_path_buf(),
+        None => PathBuf::from("."),
+    };
+    let cache = scratch.join(format!(".asv-npm-cache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cache);
+
+    let positive = match exercise_npm(
+        &npm,
+        &inputs.projection,
+        projection.registry(),
+        &relay,
+        &cache,
+        &surrogate,
+    ) {
+        Ok(outcome) if outcome.succeeded() => outcome,
+        Ok(outcome) => {
+            let _ = std::fs::remove_dir_all(&cache);
+            fail(
+                "new_path_not_working",
+                format!(
+                    "npm ran against the projection and failed, so the original is still the only \
+                     working path and nothing may be removed from it.\n{}",
+                    describe_outcome(&outcome)
+                ),
+            );
+        }
+        Err(message) => {
+            let _ = std::fs::remove_dir_all(&cache);
+            fail("npm_not_runnable", message);
+        }
+    };
+
+    let (negative, copy) = match negative_probe(
+        &npm,
+        &inputs.original,
+        &inputs.projection,
+        &positive,
+        projection.registry(),
+        &relay,
+        &cache,
+        &surrogate,
+    ) {
+        Ok(probe) => probe,
+        Err(refusal) => {
+            let _ = std::fs::remove_dir_all(&cache);
+            fail(refusal.kind, refusal.message);
+        }
+    };
+    let _ = std::fs::remove_file(&copy);
+    let _ = std::fs::remove_dir_all(&cache);
+
+    // What was projected, and — deliberately — the relay the probe went through
+    // rather than the one the file names. A state that recorded only the file's
+    // own routing would let a reader take the positive proof for a statement
+    // about it.
+    let detail = format!(
+        "projection at {}: registry {}, scoped surrogate, https-proxy {} as rendered by \
+         `asv integrations project npm`; exercised through this session's relay {relay}",
+        inputs.projection.display(),
+        projection.registry(),
+        projection.proxy(),
+    );
+
+    let facts = StorageFacts {
+        id: storage.id,
+        label: storage.label,
+        exportability: storage.exportability,
+    };
+    let state_document =
+        match MigrationState::new(inputs.receipt, facts, Posture::StrongSecretless, detail)
+            .record_positive(positive_report(&positive, &inputs.projection))
+            .and_then(|state| state.record_negative(negative))
+        {
+            Ok(state) => state,
+            Err(error) => fail("empty_proof", error.to_string()),
+        };
+
+    if let Err(message) = write_migration_state(&inputs.state, &state_document) {
+        fail("state_not_written", message);
+    }
+    let plan_digest = state_document.plan_digest();
+
+    if json {
+        let envelope = serde_json::json!({
+            "schema": asv_integrations::migration::MIGRATION_SCHEMA,
+            "family": family,
+            "state_path": inputs.state.to_string_lossy(),
+            "projection": inputs.projection.to_string_lossy(),
+            "original": inputs.original.to_string_lossy(),
+            "relay_exercised": relay,
+            "plan_digest": plan_digest,
+            "state": state_document,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&envelope).unwrap_or_default()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "proved the new path for {}; the original has not been touched",
+        inputs.audience
+    );
+    println!("  projection   {}", inputs.projection.display());
+    println!(
+        "  original     {} (read, never written)",
+        inputs.original.display()
+    );
+    println!("  relay        {relay}  (this session's, exercised)");
+    println!("  state        {}\n", inputs.state.display());
+    println!("npm worked through the projection and failed through a copy of the original");
+    println!("with its credential fields removed. That contrast is the proof; the two runs");
+    println!("differed in one file and nowhere else.");
+    println!();
+    println!("Nothing has been removed. To finish:");
+    println!("  asv integrations migrate npm apply --actor <who> --approve {plan_digest}");
+    Ok(())
+}
+
+/// §10's second half: replay the facts, ask a human, and only then remove the
+/// original.
+///
+/// The order is the whole of it. [`asv_integrations::migration::Adoption::resume`]
+/// runs the four gates in sequence — storage, new path, old path, approval —
+/// and the value it returns has one remaining method, which this command then
+/// composes with an actual scrub of an actual file. A refusal anywhere above
+/// leaves the original exactly as it was.
+fn run_integrations_migrate_apply(
+    family: &str,
+    state: Option<&str>,
+    actor: &str,
+    approve: &str,
+    file: Option<&str>,
+    home: Option<&str>,
+    json: bool,
+) -> std::io::Result<()> {
+    use asv_integrations::migration::Adoption;
+    use asv_integrations::scrub::ScrubSource as _;
+
+    refuse_unknown_family(family);
+
+    let fail = |kind: &str, message: String| -> ! {
+        if json {
+            let failure = serde_json::json!({
+                "schema": asv_integrations::migration::MIGRATION_SCHEMA,
+                "family": family,
+                "kind": kind,
+                "error": message,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&failure).unwrap_or_default()
+            );
+        } else {
+            eprintln!("asv: {message}");
+        }
+        std::process::exit(1)
+    };
+
+    let home = match home {
+        Some(home) => PathBuf::from(home),
+        None => match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home),
+            None => fail(
+                "no_home",
+                "HOME is not set, so the migration state cannot be located; pass --state or \
+                 --home"
+                    .to_string(),
+            ),
+        },
+    };
+    let state_path = match state {
+        Some(state) => PathBuf::from(state),
+        None => home.join(DEFAULT_STATE_FILE),
+    };
+    let state_document = match read_migration_state(&state_path) {
+        Ok(state) => state,
+        Err(refusal) => fail(refusal.kind, refusal.message),
+    };
+
+    // The file is named by the state, and `--file` may only confirm it. The
+    // approval about to be checked is a digest over exactly that receipt, so a
+    // scrub of any other file would destroy something nobody approved.
+    let original = match original_path(file, &state_document.receipt) {
+        Ok(original) => original,
+        Err(refusal) => fail(refusal.kind, refusal.message),
+    };
+
+    if approve.trim().is_empty() {
+        fail(
+            "no_approval",
+            "--approve names no plan. An approval has to be of *something*: pass the digest \
+             `prove` printed, which covers the file, the credential, the audience and the \
+             binding this migration adopted."
+                .to_string(),
+        );
+    }
+    if actor.trim().is_empty() {
+        fail(
+            "no_actor",
+            "--actor names nobody, so nobody approved anything. Pass who is accountable for \
+             removing the original."
+                .to_string(),
+        );
+    }
+
+    let scrubbed = match Adoption::resume(&state_document, actor.trim(), approve.trim()) {
+        Ok(scrubbed) => scrubbed,
+        Err(error) => fail(proof_error_kind(&error), error.to_string()),
+    };
+
+    // **This is the line the original stops being a credential.** Everything
+    // above it is reversible.
+    let report = match asv_integrations::NpmScrub.scrub(&original) {
+        Ok(report) => report,
+        Err(error) => {
+            let kind = match error {
+                asv_integrations::ScrubError::SymlinkedConfiguration { .. } => "symlinked",
+                asv_integrations::ScrubError::NothingToScrub { .. } => "nothing_to_scrub",
+                asv_integrations::ScrubError::Io(_) => "not_scrubbed",
+            };
+            fail(kind, error.to_string())
+        }
+    };
+
+    // The rescan is a read of the file that was just written, not a restatement
+    // of what the scrub said it did.
+    let after = match std::fs::read_to_string(&original) {
+        Ok(after) => after,
+        Err(error) => fail(
+            "rescan_failed",
+            format!(
+                "the scrub reported success but {} could not be read back, so there is no rescan \
+                 and no receipt: {error}",
+                original.display()
+            ),
+        ),
+    };
+    let remaining = asv_integrations::credential_fields(&after);
+    if !remaining.is_empty() {
+        fail(
+            "rescan_found_credential_fields",
+            format!(
+                "{} was scrubbed and still sets {}. A migration that reports the original clean \
+                 while a credential field is still in it is the worst outcome this command could \
+                 produce, so it stops here rather than writing a receipt.",
+                original.display(),
+                remaining.join(", ")
+            ),
+        );
+    }
+    let rescan = format!(
+        "{} carries no credential field after the scrub: {} removed, {} of {} lines left, and a \
+         re-read of the file finds none of npm's auth fields in it",
+        original.display(),
+        if report.removed.is_empty() {
+            "nothing".to_string()
+        } else {
+            report.removed.join(", ")
+        },
+        report.lines_after,
+        report.lines_before,
+    );
+
+    let receipt = scrubbed.rescan(rescan.clone()).complete().into_receipt();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&receipt).expect("the receipt serialises")
+        );
+        return Ok(());
+    }
+
+    println!("migration completed for {}", receipt.audience);
+    println!("  credential   {}", receipt.credential);
+    println!(
+        "  scrubbed     {} — removed {}",
+        receipt.source_file,
+        if report.removed.is_empty() {
+            "nothing".to_string()
+        } else {
+            report.removed.join(", ")
+        }
+    );
+    println!("  rescan       {rescan}");
+    println!(
+        "  approved by  {} over {}",
+        receipt.approved_by, receipt.plan_digest
+    );
+    println!(
+        "  steps        {}",
+        receipt.steps.into_iter().collect::<Vec<_>>().join(", ")
+    );
+    Ok(())
+}
+
+/// Refuses a family this build has no migration for.
+///
+/// The same sentence `project` uses and the same exit status, deliberately: an
+/// operator who mistypes the family should not have to learn two messages for
+/// one mistake.
+fn refuse_unknown_family(family: &str) {
+    if family != "npm" {
+        eprintln!(
+            "asv: no projection for {family:?}; this build knows `npm`. Adding one is a module \
+             in asv-integrations and one match arm here."
+        );
+        std::process::exit(1);
+    }
+}
+
+/// A stable machine word per [`asv_integrations::migration::ProofError`], so a
+/// consumer can branch on the reason without parsing prose.
+fn proof_error_kind(error: &asv_integrations::migration::ProofError) -> &'static str {
+    use asv_integrations::migration::ProofError;
+    match error {
+        ProofError::WrongCredential { .. } => "wrong_credential",
+        ProofError::NewPathNotWorking { .. } => "new_path_not_working",
+        ProofError::BypassStillWorks { .. } => "bypass_still_works",
+        ProofError::MalformedState { .. } => "malformed_state",
+        ProofError::ApprovalDigestMismatch { .. } => "approval_digest_mismatch",
+        ProofError::NoActor => "no_actor",
+    }
+}
+
+/// Resolves `prove`'s flags and its adopt receipt into a set of paths, or
+/// refuses with the reason.
+///
+/// Every refusal here happens before a socket is opened or a byte is written,
+/// and each one names the file it is about: this function decides which files a
+/// migration is talking about, and the destructive half of the migration acts
+/// on the answer.
+fn resolve_prove_inputs(
+    adopt: Option<&str>,
+    file: Option<&str>,
+    home: Option<&str>,
+    projection: Option<&str>,
+    audience: Option<&str>,
+    label: Option<&str>,
+    state: Option<&str>,
+) -> Result<ProveInputs, MigrateRefusal> {
+    let Some(adopt_path) = adopt else {
+        return Err(MigrateRefusal::new(
+            "no_adopt_receipt",
+            "no --adopt names the import this migration continues, and every fact below comes \
+             from that document: the credential, the audience, the file the value came from. Run \
+             `asv integrations adopt npm --json` and pass its output; adopting again would put a \
+             second credential in the vault and prove nothing about the first.",
+        ));
+    };
+    let receipt = read_adopt_receipt(std::path::Path::new(adopt_path))?;
+
+    let home =
+        match home {
+            Some(home) => PathBuf::from(home),
+            None => match std::env::var_os("HOME") {
+                Some(home) => PathBuf::from(home),
+                None => return Err(MigrateRefusal::new(
+                    "no_home",
+                    "HOME is not set, so neither the projection nor the migration state can be \
+                     located; pass --home, --projection and --state",
+                )),
+            },
+        };
+
+    let original = original_path(file, &receipt)?;
+    let projection = match projection {
+        Some(projection) => PathBuf::from(projection),
+        None => home.join(DEFAULT_PROJECTION_FILE),
+    };
+    refuse_projection_over_the_original(&original, &projection)?;
+
+    let state = match state {
+        Some(state) => PathBuf::from(state),
+        None => home.join(DEFAULT_STATE_FILE),
+    };
+
+    // The audience and the label are not this command's to choose. A digest of
+    // the plan is what an approval carries, and it is computed over the
+    // audience the credential was imported under, so a projection built for
+    // another registry would be proved under a plan nobody approved.
+    let audience = confirm_or_default(
+        audience,
+        &receipt.audience,
+        "audience",
+        "the audience the credential was imported under",
+    )?;
+    let label = confirm_or_default(
+        label,
+        &receipt.label,
+        "label",
+        "the label the credential is stored under",
+    )?;
+
+    Ok(ProveInputs {
+        receipt,
+        original,
+        projection,
+        state,
+        audience,
+        label,
+    })
+}
+
+/// A flag that may only confirm what the receipt says.
+fn confirm_or_default(
+    given: Option<&str>,
+    expected: &str,
+    flag: &str,
+    what: &str,
+) -> Result<String, MigrateRefusal> {
+    match given {
+        Some(given) if given != expected => Err(MigrateRefusal::new(
+            if flag == "audience" {
+                "audience_mismatch"
+            } else {
+                "label_mismatch"
+            },
+            format!(
+                "the adopt receipt says {what} is {expected:?}, and --{flag} says {given:?}. \
+                 Those are different migrations: the approval an `apply` carries is a digest over \
+                 the receipt, so a proof gathered for another one opens no scrub. Drop --{flag} or \
+                 pass what the receipt says."
+            ),
+        )),
+        _ => Ok(expected.to_string()),
+    }
+}
+
+/// The configuration that still holds the credential.
+///
+/// The receipt names it, and `--file` may only confirm that: the plan digest an
+/// approval carries is computed over this path, so approving one file and
+/// scrubbing another is approving nothing.
+fn original_path(
+    file: Option<&str>,
+    receipt: &asv_integrations::AdoptReceipt,
+) -> Result<PathBuf, MigrateRefusal> {
+    let named = receipt.source_file.trim();
+    if named.is_empty() {
+        return Err(MigrateRefusal::new(
+            "no_source_file",
+            "the adopt receipt names no source file, so there is nothing this migration could \
+             scrub later. Re-adopt from a file whose path the receipt carries.",
+        ));
+    }
+    match file {
+        None => Ok(PathBuf::from(named)),
+        Some(file) => {
+            let given = PathBuf::from(file);
+            if same_file(&given, std::path::Path::new(named)) {
+                Ok(PathBuf::from(named))
+            } else {
+                Err(MigrateRefusal::new(
+                    "file_mismatch",
+                    format!(
+                        "the receipt names {named:?} as the file the credential was imported \
+                         from, and --file names {}. Proving one file and scrubbing another is \
+                         not a migration, and the approval is a digest over {named:?}. Drop \
+                         --file or pass the file the receipt names.",
+                        given.display()
+                    ),
+                ))
+            }
+        }
+    }
+}
+
+/// The one check that keeps `prove` from being `apply`.
+///
+/// Writing the projection over the original would replace a registry credential
+/// with a session-scoped surrogate and leave the operator with a file that
+/// works and an import that cannot be undone — before a single proof has run and
+/// before anybody has approved anything. `project::write` would refuse it too,
+/// because the file carries a credential it did not write; this refusal is here
+/// so the refusal is about *this* decision rather than a side effect of it, and
+/// so it survives a change in what `write` guards.
+fn refuse_projection_over_the_original(
+    original: &std::path::Path,
+    projection: &std::path::Path,
+) -> Result<(), MigrateRefusal> {
+    if !same_file(projection, original) {
+        return Ok(());
+    }
+    Err(MigrateRefusal::new(
+        "projection_over_the_original",
+        format!(
+            "the projection would be written to {}, which is the file the credential still lives \
+             in. Writing the surrogate over the original is the scrub — the irreversible half — \
+             and it would happen here with no positive proof, no negative one and no human \
+             approval. Point --projection at a file of its own; {} is the default.",
+            original.display(),
+            DEFAULT_PROJECTION_FILE
+        ),
+    ))
+}
+
+/// Whether two paths name the same file.
+///
+/// `canonicalize` alone cannot answer this for a file that does not exist yet —
+/// and the projection usually does not. So the parent is canonicalized (which
+/// resolves symlinks and `..`) and the leaf is carried across. A raw string
+/// comparison would pass for `/home/u/.npmrc` and `/home/u/./.npmrc`, and would
+/// refuse for `/home/u/.npmrc` reached through a symlinked home.
+fn same_file(left: &std::path::Path, right: &std::path::Path) -> bool {
+    let resolve = |path: &std::path::Path| -> PathBuf {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let name = path.file_name().map(PathBuf::from).unwrap_or_default();
+        parent
+            .canonicalize()
+            .map(|directory| directory.join(name))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    resolve(left) == resolve(right)
+}
+
+/// Reads an adopt receipt, or refuses saying which document it wanted.
+fn read_adopt_receipt(
+    path: &std::path::Path,
+) -> Result<asv_integrations::AdoptReceipt, MigrateRefusal> {
+    let raw = std::fs::read_to_string(path).map_err(|error| {
+        MigrateRefusal::new(
+            "adopt_unreadable",
+            format!(
+                "could not read the adopt receipt at {}: {error}. Produce one with `asv \
+                 integrations adopt npm --json`.",
+                path.display()
+            ),
+        )
+    })?;
+    let receipt: asv_integrations::AdoptReceipt = serde_json::from_str(&raw).map_err(|error| {
+        MigrateRefusal::new(
+            "not_an_adopt_receipt",
+            format!(
+                "{} is not an {} document: {error}",
+                path.display(),
+                asv_integrations::ADOPT_SCHEMA
+            ),
+        )
+    })?;
+    if receipt.schema != asv_integrations::ADOPT_SCHEMA {
+        return Err(MigrateRefusal::new(
+            "not_an_adopt_receipt",
+            format!(
+                "{} declares schema {:?}, and this build only continues {}.",
+                path.display(),
+                receipt.schema,
+                asv_integrations::ADOPT_SCHEMA
+            ),
+        ));
+    }
+    Ok(receipt)
+}
+
+/// Reads a migration state, or refuses naming the schema it wanted.
+fn read_migration_state(
+    path: &std::path::Path,
+) -> Result<asv_integrations::migration::MigrationState, MigrateRefusal> {
+    let raw = std::fs::read_to_string(path).map_err(|error| {
+        MigrateRefusal::new(
+            "state_unreadable",
+            format!(
+                "could not read the migration state at {}: {error}. Run `asv integrations \
+                 migrate npm prove` first; it is what writes this file.",
+                path.display()
+            ),
+        )
+    })?;
+    serde_json::from_str(&raw).map_err(|error| {
+        MigrateRefusal::new(
+            "malformed_state",
+            format!(
+                "{} is not an {} document: {error}",
+                path.display(),
+                asv_integrations::migration::MIGRATION_SCHEMA
+            ),
+        )
+    })
+}
+
+/// Writes the state a later `apply` replays.
+///
+/// `0600`: this document carries no credential, but it names the credential, the
+/// file it came from and what the tools reported about both, and a migration is
+/// not the operator's business.
+fn write_migration_state(
+    path: &std::path::Path,
+    state: &asv_integrations::migration::MigrationState,
+) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let rendered = serde_json::to_string_pretty(state)
+        .map_err(|error| format!("the migration state could not be rendered: {error}"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| {
+            format!(
+                "could not open {} to write the migration state: {error}",
+                path.display()
+            )
+        })?;
+    file.write_all(rendered.as_bytes())
+        .and_then(|()| file.write_all(b"\n"))
+        .map_err(|error| {
+            format!(
+                "the migration state at {} could not be written: {error}",
+                path.display()
+            )
+        })
+}
+
+/// §10's first step, asked of the broker rather than asserted here.
+///
+/// `VerifyStorage` and not an inventory listing, because the value of the fact
+/// is that the **broker** said it, over the socket, as a peer it admitted. What
+/// it proves is storage and authority; `StorageProof`'s own documentation says
+/// what it deliberately does not prove, and nothing downstream may widen it.
+fn verify_storage_over_ipc(
+    socket: &std::path::Path,
+    credential: &CredentialId,
+) -> Result<asv_integrations::migration::StorageFacts, String> {
+    let response = call(
+        socket,
+        &Request::VerifyStorage {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            id: *credential,
+        },
+    )
+    .map_err(|error| {
+        format!(
+            "could not reach the broker, so nothing has been proved about the vault and no file \
+             may be scrubbed: {error}"
+        )
+    })?;
+    match response {
+        Response::StorageVerified {
+            id,
+            label,
+            exportability,
+        } => Ok(asv_integrations::migration::StorageFacts {
+            id: id.to_wire(),
+            label,
+            exportability,
+        }),
+        other => Err(format!(
+            "the broker answered {} to a storage verification, so §10's first step did not \
+             happen. Nothing below it may proceed.",
+            response_kind(&other)
+        )),
+    }
+}
+
+/// The npm this proof is about, or a refusal that says what is missing.
+///
+/// The crate's resolver rather than a loop over `PATH`, because it reports every
+/// directory it searched and why each candidate was refused. A proof that said
+/// "npm not found" when the truth is "the first npm on PATH is world-writable"
+/// would send an operator to install something they already have.
+///
+/// **A refusal, never a stand-in.** A mock on `PATH` would make this command
+/// green on a machine where the claim it makes is false, which is the one
+/// outcome this repository keeps refusing.
+fn npm_binary() -> Result<PathBuf, MigrateRefusal> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let resolution = asv_integrations::resolve_tool("npm", &path)
+        .map_err(|error| MigrateRefusal::new("npm_unresolved", error.to_string()))?;
+    match resolution.resolved {
+        Some(identity) => Ok(identity.path),
+        None => {
+            let searched = resolution
+                .candidates
+                .iter()
+                .map(|candidate| {
+                    format!(
+                        "  {} -> {}",
+                        candidate.candidate.display(),
+                        candidate.outcome
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(MigrateRefusal::new(
+                "npm_not_found",
+                format!(
+                    "no usable npm on PATH, and this proof runs the real binary: a stand-in \
+                     would make the migration look proved on a machine where it is not. Install \
+                     npm, or run this inside an `asv run` session whose PATH carries it.\nPATH \
+                     was searched as:\n{searched}"
+                ),
+            ))
+        }
+    }
+}
+
+/// Runs the real npm against one configuration file.
+///
+/// The arguments are identical for both probes; only `--userconfig` differs.
+/// That is what makes the negative result mean anything: same binary, same
+/// registry, same relay, same operation, two files.
+///
+/// `whoami` rather than `view` or `ping`: it is the operation that is *about*
+/// the credential, it is never served from a cache, and it fails when the
+/// credential is refused rather than succeeding quietly on a public endpoint.
+fn exercise_npm(
+    npm: &std::path::Path,
+    userconfig: &std::path::Path,
+    registry: &str,
+    relay: &str,
+    cache: &std::path::Path,
+    surrogate: &str,
+) -> Result<NpmOutcome, String> {
+    let output = std::process::Command::new(npm)
+        .arg("whoami")
+        .arg("--userconfig")
+        .arg(userconfig)
+        .arg("--registry")
+        .arg(registry)
+        .arg("--https-proxy")
+        .arg(relay)
+        .arg("--cache")
+        .arg(cache)
+        .arg("--loglevel")
+        .arg("error")
+        .arg("--fetch-retries")
+        .arg("0")
+        .arg("--fetch-timeout")
+        .arg("30000")
+        .output()
+        .map_err(|error| {
+            format!(
+                "npm at {} could not be run, so no proof was gathered either way: {error}",
+                npm.display()
+            )
+        })?;
+    Ok(NpmOutcome {
+        code: output.status.code(),
+        stdout: npm_excerpt(&String::from_utf8_lossy(&output.stdout), surrogate),
+        stderr: npm_excerpt(&String::from_utf8_lossy(&output.stderr), surrogate),
+    })
+}
+
+/// The report the positive proof carries.
+///
+/// Names what was run, against what, through which relay, and what npm
+/// answered. It is never empty: `project_and_verify` refuses an empty report,
+/// and a refusal there would be the correct one — but this command checks the
+/// outcome before reaching it, because the message a refusal gives about "the
+/// tool reported nothing" is much worse than one that says npm exited 1.
+fn positive_report(outcome: &NpmOutcome, projection: &std::path::Path) -> String {
+    format!(
+        "npm whoami against the projection at {} exited {}{}",
+        projection.display(),
+        exit_spelling(outcome),
+        said(outcome)
+    )
+}
+
+/// §10's third step: the same npm, against a copy of the original with the
+/// credential taken out of it.
+///
+/// ## Why a copy
+///
+/// Because the original must not be touched before a human approves. The copy
+/// is scrubbed — *with the same `NpmScrub` an `apply` will use*, so this probe
+/// exercises the scrub that will actually run — and npm is pointed at the copy.
+/// If it still worked, nothing had moved and destroying the original would
+/// destroy the only working path.
+///
+/// ## Why this is a contrast and not two probes
+///
+/// One operation, run twice over two files that differ in one respect: whether
+/// the credential is in them. A probe that merely failed could have failed for
+/// a hundred reasons; this one has the same binary, the same registry and the
+/// same relay behind both halves, so the difference is the file.
+#[allow(clippy::too_many_arguments)]
+fn negative_probe(
+    npm: &std::path::Path,
+    original: &std::path::Path,
+    projection: &std::path::Path,
+    positive: &NpmOutcome,
+    registry: &str,
+    relay: &str,
+    cache: &std::path::Path,
+    surrogate: &str,
+) -> Result<(String, PathBuf), MigrateRefusal> {
+    use asv_integrations::scrub::ScrubSource as _;
+
+    let beside = projection
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let copy = beside.join(format!(".asv-negative-{}.npmrc", std::process::id()));
+
+    std::fs::copy(original, &copy).map_err(|error| {
+        MigrateRefusal::new(
+            "negative_probe_not_prepared",
+            format!(
+                "could not copy {} beside the projection, so the negative half of the proof could \
+                 not run and no proof is recorded either way: {error}",
+                original.display()
+            ),
+        )
+    })?;
+
+    // The scrub is performed on the copy, and a refusal is a refusal: a file
+    // with no credential in it would mean this migration has nothing to move.
+    let scrubbed = match asv_integrations::NpmScrub.scrub(&copy) {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = std::fs::remove_file(&copy);
+            return Err(MigrateRefusal::new(
+                "negative_probe_not_prepared",
+                format!(
+                    "the negative probe could not be prepared: {error}. The copy was removed and \
+                     the original was not touched."
+                ),
+            ));
+        }
+    };
+
+    let outcome = match exercise_npm(npm, &copy, registry, relay, cache, surrogate) {
+        Ok(outcome) => outcome,
+        Err(message) => {
+            let _ = std::fs::remove_file(&copy);
+            return Err(MigrateRefusal::new("npm_not_runnable", message));
+        }
+    };
+    if outcome.succeeded() {
+        let _ = std::fs::remove_file(&copy);
+        return Err(MigrateRefusal::new(
+            "bypass_still_works",
+            format!(
+                "npm still authenticated against {} after the credential was scrubbed out of it \
+                 ({} removed by the scrub). Nothing has moved, so nothing may be removed: either \
+                 the credential is cached somewhere npm reads, or this registry accepts the \
+                 request without one. Do not run `apply`.",
+                copy.display(),
+                if scrubbed.removed.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    scrubbed.removed.join(", ")
+                }
+            ),
+        ));
+    }
+
+    // Both halves, from the two runs that actually happened. The positive
+    // outcome is passed in rather than restated here: a contrast assembled from
+    // anything but the two real runs is an assertion, and this is the one line
+    // in the file a later reader will take the whole proof from.
+    let report = format!(
+        "contrastive probe over one operation against one relay: the projection at {} exited \
+         {}{} while the same npm, pointed at a copy of {} with {} scrubbed out of it ({}), exited \
+         {}{}. The two runs differed in one file and nowhere else, so the old path no longer \
+         works and removing the original is not removing the only working path.",
+        projection.display(),
+        exit_spelling(positive),
+        said(positive),
+        original.display(),
+        if scrubbed.removed.is_empty() {
+            "no credential field".to_string()
+        } else {
+            format!("{} removed", scrubbed.removed.join(", "))
+        },
+        copy.display(),
+        exit_spelling(&outcome),
+        said(&outcome)
+    );
+    Ok((report, copy))
+}
+
+/// How an exit status is spelled, because `None` is not a pass.
+fn exit_spelling(outcome: &NpmOutcome) -> String {
+    match outcome.code {
+        Some(code) if code == 0 => "0".to_string(),
+        Some(code) => format!("{code} (failure)"),
+        None => "no status, killed by a signal (failure)".to_string(),
+    }
+}
+
+/// npm's own words, when it had any.
+fn said(outcome: &NpmOutcome) -> String {
+    let text = if outcome.stderr.trim().is_empty() {
+        outcome.stdout.trim()
+    } else {
+        outcome.stderr.trim()
+    };
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!(" and said: {text}")
+    }
+}
+
+/// Both outcomes in one sentence, for a refusal.
+fn describe_outcome(outcome: &NpmOutcome) -> String {
+    format!("npm exited {}{}", exit_spelling(outcome), said(outcome))
+}
+
+/// The most of an npm run this command is willing to keep.
+///
+/// npm's error text is the most actionable thing an operator will read here, so
+/// the first non-empty line of it is kept — but the projection's `_authToken`
+/// **is** a bearer, session-scoped and useless anywhere else, and an npm that
+/// echoed its configuration back would put it into a file that outlives the
+/// session. So the surrogate is replaced wherever it appears, before anything
+/// durable sees the text, and the result is cut to a length a receipt can hold.
+fn npm_excerpt(raw: &str, surrogate: &str) -> String {
+    let redacted = if surrogate.is_empty() {
+        raw.to_string()
+    } else {
+        raw.replace(surrogate, "<surrogate redacted>")
+    };
+    let Some(first) = redacted
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+    else {
+        return String::new();
+    };
+    if first.chars().count() > NPM_EXCERPT_CHARS {
+        let cut: String = first.chars().take(NPM_EXCERPT_CHARS).collect();
+        return format!("{cut}…");
+    }
+    first.to_string()
 }
 
 /// A stable machine word per refusal, so a consumer can branch on the *reason*
