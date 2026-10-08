@@ -513,13 +513,32 @@ fn stall_connection<S: OriginStream>(stream: &mut S, sink: &Arc<Mutex<Vec<String
     if raw.is_empty() {
         return;
     }
-    sink.lock()
-        .expect("origin sink")
-        .push(String::from_utf8_lossy(&raw).into_owned());
-    if stream
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\nok")
-        .is_err()
-    {
+    let request = String::from_utf8_lossy(&raw).into_owned();
+    sink.lock().expect("origin sink").push(request.clone());
+
+    // `npm whoami` asks the registry who it is authenticated as and refuses an
+    // answer it cannot parse as JSON, so an origin that answers every path with
+    // `ok` cannot let that command succeed — not because the tunnel failed but
+    // because the fixture was not a registry.
+    //
+    // The default stays `ok`, and stays byte-for-byte what it always was, so
+    // every test that is not about npm reads the same response it read before.
+    // The Content-Length it declares has always been wrong for a two-byte
+    // body; npm is the first client here to notice, and it only notices on
+    // this path, where the length is now the true one.
+    let response: Vec<u8> = if request.contains("/-/whoami") {
+        let body = br#"{"username":"e2e-operator","email":"e2e@example.invalid"}"#;
+        let mut head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        head.extend_from_slice(body);
+        head
+    } else {
+        b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\nok".to_vec()
+    };
+    if stream.write_all(&response).is_err() {
         return;
     }
     let _ = stream.flush();
@@ -591,20 +610,40 @@ fn serve_connection<S: OriginStream>(
             break;
         }
         served_any = true;
-        sink.lock()
-            .expect("origin sink")
-            .push(String::from_utf8_lossy(&raw).into_owned());
+        let request = String::from_utf8_lossy(&raw).into_owned();
+        sink.lock().expect("origin sink").push(request.clone());
         // `close` on the last request is what tells `curl` it may stop reusing
         // the connection. A holding origin never sends it: the point is that
         // the connection outlives the response, and a client told to close
         // would close it and take the tunnel with it.
         let last = served + 1 == per_connection;
-        let response: &[u8] = if last && !holding {
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+
+        // `npm whoami` asks the registry who it is authenticated as and refuses
+        // an answer it cannot parse as JSON, so an origin answering every path
+        // with `ok` cannot let that command succeed — not because the tunnel
+        // failed but because the fixture was not a registry. Every other path
+        // gets byte-for-byte the response it always got.
+        let mut response: Vec<u8> = if request.contains("/-/whoami") {
+            let body = br#"{"username":"e2e-operator","email":"e2e@example.invalid"}"#;
+            let close = if last && !holding {
+                "\r\nConnection: close"
+            } else {
+                ""
+            };
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}{close}\r\n\r\n",
+                body.len()
+            );
+            let mut bytes = head.into_bytes();
+            bytes.extend_from_slice(body);
+            bytes
+        } else if last && !holding {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
         } else {
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec()
         };
-        if stream.write_all(response).is_err() {
+        response.shrink_to_fit();
+        if stream.write_all(&response).is_err() {
             break;
         }
         let _ = stream.flush();
@@ -2424,6 +2463,305 @@ fn npm_whose_surrogate_the_broker_swaps_reaches_the_origin_as_the_real_credentia
         !chain.contains(REAL),
         "the real credential reached the audit chain:\n{chain}"
     );
+}
+
+/// La migración entera, de extremo a extremo, con todo real.
+///
+/// Ni `project` ni la máquina de estados se ejercitan en ninguna otra parte
+/// del workspace, así que hasta ahora nadie había comprobado que la secuencia
+/// que un operador ejecuta exista de verdad. Este test la ejecuta.
+///
+/// ## Qué se pone en juego
+///
+/// Un `.npmrc` con el token del registry dentro — el caso que `migrate` existe
+/// para servir, y el que ninguna otra prueba tenía. Pasa por `plan`, `adopt`,
+/// `prove` y `apply`, y al final tiene que haber perdido el token sin haber
+/// dejado de funcionar.
+///
+/// ## Qué se mide, y qué no
+///
+/// Medido: el origen recibió la credencial real durante la prueba positiva;
+/// el `.npmrc` original seguía intacto al terminar `prove`; `apply` con un
+/// digest equivocado no lo tocó; `apply` con el digest correcto lo limpió y
+/// dejó un recibo.
+///
+/// No medido: que el destino sea `registry.npmjs.org`. La audiencia es el host
+/// del fixture, porque un destino real no puede resolver a un origen local sin
+/// tocar `/etc/hosts`. Eso acota lo que la afirmación cubre y no lo que
+/// demuestra: lo que se prueba es el lifecycle, no el registry de npm.
+#[test]
+fn a_registry_credential_leaves_the_configuration_only_after_both_proofs_and_an_approval() {
+    let ca = SessionCa::new("migrate-vertical-roots", 41, Duration::from_secs(3600));
+    let f = Fixture::new_tls("migrate-vertical", &ca, true);
+    require_npm();
+
+    // `build` wiped the directory and wrote the anchors the broker was handed.
+    // The same bytes have to reach node, or npm and the broker would be
+    // verifying against different trust decisions.
+    let anchors = f.dir.join("roots.pem");
+    assert!(anchors.exists(), "the fixture wrote no anchor file");
+
+    // The audience carries the origin's port because the route file names one.
+    // Without it npm would dial 443, the route would not match, and the tunnel
+    // would be refused for a reason unrelated to this test.
+    let audience = format!("{FIXTURE_HOST}:{}", f.origin.port);
+    let sock = f.sock.to_string_lossy().into_owned();
+    let home = f.dir.to_string_lossy().into_owned();
+    let npmrc = f.dir.join(".npmrc");
+    std::fs::write(
+        &npmrc,
+        format!("registry=https://{audience}\n//{audience}/:_authToken={REAL}\n"),
+    )
+    .expect("seed the operator's configuration");
+
+    let plan_path = f.dir.join("plan.json");
+    let adopt_path = f.dir.join("adopt.json");
+    let projection = f.dir.join("projected.npmrc");
+    let state = f.dir.join("migration.json");
+
+    // --- plan -------------------------------------------------------------
+    let plan = run_asv(
+        &f,
+        &[
+            "integrations",
+            "plan",
+            "npm",
+            "--json",
+            "--cwd",
+            &home,
+            "--home",
+            &home,
+        ],
+        &[],
+    );
+    assert!(
+        plan.status.success(),
+        "plan refused a configuration holding a credential: {}{}",
+        String::from_utf8_lossy(&plan.stdout),
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    // `adopt` reads the plan from a file: the drift check compares a
+    // fingerprint taken when the operator planned against one taken now, and
+    // piping this through the plan's own stdout would have it compare itself.
+    std::fs::write(&plan_path, &plan.stdout).expect("write the plan");
+
+    // --- adopt ------------------------------------------------------------
+    let adopt = run_asv(
+        &f,
+        &[
+            "integrations",
+            "adopt",
+            "npm",
+            "--json",
+            "--audience",
+            &audience,
+            "--field",
+            "_authToken",
+            "--label",
+            f.credential_label.as_str(),
+            "--file",
+            npmrc.to_string_lossy().as_ref(),
+            "--from-plan",
+            plan_path.to_string_lossy().as_ref(),
+        ],
+        &[],
+    );
+    assert!(
+        adopt.status.success(),
+        "adopt refused: {}{}",
+        String::from_utf8_lossy(&adopt.stdout),
+        String::from_utf8_lossy(&adopt.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&adopt.stdout).contains(REAL),
+        "the receipt carried the value it adopted"
+    );
+    std::fs::write(&adopt_path, &adopt.stdout).expect("write the receipt");
+
+    // --- prove ------------------------------------------------------------
+    //
+    // Inside `asv run`, because that is where the session's surrogate and the
+    // shim are published — and the shim is the only party able to present the
+    // session proof the CONNECT listener demands. The whole command is inside
+    // the script because `sh -c` passes trailing words as `$0`, `$1`, not as
+    // arguments to `asv`.
+    // The absolute path, because `sh` inherits a PATH that does not contain the
+    // build directory: a bare `asv` here fails as "not found", which is a
+    // failure about this test's plumbing and says nothing about the migration.
+    let asv = cargo_bin("asv");
+    let script = format!(
+        "{asv} --socket {sock} integrations migrate npm prove --json \
+         --adopt {adopt} --file {npmrc} --projection {projection} --state {state}",
+        asv = asv.to_string_lossy(),
+        sock = sock,
+        adopt = adopt_path.to_string_lossy(),
+        npmrc = npmrc.to_string_lossy(),
+        projection = projection.to_string_lossy(),
+        state = state.to_string_lossy(),
+    );
+    let prove = run_asv(
+        &f,
+        &["run", "sh", "-c", &script],
+        &[
+            ("NODE_EXTRA_CA_CERTS", anchors.to_string_lossy().as_ref()),
+            // Declared, and only this much: it relaxes the fixture's
+            // certificate, not the property under test. npm still presents
+            // only its surrogate and the broker still has to redeem it. Saying
+            // so is the point — a test that turned verification off and left
+            // the reader to assume otherwise would be the worse artefact.
+            ("npm_config_strict_ssl", "false"),
+        ],
+    );
+    assert!(
+        prove.status.success(),
+        "prove refused: {}{}",
+        String::from_utf8_lossy(&prove.stdout),
+        String::from_utf8_lossy(&prove.stderr)
+    );
+
+    // A positive proof is only a claim about the proxy if the destination
+    // actually saw the credential. Without this, `prove` could have recorded a
+    // success from an npm that never left the machine.
+    assert!(
+        f.origin.wait_for_requests(1),
+        "npm never reached the origin during the positive proof, so the proof is not one: {}{}",
+        String::from_utf8_lossy(&prove.stdout),
+        String::from_utf8_lossy(&prove.stderr)
+    );
+    let seen = f.origin.saw();
+    assert!(
+        seen.contains(REAL),
+        "the destination did not receive the real credential, so nothing was substituted:\n{seen}"
+    );
+    assert_eq!(
+        f.origin.request_count(),
+        f.origin.real_credential_requests(),
+        "a request reached the destination without the real credential in it, which is a tunnel \
+         that forwarded a surrogate upstream:\n{seen}"
+    );
+
+    // **The whole of the separate-file decision.** `prove` gathers proofs; it
+    // removes nothing. A command that scrubbed here would do the irreversible
+    // half before the human ever decided — which is AAT-CW-017.
+    let after_prove = std::fs::read_to_string(&npmrc).expect("the original is still there");
+    assert!(
+        after_prove.contains(REAL),
+        "prove removed the credential from the original, which is the scrub and belongs to \
+         apply: {after_prove}"
+    );
+    assert!(
+        projection.exists(),
+        "prove wrote no projection, so there is nothing for npm to have been proved against"
+    );
+    assert!(
+        state.exists(),
+        "prove recorded nothing, so apply would have nothing to replay"
+    );
+    let chain = std::fs::read_to_string(&f.audit).expect("read the durable audit chain");
+    assert!(
+        !chain.contains(REAL),
+        "the real credential reached the audit chain:\n{chain}"
+    );
+
+    // --- apply, with an approval over a different plan --------------------
+    let wrong = run_asv(
+        &f,
+        &[
+            "integrations",
+            "migrate",
+            "npm",
+            "apply",
+            "--json",
+            "--state",
+            state.to_string_lossy().as_ref(),
+            "--actor",
+            "an-operator",
+            "--approve",
+            "not-the-plan-this-migration-carries",
+        ],
+        &[],
+    );
+    assert!(
+        !wrong.status.success(),
+        "apply honoured an approval over a plan it was not carrying"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&npmrc).expect("still there"),
+        after_prove,
+        "a refused approval must leave the original byte for byte"
+    );
+
+    // --- apply, with the digest this migration actually carries ------------
+    let digest = serde_json::from_slice::<serde_json::Value>(&prove.stdout)
+        .expect("prove printed the migration state as JSON")
+        .pointer("/plan_digest")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| {
+            panic!(
+                "prove printed no plan digest: {}",
+                String::from_utf8_lossy(&prove.stdout)
+            )
+        })
+        .to_string();
+
+    let applied = run_asv(
+        &f,
+        &[
+            "integrations",
+            "migrate",
+            "npm",
+            "apply",
+            "--json",
+            "--state",
+            state.to_string_lossy().as_ref(),
+            "--actor",
+            "an-operator",
+            "--approve",
+            &digest,
+        ],
+        &[],
+    );
+    assert!(
+        applied.status.success(),
+        "apply refused a proof it had already accepted: {}{}",
+        String::from_utf8_lossy(&applied.stdout),
+        String::from_utf8_lossy(&applied.stderr)
+    );
+
+    let after_apply = std::fs::read_to_string(&npmrc).expect("the original is still there");
+    assert!(
+        !after_apply.contains(REAL),
+        "apply reported success and the registry token is still in the file: {after_apply}"
+    );
+    assert!(
+        !after_apply.contains("_authToken"),
+        "the field survived the scrub under a spelling the report did not name: {after_apply}"
+    );
+    assert!(
+        after_apply.contains(&format!("registry=https://{audience}\n")),
+        "the scrub took more than the credential: {after_apply}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&applied.stdout).contains(REAL),
+        "the receipt quoted the credential it removed"
+    );
+}
+
+/// Runs the public `asv` binary against the fixture's socket.
+///
+/// Everything the migration needs comes through this: the socket to reach the
+/// broker, the arguments, and the environment. A test that shelled out some
+/// other way would be able to disagree with what an operator can type, which is
+/// the disagreement this whole file exists to prevent.
+fn run_asv(f: &Fixture, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+    let mut command = Command::new(cargo_bin("asv"));
+    command.arg("--socket").arg(&f.sock).args(args);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command
+        .output()
+        .unwrap_or_else(|error| panic!("could not run `asv {}`: {error}", args.join(" ")))
 }
 
 /// The npm binary, or a failure that says what is missing.

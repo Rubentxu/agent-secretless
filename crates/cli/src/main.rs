@@ -4697,9 +4697,30 @@ mod tests {
         assert_eq!(npm_excerpt("", surrogate), "");
         assert_eq!(npm_excerpt("\n  \n", surrogate), "");
         assert_eq!(
-            npm_excerpt("\n\nnpm error code E401\nmore detail\n", surrogate),
-            "npm error code E401",
-            "the first line names the failure; the rest is npm's own log"
+            npm_excerpt("\n\nnpm error code E401\nthe reason it failed\n", surrogate),
+            "npm error code E401\nthe reason it failed",
+            "a short report is kept whole; nothing is dropped for being long"
+        );
+
+        // **The case this change was made for.** npm prints this shape when a
+        // request fails at the network, and the head names nothing:
+        //
+        //     npm error code FETCH_ERROR
+        //     npm error errno FETCH_ERROR
+        //     npm error invalid json response body at https://host/-/whoami
+        //
+        // The reason is at the end. An excerpt that took the first line left an
+        // operator with a code and no cause, which is what the previous doc
+        // comment promised would not happen.
+        let network = npm_excerpt(
+            "npm error code FETCH_ERROR\n\
+             npm error errno FETCH_ERROR\n\
+             npm error invalid json response body at https://host/-/whoami\n",
+            surrogate,
+        );
+        assert!(
+            network.contains("invalid json response body"),
+            "the line that says what went wrong must survive truncation: {network}"
         );
         let long = "x".repeat(NPM_EXCERPT_CHARS + 50);
         let cut = npm_excerpt(&long, surrogate);
@@ -6393,18 +6414,46 @@ fn npm_excerpt(raw: &str, surrogate: &str) -> String {
     } else {
         raw.replace(surrogate, "<surrogate redacted>")
     };
-    let Some(first) = redacted
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-    else {
-        return String::new();
-    };
-    if first.chars().count() > NPM_EXCERPT_CHARS {
-        let cut: String = first.chars().take(NPM_EXCERPT_CHARS).collect();
-        return format!("{cut}…");
+
+    // **The tail, not the head.** This took the first non-empty line for its
+    // whole life, on the grounds that "the first line names the failure". That
+    // was measured to be false: when npm fails at the network it prints
+    // `npm error code FETCH_ERROR`, which names nothing at all, and the reason
+    // sits four lines below it. An operator reading this report was told a
+    // fetch failed and not why — by a truncation whose own doc comment said it
+    // would not do that.
+    //
+    // So it accumulates backwards until the budget is spent, which keeps the
+    // short common case whole and spends the budget on the end of the message
+    // when the message is long. The end is where the reason is.
+    let mut kept: Vec<String> = Vec::new();
+    let mut budget = NPM_EXCERPT_CHARS;
+    for line in redacted.lines().rev().map(str::trim_end) {
+        let cost = line.chars().count() + 1;
+        if kept.is_empty() {
+            // Always keep at least the last line, truncated to fit, so a
+            // refusal is never an empty string.
+            let cut: String = line.chars().take(NPM_EXCERPT_CHARS).collect();
+            budget = budget.saturating_sub(cut.chars().count());
+            kept.push(cut);
+            continue;
+        }
+        if cost > budget {
+            break;
+        }
+        budget -= cost;
+        kept.push(line.to_string());
     }
-    first.to_string()
+    kept.reverse();
+    let joined = kept.join("\n");
+    if joined.chars().count() > NPM_EXCERPT_CHARS + 1 {
+        format!(
+            "…{}",
+            &joined[joined.len().saturating_sub(NPM_EXCERPT_CHARS)..]
+        )
+    } else {
+        joined.trim().to_string()
+    }
 }
 
 /// A stable machine word per refusal, so a consumer can branch on the *reason*
