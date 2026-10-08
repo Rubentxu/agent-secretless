@@ -259,6 +259,16 @@ fn wait_for(sock: &Path, message: &str) {
     assert!(sock.exists(), "{message}");
 }
 
+/// A loopback address standing in for the session's shim.
+///
+/// These tests assert **what the verb writes**, not that npm can tunnel
+/// through it, so a real shim is not needed to test them — and starting one
+/// would mean a real `asv run`, which belongs to the vertical. What matters
+/// here is that the address written into `https-proxy` is the one the session
+/// published and not the broker's CONNECT listener, which refuses any tunnel
+/// whose client presented no session proof.
+const SHIM: &str = "127.0.0.1:41571";
+
 fn project(sock: &Path, npmrc: &Path, session: &str, surrogate: &str) -> std::process::Output {
     Command::new(cargo_bin("asv"))
         .arg("--socket")
@@ -278,12 +288,31 @@ fn project(sock: &Path, npmrc: &Path, session: &str, surrogate: &str) -> std::pr
             format!("ASV_SURROGATE_{}", LABEL.replace('-', "_").to_uppercase()),
             surrogate,
         )
+        // `asv run` publishes this, and it is what the projection must name.
+        // Cleared first so an inherited value from the test runner cannot be
+        // what makes this pass.
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env("HTTPS_PROXY", format!("http://{SHIM}"))
         .output()
         .expect("run asv integrations project npm")
 }
 
+/// The projection names the session's shim, never the broker's own listener.
+///
+/// **This test used to assert the opposite.** It was named
+/// `the_projection_names_the_relay_the_broker_published` and required
+/// `https-proxy=http://{connect_listen}`. That was true of the code and
+/// wrong about the world: the CONNECT listener refuses every tunnel whose
+/// client presented no session proof, npm cannot present one, and npm was
+/// measured preferring the file's `https-proxy` over `HTTPS_PROXY` — so that
+/// line overrode a working session proxy with one that could not tunnel.
+///
+/// A test that certifies a configuration that cannot work is the same defect
+/// this repository keeps refusing, so the assertion was inverted rather than
+/// deleted: the file must carry the shim, and must not carry the listener.
 #[test]
-fn the_projection_names_the_relay_the_broker_published_and_carries_no_registry_token() {
+fn the_projection_names_the_session_shim_and_carries_no_registry_token() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (_broker, sock, relay) = broker_with_a_published_relay(dir.path());
     let npmrc = dir.path().join(".npmrc");
@@ -299,8 +328,15 @@ fn the_projection_names_the_relay_the_broker_published_and_carries_no_registry_t
 
     let written = std::fs::read_to_string(&npmrc).expect("the file this verb wrote");
     assert!(
-        written.contains(&format!("https-proxy=http://{relay}\n")),
-        "the file must name the address the broker published, not one this test guessed: {written}"
+        written.contains(&format!("https-proxy=http://{SHIM}\n")),
+        "the file must name the session's shim, which is the only party able to present the \
+         session proof the CONNECT listener demands: {written}"
+    );
+    assert!(
+        !written.contains(&format!("https-proxy=http://{relay}\n")),
+        "the broker's own CONNECT listener cannot carry a tunnel for npm, and a projection \
+         naming it overrides the working proxy the session exported instead of helping: \
+         {written}"
     );
     assert!(
         written.contains(&format!("registry=https://{REGISTRY}\n")),
@@ -331,7 +367,7 @@ fn the_projection_names_the_relay_the_broker_published_and_carries_no_registry_t
 #[test]
 fn a_second_run_refreshes_its_own_surrogate_rather_than_refusing_its_own_output() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (_broker, sock, relay) = broker_with_a_published_relay(dir.path());
+    let (_broker, sock, _relay) = broker_with_a_published_relay(dir.path());
     let npmrc = dir.path().join(".npmrc");
 
     let first = project(&sock, &npmrc, "session-under-test", "surrogate-one");
@@ -345,7 +381,7 @@ fn a_second_run_refreshes_its_own_surrogate_rather_than_refusing_its_own_output(
     );
 
     let written = std::fs::read_to_string(&npmrc).expect("read back");
-    assert!(written.contains(&format!("https-proxy=http://{relay}\n")));
+    assert!(written.contains(&format!("https-proxy=http://{SHIM}\n")));
     assert!(
         written.contains(&format!("//{REGISTRY}/:_authToken=surrogate-two\n")),
         "{written}"
@@ -376,5 +412,62 @@ fn a_configuration_holding_someone_elses_token_is_refused_and_survives_intact() 
         std::fs::read_to_string(&npmrc).expect("still there"),
         original,
         "a refused write must leave the original byte for byte"
+    );
+}
+
+/// With no session shim there is no relay a projection can name that works,
+/// so the verb writes nothing at all.
+///
+/// The refusal that mattered was never the shim's: it was the temptation to
+/// fall back to the broker's CONNECT listener, which produces an npmrc npm
+/// obeys and that cannot tunnel — and that, measured against npm 11.12.1,
+/// overrides the working proxy `asv run` exported. The two assertions are
+/// there so neither half can come back quietly: the refusal names the shim,
+/// and the file was not created.
+#[test]
+fn without_a_session_shim_the_projection_is_refused_and_nothing_is_written() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_broker, sock, _relay) = broker_with_a_published_relay(dir.path());
+    let npmrc = dir.path().join(".npmrc");
+
+    let out = Command::new(cargo_bin("asv"))
+        .arg("--socket")
+        .arg(&sock)
+        .arg("integrations")
+        .arg("project")
+        .arg("npm")
+        .arg("--audience")
+        .arg(REGISTRY)
+        .arg("--label")
+        .arg(LABEL)
+        .arg("--file")
+        .arg(&npmrc)
+        .arg("--json")
+        .env("ASV_SESSION_ID", "session-under-test")
+        .env(
+            format!("ASV_SURROGATE_{}", LABEL.replace('-', "_").to_uppercase()),
+            "surrogate-one",
+        )
+        // Present but empty, so this is "not inside a session" rather than
+        // "the environment was hostile". An inherited value would make the
+        // test pass for a reason that has nothing to do with this code.
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env("HTTPS_PROXY", "")
+        .output()
+        .expect("run asv integrations project npm");
+
+    assert!(
+        !out.status.success(),
+        "the verb wrote a projection with no relay that could carry it: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains("no_session_shim"), "{said}");
+    assert!(
+        !npmrc.exists(),
+        "a refused projection must leave no file behind; a half-written npmrc is an npmrc that \
+         looks migrated"
     );
 }
