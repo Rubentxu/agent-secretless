@@ -1983,7 +1983,6 @@ fn run_integrations(
             audience,
             label,
         } => run_integrations_project(
-            socket,
             family,
             *json,
             file.as_deref(),
@@ -4335,9 +4334,57 @@ mod tests {
         assert_eq!(inputs.label, "npm-registry");
     }
 
-    /// The projection may not be written over the credential it would replace.
+    /// The relay a projection names is the one that can carry a tunnel.
     ///
-    /// This is the whole of the "separate file" decision, in one row. The
+    /// The broker's CONNECT listener refuses every tunnel whose client
+    /// presented no session proof, and npm cannot present one — only the
+    /// session's shim can. So a projection naming the listener is a file npm
+    /// obeys and then fails on, and because npm prefers the file's
+    /// `https-proxy` over the environment, it also overrides the working
+    /// proxy `asv run` exported.
+    ///
+    /// Both halves are asserted: the shim is what comes back, and with no shim
+    /// the answer is a refusal whose text says why — not a quiet fall back to
+    /// the listener address, which is the shape of the bug this replaced.
+    #[test]
+    fn a_projection_names_the_session_shim_or_refuses_rather_than_the_listener() {
+        use crate::tests_support::with_env;
+        use std::ffi::OsStr;
+
+        let shimmed = with_env(
+            &[
+                ("HTTPS_PROXY", OsStr::new("http://127.0.0.1:39251")),
+                // Present and wrong, to prove the shim wins over it. The
+                // broker's own CONNECT listener is loopback like the shim and
+                // was the value this used to pass.
+                ("https_proxy", OsStr::new("http://127.0.0.1:39252")),
+            ],
+            session_shim_url,
+        )
+        .expect("a shim");
+        assert_eq!(
+            shimmed, "http://127.0.0.1:39251",
+            "the projection must name the shim, which is the only party able to present the \
+             session proof the CONNECT listener demands"
+        );
+
+        let refusal = with_env(
+            &[
+                ("HTTPS_PROXY", OsStr::new("")),
+                ("https_proxy", OsStr::new("")),
+            ],
+            session_shim_url,
+        )
+        .expect_err("an empty variable is not a relay");
+        for (phrase, why) in [
+            ("session proof", "the refusal has to say what is missing"),
+            ("asv run", "and what the operator does about it"),
+        ] {
+            assert!(refusal.contains(phrase), "{why}: {refusal}");
+        }
+    }
+
+    /// The whole of the "separate file" decision, in one row. The
     /// projection carries a session-scoped surrogate; the original carries the
     /// registry credential; writing the first where the second is would leave
     /// an operator with a file that works and an import nobody can undo, before
@@ -4917,11 +4964,60 @@ fn run_integrations_adopt(
 ///   so there is no relay on this machine and `https-proxy` would name a port
 ///   nothing is listening on.
 ///
+/// The proxy a projection is allowed to name, or the refusal explaining why
+/// there is none.
+///
+/// ## Why this is the session's shim and not the broker's CONNECT listener
+///
+/// Both are loopback and both are "the relay", and writing the wrong one
+/// produces a file that looks finished and cannot work.
+///
+/// The broker's CONNECT listener refuses every tunnel whose client presented
+/// no session proof (`tls_bridge.rs`, `BridgeError::NoSessionProof`), and npm
+/// cannot present one — only the session's shim can, because it holds the
+/// session's nonce and key. So a projection naming the listener directly is a
+/// configuration that npm loads, obeys, and then fails on.
+///
+/// It is worse than inert. npm was measured preferring the file's `https-proxy`
+/// over `HTTPS_PROXY`: two loopback listeners, the file-named one took 6
+/// connections and the environment-named one took 0. So a projection naming
+/// the listener *overrides* the working proxy `asv run` exported and replaces
+/// it with one that cannot carry a tunnel.
+///
+/// Hence: read the shim, and refuse when there is none rather than falling
+/// back to the listener address. A refusal here costs the operator one command
+/// to fix; the fallback costs them an npmrc that silently overrides their
+/// working session.
+///
+/// The loopback requirement is not restated here. `NpmProjection::new` already
+/// refuses an endpoint that is not loopback, and restating it would be a second
+/// authority for a rule that has one.
+fn session_shim_url() -> Result<String, String> {
+    match std::env::var("HTTPS_PROXY")
+        .ok()
+        .filter(|proxy| !proxy.trim().is_empty())
+        .or_else(|| {
+            std::env::var("https_proxy")
+                .ok()
+                .filter(|proxy| !proxy.trim().is_empty())
+        }) {
+        Some(shim) => Ok(shim),
+        None => Err(
+            "neither HTTPS_PROXY nor https_proxy is set, so this is not running inside a \
+             session. A projection names the session's shim, and deliberately not the broker's \
+             own CONNECT listener: that listener refuses any tunnel whose client presented no \
+             session proof, which npm cannot do. `asv run` publishes the shim under those names. \
+             Run this inside `asv run` — writing the listener address instead would produce an \
+             npmrc that npm obeys and that cannot tunnel."
+                .to_string(),
+        ),
+    }
+}
+
 /// The surrogate is read from the environment and never minted, never printed,
 /// and never logged. The receipt names the file, the registry and the relay, and
 /// says how long the file stays useful.
 fn run_integrations_project(
-    socket: &std::path::Path,
     family: &str,
     json: bool,
     file: Option<&str>,
@@ -4989,20 +5085,10 @@ fn run_integrations_project(
         ),
     };
 
-    let facts = crate::ipc::fetch_broker_facts(socket);
-    let connect = facts
-        .as_ref()
-        .and_then(|facts| facts.connect_listen.clone())
-        .unwrap_or_else(|| {
-            fail(
-                "no_relay",
-                "this broker publishes no CONNECT address, so there is no relay to route npm \
-                 through. It was started without `--connect-listen`; a projection naming a port \
-                 nothing listens on is a configuration that fails at the first request."
-                    .to_string(),
-            )
-        });
-    let endpoint = format!("http://{connect}");
+    let endpoint = match session_shim_url() {
+        Ok(shim) => shim,
+        Err(message) => fail("no_session_shim", message),
+    };
 
     let projection = match NpmProjection::new(&audience, &endpoint, &surrogate) {
         Ok(projection) => projection,
@@ -5213,17 +5299,23 @@ fn run_integrations_migrate(
 /// file, because overwriting it *is* the scrub, and a scrub here would happen
 /// with no positive proof, no negative one and no human.
 ///
-/// ## Which relay npm is pointed at, and what that does not prove
+/// ## Which relay npm is pointed at: the one the file names
 ///
-/// npm is pointed at **this session's** relay — the `HTTPS_PROXY` `asv run`
-/// exports — and not at the `https-proxy` line the projection carries. The
-/// reason is ADR-0019: the broker's CONNECT listener refuses a tunnel whose
-/// client proved nothing, and the only party that can produce that proof is the
-/// session's shim. So the probe measures what it can measure honestly — *the
-/// surrogate in this file authenticates npm through the broker, and the broker
-/// substitutes* — and says in the persisted state that the projection's own
-/// routing line was not exercised. A reader must not take the positive proof
-/// for a statement about that line.
+/// The projection names **this session's shim**, and npm is then run with no
+/// `--https-proxy` of its own, so the relay under test is the one the file
+/// says. That is the only way the positive proof can be about the projection.
+///
+/// It was measured, not assumed: npm 11.12.1 prefers a file's `https-proxy`
+/// over `HTTPS_PROXY`, two loopback listeners taking 6 and 0 connections
+/// respectively. So a projection naming the broker's CONNECT listener would
+/// override a working session proxy with one that cannot tunnel — that
+/// listener refuses any tunnel whose client presented no session proof, and
+/// npm cannot present one.
+///
+/// An earlier version of this command measured around the problem instead of
+/// fixing it, and said so in the persisted state. That was honest and still
+/// the wrong claim: it proved the surrogate works through the session, which
+/// is not a statement about the projection an operator is left holding.
 ///
 /// The argument list is the flag set, one parameter each, which is what stops
 /// two callers from remembering two different orders. `run_integrations_execute`
@@ -5346,19 +5438,13 @@ fn run_integrations_migrate_prove(
         Err(refusal) => fail(refusal.kind, refusal.message),
     };
 
-    let facts = crate::ipc::fetch_broker_facts(socket);
-    let connect = facts
-        .as_ref()
-        .and_then(|facts| facts.connect_listen.clone())
-        .unwrap_or_else(|| {
-            fail(
-                "no_relay_address",
-                "this broker publishes no CONNECT address, so the projection would name a port \
-                 nothing is listening on. It was started without `--connect-listen`."
-                    .to_string(),
-            )
-        });
-    let endpoint = format!("http://{connect}");
+    // The proxy the projection will name, and the one npm is exercised
+    // through. Same value, because the point of this command is to measure
+    // what the file says — not what the environment would have said.
+    let endpoint = match session_shim_url() {
+        Ok(shim) => shim,
+        Err(message) => fail("no_session_shim", message),
+    };
 
     let projection = match NpmProjection::new(&audience_value, &endpoint, &surrogate) {
         Ok(projection) => projection,
@@ -5394,7 +5480,6 @@ fn run_integrations_migrate_prove(
         &npm,
         &inputs.projection,
         projection.registry(),
-        &relay,
         &cache,
         &surrogate,
     ) {
@@ -5422,7 +5507,6 @@ fn run_integrations_migrate_prove(
         &inputs.projection,
         &positive,
         projection.registry(),
-        &relay,
         &cache,
         &surrogate,
     ) {
@@ -6092,7 +6176,13 @@ fn npm_binary() -> Result<PathBuf, MigrateRefusal> {
 ///
 /// The arguments are identical for both probes; only `--userconfig` differs.
 /// That is what makes the negative result mean anything: same binary, same
-/// registry, same relay, same operation, two files.
+/// registry, same operation, two files.
+///
+/// **No `--https-proxy` on the command line.** It would be redundant with the
+/// file and worse than redundant: npm was measured preferring the file's
+/// `https-proxy` over the environment, so an explicit flag would make this
+/// command report a working projection no matter what the projection says.
+/// The proxy under test has to be the one the projection wrote.
 ///
 /// `whoami` rather than `view` or `ping`: it is the operation that is *about*
 /// the credential, it is never served from a cache, and it fails when the
@@ -6101,7 +6191,6 @@ fn exercise_npm(
     npm: &std::path::Path,
     userconfig: &std::path::Path,
     registry: &str,
-    relay: &str,
     cache: &std::path::Path,
     surrogate: &str,
 ) -> Result<NpmOutcome, String> {
@@ -6111,8 +6200,6 @@ fn exercise_npm(
         .arg(userconfig)
         .arg("--registry")
         .arg(registry)
-        .arg("--https-proxy")
-        .arg(relay)
         .arg("--cache")
         .arg(cache)
         .arg("--loglevel")
@@ -6175,7 +6262,6 @@ fn negative_probe(
     projection: &std::path::Path,
     positive: &NpmOutcome,
     registry: &str,
-    relay: &str,
     cache: &std::path::Path,
     surrogate: &str,
 ) -> Result<(String, PathBuf), MigrateRefusal> {
@@ -6214,7 +6300,7 @@ fn negative_probe(
         }
     };
 
-    let outcome = match exercise_npm(npm, &copy, registry, relay, cache, surrogate) {
+    let outcome = match exercise_npm(npm, &copy, registry, cache, surrogate) {
         Ok(outcome) => outcome,
         Err(message) => {
             let _ = std::fs::remove_file(&copy);
