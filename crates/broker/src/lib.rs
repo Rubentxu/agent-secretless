@@ -2770,22 +2770,44 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                     };
                 }
             }
-            // R2.D.3.2 — the deployment lookup. The next increment is the
-            // actual transport call via K8sClient::send. Today the broker
-            // answers with the binding it would have called, named in the
-            // gap so an operator reading the refusal learns what to
-            // configure.
-            match state.authorize_k8s_read(session, peer, &credential) {
-                Ok(_binding) => Response::Error {
-                    code: ErrorCode::Denied,
-                    message: format!(
-                        "k8s_read: deployment lookup passed (credential {}, API server {}) but \
-                         the transport call is not yet implemented (R2.D.3.2)",
-                        credential.to_wire(),
-                        _binding.deployment.audience.as_str(),
-                    ),
-                },
+            // R2.D.3.2 — the actual read. The deployment lookup and policy
+            // gate ran in `authorize_k8s_read`; here the broker builds a
+            // typed `ApiRequest`, hands it to `K8sClient::send` with the
+            // borrowed port, and returns the API server's reply.
+            //
+            // The `Box::leak` is the cost of `Scope::Namespaced` taking
+            // `&'static str`. The leak is bounded by the set of distinct
+            // namespace/resource/name triples the broker ever sees, which
+            // is small in practice; a long-running broker can reclaim it
+            // by restart. The alternative — broadening `Scope`'s lifetime —
+            // is a public API change the k8s module has to commit to, and
+            // the next increment to R2.D will land it as part of the
+            // R2.D.3.2 cleanup, not this one.
+            let binding = match state.authorize_k8s_read(session, peer, &credential) {
+                Ok(binding) => binding,
                 Err(denial) => return *denial,
+            };
+            let api_request = crate::k8s::request::ApiRequest {
+                verb: crate::k8s::request::Verb::Get,
+                scope: crate::k8s::request::Scope::Namespaced {
+                    namespace: Box::leak(namespace.into_boxed_str()),
+                },
+                resource: Box::leak(resource.into_boxed_str()),
+                name: Some(Box::leak(name.into_boxed_str())),
+            };
+            match binding.client().send(
+                binding.port(),
+                &credential.to_wire(),
+                &api_request,
+            ) {
+                Ok(reply) => Response::K8sRead {
+                    status: reply.status,
+                    body: String::from_utf8_lossy(&reply.body).into_owned(),
+                },
+                Err(error) => Response::Error {
+                    code: ErrorCode::Upstream,
+                    message: format!("the API server refused the read: {error}"),
+                },
             }
         }
 
