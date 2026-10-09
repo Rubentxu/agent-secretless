@@ -3566,7 +3566,13 @@ fn run_k8s(socket: &std::path::Path, command: &K8sCommand) -> std::io::Result<()
     // the broker arm refuses before either is spent, which is the
     // property this surface has: a verb exists that an agent can call,
     // and the gap is the answer, not a panic.
-    let outcome = call(
+    //
+    // `github_call` centralises the transport-failure exit (2 with
+    // `ASV_CONNECTION_FAILED`); the only branch left here is the
+    // session-shape refusal, which is a broker error rather than a
+    // connection error and so gets a different exit code (1) and a
+    // different message.
+    let session = match github_call(
         socket,
         &Request::CreateSession {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -3574,16 +3580,11 @@ fn run_k8s(socket: &std::path::Path, command: &K8sCommand) -> std::io::Result<()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| ".".to_string()),
         },
-    );
-    let session = match outcome {
-        Ok(Response::SessionCreated { session, .. }) => session,
-        Ok(other) => {
+    ) {
+        Response::SessionCreated { session, .. } => session,
+        other => {
             eprintln!("asv k8s: session creation was refused: {other:?}");
             std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("ASV_CONNECTION_FAILED: {e}");
-            std::process::exit(2);
         }
     };
     let request = Request::K8sRead {
@@ -3594,27 +3595,20 @@ fn run_k8s(socket: &std::path::Path, command: &K8sCommand) -> std::io::Result<()
         resource,
         name,
     };
-    match call(socket, &request) {
-        Ok(response) => {
-            if json {
-                let result = ipc::from_response(&response);
-                println!(
-                    "{}",
-                    render::json::envelope(&render::json::for_result(&result))
-                );
-            } else {
-                print_response(&response);
-            }
-            if matches!(response, Response::Error { .. }) {
-                std::process::exit(1);
-            }
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("ASV_CONNECTION_FAILED: {e}");
-            std::process::exit(2);
-        }
+    let response = github_call(socket, &request);
+    if json {
+        let result = ipc::from_response(&response);
+        println!(
+            "{}",
+            render::json::envelope(&render::json::for_result(&result))
+        );
+    } else {
+        print_response(&response);
     }
+    if matches!(response, Response::Error { .. }) {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// R2.E.3. Reads a PKCS#10 CSR from stdin and asks the broker to sign it.
@@ -3638,7 +3632,12 @@ fn run_mtls(socket: &std::path::Path, command: &MTlsCommand) -> std::io::Result<
     let csr_pem = csr_pem.strip_suffix('\n').unwrap_or(&csr_pem).to_string();
 
     // Open the session and send the typed request, mirroring the K8s arm.
-    let outcome = call(
+    // `github_call` centralises the transport-failure exit (2 with
+    // `ASV_CONNECTION_FAILED`); the only branch left here is the
+    // session-shape refusal, which is a broker error rather than a
+    // connection error and so gets a different exit code (1) and a
+    // different message.
+    let session = match github_call(
         socket,
         &Request::CreateSession {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -3646,16 +3645,11 @@ fn run_mtls(socket: &std::path::Path, command: &MTlsCommand) -> std::io::Result<
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| ".".to_string()),
         },
-    );
-    let session = match outcome {
-        Ok(Response::SessionCreated { session, .. }) => session,
-        Ok(other) => {
+    ) {
+        Response::SessionCreated { session, .. } => session,
+        other => {
             eprintln!("asv mtls: session creation was refused: {other:?}");
             std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("ASV_CONNECTION_FAILED: {e}");
-            std::process::exit(2);
         }
     };
     let request = Request::MTlsSign {
@@ -3664,27 +3658,20 @@ fn run_mtls(socket: &std::path::Path, command: &MTlsCommand) -> std::io::Result<
         credential,
         csr_pem,
     };
-    match call(socket, &request) {
-        Ok(response) => {
-            if json {
-                let result = ipc::from_response(&response);
-                println!(
-                    "{}",
-                    render::json::envelope(&render::json::for_result(&result))
-                );
-            } else {
-                print_response(&response);
-            }
-            if matches!(response, Response::Error { .. }) {
-                std::process::exit(1);
-            }
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("ASV_CONNECTION_FAILED: {e}");
-            std::process::exit(2);
-        }
+    let response = github_call(socket, &request);
+    if json {
+        let result = ipc::from_response(&response);
+        println!(
+            "{}",
+            render::json::envelope(&render::json::for_result(&result))
+        );
+    } else {
+        print_response(&response);
     }
+    if matches!(response, Response::Error { .. }) {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn run_oauth2(socket: &std::path::Path, command: &Oauth2Command) -> std::io::Result<()> {
