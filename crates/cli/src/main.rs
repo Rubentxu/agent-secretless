@@ -1142,15 +1142,10 @@ async fn main() -> std::io::Result<()> {
             // The error is input-free by construction (`CredentialId`'s parse
             // error carries no text), so nothing the operator typed comes back
             // out through a diagnostic.
-            match CredentialId::from_wire(&id) {
-                Ok(id) => Request::DeleteCredential {
-                    protocol: asv_ipc_protocol::PROTOCOL_VERSION,
-                    id,
-                },
-                Err(_) => {
-                    eprintln!("asv: {id:?} is not a credential id; copy it from `asv credentials`");
-                    std::process::exit(2);
-                }
+            let id = parse_vault_credential(&id);
+            Request::DeleteCredential {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                id,
             }
         }
         Command::Audit { since } => {
@@ -1735,6 +1730,28 @@ fn parse_duration_secs(spec: &str) -> Option<u64> {
     }
 }
 
+/// Parses a CLI-supplied credential id, refusing anything that is not in the
+/// canonical lowercase hyphenated UUID form the vault expects.
+///
+/// Exits with code 2 on a malformed id, for the reason every other argument
+/// check in this CLI does: a usage error is not a "the broker said no"
+/// outcome, and a script that distinguishes the two needs the same exit code
+/// it sees everywhere else. The message quotes nothing the operator typed —
+/// `CredentialId`'s parse error carries no text, and a diagnostic that
+/// echoed the rejected string would re-leak exactly what the parser refused
+/// to accept.
+fn parse_vault_credential(input: &str) -> CredentialId {
+    match CredentialId::from_wire(input) {
+        Ok(id) => id,
+        Err(_) => {
+            eprintln!(
+                "asv: the --credential value is not a vault id; copy it from `asv credentials`"
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
 const QUARANTINED_ENV_NAMES: &[&str] = &[
     "GITHUB_TOKEN",
     "AWS_SECRET_ACCESS_KEY",
@@ -1973,22 +1990,7 @@ fn run_github(socket: &std::path::Path, command: &GithubCommand) -> std::io::Res
     // spelling would be accepted here and then miss in the vault, and the
     // operator would be told the credential does not exist. `CredentialId`'s
     // parse error carries no text, so nothing they typed comes back out.
-    let credential = match CredentialId::from_wire(github_credential_arg(command)) {
-        Ok(id) => id,
-        Err(_) => {
-            // A usage error, and reported as one: this is the shape every
-            // other argument check in this CLI uses (`parse_credential_kind`,
-            // `CredentialId::from_wire` in `delete-credential`), so a script
-            // that distinguishes "you called me wrong" from "the broker said
-            // no" sees the same exit code here it sees everywhere else. The
-            // message quotes nothing, so nothing the operator typed comes back
-            // out.
-            eprintln!(
-                "asv: the --credential value is not a vault id; copy it from `asv credentials`"
-            );
-            std::process::exit(2);
-        }
-    };
+    let credential = parse_vault_credential(github_credential_arg(command));
 
     // Bodies are read before the session exists, for the same reason
     // `add-credential` reads its secret first: a payload this process is
@@ -2125,10 +2127,7 @@ fn run_aws(socket: &std::path::Path, command: &AwsCommand) -> std::io::Result<()
     // Validated before a session exists, for the reason `run_github` does it:
     // a malformed id would be accepted here and then miss in the broker, and the
     // operator would be told a credential does not exist.
-    if CredentialId::from_wire(credential).is_err() {
-        eprintln!("asv: the --credential value is not a vault id; copy it from `asv credentials`");
-        std::process::exit(2);
-    }
+    parse_vault_credential(credential);
 
     let session = match github_call(
         socket,
@@ -3120,15 +3119,7 @@ fn run_registry(socket: &std::path::Path, command: &RegistryCommand) -> std::io:
     // malformed id would be accepted here and then miss in the vault, and the
     // operator would be told a credential does not exist. The parse error
     // carries no text, so nothing they typed comes back out.
-    let credential = match CredentialId::from_wire(credential_arg) {
-        Ok(id) => id,
-        Err(_) => {
-            eprintln!(
-                "asv: the --credential value is not a vault id; copy it from `asv credentials`"
-            );
-            std::process::exit(2);
-        }
-    };
+    let credential = parse_vault_credential(credential_arg);
 
     let session = match github_call(
         socket,
@@ -3370,15 +3361,7 @@ fn run_registry_push(socket: &std::path::Path, command: &RegistryCommand) -> std
     // Same reason, and the same message, as on `run_registry`: a malformed id
     // accepted here would miss in the vault later and be reported as a missing
     // credential.
-    let credential = match CredentialId::from_wire(credential_arg) {
-        Ok(id) => id,
-        Err(_) => {
-            eprintln!(
-                "asv: the --credential value is not a vault id; copy it from `asv credentials`"
-            );
-            std::process::exit(2);
-        }
-    };
+    let credential = parse_vault_credential(credential_arg);
 
     let bytes = std::fs::read(file).map_err(|error| {
         std::io::Error::other(format!(
@@ -3680,10 +3663,7 @@ fn run_oauth2(socket: &std::path::Path, command: &Oauth2Command) -> std::io::Res
     // Validated before a session exists, for the reason `run_aws` does it: a
     // malformed id would be accepted here and then miss in the broker, and the
     // operator would be told a credential does not exist.
-    if CredentialId::from_wire(credential).is_err() {
-        eprintln!("asv: the --credential value is not a vault id; copy it from `asv credentials`");
-        std::process::exit(2);
-    }
+    parse_vault_credential(credential);
 
     let session = match github_call(
         socket,
