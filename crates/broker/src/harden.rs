@@ -317,9 +317,15 @@ pub fn dumpable_is_zero() -> bool {
         let ret = libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0);
         ret == 0
     }
+    // The honest answer on a platform without `PR_SET_DUMPABLE` is
+    // `false`: we cannot make the process undumpable on macOS, BSD,
+    // or Windows, so claiming `true` would be a security property
+    // the broker does not have. The build-host kernel matrix in the
+    // release gates makes the host check explicit; this arm is the
+    // development-host equivalent.
     #[cfg(not(target_os = "linux"))]
     {
-        true
+        false
     }
 }
 
@@ -332,9 +338,12 @@ pub fn no_new_privs_is_set() -> bool {
         let ret = libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
         ret == 1
     }
+    // Same reasoning as `dumpable_is_zero`: the platform cannot have
+    // set a property it does not know how to set, so the honest answer
+    // on non-Linux is `false`.
     #[cfg(not(target_os = "linux"))]
     {
-        true
+        false
     }
 }
 
