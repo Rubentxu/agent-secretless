@@ -89,7 +89,7 @@ pub mod grant;
 pub mod issue;
 pub mod present;
 
-pub use deployment::{ClientBinding, DeploymentError, MtlsDeployment};
+pub use deployment::{ClientBinding, DeploymentError, MtlsDeployment, SigningBinding};
 pub use grant::{ClientGrant, MIN_CLIENT_CERT_TTL};
 pub use issue::{issue_client_certificate, ClientCertError, ClientCsr, IssuedClientCert};
 pub use present::ClientIdentity;

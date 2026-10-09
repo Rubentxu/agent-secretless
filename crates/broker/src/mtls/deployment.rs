@@ -40,7 +40,7 @@
 
 use std::time::{Duration, Instant};
 
-use asv_domain::Authority;
+use asv_domain::{Authority, CredentialId};
 
 use super::grant::{ClientGrant, MIN_CLIENT_CERT_TTL};
 use super::issue::ClientCertError;
@@ -87,10 +87,79 @@ impl ClientBinding {
     }
 }
 
+/// One operator-declared grant, for one vault credential.
+///
+/// R2.E.3.2: the broker signs a CSR the agent brought, and what gets signed
+/// is the identity the operator declared for the credential — never a name
+/// the request supplied. The shape mirrors [`ClientBinding`] so the dispatch
+/// path treats the two with the same vocabulary, and what differs is the
+/// access pattern: `ClientBinding` is destination-keyed (the broker presents
+/// a cert when reaching a host), `SigningBinding` is credential-keyed (the
+/// broker signs when an agent asks for one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigningBinding {
+    credential: CredentialId,
+    identity: Authority,
+    ttl: Duration,
+}
+
+impl SigningBinding {
+    /// Declare `credential` as the holder of an identity, valid for `ttl`.
+    ///
+    /// The credential is parsed at construction (not stored as a free-form
+    /// string) for the same reason [`ClientBinding`] canonicalizes: the value
+    /// enters the program here, and a declaration that *exists* is a
+    /// declaration that already passed the only check worth running on it.
+    pub fn new(
+        credential: &str,
+        identity: &str,
+        ttl: Duration,
+    ) -> Result<Self, DeploymentError> {
+        let credential = CredentialId::from_wire(credential)
+            .map_err(|_| DeploymentError::UnusableCredential(credential.to_string()))?;
+        Ok(Self {
+            credential,
+            identity: canonical(identity, DeploymentError::UnusableIdentity)?,
+            ttl,
+        })
+    }
+
+    /// The vault credential this binding answers for.
+    pub fn credential(&self) -> &CredentialId {
+        &self.credential
+    }
+
+    /// The name this binding authenticates as.
+    pub fn identity(&self) -> &str {
+        self.identity.as_str()
+    }
+
+    /// The lifetime a certificate minted from this binding may have.
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    /// Whether this binding is the one a request's credential names.
+    ///
+    /// Compared as a `CredentialId` rather than as text: a wire id that parses
+    /// is one record and two spellings of it are the same record, so there
+    /// is no case-folding decision to get wrong.
+    pub fn serves(&self, credential: &CredentialId) -> bool {
+        &self.credential == credential
+    }
+
+    /// The grant the issuer needs, built here so the issuance path does not
+    /// have to know how a binding is shaped.
+    pub fn to_grant(&self) -> Result<ClientGrant, ClientCertError> {
+        ClientGrant::for_identity(self.identity.as_str(), self.ttl)
+    }
+}
+
 /// A set of bindings, checked for the one thing that would make it ambiguous.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MtlsDeployment {
     bindings: Vec<ClientBinding>,
+    signers: Vec<SigningBinding>,
 }
 
 impl MtlsDeployment {
@@ -100,11 +169,15 @@ impl MtlsDeployment {
     pub fn empty() -> Self {
         Self {
             bindings: Vec::new(),
+            signers: Vec::new(),
         }
     }
 
     /// A declaration from a list, refusing a destination declared twice.
-    pub fn new(bindings: Vec<ClientBinding>) -> Result<Self, DeploymentError> {
+    pub fn new(
+        bindings: Vec<ClientBinding>,
+        signers: Vec<SigningBinding>,
+    ) -> Result<Self, DeploymentError> {
         for (index, binding) in bindings.iter().enumerate() {
             if let Some(first) = bindings[..index]
                 .iter()
@@ -117,7 +190,19 @@ impl MtlsDeployment {
                 });
             }
         }
-        Ok(Self { bindings })
+        for (index, signer) in signers.iter().enumerate() {
+            if let Some(first) = signers[..index]
+                .iter()
+                .find(|other| other.credential() == signer.credential())
+            {
+                return Err(DeploymentError::DuplicateCredential {
+                    credential: signer.credential().to_wire(),
+                    first: first.identity().to_string(),
+                    second: signer.identity().to_string(),
+                });
+            }
+        }
+        Ok(Self { bindings, signers })
     }
 
     /// The identity this declaration has for `host`, minted now.
@@ -173,6 +258,19 @@ impl MtlsDeployment {
     pub fn is_empty(&self) -> bool {
         self.bindings.is_empty()
     }
+
+    /// The signing binding for `credential`, or `None` if no such binding is
+    /// declared.
+    ///
+    /// The same shape as `identity_for`: `None` is the ordinary answer for a
+    /// credential nobody declared, and it is not a refusal. An agent that asks
+    /// for a credential the operator did not register gets nothing, and the
+    /// dispatch path turns that into a `Denied` with the configured list.
+    pub fn signer_for(&self, credential: &CredentialId) -> Option<&SigningBinding> {
+        self.signers
+            .iter()
+            .find(|signer| signer.serves(credential))
+    }
 }
 
 fn canonical(raw: &str, arm: fn(String) -> DeploymentError) -> Result<Authority, DeploymentError> {
@@ -205,6 +303,21 @@ pub enum DeploymentError {
     /// The destination is not a destination.
     #[error("{0}")]
     UnusableDestination(String),
+
+    /// A signing binding named a credential that is not a canonical vault id.
+    #[error("{0} is not a canonical credential id")]
+    UnusableCredential(String),
+
+    /// The same credential was declared as a signer more than once.
+    #[error("credential {credential} is declared twice, as {first} and as {second}; a credential has one identity or none")]
+    DuplicateCredential {
+        /// The credential both bindings name.
+        credential: String,
+        /// The identity of the earlier binding.
+        first: String,
+        /// The identity of the later one.
+        second: String,
+    },
 }
 
 /// The floor a declaration's lifetime is measured against, re-exported so a

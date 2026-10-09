@@ -29,7 +29,7 @@ fn ca() -> SessionCa {
 /// the one after it is the control for it.
 #[test]
 fn un_destino_declarado_produce_una_identidad_para_ese_destino() {
-    let deployment = MtlsDeployment::new(vec![binding("svc-a.internal", HOST)])
+    let deployment = MtlsDeployment::new(vec![binding("svc-a.internal", HOST)], vec![])
         .expect("one destination, one identity");
     let ca = ca();
 
@@ -47,7 +47,7 @@ fn un_destino_declarado_produce_una_identidad_para_ese_destino() {
 /// shape that hands a client certificate to a host nobody declared.
 #[test]
 fn un_destino_sin_declaracion_no_produce_identidad() {
-    let deployment = MtlsDeployment::new(vec![binding("svc-a.internal", HOST)]).expect("ok");
+    let deployment = MtlsDeployment::new(vec![binding("svc-a.internal", HOST)], vec![]).expect("ok");
     let ca = ca();
 
     for host in [
@@ -77,7 +77,7 @@ fn un_destino_declarado_dos_veces_se_rechaza() {
     let refusal = MtlsDeployment::new(vec![
         binding("svc-a.internal", HOST),
         binding("svc-b.internal", HOST),
-    ])
+    ], vec![])
     .expect_err("a destination has one identity or none");
 
     assert_eq!(
@@ -95,7 +95,7 @@ fn un_destino_declarado_dos_veces_se_rechaza() {
 #[test]
 fn la_resolucion_es_exacta_y_no_por_sufijo() {
     let deployment =
-        MtlsDeployment::new(vec![binding("svc-a.internal", "svc.example")]).expect("ok");
+        MtlsDeployment::new(vec![binding("svc-a.internal", "svc.example")], vec![]).expect("ok");
     let ca = ca();
 
     assert!(deployment.declares("svc.example"));
@@ -112,7 +112,7 @@ fn la_resolucion_es_exacta_y_no_por_sufijo() {
 /// a different case, and the identity silently stops existing.
 #[test]
 fn el_host_se_canonicaliza_antes_de_resolver() {
-    let deployment = MtlsDeployment::new(vec![binding("svc-a.internal", HOST)]).expect("ok");
+    let deployment = MtlsDeployment::new(vec![binding("svc-a.internal", HOST)], vec![]).expect("ok");
     let ca = ca();
 
     for spelling in ["INTERNAL.SVC.EXAMPLE", "internal.svc.example."] {
@@ -169,7 +169,7 @@ fn el_plazo_lo_manda_el_emisor_y_no_la_declaracion() {
         HOST,
         Duration::from_secs(1),
     )
-    .expect("a canonical pair")])
+    .expect("a canonical pair")], vec![])
     .expect("the declaration itself is well formed");
 
     let refusal = deployment
@@ -188,8 +188,8 @@ fn el_plazo_lo_manda_el_emisor_y_no_la_declaracion() {
 #[test]
 fn rotar_es_cambiar_la_declaracion() {
     let ca = ca();
-    let before = MtlsDeployment::new(vec![binding("svc-a.internal", HOST)]).expect("ok");
-    let after = MtlsDeployment::new(vec![binding("svc-b.internal", HOST)]).expect("ok");
+    let before = MtlsDeployment::new(vec![binding("svc-a.internal", HOST)], vec![]).expect("ok");
+    let after = MtlsDeployment::new(vec![binding("svc-b.internal", HOST)], vec![]).expect("ok");
 
     let first = before
         .identity_for(&ca, HOST, Instant::now())
@@ -237,7 +237,7 @@ fn un_destino_repetido_con_otra_ortografia_tambien_se_rechaza() {
     let refusal = MtlsDeployment::new(vec![
         binding("svc-a.internal", HOST),
         binding("svc-b.internal", "INTERNAL.SVC.EXAMPLE"),
-    ])
+    ], vec![])
     .expect_err("the same destination twice, whatever the spelling");
 
     match refusal {

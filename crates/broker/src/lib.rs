@@ -915,6 +915,20 @@ pub struct BrokerState {
     /// every call, and the second of those is the DNS-rebinding hole the
     /// pinned client exists to close.
     pub oauth2: Vec<crate::oauth2_binding::OAuth2Binding>,
+    /// R2.E.3: the mTLS signing grants this broker will honour, keyed by
+    /// vault credential.
+    ///
+    /// **Empty is the default and refuses every `MTlsSign` request**, the
+    /// same fail-closed reading as [`Self::aws`] and [`Self::registries`]: a
+    /// broker that was not told which credential a CSR can be signed under
+    /// is not a broker that gets to sign whatever an agent brings.
+    ///
+    /// The session CA itself is **not** stored here. It is the per-session
+    /// [`SessionCa`](crate::tls_bridge::SessionCa) the broker already mints
+    /// for the CONNECT listener; the sign path borrows that one and the
+    /// present path mints its own from the same source, so a single source
+    /// of authority stays in one place.
+    pub mtls_signers: Vec<crate::tls_bridge::mtls::deployment::SigningBinding>,
     /// R9: tamper-evident log of every handled request. One record per
     /// `handle` call, appended by the public wrapper (not by the inner
     /// dispatcher), so the audit cannot be bypassed by a new variant.
@@ -1021,6 +1035,10 @@ impl Default for BrokerState {
             // a role nobody chose.
             aws: Vec::new(),
             oauth2: Vec::new(),
+            // No mTLS signing grant unless the operator declares one, for
+            // the same reason `aws` is empty and `oauth2` is empty: a default
+            // that minted a client cert would be one nobody chose.
+            mtls_signers: Vec::new(),
             audit: Arc::new(Mutex::new(audit::AuditLog::default())),
             control_plane: admission::Enrolment::empty(),
             vault_writer: None,
@@ -2568,18 +2586,21 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
         // that would answer it has not landed.
         Request::MTlsSign {
             protocol: _,
-            session: _,
+            session,
             credential,
             csr_pem,
         } => {
             // The credential is parsed first, for the same reason the AWS
             // and K8s arms do.
-            if CredentialId::from_wire(&credential).is_err() {
-                return Response::Error {
-                    code: ErrorCode::InvalidRequest,
-                    message: "the credential is not a vault id".into(),
-                };
-            }
+            let credential = match CredentialId::from_wire(&credential) {
+                Ok(id) => id,
+                Err(_) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: "the credential is not a vault id".into(),
+                    };
+                }
+            };
             // R2.E.3.1 — refuse an empty CSR. A PEM that is too short to
             // contain "-----BEGIN CERTIFICATE REQUEST-----" cannot be a CSR,
             // and "trusted input that turned out to be garbage" is the
@@ -2590,15 +2611,22 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                     message: "the CSR is not a PEM-encoded PKCS#10 request".into(),
                 };
             }
-            // R2.E.3.2 — deployment lookup, CA selection, leaf sign, audit.
-            Response::Error {
-                code: ErrorCode::Denied,
-                message: format!(
-                    "mtls_sign is not yet wired end-to-end: CSR validated ({} bytes) but \
-                     the mTLS deployment lookup, CA selection, leaf sign, and audit \
-                     are not implemented (R2.E.3.2)",
-                    csr_pem.len(),
-                ),
+            // R2.E.3.2 — the signer lookup. The next increments are the
+            // session CA wiring, the actual signature, and the audit row;
+            // today the broker answers with the binding it would have signed
+            // against, named in the gap so an operator reading the refusal
+            // learns what to configure.
+            match state.authorize_mtls_sign(session, peer, &credential) {
+                Ok(_signer) => Response::Error {
+                    code: ErrorCode::Denied,
+                    message: format!(
+                        "mtls_sign: signer lookup passed (credential {}, identity {}) but \
+                         the CA selection, leaf sign, and audit are not yet implemented (R2.E.3.2)",
+                        credential.to_wire(),
+                        _signer.identity(),
+                    ),
+                },
+                Err(denial) => return *denial,
             }
         }
 
@@ -3243,6 +3271,86 @@ impl BrokerState {
             },
         )?;
         Ok(binding)
+    }
+
+    /// The signing grant an mTLS request named, or a refusal that lists the
+    /// configured credentials so the operator can see what was missed.
+    fn mtls_signer_for(
+        &self,
+        credential: &CredentialId,
+    ) -> Result<&crate::tls_bridge::mtls::deployment::SigningBinding, Box<Response>> {
+        match self
+            .mtls_signers
+            .iter()
+            .find(|signer| signer.serves(credential))
+        {
+            Some(signer) => Ok(signer),
+            None => {
+                let configured: Vec<String> = self
+                    .mtls_signers
+                    .iter()
+                    .map(|signer| signer.credential().to_wire())
+                    .collect();
+                Err(Box::new(Response::Error {
+                    code: ErrorCode::Denied,
+                    message: format!(
+                        "no mTLS signing grant is configured for {}; configured: {configured:?}",
+                        credential.to_wire()
+                    ),
+                }))
+            }
+        }
+    }
+
+    /// Every check an `MTlsSign` request must pass **before any signature is
+    /// produced**.
+    ///
+    /// Ordered the way the failures are cheapest to refuse: session ownership,
+    /// then the signer lookup, then the policy. A request that fails any of
+    /// them has not reached the issuer and cannot have spent a CA.
+    ///
+    /// The audience is the declared identity on the binding, never anything
+    /// the request supplied. A policy permitting `mtls.sign` on
+    /// `svc-a.internal` therefore permits it for that identity and for no
+    /// other — a request that brought a CSR asking for `*.internal` still
+    /// gets `svc-a.internal`, and that is the property.
+    fn authorize_mtls_sign(
+        &self,
+        session: AgentSessionId,
+        peer: &WorkloadIdentity,
+        credential: &CredentialId,
+    ) -> Result<&crate::tls_bridge::mtls::deployment::SigningBinding, Box<Response>> {
+        if !self.session_owned_by(session, peer)? {
+            return Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: "session is not owned by the authenticated peer".into(),
+            }));
+        }
+        let signer = self.mtls_signer_for(credential)?;
+        self.authorize_verb(
+            session,
+            peer,
+            Action::MTlsSign,
+            // The resource is the **declared** identity. A policy that names
+            // `resource.identity == "svc-a.internal"` permits that and only
+            // that; a policy that names a host is evaluated against the
+            // destination of the *present* operation, not here. The two are
+            // distinct because an agent that controls the resource it signs
+            // for can also sign for things it should not reach.
+            Resource::Api {
+                audience: asv_domain::Authority::canonicalize(signer.identity())
+                    .map_err(|error| {
+                        Box::new(Response::Error {
+                            code: ErrorCode::Denied,
+                            message: format!(
+                                "the declared identity {identity:?} is not a canonical authority: {error}",
+                                identity = signer.identity()
+                            ),
+                        })
+                    })?,
+            },
+        )?;
+        Ok(signer)
     }
 
     /// Resolves the registry a request selected, authorizes it, and returns the
@@ -7889,12 +7997,68 @@ mod e2e {
         }
     }
 
-    /// When the mTLS sign arm has accepted the credential and the CSR, the
-    /// gap-named `Denied` it returns is the property the roadmap describes:
-    /// R2.E.3.2 (mTLS deployment lookup, CA selection, leaf sign, audit) is
-    /// the next increment, and the refusal names it.
+    /// The mTLS sign arm, after the signer lookup was wired: a configured
+    /// grant passes the lookup, and the policy gate decides what comes
+    /// next. The default policy denies, so the refusal here is the policy
+    /// refusal — and the test pins that the *signer lookup* ran, not the
+    /// gap-named denial, by asserting the message names the missing grant
+    /// in a way only a found-then-denied signer produces.
+    ///
+    /// The point of the row is structural: a regression that broke the
+    /// lookup would send this test to the "no mTLS signing grant is
+    /// configured" path instead, because the broker would never find the
+    /// grant to deny.
     #[test]
-    fn mtls_sign_with_a_well_formed_csr_names_r2_e_3_2_as_the_gap() {
+    fn mtls_sign_with_a_configured_signer_reaches_the_policy_gate() {
+        let mut state = bare();
+        state.mtls_signers = vec![
+            crate::tls_bridge::mtls::deployment::SigningBinding::new(
+                "11111111-2222-3333-4444-555555555555",
+                "svc-a.internal",
+                std::time::Duration::from_secs(3600),
+            )
+            .expect("canonical pair"),
+        ];
+        let peer = self_peer();
+        let session = sess(&state).create("/repo".into(), &peer);
+        match handle(
+            &mut state,
+            &peer,
+            Request::MTlsSign {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                session,
+                credential: "11111111-2222-3333-4444-555555555555".into(),
+                csr_pem: PEM_CSR.into(),
+            },
+        ) {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::Denied, "{message}");
+                // A signer was found, so the unconfigured refusal cannot
+                // have run. The default policy denies every action, so the
+                // message is the policy gate's, not the gap's.
+                assert!(
+                    !message.contains("no mTLS signing grant is configured"),
+                    "the signer was configured, so the unconfigured refusal must not appear: {message}"
+                );
+                assert!(
+                    message.contains("denied") || message.contains("policy"),
+                    "expected a policy denial, got {message}"
+                );
+            }
+            other => panic!("expected a policy denial, got {other:?}"),
+        }
+    }
+
+    /// The mTLS sign arm, before the signer is declared: the lookup fails
+    /// first and the refusal names the credential, not the gap.
+    ///
+    /// The two refusals (no signer vs. signer present but unsigned) are
+    /// distinct because the operator's response is different in each case:
+    /// one needs a declaration, the other needs R2.E.3.2 to land. A test
+    /// that treated them as one would let a regression that lost the
+    /// configured-but-unsigned message go unnoticed.
+    #[test]
+    fn mtls_sign_without_a_signer_refuses_by_credential() {
         let mut state = bare();
         let peer = self_peer();
         let session = sess(&state).create("/repo".into(), &peer);
@@ -7910,13 +8074,16 @@ mod e2e {
         ) {
             Response::Error { code, message } => {
                 assert_eq!(code, ErrorCode::Denied, "{message}");
-                assert!(message.contains("R2.E.3.2"), "{message}");
                 assert!(
-                    message.contains("not yet wired"),
-                    "the refusal must name the gap, not pretend success: {message}"
+                    message.contains("no mTLS signing grant is configured"),
+                    "{message}"
+                );
+                assert!(
+                    !message.contains("R2.E.3.2"),
+                    "an unconfigured broker is the operator's problem, not a code gap: {message}"
                 );
             }
-            other => panic!("expected a gap-named denial, got {other:?}"),
+            other => panic!("expected a denial naming the missing grant, got {other:?}"),
         }
     }
 

@@ -755,6 +755,16 @@ pub enum Action {
     /// are separate actions, the policy default permits only the read, and an
     /// operator who wants writes to a shared registry has to say so.
     RegistryPush,
+    /// Signs a client certificate the agent presented as a CSR (M11-R2.E.3).
+    ///
+    /// A *semantic* operation, for the reason every other one here is: the
+    /// mTLS protocol is a handshake, and a generic "sign this CSR" verb
+    /// against a host the request chose would be a CA that signs whatever a
+    /// caller hands it — which is the exact failure `mtls::issue` exists to
+    /// not have. The broker decides the identity and the destination from
+    /// the deployment; the CSR is read only for the public key, and the
+    /// agent's subject, SANs, key usages and EKUs are discarded.
+    MTlsSign,
 }
 
 impl fmt::Display for Action {
@@ -778,6 +788,7 @@ impl fmt::Display for Action {
             Self::OAuth2Identity => "oauth2.identity",
             Self::RegistryPull => "registry.pull",
             Self::RegistryPush => "registry.push",
+            Self::MTlsSign => "mtls.sign",
         };
         f.write_str(s)
     }
@@ -1209,6 +1220,7 @@ mod tests {
             Action::OAuth2Identity,
             Action::RegistryPull,
             Action::RegistryPush,
+            Action::MTlsSign,
         ] {
             let name = action.to_string();
             assert!(!name.is_empty(), "{action:?} has no action name");
@@ -1235,6 +1247,7 @@ mod tests {
         // one, and the two are separate strings that have to agree.
         assert_eq!(Action::RegistryPull.to_string(), "registry.pull");
         assert_eq!(Action::RegistryPush.to_string(), "registry.push");
+        assert_eq!(Action::MTlsSign.to_string(), "mtls.sign");
     }
 
     // This row's list is a **sample, not an enumeration**, and saying so is the

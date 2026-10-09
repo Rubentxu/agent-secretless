@@ -396,7 +396,7 @@ fn una_declaracion_del_operador_produce_la_identidad_que_llega_al_destino() {
     let ca = SessionCa::new("s-r2e2", 21, HOUR);
     let deployment = MtlsDeployment::new(vec![
         ClientBinding::new("svc-a.internal", HOST, HOUR).expect("a canonical pair")
-    ])
+    ], vec![])
     .expect("one destination, one identity");
 
     let declared = deployment
@@ -429,7 +429,7 @@ fn una_declaracion_para_otro_destino_no_produce_una_identidad_usable() {
         "other.svc.example",
         HOUR,
     )
-    .expect("pair")])
+    .expect("pair")], vec![])
     .expect("ok");
 
     assert!(

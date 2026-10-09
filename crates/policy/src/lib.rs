@@ -1245,6 +1245,7 @@ fn action_name(action: &Action) -> &'static str {
         Action::OAuth2Identity => "oauth2_identity",
         Action::RegistryPull => "registry_pull",
         Action::RegistryPush => "registry_push",
+        Action::MTlsSign => "mtls_sign",
     }
 }
 
