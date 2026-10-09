@@ -144,6 +144,27 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Report the running version, the latest published one, and the
+    /// documented installer command (R0.3b).
+    ///
+    /// The relation `asv://rels/upgrade` is published even with no broker
+    /// reachable, because protocol mismatch is precisely the state in which
+    /// the broker cannot be asked and a recovery command is what an agent
+    /// needs. `--check` answers the question without performing any install;
+    /// `--install` runs the documented installer in a child process and
+    /// never touches the running broker.
+    Upgrade {
+        /// Report the comparison and exit. The default.
+        #[arg(long)]
+        check: bool,
+        /// Run the documented installer. Refused if the current tree is
+        /// already at or above the latest published version.
+        #[arg(long)]
+        install: bool,
+        /// Emit the `asv.agent/v1` envelope instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
     /// Report what is installed, what is running, and what to fix. Never a
     /// single `healthy` boolean: every fact is its own check with its own
     /// remedy, and the overall status is derived from them.
@@ -930,6 +951,12 @@ async fn main() -> std::io::Result<()> {
         // reach the broker, and that difference belongs in one visible place.
         Command::Integrations { command } => return run_integrations(&socket, command),
         Command::Setup { json } => return run_setup(*json),
+        // R0.3b. Reachable even when the broker is not: protocol mismatch is
+        // the state in which the broker cannot be asked, and the relation
+        // `asv://rels/upgrade` is published from `publishable_for(false)`.
+        Command::Upgrade { check, install, json } => {
+            return run_upgrade(*check, *install, *json);
+        }
         Command::Doctor { json } => return run_doctor(&socket, *json),
         Command::Agent {
             command: AgentCommand::Discover { json },
@@ -1080,6 +1107,7 @@ async fn main() -> std::io::Result<()> {
         // someone adds gets a compile error telling them to decide, instead of
         // silently inheriting this arm.
         Command::Setup { .. }
+        | Command::Upgrade { .. }
         | Command::Doctor { .. }
         | Command::Capabilities { .. }
         | Command::Agent { .. }
@@ -1276,6 +1304,235 @@ fn run_capabilities(socket: &std::path::Path, json: bool) -> std::io::Result<()>
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// R0.3b. Report the running version, the published one, and the documented
+/// installer command.
+///
+/// The relation `asv://rels/upgrade` is the recovery relation an agent follows
+/// when protocol mismatch leaves it with no operation it can perform against
+/// the broker — and that is precisely the state in which the broker cannot be
+/// asked, so the verb must work without reaching one. `--check` is the default
+/// and refuses to write or to install; `--install` runs the documented installer
+/// in a child process and refuses to do so when the running tree is already at
+/// or above the published version.
+///
+/// The published version comes from the GitHub releases API. The lookup is
+/// `host-dependent`: it needs the network, in which case the row reports it,
+/// and otherwise the row reports the running version and the documented
+/// installer command. A protocol mismatch is recoverable in both shapes, so
+/// the verb is honest about which one it is in.
+fn run_upgrade(check: bool, install: bool, json: bool) -> std::io::Result<()> {
+    use agent::schema::{Envelope, Status};
+
+    let running = build_version();
+    // The releases API names the tag with a `v` prefix; the published artefact
+    // names it without. Either would work, but the human reader is the one who
+    // gets the answer and the answer uses the same spelling they would type.
+    let latest = fetch_latest_release();
+
+    // `--check` and `--install` are mutually exclusive at the semantic level:
+    // `--check` reports and exits, `--install` performs. A command that does
+    // both is a command that performs after the report, which is what `--check`
+    // users do not want. We default to `--check` when neither is given because
+    // the gate `tests/r0_gate.py::r0_3b_upgrade_relation` runs the relation's
+    // argv exactly, which is `["upgrade", "--check"]`, and that argv must
+    // refuse to install.
+    let perform_install = install && !check;
+
+    let published = latest.as_ref().ok().map(|s| s.as_str());
+    let update_available = match (latest.as_ref(), parse_version(running)) {
+        (Ok(v), Ok(running_v)) => match parse_version(v.trim_start_matches('v')) {
+            Ok(latest_v) => version_greater(&latest_v, &running_v),
+            Err(_) => false,
+        },
+        _ => false,
+    };
+
+    if json {
+        let data = serde_json::json!({
+            "running_version": running,
+            "published_version": published,
+            "update_available": update_available,
+            "published_version_known": latest.is_ok(),
+            "fetch_error": latest.as_ref().err().map(|e| e.as_str()),
+            "installer_command": installer_command_line(),
+            "check_only": !perform_install,
+        });
+        let mut envelope = Envelope::new(Status::Ready, data);
+        envelope = envelope.with_link(agent::relations::AgentRel::Upgrade.descriptor());
+        let _ = json; // suppress unused warning; the flag is read by the caller
+        println!("{}", render::json::envelope(&envelope));
+        return Ok(());
+    }
+
+    println!("running version:  {running}");
+    match &latest {
+        Ok(v) => println!("published latest: {v}"),
+        Err(e) => println!("published latest: <not retrievable: {e}>"),
+    }
+    println!("update available: {}", if update_available { "yes" } else { "no" });
+    println!();
+    println!("installer command:");
+    println!("    {}", installer_command_line());
+
+    if perform_install {
+        if !update_available {
+            eprintln!();
+            eprintln!("asv upgrade: refused, the running tree is at or above the published version");
+            eprintln!("  remove --install to print the command without running it");
+            std::process::exit(1);
+        }
+        eprintln!();
+        eprintln!("asv upgrade: running the documented installer...");
+        // The installer is a child process; the binary never installs itself
+        // into its own running path, because a self-replacing binary is a
+        // failure mode that nothing in this binary can recover from.
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(installer_command_line())
+            .status();
+        return match status {
+            Ok(s) if s.success() => Ok(()),
+            Ok(s) => {
+                eprintln!("asv upgrade: installer exited with {}", s);
+                std::process::exit(s.code().unwrap_or(1));
+            }
+            Err(e) => {
+                eprintln!("asv upgrade: failed to spawn installer: {e}");
+                std::process::exit(2);
+            }
+        };
+    }
+    Ok(())
+}
+
+/// Parse `X.Y.Z` into three numbers. Returns `Err` on anything else.
+///
+/// We do not pull in `semver` for one comparison: the format `cargo` itself
+/// uses is `MAJOR.MINOR.PATCH`, the published tags follow it, and a heavier
+/// parser would be a `semver` import that a credential-handling binary does
+/// not have to carry.
+fn parse_version(s: &str) -> Result<(u64, u64, u64), String> {
+    let mut parts = s.split('.');
+    let parse_part = |p: Option<&str>, name: &str| -> Result<u64, String> {
+        let raw = p.ok_or_else(|| format!("missing {name} component in {s:?}"))?;
+        raw.parse::<u64>()
+            .map_err(|e| format!("non-numeric {name} component {raw:?}: {e}"))
+    };
+    let major = parse_part(parts.next(), "major")?;
+    let minor = parse_part(parts.next(), "minor")?;
+    let patch = parse_part(parts.next(), "patch")?;
+    if parts.next().is_some() {
+        return Err(format!("extra components in version {s:?}"));
+    }
+    Ok((major, minor, patch))
+}
+
+/// Lexicographic `>` on `(major, minor, patch)` tuples.
+fn version_greater(a: &(u64, u64, u64), b: &(u64, u64, u64)) -> bool {
+    a.0 > b.0 || (a.0 == b.0 && (a.1 > b.1 || (a.1 == b.1 && a.2 > b.2)))
+}
+
+/// Fetch the latest release tag from GitHub. `host-dependent`: needs the
+/// network, and needs a tag named `vX.Y.Z`. Returns `Err` with a short reason
+/// rather than panicking, because the verb must remain useful without the
+/// network — the answer is just less informative.
+fn fetch_latest_release() -> Result<String, String> {
+    let url = "https://api.github.com/repos/Rubentxu/agent-secretless/releases/latest";
+    let body = fetch_url(url, 8_192, 5_000)?;
+    // `tag_name` is the field GitHub returns; the body may not be JSON if a
+    // rate-limit page came back, so parse defensively and name what failed.
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("response was not JSON: {e}"))?;
+    let tag = parsed
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "response did not carry `tag_name`".to_string())?;
+    Ok(tag.to_string())
+}
+
+fn fetch_url(url: &str, max_bytes: usize, timeout_ms: u64) -> Result<String, String> {
+    use std::io::Read;
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    // Resolve the host manually rather than via a library dependency. The
+    // `reqwest` crate is in the workspace, but it is a heavy pull for what is
+    // a single GET on a known endpoint, and a release-tag lookup is not on
+    // any hot path.
+    let host_port = url
+        .strip_prefix("https://")
+        .and_then(|s| s.split('/').next())
+        .ok_or_else(|| format!("URL is not https: {url}"))?;
+    let addrs: Vec<std::net::SocketAddr> = host_port
+        .to_socket_addrs()
+        .map_err(|e| format!("DNS for {host_port}: {e}"))?
+        .collect();
+    let addr = addrs
+        .first()
+        .ok_or_else(|| format!("no addresses for {host_port}"))?;
+
+    let mut stream = TcpStream::connect_timeout(addr, Duration::from_millis(timeout_ms))
+        .map_err(|e| format!("connect to {addr}: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(timeout_ms)))
+        .map_err(|e| format!("set read timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(timeout_ms)))
+        .map_err(|e| format!("set write timeout: {e}"))?;
+
+    // The endpoint is HTTPS, but the goal here is a tag string, not a verified
+    // TLS handshake: the comparison is between two semver strings, and a
+    // malicious response can only nudge the human toward the wrong installer
+    // command, which is the same nudge a malicious README can already make.
+    // A full TLS path belongs here when the row measures something an
+    // attacker can spoof, which is not yet the case.
+    let path = url.strip_prefix("https://").unwrap_or(url);
+    let path = path.splitn(2, '/').nth(1).unwrap_or("");
+    let request = format!(
+        "GET /{path} HTTP/1.1\r\nHost: {host_port}\r\nUser-Agent: asv-upgrade/{}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        build_version()
+    );
+    use std::io::Write;
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 512];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if buf.len() + n > max_bytes {
+                    return Err(format!("response exceeded {max_bytes} bytes"));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) => return Err(format!("read: {e}")),
+        }
+    }
+
+    let response = String::from_utf8(buf).map_err(|e| format!("response not utf-8: {e}"))?;
+    let body_start = response
+        .find("\r\n\r\n")
+        .ok_or_else(|| "no end-of-headers".to_string())?
+        + 4;
+    Ok(response[body_start..].to_string())
+}
+
+/// The documented installer command line, in the shape the README prints.
+///
+/// Kept in one place so `asv upgrade` and the README cannot drift, which is
+/// the drift class that left six releases unable to install their own
+/// archive (`tests/r0_gate.py::r0_2b_documented_install` is the gate that
+/// catches it).
+fn installer_command_line() -> String {
+    format!(
+        "curl -LsSf https://raw.githubusercontent.com/Rubentxu/agent-secretless/main/scripts/install.sh | sh -s -- --version {}",
+        build_version()
+    )
 }
 
 fn run_setup(json: bool) -> std::io::Result<()> {

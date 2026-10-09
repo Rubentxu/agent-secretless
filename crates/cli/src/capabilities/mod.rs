@@ -250,7 +250,17 @@ fn relations_for(capabilities: &[String]) -> Vec<String> {
         .filter(|rel| {
             let op = rel.operation();
             match op {
-                "system.status" | "system.doctor" | "system.setup" | "system.capabilities" => true,
+                // R0.3b. `system.upgrade` is always published regardless of
+                // capability set: it is the recovery relation an agent
+                // follows when protocol mismatch is the reason the broker
+                // cannot be asked, and that is the very state in which
+                // filtering by capability would hide the only link that
+                // points at a runnable command.
+                "system.status"
+                | "system.doctor"
+                | "system.setup"
+                | "system.capabilities"
+                | "system.upgrade" => true,
                 "credentials.metadata.list" => {
                     capabilities.iter().any(|c| c == "credentials.metadata")
                 }

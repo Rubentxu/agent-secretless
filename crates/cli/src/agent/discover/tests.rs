@@ -95,7 +95,11 @@ fn the_document_never_points_at_the_private_broker() {
             .collect();
         assert_eq!(
             rels,
-            ["asv://rels/doctor", "asv://rels/setup"],
+            // `upgrade` is published even with no broker: protocol mismatch
+            // is the state in which the broker cannot be reached, and that
+            // is the state in which the recovery relation is the one that
+            // actually points at a runnable command.
+            ["asv://rels/doctor", "asv://rels/setup", "asv://rels/upgrade"],
             "{socket_state}"
         );
     }

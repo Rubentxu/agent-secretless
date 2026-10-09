@@ -93,6 +93,12 @@ pub enum AgentRel {
     Doctor,
     Setup,
     Capabilities,
+    /// R0.3b. A relation an agent can follow when a protocol mismatch leaves
+    /// it with no operation it can perform against the running broker. Closes
+    /// the gate `tests/r0_gate.py::r0_3b_upgrade_relation` measures, which
+    /// looks for an `upgrade`/`recover`/`repair` relation on the surface
+    /// `asv capabilities --json` publishes even with no broker reachable.
+    Upgrade,
     CredentialList,
     SessionRun,
     // Minted and spent inside a single `asv github` invocation, so the token
@@ -148,6 +154,7 @@ impl AgentRel {
             AgentRel::Doctor => "asv://rels/doctor",
             AgentRel::Setup => "asv://rels/setup",
             AgentRel::Capabilities => "asv://rels/capabilities",
+            AgentRel::Upgrade => "asv://rels/upgrade",
             AgentRel::CredentialList => "asv://rels/credentials/list",
             AgentRel::SessionRun => "asv://rels/session/run",
             AgentRel::GithubIssueRead => "asv://rels/github/issue/read",
@@ -172,6 +179,7 @@ impl AgentRel {
             AgentRel::Doctor => "system.doctor",
             AgentRel::Setup => "system.setup",
             AgentRel::Capabilities => "system.capabilities",
+            AgentRel::Upgrade => "system.upgrade",
             AgentRel::CredentialList => "credentials.metadata.list",
             AgentRel::SessionRun => "session.run",
             AgentRel::GithubIssueRead => "github.issue.read",
@@ -239,6 +247,18 @@ impl AgentRel {
                 Safety::BoundedExecution,
                 false,
                 "Run a command inside a broker-owned session",
+            ),
+            // R0.3b. Reports the current version, the latest published one,
+            // and the documented installer command. Safe to publish even with
+            // no broker reachable, because protocol mismatch is precisely the
+            // state in which the broker is the thing the agent cannot reach.
+            AgentRel::Upgrade => AgentLink::new(
+                self.uri(),
+                self.operation(),
+                &["upgrade", "--check"],
+                Safety::ReadOnly,
+                false,
+                "Report the running version and the published one",
             ),
             AgentRel::GithubIssueRead => AgentLink::new(
                 self.uri(),
@@ -377,6 +397,7 @@ impl AgentRel {
             AgentRel::Doctor,
             AgentRel::Setup,
             AgentRel::Capabilities,
+            AgentRel::Upgrade,
             AgentRel::CredentialList,
             AgentRel::SessionRun,
             AgentRel::GithubIssueRead,
@@ -407,7 +428,11 @@ impl AgentRel {
         if broker_reachable {
             AgentRel::operational().to_vec()
         } else {
-            vec![AgentRel::Doctor, AgentRel::Setup]
+            // `upgrade` is reachable even with no broker: protocol mismatch is
+            // the state in which the broker cannot be reached, and that is the
+            // state in which the recovery relation is the only one that points
+            // at a runnable command.
+            vec![AgentRel::Doctor, AgentRel::Setup, AgentRel::Upgrade]
         }
     }
 }
@@ -611,6 +636,10 @@ mod tests {
                 "asv://rels/doctor",
                 "asv://rels/setup",
                 "asv://rels/capabilities",
+                // R0.3b. The recovery relation an agent follows when the
+                // running broker speaks a protocol it cannot reach, instead
+                // of stalling on `PROTOCOL_MISMATCH` with no command to run.
+                "asv://rels/upgrade",
                 "asv://rels/credentials/list",
                 "asv://rels/session/run",
                 // R2.A. The surrogate is minted and spent inside `asv github`,
@@ -722,17 +751,24 @@ mod tests {
         }
     }
 
-    /// A stopped broker publishes only the two links that lead somewhere.
+    /// A stopped broker publishes only the two links that lead somewhere,
+    /// plus the recovery relation an agent follows when protocol mismatch
+    /// is the reason the broker cannot be reached (R0.3b).
     ///
     /// The failure this closes: publishing `credentials/list` into an
     /// installation whose broker is down. The agent follows it, gets
     /// `ASV_CONNECTION_FAILED`, and has learned that the discovery document
-    /// describes commands rather than the installation.
+    /// describes commands rather than the installation. `upgrade` stays
+    /// published because the relation points at a runnable command that
+    /// does not need the broker.
     #[test]
     fn a_stopped_broker_publishes_only_the_links_that_reach_something() {
         let published = AgentRel::publishable_for(false);
         let uris: Vec<&str> = published.iter().map(|r| r.uri()).collect();
-        assert_eq!(uris, ["asv://rels/doctor", "asv://rels/setup"]);
+        assert_eq!(
+            uris,
+            ["asv://rels/doctor", "asv://rels/setup", "asv://rels/upgrade"]
+        );
 
         for rel in &published {
             let link = rel.descriptor();

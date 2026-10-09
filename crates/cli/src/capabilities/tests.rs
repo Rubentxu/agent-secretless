@@ -128,7 +128,9 @@ fn a_relation_is_published_only_when_the_broker_has_the_capability() {
 
 /// The system relations do not depend on a capability, and must survive a
 /// broker with an empty capability list — otherwise an agent with a stopped
-/// broker has no link to `doctor`, which is the one it needs.
+/// broker has no link to `doctor`, which is the one it needs. `upgrade` is
+/// here for the same reason protocol mismatch needs a recovery relation even
+/// when no broker is reachable.
 #[test]
 fn the_system_relations_survive_an_empty_capability_list() {
     let report = CapabilityReport::from_broker(Some(&facts(&[])), true, true);
@@ -137,6 +139,7 @@ fn the_system_relations_survive_an_empty_capability_list() {
         "asv://rels/doctor",
         "asv://rels/setup",
         "asv://rels/capabilities",
+        "asv://rels/upgrade",
     ] {
         assert!(
             report.relations.contains(&required.to_string()),
