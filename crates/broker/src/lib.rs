@@ -951,6 +951,14 @@ pub struct BrokerState {
     /// present path mints its own from the same source, so a single source
     /// of authority stays in one place.
     pub mtls_signers: Vec<crate::tls_bridge::mtls::deployment::SigningBinding>,
+    /// R2.D.3: the Kubernetes API server deployments this broker will proxy
+    /// to, keyed by vault credential.
+    ///
+    /// **Empty is the default and refuses every `K8sRead` request**, the
+    /// same fail-closed reading as [`Self::aws`] and [`Self::mtls_signers`]:
+    /// a broker that was not told which API server a credential serves is
+    /// not a broker that gets to reach whatever a request names.
+    pub k8s_bindings: Vec<crate::k8s::binding::K8sBinding>,
     /// R9: tamper-evident log of every handled request. One record per
     /// `handle` call, appended by the public wrapper (not by the inner
     /// dispatcher), so the audit cannot be bypassed by a new variant.
@@ -1061,6 +1069,10 @@ impl Default for BrokerState {
             // the same reason `aws` is empty and `oauth2` is empty: a default
             // that minted a client cert would be one nobody chose.
             mtls_signers: Vec::new(),
+            // No K8s deployment unless the operator declares one, for the
+            // same reason `aws` is empty: a fabricated default here would
+            // be an API server nobody chose.
+            k8s_bindings: Vec::new(),
             audit: Arc::new(Mutex::new(audit::AuditLog::default())),
             control_plane: admission::Enrolment::empty(),
             vault_writer: None,
@@ -2712,7 +2724,7 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
         // that ships in a release binary.
         Request::K8sRead {
             protocol: _,
-            session: _,
+            session,
             credential,
             namespace,
             resource,
@@ -2723,12 +2735,15 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
             // cannot name a deployment, and refusing it as `InvalidRequest`
             // says "you called me wrong" where a deployment lookup would
             // have said "not granted".
-            if CredentialId::from_wire(&credential).is_err() {
-                return Response::Error {
-                    code: ErrorCode::InvalidRequest,
-                    message: "the credential is not a vault id".into(),
-                };
-            }
+            let credential = match CredentialId::from_wire(&credential) {
+                Ok(id) => id,
+                Err(_) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: "the credential is not a vault id".into(),
+                    };
+                }
+            };
             // R2.D.3.1 — refuse parts that look like path traversal or are
             // empty, without sending any byte over the wire. The k8s::request
             // module owns the canonical refusal list; this arm mirrors its
@@ -2755,20 +2770,22 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                     };
                 }
             }
-            // R2.D.3.2 — deployment lookup, surrogate mint, transport. The
-            // refusal is honest about the gap: a typed IPC request exists,
-            // the CLI can name it, but the broker operation that would
-            // answer it has not landed. An agent reading this refusal
-            // learns that R2.D is not closed, which is what the roadmap
-            // says — and what a `todo!()` would not have said.
-            Response::Error {
-                code: ErrorCode::Denied,
-                message: format!(
-                    "k8s_read is not yet wired end-to-end: request validated as \
-                     /api/v1/namespaces/{namespace}/{resource}/{name} but the \
-                     deployment lookup, surrogate mint, and transport are not \
-                     implemented (R2.D.3.2)",
-                ),
+            // R2.D.3.2 — the deployment lookup. The next increment is the
+            // actual transport call via K8sClient::send. Today the broker
+            // answers with the binding it would have called, named in the
+            // gap so an operator reading the refusal learns what to
+            // configure.
+            match state.authorize_k8s_read(session, peer, &credential) {
+                Ok(_binding) => Response::Error {
+                    code: ErrorCode::Denied,
+                    message: format!(
+                        "k8s_read: deployment lookup passed (credential {}, API server {}) but \
+                         the transport call is not yet implemented (R2.D.3.2)",
+                        credential.to_wire(),
+                        _binding.deployment.audience.as_str(),
+                    ),
+                },
+                Err(denial) => return *denial,
             }
         }
 
@@ -3420,6 +3437,78 @@ impl BrokerState {
             },
         )?;
         Ok(signer)
+    }
+
+    /// The K8s deployment an mTLS request named, or a refusal that lists
+    /// the configured credentials so the operator can see what was missed.
+    fn k8s_binding_for(
+        &self,
+        credential: &CredentialId,
+    ) -> Result<&crate::k8s::binding::K8sBinding, Box<Response>> {
+        match self
+            .k8s_bindings
+            .iter()
+            .find(|binding| binding.serves(credential))
+        {
+            Some(binding) => Ok(binding),
+            None => {
+                let configured: Vec<String> = self
+                    .k8s_bindings
+                    .iter()
+                    .map(|binding| binding.deployment.credential.to_wire())
+                    .collect();
+                Err(Box::new(Response::Error {
+                    code: ErrorCode::Denied,
+                    message: format!(
+                        "no K8s deployment is configured for {}; configured: {configured:?}",
+                        credential.to_wire()
+                    ),
+                }))
+            }
+        }
+    }
+
+    /// Every check a `K8sRead` request must pass **before any socket is
+    /// touched**. Same shape as [`Self::authorize_mtls_sign`]: ownership,
+    /// binding lookup, policy.
+    ///
+    /// The resource is the **declared** API server. A policy permitting
+    /// `k8s.read` on `kubernetes.default.svc` therefore permits it there
+    /// and not on a host a request asked for. An agent that could name the
+    /// host could otherwise redirect a read at a different cluster.
+    fn authorize_k8s_read(
+        &self,
+        session: AgentSessionId,
+        peer: &WorkloadIdentity,
+        credential: &CredentialId,
+    ) -> Result<&crate::k8s::binding::K8sBinding, Box<Response>> {
+        if !self.session_owned_by(session, peer)? {
+            return Err(Box::new(Response::Error {
+                code: ErrorCode::Denied,
+                message: "session is not owned by the authenticated peer".into(),
+            }));
+        }
+        let binding = self.k8s_binding_for(credential)?;
+        self.authorize_verb(
+            session,
+            peer,
+            Action::K8sRead,
+            Resource::Api {
+                audience: asv_domain::Authority::canonicalize(
+                    binding.deployment.audience.as_str(),
+                )
+                .map_err(|error| {
+                    Box::new(Response::Error {
+                        code: ErrorCode::Denied,
+                        message: format!(
+                            "the declared API server {host:?} is not a canonical authority: {error}",
+                            host = binding.deployment.audience.as_str()
+                        ),
+                    })
+                })?,
+            },
+        )?;
+        Ok(binding)
     }
 
     /// Resolves the registry a request selected, authorizes it, and returns the
@@ -7974,8 +8063,16 @@ mod e2e {
     /// is the next increment, and an agent reading the refusal learns
     /// that R2.D is not closed, which is what the roadmap says — and what
     /// a `todo!()` panic would not have said.
+    /// The K8s read arm, before the deployment is declared: the lookup
+    /// fails first and the refusal names the credential, not the gap.
+    ///
+    /// The two refusals (no binding vs. binding present but unsigned) are
+    /// distinct because the operator's response is different in each case:
+    /// one needs a declaration, the other needs R2.D.3.2 to land. A test
+    /// that treated them as one would let a regression that lost the
+    /// configured-but-unsigned message go unnoticed.
     #[test]
-    fn k8s_read_with_valid_parts_names_r2_d_3_2_as_the_gap() {
+    fn k8s_read_without_a_binding_refuses_by_credential() {
         let mut state = bare();
         let peer = self_peer();
         let session = sess(&state).create("/repo".into(), &peer);
@@ -7993,13 +8090,16 @@ mod e2e {
         ) {
             Response::Error { code, message } => {
                 assert_eq!(code, ErrorCode::Denied, "{message}");
-                assert!(message.contains("R2.D.3.2"), "{message}");
                 assert!(
-                    message.contains("not yet wired"),
-                    "the refusal must name the gap, not pretend success: {message}"
+                    message.contains("no K8s deployment is configured"),
+                    "{message}"
+                );
+                assert!(
+                    !message.contains("R2.D.3.2"),
+                    "an unconfigured broker is the operator's problem, not a code gap: {message}"
                 );
             }
-            other => panic!("expected a gap-named denial, got {other:?}"),
+            other => panic!("expected a denial naming the missing deployment, got {other:?}"),
         }
     }
 

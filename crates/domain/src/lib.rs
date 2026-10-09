@@ -755,6 +755,21 @@ pub enum Action {
     /// are separate actions, the policy default permits only the read, and an
     /// operator who wants writes to a shared registry has to say so.
     RegistryPush,
+    /// Reads a Kubernetes object the agent named (M11-R2.D.3).
+    ///
+    /// A *semantic* operation, for the reason every other one here is: a
+    /// generic `http_request` against `https://api.k8s.example/...` would
+    /// be unauthorizable in the way that matters — the thing being granted
+    /// is not "a request to a host", it is "the right to read an object
+    /// from one declared API server", and only the declared-cluster form
+    /// of the grant says that.
+    ///
+    /// Read-only on purpose. The Kubernetes protocol has `GET`,
+    /// `POST`, `PUT`, `PATCH`, and `DELETE`, and an `Action` that took a
+    /// verb flag would be a place for a future caller to widen by
+    /// forgetting. The semantic operation the broker exposes is the read,
+    /// and any write is a separate increment.
+    K8sRead,
     /// Signs a client certificate the agent presented as a CSR (M11-R2.E.3).
     ///
     /// A *semantic* operation, for the reason every other one here is: the
@@ -788,6 +803,7 @@ impl fmt::Display for Action {
             Self::OAuth2Identity => "oauth2.identity",
             Self::RegistryPull => "registry.pull",
             Self::RegistryPush => "registry.push",
+            Self::K8sRead => "k8s.read",
             Self::MTlsSign => "mtls.sign",
         };
         f.write_str(s)
@@ -1220,6 +1236,7 @@ mod tests {
             Action::OAuth2Identity,
             Action::RegistryPull,
             Action::RegistryPush,
+            Action::K8sRead,
             Action::MTlsSign,
         ] {
             let name = action.to_string();
@@ -1247,6 +1264,7 @@ mod tests {
         // one, and the two are separate strings that have to agree.
         assert_eq!(Action::RegistryPull.to_string(), "registry.pull");
         assert_eq!(Action::RegistryPush.to_string(), "registry.push");
+        assert_eq!(Action::K8sRead.to_string(), "k8s.read");
         assert_eq!(Action::MTlsSign.to_string(), "mtls.sign");
     }
 

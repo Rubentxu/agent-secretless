@@ -529,6 +529,20 @@ const SCHEMA_JSON: &str = r#"{
           }
         }
       },
+      "k8s_read": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Api"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
       "mtls_sign": {
         "memberOf": [],
         "appliesTo": {
@@ -1259,6 +1273,7 @@ fn action_name(action: &Action) -> &'static str {
         Action::OAuth2Identity => "oauth2_identity",
         Action::RegistryPull => "registry_pull",
         Action::RegistryPush => "registry_push",
+        Action::K8sRead => "k8s_read",
         Action::MTlsSign => "mtls_sign",
     }
 }
