@@ -15,6 +15,7 @@ __pycache__/
 
 # SDDK runtime state and cycle artifacts are machine-owned, not source.
 .sddk/
+.atl/
 *.sqlite
 *.sqlite-journal
 
