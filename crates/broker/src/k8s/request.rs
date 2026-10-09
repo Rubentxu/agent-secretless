@@ -135,11 +135,18 @@ impl fmt::Display for Verb {
 
 /// Where the addressed object lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scope {
+pub enum Scope<'a> {
     /// `/api/v1/namespaces/{namespace}/{resource}[/{name}]`
     Namespaced {
         /// The namespace the object is claimed to be in.
-        namespace: &'static str,
+        ///
+        /// `&'a str` rather than `&'static str` for the reason
+        /// [`ApiRequest`] is: a request that names a non-static namespace
+        /// string would otherwise be forced to `Box::leak` the string, and a
+        /// long-running broker would leak on every call. The lifetime ties
+        /// the namespace to the request that produced it, so the borrow
+        /// checker is what outlives the call rather than the allocator.
+        namespace: &'a str,
     },
     /// `/api/v1/{resource}/{name}` — nodes, namespaces, persistent volumes.
     Cluster,
@@ -156,7 +163,7 @@ pub struct ApiRequest<'a> {
     /// The operation, from a closed set.
     pub verb: Verb,
     /// Where the object lives.
-    pub scope: Scope,
+    pub scope: Scope<'a>,
     /// The plural resource name, as the API server spells it: `pods`, `secrets`.
     pub resource: &'a str,
     /// The object's name, for the operations that take one.

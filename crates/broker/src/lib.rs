@@ -2775,14 +2775,10 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
             // typed `ApiRequest`, hands it to `K8sClient::send` with the
             // borrowed port, and returns the API server's reply.
             //
-            // The `Box::leak` is the cost of `Scope::Namespaced` taking
-            // `&'static str`. The leak is bounded by the set of distinct
-            // namespace/resource/name triples the broker ever sees, which
-            // is small in practice; a long-running broker can reclaim it
-            // by restart. The alternative — broadening `Scope`'s lifetime —
-            // is a public API change the k8s module has to commit to, and
-            // the next increment to R2.D will land it as part of the
-            // R2.D.3.2 cleanup, not this one.
+            // `Scope` carries `&'a str` (not `&'static`), so the request
+            // borrows from the `String`s the IPC message carried. The
+            // borrow checker now outlives the call, and the allocator does
+            // not have to.
             let binding = match state.authorize_k8s_read(session, peer, &credential) {
                 Ok(binding) => binding,
                 Err(denial) => return *denial,
@@ -2790,10 +2786,10 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
             let api_request = crate::k8s::request::ApiRequest {
                 verb: crate::k8s::request::Verb::Get,
                 scope: crate::k8s::request::Scope::Namespaced {
-                    namespace: Box::leak(namespace.into_boxed_str()),
+                    namespace: &namespace,
                 },
-                resource: Box::leak(resource.into_boxed_str()),
-                name: Some(Box::leak(name.into_boxed_str())),
+                resource: &resource,
+                name: Some(&name),
             };
             match binding.client().send(
                 binding.port(),
