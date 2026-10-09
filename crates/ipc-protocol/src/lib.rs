@@ -612,6 +612,32 @@ pub enum Request {
         /// Return only records newer than this many seconds.
         since_secs: u64,
     },
+    /// R2.D.3: read one Kubernetes object via the broker.
+    ///
+    /// The agent names the namespace, the resource and the name. It never
+    /// names a cluster, API endpoint, audience or token: the broker resolves
+    /// each of those from the deployment registered against the named
+    /// credential, so a request that could name its own audience would be a
+    /// request that could sign itself against a different authority.
+    ///
+    /// The shape is `AsvRequestAction` rather than a raw HTTP method/path for
+    /// the same reason [`Request::AwsCallerIdentity`] refuses to name its
+    /// audience: the broker decides what verb maps to the operation, and the
+    /// agent can only ask. The broker also refuses an unauthorised verb — a
+    /// `Delete` against a `Get`-only capability, for example — so the agent's
+    /// intent is what the policy sees, not the HTTP byte.
+    K8sRead {
+        protocol: u16,
+        session: AgentSessionId,
+        /// A vault credential reference naming the K8s deployment.
+        credential: String,
+        /// The namespace the object is claimed to be in.
+        namespace: String,
+        /// The resource kind, e.g. `pods`, `configmaps`, `services`.
+        resource: String,
+        /// The name of the object within the resource.
+        name: String,
+    },
     /// M6-R1: open a PostgreSQL session for a typed audience.
     ///
     /// The agent names the audience, the database, and the role. It never
@@ -881,6 +907,17 @@ pub enum Response {
     /// the provider's own account of them, and neither has a field a credential
     /// could go in. There is no access token here and no client secret, and
     /// there is no `OpaqueSecret` wrapper because there is nothing to wrap.
+    /// R2.D.3: the broker's read of one Kubernetes object, by the names the
+    /// agent supplied. The response is the API server's own bytes, returned
+    /// in the same envelope as the verb that fetched them, and never in a
+    /// shape a token could ride.
+    K8sRead {
+        /// The HTTP status the API server returned. Reported so an agent can
+        /// distinguish a refusal from a non-existent object without parsing.
+        status: u16,
+        /// The API server's response body, verbatim.
+        body: String,
+    },
     ///
     /// ## Why these three fields are checked before they are returned
     ///
@@ -1222,6 +1259,7 @@ impl Request {
             Request::CreateCredential { .. } => "create_credential",
             Request::RunIsolated { .. } => "run_isolated",
             Request::AwsCallerIdentity { .. } => "aws_caller_identity",
+            Request::K8sRead { .. } => "k8s_read",
         }
     }
 
@@ -1261,7 +1299,8 @@ impl Request {
             | Request::AuditQuery { protocol, .. }
             | Request::PostgresConnect { protocol, .. }
             | Request::PostgresQuery { protocol, .. }
-            | Request::PostgresRevoke { protocol, .. } => *protocol,
+            | Request::PostgresRevoke { protocol, .. }
+            | Request::K8sRead { protocol, .. } => *protocol,
         }
     }
 }
@@ -1688,6 +1727,10 @@ mod tests {
                 arn: "arn:aws:sts::123456789012:assumed-role/demo/asv-session".into(),
                 user_id: "ARO123EXAMPLE123:asv-session".into(),
                 account: "123456789012".into(),
+            },
+            Response::K8sRead {
+                status: 200,
+                body: r#"{"metadata":{"name":"web"},"spec":{}}"#.into(),
             },
         ] {
             let json = serde_json::to_string(&response).expect("serializes");
