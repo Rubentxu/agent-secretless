@@ -7670,6 +7670,300 @@ mod e2e {
         );
     }
 
+    /// The K8s read arm refuses a credential that is not a vault id before
+    /// doing anything else. The credential is the part of the request that
+    /// names the deployment, and a string that cannot name one is
+    /// `InvalidRequest`, not `Denied` — the caller mis-named the
+    /// credential, which is not the same as being unauthorised.
+    #[test]
+    fn k8s_read_refuses_a_credential_that_is_not_a_vault_id() {
+        let mut state = bare();
+        let peer = self_peer();
+        let session = sess(&state).create("/repo".into(), &peer);
+        match handle(
+            &mut state,
+            &peer,
+            Request::K8sRead {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                session,
+                credential: "not-a-uuid".into(),
+                namespace: "default".into(),
+                resource: "configmap".into(),
+                name: "app".into(),
+            },
+        ) {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
+                assert!(message.contains("vault id"), "{message}");
+            }
+            other => panic!("expected an invalid-request refusal, got {other:?}"),
+        }
+    }
+
+    /// The K8s read arm refuses each of namespace, resource, name when it is
+    /// empty. The three segments are checked in declaration order, so a test
+    /// that exercises them one at a time pins the order as well as the
+    /// predicate — a future refactor that swapped the loop for a helper that
+    /// short-circuits on `namespace.is_empty()` only would still pass, and
+    /// the one that only checked the first segment would not.
+    #[test]
+    fn k8s_read_refuses_an_empty_segment_in_each_position() {
+        let peer = self_peer();
+        let (namespace, resource, name) = ("default", "configmap", "app");
+        for (which, mut req) in [
+            (
+                "namespace",
+                K8sReadReq {
+                    namespace: String::new(),
+                    ..K8sReadReq::ok(namespace, resource, name)
+                },
+            ),
+            (
+                "resource",
+                K8sReadReq {
+                    resource: String::new(),
+                    ..K8sReadReq::ok(namespace, resource, name)
+                },
+            ),
+            (
+                "name",
+                K8sReadReq {
+                    name: String::new(),
+                    ..K8sReadReq::ok(namespace, resource, name)
+                },
+            ),
+        ] {
+            let mut state = bare();
+            let session = sess(&state).create("/repo".into(), &peer);
+            req.session = session;
+            let response = handle(&mut state, &peer, req.into());
+            match response {
+                Response::Error { code, message } => {
+                    assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
+                    assert!(
+                        message.contains(&format!("{which} is empty")),
+                        "expected an empty-{which} refusal, got {message}"
+                    );
+                }
+                other => panic!("expected an empty-{which} refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// The K8s read arm refuses each traversal character in each segment.
+    /// The four characters are checked together rather than one at a time
+    /// because the loop is a single predicate; the test pins the predicate
+    /// rather than four lines of identical intent.
+    #[test]
+    fn k8s_read_refuses_traversal_characters_in_each_segment() {
+        let peer = self_peer();
+        for bad in ['/', '%', '?', '#'] {
+            for (which, field) in [
+                ("namespace", "namespace"),
+                ("resource", "resource"),
+                ("name", "name"),
+            ] {
+                let mut state = bare();
+                let session = sess(&state).create("/repo".into(), &peer);
+                let mut req = K8sReadReq::ok("default", "configmap", "app");
+                *match field {
+                    "namespace" => &mut req.namespace,
+                    "resource" => &mut req.resource,
+                    "name" => &mut req.name,
+                    _ => unreachable!(),
+                } = format!("seg{bad}ment");
+                req.session = session;
+                let response = handle(&mut state, &peer, req.into());
+                match response {
+                    Response::Error { code, message } => {
+                        assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
+                        assert!(
+                            message.contains(&format!("{which} "))
+                                && message.contains("is not a name this proxy will place in a path"),
+                            "expected a traversal refusal for {which}={bad:?}, got {message}"
+                        );
+                    }
+                    other => panic!(
+                        "expected a traversal refusal for {which}={bad:?}, got {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// When the K8s read arm has accepted the credential and the segments,
+    /// the gap-named `Denied` it returns is the property the roadmap
+    /// describes: R2.D.3.2 (deployment lookup, surrogate mint, transport)
+    /// is the next increment, and an agent reading the refusal learns
+    /// that R2.D is not closed, which is what the roadmap says — and what
+    /// a `todo!()` panic would not have said.
+    #[test]
+    fn k8s_read_with_valid_parts_names_r2_d_3_2_as_the_gap() {
+        let mut state = bare();
+        let peer = self_peer();
+        let session = sess(&state).create("/repo".into(), &peer);
+        match handle(
+            &mut state,
+            &peer,
+            Request::K8sRead {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                session,
+                credential: "11111111-2222-3333-4444-555555555555".into(),
+                namespace: "default".into(),
+                resource: "configmap".into(),
+                name: "app".into(),
+            },
+        ) {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::Denied, "{message}");
+                assert!(message.contains("R2.D.3.2"), "{message}");
+                assert!(
+                    message.contains("not yet wired"),
+                    "the refusal must name the gap, not pretend success: {message}"
+                );
+            }
+            other => panic!("expected a gap-named denial, got {other:?}"),
+        }
+    }
+
+    /// The mTLS sign arm refuses a credential that is not a vault id. The
+    /// reason is the same as the K8s arm: a string that cannot name a
+    /// deployment is `InvalidRequest`, not `Denied`.
+    #[test]
+    fn mtls_sign_refuses_a_credential_that_is_not_a_vault_id() {
+        let mut state = bare();
+        let peer = self_peer();
+        let session = sess(&state).create("/repo".into(), &peer);
+        match handle(
+            &mut state,
+            &peer,
+            Request::MTlsSign {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                session,
+                credential: "not-a-uuid".into(),
+                csr_pem: PEM_CSR.into(),
+            },
+        ) {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
+                assert!(message.contains("vault id"), "{message}");
+            }
+            other => panic!("expected an invalid-request refusal, got {other:?}"),
+        }
+    }
+
+    /// The mTLS sign arm refuses a CSR that is not a PEM. The three
+    /// predicates — too short, missing `BEGIN`, missing `END` — are checked
+    /// together rather than one at a time because they are a single
+    /// predicate in the arm; the test pins the predicate rather than three
+    /// lines of identical intent.
+    #[test]
+    fn mtls_sign_refuses_a_csr_that_is_not_pem() {
+        let peer = self_peer();
+        for (label, csr) in [
+            ("too-short", "-----BEGIN"),
+            ("missing-end", &"x".repeat(80)),
+            ("missing-begin", &"x".repeat(80)),
+        ] {
+            let mut state = bare();
+            let session = sess(&state).create("/repo".into(), &peer);
+            match handle(
+                &mut state,
+                &peer,
+                Request::MTlsSign {
+                    protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                    session,
+                    credential: "11111111-2222-3333-4444-555555555555".into(),
+                    csr_pem: csr.into(),
+                },
+            ) {
+                Response::Error { code, message } => {
+                    assert_eq!(code, ErrorCode::InvalidRequest, "{label}: {message}");
+                    assert!(
+                        message.contains("PEM-encoded PKCS#10"),
+                        "{label}: {message}"
+                    );
+                }
+                other => panic!("{label}: expected an invalid-request refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// When the mTLS sign arm has accepted the credential and the CSR, the
+    /// gap-named `Denied` it returns is the property the roadmap describes:
+    /// R2.E.3.2 (mTLS deployment lookup, CA selection, leaf sign, audit) is
+    /// the next increment, and the refusal names it.
+    #[test]
+    fn mtls_sign_with_a_well_formed_csr_names_r2_e_3_2_as_the_gap() {
+        let mut state = bare();
+        let peer = self_peer();
+        let session = sess(&state).create("/repo".into(), &peer);
+        match handle(
+            &mut state,
+            &peer,
+            Request::MTlsSign {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                session,
+                credential: "11111111-2222-3333-4444-555555555555".into(),
+                csr_pem: PEM_CSR.into(),
+            },
+        ) {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::Denied, "{message}");
+                assert!(message.contains("R2.E.3.2"), "{message}");
+                assert!(
+                    message.contains("not yet wired"),
+                    "the refusal must name the gap, not pretend success: {message}"
+                );
+            }
+            other => panic!("expected a gap-named denial, got {other:?}"),
+        }
+    }
+
+    /// A long enough string with both `BEGIN` and `END`, kept here so the
+    /// refusal tests can quote a single fixture. The bytes do not need to
+    /// be a real CSR — the dispatch arm only checks the envelope.
+    const PEM_CSR: &str = "-----BEGIN CERTIFICATE REQUEST-----\n\
+        MIIBhDCB7gIBADAdMQswCQYDVQQGEwJVUzEOMAwGA1UEAwwFdGVzdDEwgZ8wDQYJ\n\
+        KoZIhvcNAQEBBQADgY0AMIGJAoGBAJZ5bH5jQ4m1k3pF6oGZ4w7lCvkP3Rh\n\
+        -----END CERTIFICATE REQUEST-----\n";
+
+    /// A K8s read request with every field set, used as the starting point
+    /// for the loop in `k8s_read_refuses_*` tests that swap one field at a
+    /// time. Building the request inline each time would re-state the five
+    /// valid fields five times, and a test that drifted on any of them
+    /// would still pass for the wrong reason.
+    struct K8sReadReq {
+        session: AgentSessionId,
+        namespace: String,
+        resource: String,
+        name: String,
+    }
+
+    impl K8sReadReq {
+        fn ok(namespace: &str, resource: &str, name: &str) -> Self {
+            Self {
+                session: AgentSessionId::new(),
+                namespace: namespace.into(),
+                resource: resource.into(),
+                name: name.into(),
+            }
+        }
+    }
+
+    impl From<K8sReadReq> for Request {
+        fn from(req: K8sReadReq) -> Self {
+            Request::K8sRead {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                session: req.session,
+                credential: "11111111-2222-3333-4444-555555555555".into(),
+                namespace: req.namespace,
+                resource: req.resource,
+                name: req.name,
+            }
+        }
+    }
+
     /// A runtime for a test that needs one but does no I/O.
     fn test_runtime() -> PgRuntime {
         static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
