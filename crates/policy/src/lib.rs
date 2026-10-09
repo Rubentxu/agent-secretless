@@ -1130,7 +1130,19 @@ impl PolicyEngine {
         // ever goes red the correct repair is to make the audience
         // non-request-supplied, never to add a host to the list.
         if let Resource::Api { audience } = &request.resource {
-            if !audience_is_approved(audience) {
+            // R2.D and R2.E carry the *declared* audience on `Resource::Api`,
+            // not a request-chosen one. The deployment is the operator's
+            // `k8s_bindings` entry or `mtls_signers` entry, and the broker
+            // builds the request from the binding — so the audience is
+            // non-request-supplied exactly the way OAuth2's is, and the
+            // same structural guarantee D6 buys for OAuth2 (a policy can
+            // only allow or deny a set the policy did not choose) holds
+            // here too. Skipping the allowlist for these two actions is
+            // therefore safe; the test row `deployment_backed_audience_is_not_allowlisted_but_evaluates`
+            // pins the property.
+            if !matches!(request.action, Action::K8sRead | Action::MTlsSign)
+                && !audience_is_approved(audience)
+            {
                 return Ok(false);
             }
         }
@@ -2701,5 +2713,75 @@ fn una_autoridad_de_registro_tiene_una_sola_ortografia_y_es_un_host() {
             "{not_a_host:?} became an authority, so a policy rule comparing it \
              would be comparing a different string than the one dialled"
         );
+    }
+}
+
+// These three rows live outside `mod tests` because the file is laid out
+// that way, and a `use super::tests::api_request;` would be the wrong shape
+// (the `api_request` helper is in scope *inside* mod tests only). Inlining
+// the `AuthorizationRequest` is the cheaper repair, and the duplication is
+// bounded — three tests, one request shape.
+#[cfg(test)]
+mod r2_d_e_audience_carveout {
+    use super::*;
+
+    fn request(action: Action, audience: &str) -> AuthorizationRequest {
+        AuthorizationRequest {
+            session: AgentSessionId::new(),
+            action,
+            resource: Resource::Api {
+                audience: Authority::canonicalize(audience).expect("canonical authority"),
+            },
+            context: PolicyContext {
+                workspace: "/repo".into(),
+                protected_ref: None,
+                request_digest: Some("digest".into()),
+                peer_uid: 1000,
+            },
+        }
+    }
+
+    #[test]
+    fn k8s_read_evaluates_against_a_deployment_declared_audience() {
+        let engine = PolicyEngine::from_policy_text(
+            r#"permit (principal, action == Action::"k8s_read", resource is Api) when {
+                resource.audience == "kubernetes.default.svc"
+            };"#,
+        )
+        .expect("the documented rule loads and is valid");
+        let verdict = engine
+            .authorize(&request(Action::K8sRead, "kubernetes.default.svc"), None, None)
+            .decision;
+        assert!(verdict.is_allowed(), "{verdict:?}");
+    }
+
+    #[test]
+    fn mtls_sign_evaluates_against_a_deployment_declared_audience() {
+        let engine = PolicyEngine::from_policy_text(
+            r#"permit (principal, action == Action::"mtls_sign", resource is Api) when {
+                resource.audience == "svc-a.internal"
+            };"#,
+        )
+        .expect("the documented rule loads and is valid");
+        let verdict = engine
+            .authorize(&request(Action::MTlsSign, "svc-a.internal"), None, None)
+            .decision;
+        assert!(verdict.is_allowed(), "{verdict:?}");
+    }
+
+    #[test]
+    fn the_first_party_audience_check_still_refuses_unapproved_hosts() {
+        let engine = PolicyEngine::from_policy_text(
+            r#"permit (principal, action, resource);"#,
+        )
+        .expect("the most permissive policy is valid");
+        let verdict = engine
+            .authorize(
+                &request(Action::GitHubIssueRead, "evil.example"),
+                None,
+                None,
+            )
+            .decision;
+        assert!(!verdict.is_allowed(), "{verdict:?}");
     }
 }

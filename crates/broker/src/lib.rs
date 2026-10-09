@@ -8121,6 +8121,114 @@ mod e2e {
         }
     }
 
+    /// The happy path: a real CSR the agent generated, a configured signer
+    /// the operator declared, a policy that allows the action, and the
+    /// broker returns a parseable certificate whose SAN carries the
+    /// identity the **broker** chose, not the identity the **request**
+    /// asked for.
+    ///
+    /// The CSR's own SAN is `attacker.test` and its own subject is
+    /// `CN=admin,O=attacker` — the hostile shape. The cert that comes back
+    /// must carry `svc-a.internal` (the declared identity) and not a
+    /// single one of the request's attacker-chosen names. A bug that
+    /// signed the CSR's identity, or its SANs, would let an agent mint a
+    /// cert for a name it was never granted, and the assertion that
+    /// `sans == ["svc-a.internal"]` is what catches that.
+    #[test]
+    fn mtls_sign_with_a_configured_signer_and_permitted_policy_signs_the_requested_csr() {
+        let mut state = bare();
+        state.mtls_signers = vec![
+            crate::tls_bridge::mtls::deployment::SigningBinding::new(
+                "11111111-2222-3333-4444-555555555555",
+                "svc-a.internal",
+                std::time::Duration::from_secs(3600),
+            )
+            .expect("canonical pair"),
+        ];
+        state.policy = asv_policy::PolicyEngine::from_policy_text(
+            r#"permit (principal, action == Action::"mtls_sign", resource);"#,
+        )
+        .expect("the policy is well formed");
+        let peer = self_peer();
+        let session = sess(&state).create("/repo".into(), &peer);
+        let key = rcgen::KeyPair::generate().expect("key");
+        let mut params =
+            rcgen::CertificateParams::new(vec!["attacker.test".to_string()]).expect("SAN");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "CN=admin,O=attacker");
+        let csr_pem = params
+            .serialize_request(&key)
+            .expect("the request serializes")
+            .pem()
+            .expect("the request PEM-encodes");
+        let response = handle(
+            &mut state,
+            &peer,
+            Request::MTlsSign {
+                protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                session,
+                credential: "11111111-2222-3333-4444-555555555555".into(),
+                csr_pem,
+            },
+        );
+        let certificate_pem = match response {
+            Response::MTlsSign { certificate_pem } => certificate_pem,
+            other => panic!("expected a signed certificate, got {other:?}"),
+        };
+        assert!(
+            certificate_pem.starts_with("-----BEGIN CERTIFICATE-----\n"),
+            "the response must be a PEM-encoded certificate"
+        );
+        let der = pem_to_der(&certificate_pem).expect("the PEM is well formed");
+        let (_, cert) = {
+            use x509_parser::prelude::FromDer;
+            x509_parser::prelude::X509Certificate::from_der(&der).expect("the cert parses")
+        };
+        let sans: Vec<String> = cert
+            .subject_alternative_name()
+            .expect("the SAN extension parses")
+            .map(|ext| {
+                ext.value
+                    .general_names
+                    .iter()
+                    .map(|n| match n {
+                        x509_parser::extensions::GeneralName::DNSName(d) => d.to_string(),
+                        other => format!("{other:?}"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            sans,
+            vec!["svc-a.internal".to_string()],
+            "the SAN must be the declared identity, not the request's: {sans:?}"
+        );
+    }
+
+    /// A DER blob, parsed out of a PEM envelope. The inverse of `der_to_pem`.
+    fn pem_to_der(pem: &str) -> Option<Vec<u8>> {
+        use base64::Engine as _;
+        let mut lines = pem.lines();
+        let begin = lines.next()?;
+        if begin != "-----BEGIN CERTIFICATE-----" {
+            return None;
+        }
+        let mut b64 = String::new();
+        let mut ended = false;
+        for line in lines {
+            if line == "-----END CERTIFICATE-----" {
+                ended = true;
+                break;
+            }
+            b64.push_str(line);
+        }
+        if !ended {
+            return None;
+        }
+        base64::engine::general_purpose::STANDARD.decode(b64).ok()
+    }
+
     /// The mTLS sign arm refuses a credential that is not a vault id. The
     /// reason is the same as the K8s arm: a string that cannot name a
     /// deployment is `InvalidRequest`, not `Denied`.
