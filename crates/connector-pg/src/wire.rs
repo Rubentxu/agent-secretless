@@ -60,15 +60,6 @@ pub const ALPN_PROTOCOL: &[u8] = b"postgresql";
 /// bounds both the allocation and the response the agent has to parse.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
-/// The SSL request code the client sends to ask for TLS.
-const SSL_REQUEST_CODE: i32 = 80877103;
-
-/// The cancellation request code, which must be refused rather than honoured.
-const CANCEL_REQUEST_CODE: i32 = 80877102;
-
-/// The GSSAPI request code, refused for the same reason.
-const GSSAPI_REQUEST_CODE: i32 = 80877104;
-
 /// A protocol-level failure.
 ///
 /// `Io` is separated from the rest because the transport treats a closed
@@ -521,31 +512,6 @@ fn read_error_fields(body: &[u8]) -> (String, String) {
         }
     }
     (code, message)
-}
-
-/// Builds the TLS negotiation packet.
-///
-/// Refusing the plaintext fallback is the point of this function existing. A
-/// connector that answers `N` to the server's `S` request has just offered to
-/// send a SCRAM exchange, and therefore a password-derived key, in the clear.
-#[allow(dead_code)]
-pub(crate) fn ssl_request_packet() -> Vec<u8> {
-    let mut packet = Vec::with_capacity(8);
-    packet.extend_from_slice(&8i32.to_be_bytes());
-    packet.extend_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
-    packet
-}
-
-/// Whether a startup code is one this connector must refuse.
-///
-/// Cancellation and GSSAPI are here rather than inline because both are
-/// requests a client can send to a server and both are answered with an
-/// error: a cancellation request is an unauthenticated way to kill a
-/// backend, and honouring one would let anyone with a socket terminate a
-/// session the broker authorised.
-#[allow(dead_code)]
-pub(crate) fn is_refused_startup_code(code: i32) -> bool {
-    matches!(code, CANCEL_REQUEST_CODE | GSSAPI_REQUEST_CODE)
 }
 
 /// The startup packet for `(user, database)`.

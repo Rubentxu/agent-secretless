@@ -7,13 +7,6 @@ license.workspace = true
 repository.workspace = true
 description = "ASV PostgreSQL connector: pinned transport for brokered semantic DB calls"
 
-[features]
-# Exposes `fake_pg`, a local in-process TCP server that speaks the
-# PostgreSQL startup protocol enough to drive the real connector against a
-# real socket without touching the network. Optional and off by default,
-# matching the pattern set by asv-connector-http's `test-support`.
-test-support = []
-
 [dependencies]
 asv-domain.workspace = true
 thiserror.workspace = true

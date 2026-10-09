@@ -17,13 +17,10 @@
 //! it; for now every code path that would set `PGPASSWORD` or
 //! `PGPASSFILE` is forbidden by inspection.
 
-#![cfg_attr(any(test, feature = "test-support"), allow(dead_code, unused_imports))]
-
 /// A local in-process TCP server that speaks the PostgreSQL startup
 /// protocol enough to drive the real connector against a real socket
-/// without touching the network. Gated on `cfg(test)` or the
-/// `test-support` feature, mirroring `asv-connector-http::fake_origin`.
-#[cfg(any(test, feature = "test-support"))]
+/// without touching the network. Test-only.
+#[cfg(test)]
 pub mod fake_pg;
 
 /// The semantic PostgreSQL surface: a `PostgresClient` whose methods
@@ -115,5 +112,5 @@ pub use transport::{
     resolve_and_pin, AddressPolicy, PgAudience, PinnedPgClient, PinnedPgError, ResolvedPgAudience,
 };
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub use fake_pg::FakePg;
