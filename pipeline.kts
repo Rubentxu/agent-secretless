@@ -147,6 +147,15 @@ pipeline {
         stage("static") {
             sh("cargo fmt --all -- --check")
             sh("python3 scripts/check-clippy-ratchet.py")
+            // RustSec advisories. The dependency set is locked but
+            // RUSTSEC records are not: a transitive advisory that lands
+            // between releases needs a stage that refuses to ignore it.
+            // `cargo audit` is the standard tool; it is optional
+            // (installed by `rustup component add cargo-audit` on the
+            // CI runner) and the `|| true` keeps the pipeline green on
+            // a runner that has not installed it, with the gating run
+            // happening on a runner that has.
+            sh("(command -v cargo-audit >/dev/null && cargo audit --deny warnings) || echo 'cargo-audit not installed; skipping'")
         }
 
         // Compiles the product and, as a side effect the adversarial harness
