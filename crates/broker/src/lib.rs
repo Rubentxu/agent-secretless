@@ -2556,6 +2556,79 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
             }
         }
 
+        // R2.D.3: the broker operation an agent names when it asks for a
+        // Kubernetes object. The request shape carries nothing that names a
+        // cluster, audience, or token, so the broker is the only place that
+        // can resolve them — and that is the property, not an omission.
+        //
+        // R2.D.3.1 (validation) is the only piece wired here. R2.D.3.2 — the
+        // K8s deployment lookup, surrogate mint, transport call, audit — is
+        // the next increment. The variant exists on the wire today so the
+        // CLI can be built and tested against it; until R2.D.3.2 lands, the
+        // arm refuses with a clear `Denied` rather than a `todo!()` panic
+        // that ships in a release binary.
+        Request::K8sRead {
+            protocol: _,
+            session: _,
+            credential,
+            namespace,
+            resource,
+            name,
+        } => {
+            // Parse the credential wire id first, for the same reason the
+            // AWS and OAuth2 arms do: a string that is not a vault id
+            // cannot name a deployment, and refusing it as `InvalidRequest`
+            // says "you called me wrong" where a deployment lookup would
+            // have said "not granted".
+            if CredentialId::from_wire(&credential).is_err() {
+                return Response::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: "the credential is not a vault id".into(),
+                };
+            }
+            // R2.D.3.1 — refuse parts that look like path traversal or are
+            // empty, without sending any byte over the wire. The k8s::request
+            // module owns the canonical refusal list; this arm mirrors its
+            // predicates inline because `ApiRequest::Scope::Namespaced`
+            // takes `&'static str`, and an agent-supplied namespace is not
+            // one. The shape of the refusal is the same; the difference is
+            // that the canonical check runs at compile time on a literal and
+            // runs here at request time on a string the agent named.
+            for (what, value) in [
+                ("namespace", namespace.as_str()),
+                ("resource", resource.as_str()),
+                ("name", name.as_str()),
+            ] {
+                if value.is_empty() {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("{what} is empty, and an empty segment changes what the path means"),
+                    };
+                }
+                if value.contains('/') || value.contains('%') || value.contains('?') || value.contains('#') {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("{what} {value:?} is not a name this proxy will place in a path"),
+                    };
+                }
+            }
+            // R2.D.3.2 — deployment lookup, surrogate mint, transport. The
+            // refusal is honest about the gap: a typed IPC request exists,
+            // the CLI can name it, but the broker operation that would
+            // answer it has not landed. An agent reading this refusal
+            // learns that R2.D is not closed, which is what the roadmap
+            // says — and what a `todo!()` would not have said.
+            Response::Error {
+                code: ErrorCode::Denied,
+                message: format!(
+                    "k8s_read is not yet wired end-to-end: request validated as \
+                     /api/v1/namespaces/{namespace}/{resource}/{name} but the \
+                     deployment lookup, surrogate mint, and transport are not \
+                     implemented (R2.D.3.2)",
+                ),
+            }
+        }
+
         Request::AwsCallerIdentity {
             session,
             credential,

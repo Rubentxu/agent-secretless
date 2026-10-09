@@ -144,6 +144,11 @@ pub enum AgentRel {
     SshSign,
     ApprovalStatus,
     AuditRead,
+    /// R2.D.3. The K8s read surface (`asv k8s read`). Published because an
+    /// agent that asks for a Kubernetes read gets a refusal that names the
+    /// gap, which is the answer the roadmap wants — and what an
+    /// unpublished link would have hidden.
+    K8sRead,
 }
 
 impl AgentRel {
@@ -164,6 +169,7 @@ impl AgentRel {
             AgentRel::RegistryBlobRead => "asv://rels/registry/blob/read",
             AgentRel::RegistryManifestPush => "asv://rels/registry/manifest/push",
             AgentRel::RegistryBlobPush => "asv://rels/registry/blob/push",
+            AgentRel::K8sRead => "asv://rels/k8s/read",
             AgentRel::PostgresConnect => "asv://rels/postgres/connect",
             AgentRel::PostgresQuery => "asv://rels/postgres/query",
             AgentRel::SshSign => "asv://rels/ssh/sign",
@@ -189,11 +195,13 @@ impl AgentRel {
             AgentRel::RegistryBlobRead => "registry.blob.read",
             AgentRel::RegistryManifestPush => "registry.manifest.push",
             AgentRel::RegistryBlobPush => "registry.blob.push",
+            AgentRel::K8sRead => "k8s.read",
             AgentRel::PostgresConnect => "postgres.connect",
             AgentRel::PostgresQuery => "postgres.query",
             AgentRel::SshSign => "ssh.sign",
             AgentRel::ApprovalStatus => "approval.status",
             AgentRel::AuditRead => "audit.read",
+            AgentRel::K8sRead => "k8s.read",
         }
     }
 
@@ -361,6 +369,20 @@ impl AgentRel {
                 false,
                 "Read the broker audit log",
             ),
+            // R2.D.3. The K8s read surface; the broker refuses with `Denied`
+            // today because R2.D.3.2 (deployment registry, surrogate mint,
+            // transport) has not landed. Requires human because reading a
+            // Kubernetes object carries the same risk as a credentialed
+            // request — the response is the API server's authority on what
+            // the agent will see.
+            AgentRel::K8sRead => AgentLink::new(
+                self.uri(),
+                self.operation(),
+                &["k8s", "read"],
+                Safety::BoundedExecution,
+                true,
+                "Read one Kubernetes object through a broker-leased token",
+            ),
         }
     }
 
@@ -407,6 +429,7 @@ impl AgentRel {
             AgentRel::RegistryBlobRead,
             AgentRel::RegistryManifestPush,
             AgentRel::RegistryBlobPush,
+            AgentRel::K8sRead,
         ]
     }
 
@@ -586,6 +609,20 @@ mod tests {
                 "--credential",
                 "00000000-0000-4000-8000-000000000000",
             ],
+            // R2.D.3. The K8s read surface — the same placeholder pattern the
+            // GitHub three and the registry four use. A consumer that wants to
+            // *check* the surface parses the whole command and runs; the real
+            // broker operation refuses with `Denied` until R2.D.3.2 lands.
+            "asv://rels/k8s/read" => &[
+                "--credential",
+                "00000000-0000-4000-8000-000000000000",
+                "--namespace",
+                "default",
+                "--resource",
+                "pods",
+                "--name",
+                "example",
+            ],
             _ => return None,
         })
     }
@@ -658,6 +695,10 @@ mod tests {
                 // from completing one noun for both directions.
                 "asv://rels/registry/manifest/push",
                 "asv://rels/registry/blob/push",
+                // R2.D.3. The K8s read surface — published with a refusal
+                // that names the gap, so the agent can read it rather
+                // than guess.
+                "asv://rels/k8s/read",
             ]
         );
     }

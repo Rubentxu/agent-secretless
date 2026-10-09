@@ -125,6 +125,18 @@ enum Command {
         #[command(subcommand)]
         command: RegistryCommand,
     },
+    /// Read a Kubernetes object via the broker (M11-R2.D.3).
+    ///
+    /// The credential named by `--credential` is a vault id, never a token.
+    /// This process never holds the bearer; it asks the broker to spend a
+    /// surrogate and returns the API server's response. There is no code path
+    /// in which a ServiceAccount token is in this process's memory, its argv,
+    /// its environment, or anything it prints.
+    K8s {
+        /// The Kubernetes operation to perform. Today only `read`.
+        #[command(subcommand)]
+        command: K8sCommand,
+    },
     /// List credential metadata. Never values.
     Credentials {
         /// Emit the `asv.agent/v1` envelope instead of prose.
@@ -631,6 +643,33 @@ enum GithubCommand {
     Release(GithubReleaseCommand),
 }
 
+/// The Kubernetes verbs (R2.D.3).
+///
+/// Today the only verb is `read`; the rest of the surface (list, create,
+/// delete, log) is out of scope for this increment and waits for the same
+/// authorization and transport wiring R2.D.3.2 owes.
+#[derive(Subcommand)]
+enum K8sCommand {
+    /// Read one namespaced object via the broker.
+    Read {
+        /// The vault id of a registered Kubernetes deployment.
+        #[arg(long, value_name = "VAULT_ID")]
+        credential: String,
+        /// The namespace the object is in.
+        #[arg(long)]
+        namespace: String,
+        /// The resource kind, e.g. `pods`, `configmaps`.
+        #[arg(long)]
+        resource: String,
+        /// The object's name within the resource.
+        #[arg(long)]
+        name: String,
+        /// Emit the `asv.agent/v1` envelope instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// The AWS verbs.
 ///
 /// **There is no `--role`, no `--region` and no `--audience`**, and their
@@ -945,6 +984,11 @@ async fn main() -> std::io::Result<()> {
         Command::Aws { command } => return run_aws(&socket, command),
         Command::Oauth2 { command } => return run_oauth2(&socket, command),
         Command::Registry { command } => return run_registry_dispatch(&socket, command),
+        // R2.D.3. Surface exists; the broker operation behind it is wired
+        // to the k8s::request validation but not to the deployment registry
+        // (R2.D.3.2). Returns a clear `Denied` rather than a panic, so the
+        // verb exists for the agent to try and the gap is the answer.
+        Command::K8s { command } => return run_k8s(&socket, command),
         // `plan` opens a session and `discover` does not, so the whole
         // subcommand tree is dispatched here rather than in the single-request
         // path below: the two halves differ in whether they have a reason to
@@ -1096,6 +1140,9 @@ async fn main() -> std::io::Result<()> {
         Command::Aws { .. } => {
             unreachable!("aws opens its own session and is handled before broker IPC")
         }
+        Command::K8s { .. } => {
+            unreachable!("k8s is handled before broker IPC")
+        }
         Command::Oauth2 { .. } => {
             unreachable!("oauth2 opens its own session and is handled before broker IPC")
         }
@@ -1216,6 +1263,7 @@ pub fn response_kind(response: &Response) -> &'static str {
         Response::BlobRead { .. } => "BlobRead",
         Response::ManifestPushed { .. } => "ManifestPushed",
         Response::BlobPushed { .. } => "BlobPushed",
+        Response::K8sRead { .. } => "K8sRead",
         Response::Error { .. } => "Error",
     }
 }
@@ -3449,6 +3497,86 @@ fn content_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", sha2::Sha256::digest(bytes))
 }
 
+/// R2.D.3. Reads one Kubernetes object through the broker.
+///
+/// The wire shape is `Request::K8sRead`, which carries the credential id
+/// (a vault reference), the namespace, the resource, and the name. The
+/// broker validates the path parts and refuses traversal/empty parts,
+/// then refuses with `Denied` because R2.D.3.2 — the deployment registry,
+/// surrogate mint, transport — has not landed.
+fn run_k8s(socket: &std::path::Path, command: &K8sCommand) -> std::io::Result<()> {
+    let (credential, namespace, resource, name, json) = match command {
+        K8sCommand::Read {
+            credential,
+            namespace,
+            resource,
+            name,
+            json,
+        } => (
+            credential.clone(),
+            namespace.clone(),
+            resource.clone(),
+            name.clone(),
+            *json,
+        ),
+    };
+
+    // Session + surrogate have to live for the request, so the CLI owns
+    // their lifecycle — same shape `asv github` and `asv aws` use. Today
+    // the broker arm refuses before either is spent, which is the
+    // property this surface has: a verb exists that an agent can call,
+    // and the gap is the answer, not a panic.
+    let outcome = call(
+        socket,
+        &Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            workspace: std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| ".".to_string()),
+        },
+    );
+    let session = match outcome {
+        Ok(Response::SessionCreated { session, .. }) => session,
+        Ok(other) => {
+            eprintln!("asv k8s: session creation was refused: {other:?}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("ASV_CONNECTION_FAILED: {e}");
+            std::process::exit(2);
+        }
+    };
+    let request = Request::K8sRead {
+        protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+        session,
+        credential,
+        namespace,
+        resource,
+        name,
+    };
+    match call(socket, &request) {
+        Ok(response) => {
+            if json {
+                let result = ipc::from_response(&response);
+                println!(
+                    "{}",
+                    render::json::envelope(&render::json::for_result(&result))
+                );
+            } else {
+                print_response(&response);
+            }
+            if matches!(response, Response::Error { .. }) {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("ASV_CONNECTION_FAILED: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn run_oauth2(socket: &std::path::Path, command: &Oauth2Command) -> std::io::Result<()> {
     let Oauth2Command::Whoami { credential, json } = command;
 
@@ -3960,6 +4088,14 @@ fn print_response(response: &Response) {
             println!("resource: {resource}");
             println!("scope:    {scope}");
             println!("audience: {audience}");
+        }
+        // R2.D.3. The wired surface returns ErrorCode::Denied today because
+        // R2.D.3.2 has not landed; the arm is here so the response enum is
+        // exhaustively matched and a future end-to-end implementation gets
+        // a compile error pointing at the place to add the human renderer.
+        Response::K8sRead { status, body } => {
+            println!("status: {status}");
+            println!("body: {body}");
         }
         Response::Pong { protocol } => {
             println!("broker reachable, protocol v{protocol}");
