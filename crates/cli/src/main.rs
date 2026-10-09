@@ -137,6 +137,21 @@ enum Command {
         #[command(subcommand)]
         command: K8sCommand,
     },
+    /// Ask the broker to sign a client certificate (M11-R2.E.3).
+    ///
+    /// The CSR is read from **stdin**, never from argv and never from the
+    /// environment. Both are readable by any same-uid peer through
+    /// `/proc/<pid>/cmdline` and `/proc/<pid>/environ`, which is a kernel
+    /// property this product does not claim to control — and a CSR read from
+    /// argv would contradict the same threat model that pins `add-credential`
+    /// to stdin. The private key never crosses the broker boundary; the
+    /// broker learns only the public half.
+    #[command(name = "mtls")]
+    MTls {
+        /// The mTLS operation. Today only `sign`.
+        #[command(subcommand)]
+        command: MTlsCommand,
+    },
     /// List credential metadata. Never values.
     Credentials {
         /// Emit the `asv.agent/v1` envelope instead of prose.
@@ -670,6 +685,24 @@ enum K8sCommand {
     },
 }
 
+/// The mTLS verbs (R2.E.3).
+///
+/// Today the only verb is `sign`; presentment — the broker holding the leaf
+/// and presenting it on an outbound mTLS connection — is a separate
+/// increment and waits for R2.E.4.
+#[derive(Subcommand)]
+enum MTlsCommand {
+    /// Ask the broker to sign a PKCS#10 CSR against the CA it manages.
+    Sign {
+        /// The vault id of a registered mTLS deployment.
+        #[arg(long, value_name = "VAULT_ID")]
+        credential: String,
+        /// Emit the `asv.agent/v1` envelope instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// The AWS verbs.
 ///
 /// **There is no `--role`, no `--region` and no `--audience`**, and their
@@ -989,6 +1022,9 @@ async fn main() -> std::io::Result<()> {
         // (R2.D.3.2). Returns a clear `Denied` rather than a panic, so the
         // verb exists for the agent to try and the gap is the answer.
         Command::K8s { command } => return run_k8s(&socket, command),
+        // R2.E.3. Same shape as K8s: the surface exists; the broker arm
+        // refuses with `Denied` until R2.E.3.2 lands.
+        Command::MTls { command } => return run_mtls(&socket, command),
         // `plan` opens a session and `discover` does not, so the whole
         // subcommand tree is dispatched here rather than in the single-request
         // path below: the two halves differ in whether they have a reason to
@@ -1143,6 +1179,9 @@ async fn main() -> std::io::Result<()> {
         Command::K8s { .. } => {
             unreachable!("k8s is handled before broker IPC")
         }
+        Command::MTls { .. } => {
+            unreachable!("mtls is handled before broker IPC")
+        }
         Command::Oauth2 { .. } => {
             unreachable!("oauth2 opens its own session and is handled before broker IPC")
         }
@@ -1265,6 +1304,7 @@ pub fn response_kind(response: &Response) -> &'static str {
         Response::BlobPushed { .. } => "BlobPushed",
         Response::K8sRead { .. } => "K8sRead",
         Response::Error { .. } => "Error",
+        Response::MTlsSign { .. } => "MTlsSign",
     }
 }
 
@@ -3577,6 +3617,76 @@ fn run_k8s(socket: &std::path::Path, command: &K8sCommand) -> std::io::Result<()
     }
 }
 
+/// R2.E.3. Reads a PKCS#10 CSR from stdin and asks the broker to sign it.
+///
+/// The CSR is read before any socket is opened, for the same reason
+/// `add-credential` reads the secret before opening one: a request that
+/// carries a CSR in a buffer should never sit on a socket the broker
+/// could not reach. The broker validates the CSR is PEM-encoded, refuses
+/// empty input, and refuses with `Denied` because R2.E.3.2 — the mTLS
+/// deployment lookup, CA selection, leaf sign — has not landed.
+fn run_mtls(socket: &std::path::Path, command: &MTlsCommand) -> std::io::Result<()> {
+    let (credential, json) = match command {
+        MTlsCommand::Sign { credential, json } => (credential.clone(), *json),
+    };
+
+    // Read CSR from stdin. Trimming the trailing newline for the same
+    // reason `add-credential` does: `echo ... |` is the common invocation
+    // and a stored trailing newline is a CSR that silently never parses.
+    let mut csr_pem = String::new();
+    std::io::stdin().read_to_string(&mut csr_pem)?;
+    let csr_pem = csr_pem.strip_suffix('\n').unwrap_or(&csr_pem).to_string();
+
+    // Open the session and send the typed request, mirroring the K8s arm.
+    let outcome = call(
+        socket,
+        &Request::CreateSession {
+            protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+            workspace: std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| ".".to_string()),
+        },
+    );
+    let session = match outcome {
+        Ok(Response::SessionCreated { session, .. }) => session,
+        Ok(other) => {
+            eprintln!("asv mtls: session creation was refused: {other:?}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("ASV_CONNECTION_FAILED: {e}");
+            std::process::exit(2);
+        }
+    };
+    let request = Request::MTlsSign {
+        protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+        session,
+        credential,
+        csr_pem,
+    };
+    match call(socket, &request) {
+        Ok(response) => {
+            if json {
+                let result = ipc::from_response(&response);
+                println!(
+                    "{}",
+                    render::json::envelope(&render::json::for_result(&result))
+                );
+            } else {
+                print_response(&response);
+            }
+            if matches!(response, Response::Error { .. }) {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("ASV_CONNECTION_FAILED: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn run_oauth2(socket: &std::path::Path, command: &Oauth2Command) -> std::io::Result<()> {
     let Oauth2Command::Whoami { credential, json } = command;
 
@@ -4096,6 +4206,12 @@ fn print_response(response: &Response) {
         Response::K8sRead { status, body } => {
             println!("status: {status}");
             println!("body: {body}");
+        }
+        // R2.E.3: same shape as the K8s arm. Wired through for the
+        // response variant to be exhaustively matched; the broker refuses
+        // with `Denied` because R2.E.3.2 has not landed.
+        Response::MTlsSign { certificate_pem } => {
+            println!("{certificate_pem}");
         }
         Response::Pong { protocol } => {
             println!("broker reachable, protocol v{protocol}");

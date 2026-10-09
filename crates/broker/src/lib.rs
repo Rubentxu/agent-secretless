@@ -2556,6 +2556,52 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
             }
         }
 
+        // R2.E.3: the broker operation an agent names when it asks the broker
+        // to sign a client certificate. The request shape carries nothing
+        // that names the issuer or the TTL — both come from the mTLS
+        // deployment — and that is the property, not an omission.
+        //
+        // R2.E.3.1 (CSR validation) is the only piece wired here. R2.E.3.2 —
+        // the mTLS deployment lookup, CA selection, leaf sign, audit — is
+        // the next increment. The refusal is honest about the gap: a typed
+        // IPC request exists, the CLI can name it, but the broker operation
+        // that would answer it has not landed.
+        Request::MTlsSign {
+            protocol: _,
+            session: _,
+            credential,
+            csr_pem,
+        } => {
+            // The credential is parsed first, for the same reason the AWS
+            // and K8s arms do.
+            if CredentialId::from_wire(&credential).is_err() {
+                return Response::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: "the credential is not a vault id".into(),
+                };
+            }
+            // R2.E.3.1 — refuse an empty CSR. A PEM that is too short to
+            // contain "-----BEGIN CERTIFICATE REQUEST-----" cannot be a CSR,
+            // and "trusted input that turned out to be garbage" is the
+            // failure a length check is here to prevent.
+            if csr_pem.len() < 64 || !csr_pem.contains("BEGIN") || !csr_pem.contains("END") {
+                return Response::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: "the CSR is not a PEM-encoded PKCS#10 request".into(),
+                };
+            }
+            // R2.E.3.2 — deployment lookup, CA selection, leaf sign, audit.
+            Response::Error {
+                code: ErrorCode::Denied,
+                message: format!(
+                    "mtls_sign is not yet wired end-to-end: CSR validated ({} bytes) but \
+                     the mTLS deployment lookup, CA selection, leaf sign, and audit \
+                     are not implemented (R2.E.3.2)",
+                    csr_pem.len(),
+                ),
+            }
+        }
+
         // R2.D.3: the broker operation an agent names when it asks for a
         // Kubernetes object. The request shape carries nothing that names a
         // cluster, audience, or token, so the broker is the only place that

@@ -149,6 +149,10 @@ pub enum AgentRel {
     /// gap, which is the answer the roadmap wants — and what an
     /// unpublished link would have hidden.
     K8sRead,
+    /// R2.E.3. The mTLS sign surface (`asv mtls sign`). Same reasoning as
+    /// `K8sRead`: the broker validates the CSR and refuses with `Denied`
+    /// until R2.E.3.2 lands.
+    MTlsSign,
 }
 
 impl AgentRel {
@@ -170,6 +174,7 @@ impl AgentRel {
             AgentRel::RegistryManifestPush => "asv://rels/registry/manifest/push",
             AgentRel::RegistryBlobPush => "asv://rels/registry/blob/push",
             AgentRel::K8sRead => "asv://rels/k8s/read",
+            AgentRel::MTlsSign => "asv://rels/mtls/sign",
             AgentRel::PostgresConnect => "asv://rels/postgres/connect",
             AgentRel::PostgresQuery => "asv://rels/postgres/query",
             AgentRel::SshSign => "asv://rels/ssh/sign",
@@ -196,12 +201,12 @@ impl AgentRel {
             AgentRel::RegistryManifestPush => "registry.manifest.push",
             AgentRel::RegistryBlobPush => "registry.blob.push",
             AgentRel::K8sRead => "k8s.read",
+            AgentRel::MTlsSign => "mtls.sign",
             AgentRel::PostgresConnect => "postgres.connect",
             AgentRel::PostgresQuery => "postgres.query",
             AgentRel::SshSign => "ssh.sign",
             AgentRel::ApprovalStatus => "approval.status",
             AgentRel::AuditRead => "audit.read",
-            AgentRel::K8sRead => "k8s.read",
         }
     }
 
@@ -383,6 +388,18 @@ impl AgentRel {
                 true,
                 "Read one Kubernetes object through a broker-leased token",
             ),
+            // R2.E.3. Same shape as K8s. The broker validates the CSR and
+            // refuses; signing happens at the broker. Requires human
+            // because the response is the authority the broker asserts
+            // about who the agent is to a third party.
+            AgentRel::MTlsSign => AgentLink::new(
+                self.uri(),
+                self.operation(),
+                &["mtls", "sign"],
+                Safety::BoundedExecution,
+                true,
+                "Sign a client certificate with a broker-managed CA",
+            ),
         }
     }
 
@@ -430,6 +447,7 @@ impl AgentRel {
             AgentRel::RegistryManifestPush,
             AgentRel::RegistryBlobPush,
             AgentRel::K8sRead,
+            AgentRel::MTlsSign,
         ]
     }
 
@@ -623,6 +641,12 @@ mod tests {
                 "--name",
                 "example",
             ],
+            // R2.E.3. The mTLS sign surface — the CSR is read from stdin, so
+            // the completion is just the credential reference.
+            "asv://rels/mtls/sign" => &[
+                "--credential",
+                "00000000-0000-4000-8000-000000000000",
+            ],
             _ => return None,
         })
     }
@@ -699,6 +723,8 @@ mod tests {
                 // that names the gap, so the agent can read it rather
                 // than guess.
                 "asv://rels/k8s/read",
+                // R2.E.3. The mTLS sign surface, same reasoning.
+                "asv://rels/mtls/sign",
             ]
         );
     }

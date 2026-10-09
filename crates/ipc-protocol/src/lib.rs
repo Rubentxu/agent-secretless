@@ -638,6 +638,27 @@ pub enum Request {
         /// The name of the object within the resource.
         name: String,
     },
+    /// R2.E.3: ask the broker to sign a client certificate.
+    ///
+    /// The agent supplies a CSR (PKCS#10) and a credential reference naming
+    /// the mTLS deployment. The broker decides which CA signs it and how
+    /// long the leaf is valid for; the agent cannot name its own issuer or
+    /// its own TTL, because a request that could name its own CA would be a
+    /// request that could ask the broker to sign under any authority the
+    /// policy engine had not been asked about.
+    ///
+    /// The private key never leaves the agent — that is the property of a
+    /// CSR and the reason this endpoint exists at all. The response is the
+    /// signed certificate bytes, base64-encoded inside the envelope, and
+    /// nothing else.
+    MTlsSign {
+        protocol: u16,
+        session: AgentSessionId,
+        /// A vault credential reference naming the mTLS deployment.
+        credential: String,
+        /// The agent's PKCS#10 CSR, PEM-encoded.
+        csr_pem: String,
+    },
     /// M6-R1: open a PostgreSQL session for a typed audience.
     ///
     /// The agent names the audience, the database, and the role. It never
@@ -917,6 +938,13 @@ pub enum Response {
         status: u16,
         /// The API server's response body, verbatim.
         body: String,
+    },
+    /// R2.E.3: the broker's signed certificate for a CSR the agent supplied.
+    /// The private key never appears on the wire; what travels back is the
+    /// leaf certificate the broker minted, in PEM.
+    MTlsSign {
+        /// The signed leaf certificate, PEM-encoded.
+        certificate_pem: String,
     },
     ///
     /// ## Why these three fields are checked before they are returned
@@ -1260,6 +1288,7 @@ impl Request {
             Request::RunIsolated { .. } => "run_isolated",
             Request::AwsCallerIdentity { .. } => "aws_caller_identity",
             Request::K8sRead { .. } => "k8s_read",
+            Request::MTlsSign { .. } => "mtls_sign",
         }
     }
 
@@ -1300,7 +1329,8 @@ impl Request {
             | Request::PostgresConnect { protocol, .. }
             | Request::PostgresQuery { protocol, .. }
             | Request::PostgresRevoke { protocol, .. }
-            | Request::K8sRead { protocol, .. } => *protocol,
+            | Request::K8sRead { protocol, .. }
+            | Request::MTlsSign { protocol, .. } => *protocol,
         }
     }
 }
@@ -1731,6 +1761,9 @@ mod tests {
             Response::K8sRead {
                 status: 200,
                 body: r#"{"metadata":{"name":"web"},"spec":{}}"#.into(),
+            },
+            Response::MTlsSign {
+                certificate_pem: "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----".into(),
             },
         ] {
             let json = serde_json::to_string(&response).expect("serializes");

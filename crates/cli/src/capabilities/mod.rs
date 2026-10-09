@@ -264,17 +264,17 @@ fn relations_for(capabilities: &[String]) -> Vec<String> {
                 // not serve `k8s.read` cannot hide the gap by omission —
                 // hiding it would be the same failure the GitHub three
                 // closed at R2.A by publishing rather than withholding.
+                //
+                // R2.E.3. Same reasoning as R2.D.3: the broker validates
+                // the CSR, refuses with `Denied` until R2.E.3.2 lands, and
+                // publishing the link is the answer to "is mTLS there yet?"
+                // rather than withholding it.
                 "system.status"
                 | "system.doctor"
                 | "system.setup"
                 | "system.capabilities"
                 | "system.upgrade" => true,
-                // R2.D.3. Same reasoning as `system.upgrade` above: the link
-                // is the answer to "is there a K8s read yet?", and the broker
-                // says yes-by-refusal until R2.D.3.2 lands. A broker that
-                // has not implemented K8s at all would say no here, and the
-                // gate stays checked by capability when reachable.
-                "k8s.read" => true,
+                "k8s.read" | "mtls.sign" => true,
                 "credentials.metadata.list" => {
                     capabilities.iter().any(|c| c == "credentials.metadata")
                 }
@@ -289,16 +289,6 @@ fn relations_for(capabilities: &[String]) -> Vec<String> {
                 // would be the drift this line is meant to remove; they keep
                 // their explicit arms until this arm is the only arm.
                 op if op.starts_with("registry.") => capabilities.iter().any(|c| c == op),
-                // R2.D.3: same reasoning as the registry arm — a relation an
-                // agent can ask for must be backed by the broker, and the
-                // broker signals "I serve this" by listing the capability.
-                // The K8s read is wired on the broker side (validation, IPC
-                // variant, dispatch arm) but the deployment registry has not
-                // landed, so a broker today answers with `Denied` rather
-                // than a real object — and a broker that does not serve K8s
-                // at all would answer with `UnsupportedAction`. Both are the
-                // broker's call, so the link is gated on the capability.
-                op if op.starts_with("k8s.") => capabilities.iter().any(|c| c == op),
                 _ => false,
             }
         })
