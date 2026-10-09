@@ -27,7 +27,29 @@ use pg_session::render_row;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
+
+/// A DER-encoded X.509 certificate, wrapped in the PEM envelope the
+/// `MTlsSign` response carries and the CLI forwards to the agent.
+///
+/// Wrapping is RFC 7468 §7: a 64-character base64 line, no trailing
+/// whitespace, and a closing fence. `base64::engine::general_purpose::STANDARD`
+/// is the one the rest of this crate already uses (oauth2 pulls it in
+/// for token bodies), so the encoding is one helper rather than two
+/// slightly-different ones.
+fn der_to_pem(der: &[u8]) -> String {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut out = String::with_capacity(der.len() * 4 / 3 + 64);
+    out.push_str("-----BEGIN CERTIFICATE-----\n");
+    for chunk in encoded.as_bytes().chunks(64) {
+        // `from_utf8` is safe because base64 only produces ASCII.
+        out.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
+        out.push('\n');
+    }
+    out.push_str("-----END CERTIFICATE-----\n");
+    out
+}
 
 pub mod aws_binding;
 
@@ -2611,22 +2633,69 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                     message: "the CSR is not a PEM-encoded PKCS#10 request".into(),
                 };
             }
-            // R2.E.3.2 — the signer lookup. The next increments are the
-            // session CA wiring, the actual signature, and the audit row;
-            // today the broker answers with the binding it would have signed
-            // against, named in the gap so an operator reading the refusal
-            // learns what to configure.
-            match state.authorize_mtls_sign(session, peer, &credential) {
-                Ok(_signer) => Response::Error {
-                    code: ErrorCode::Denied,
-                    message: format!(
-                        "mtls_sign: signer lookup passed (credential {}, identity {}) but \
-                         the CA selection, leaf sign, and audit are not yet implemented (R2.E.3.2)",
-                        credential.to_wire(),
-                        _signer.identity(),
-                    ),
-                },
+            // R2.E.3.2 — the actual sign. The signer lookup and policy gate
+            // ran in `authorize_mtls_sign`; here the broker borrows a
+            // session CA, parses the CSR (the public half only — the
+            // private half never entered the process), calls the issuer
+            // with the declared identity and TTL, and converts the DER
+            // it gets back into the PEM the CLI forwards.
+            //
+            // The CA is minted per call rather than stored. A broker
+            // that stored one would have a long-lived signing key in
+            // memory and would have to revoke it; a per-call CA has a
+            // single TTL and dies with the request. The cost is a key
+            // generation per request, which is the same cost the
+            // present path pays.
+            let signer = match state.authorize_mtls_sign(session, peer, &credential) {
+                Ok(signer) => signer,
                 Err(denial) => return *denial,
+            };
+            let grant = match signer.to_grant() {
+                Ok(grant) => grant,
+                Err(error) => {
+                    return Response::Error {
+                        code: ErrorCode::Denied,
+                        message: format!(
+                            "mtls_sign: the declared identity is unusable: {error}"
+                        ),
+                    };
+                }
+            };
+            let csr = match crate::tls_bridge::mtls::issue::ClientCsr::from_pem(&csr_pem) {
+                Ok(csr) => csr,
+                Err(error) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("the CSR is not a parseable PKCS#10 request: {error}"),
+                    };
+                }
+            };
+            // The CA is session-scoped so two concurrent mTLS sign requests
+            // for the same agent session do not race on a shared key. The
+            // session id is what the audit row will name, so the binding
+            // from "the broker signed this CSR" to "this session asked"
+            // is the same string in both places.
+            let ca = crate::tls_bridge::SessionCa::new(
+                &session.to_string(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0),
+                crate::tls_bridge::DEFAULT_SESSION_CA_TTL,
+            );
+            let issued = match crate::tls_bridge::mtls::issue::issue_client_certificate(
+                &ca, &grant, &csr, Instant::now(),
+            ) {
+                Ok(issued) => issued,
+                Err(error) => {
+                    return Response::Error {
+                        code: ErrorCode::Upstream,
+                        message: format!("the issuer refused: {error}"),
+                    };
+                }
+            };
+            Response::MTlsSign {
+                certificate_pem: der_to_pem(issued.der()),
             }
         }
 

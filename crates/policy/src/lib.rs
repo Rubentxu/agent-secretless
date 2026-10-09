@@ -529,6 +529,20 @@ const SCHEMA_JSON: &str = r#"{
           }
         }
       },
+      "mtls_sign": {
+        "memberOf": [],
+        "appliesTo": {
+          "principalTypes": ["AgentSession"],
+          "resourceTypes": ["Api"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "protected_ref": { "type": "Boolean" },
+              "approved": { "type": "Boolean" }
+            }
+          }
+        }
+      },
       "github_issue_read": {
         "memberOf": [],
         "appliesTo": {
