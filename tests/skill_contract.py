@@ -262,7 +262,14 @@ def c2_frontmatter(files: dict[str, str], truth: dict) -> None:
 
 def c3_no_invented_rel(files: dict[str, str], truth: dict) -> None:
     declared = set(truth["rels"].values())
-    mentioned = set(re.findall(r"asv://rels/[a-z/]+", all_text(files)))
+    # `[a-z0-9/]+` rather than `[a-z/]+` because `k8s` contains a digit and the
+    # `+` stops at the first byte outside the class, so a strict lowercase
+    # class would emit `asv://rels/k` (a relation that does not exist) from
+    # the legitimate `asv://rels/k8s/read`. The declared set is the truth
+    # side, the mentioned set is the skill side, and the comparison is
+    # between the two — the regex's job is to extract every URI the skill
+    # names, not to filter them by hand.
+    mentioned = set(re.findall(r"asv://rels/[a-z0-9/]+", all_text(files)))
     invented = mentioned - declared
     check(not invented,
           "the skill invents no relation the product does not declare"
@@ -723,16 +730,18 @@ def check_truth_is_not_vacuous(truth: dict) -> None:
     codes = set(truth["codes"]) | set(truth["warn_codes"])
     check(len(rels) >= 14, f"parsed {len(rels)} relations from relations.rs")
     # An exact count, not a floor. The number went 6 -> 9 in R2.A when the three
-    # GitHub relations were republished against a real command, and 9 -> 13 in
-    # R2.F when the four registry relations were published against real verbs. A
-    # `>=` here would have let the published set grow by any amount without this
+    # GitHub relations were republished against a real command, 9 -> 13 in
+    # R2.F when the four registry relations were published against real verbs,
+    # and 13 -> 16 when `asv://rels/upgrade`, `asv://rels/k8s/read`, and
+    # `asv://rels/mtls/sign` were added to the operational set. A `>=` here
+    # would have let the published set grow by any amount without this
     # noticing. The tripwire is also the thing that makes the skill update
     # mandatory: a release cannot pass with a skill that has not caught up. So
     # this number tracks the *product* and moves the moment a relation ships;
     # the four per-relation checks below are what track the *skill*, and they
     # stay red until the sibling checkout actually documents them.
-    check(len(operational) == 13,
-          f"parsed {len(operational)} published relations, expected 13")
+    check(len(operational) == 16,
+          f"parsed {len(operational)} published relations, expected 16")
     check(len(argv) == len(rels) and len(argv) >= 14,
           f"parsed an argv for every relation ({len(argv)} of {len(rels)})")
     check(len(codes) >= 5, f"parsed {len(codes)} error and warning codes")

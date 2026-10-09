@@ -481,23 +481,33 @@ def r0_3b_upgrade_relation() -> None:
     either shipping a real `asv upgrade` verb or amending that invariant, and
     both are decisions rather than repairs.
     """
-    target = os.environ.get("CARGO_TARGET_DIR") or ""
-    binary = (Path(target) if target else None)
-    if binary is None:
-        code, out = run(["cargo", "metadata", "--format-version", "1", "--no-deps",
-                         "--manifest-path", str(REPO / "Cargo.toml")], timeout=300)
-        # Guarded rather than trusted: a `cargo metadata` that exits zero having
-        # printed something else used to take this gate down with a traceback,
-        # and a gate that crashes reports nothing at all — which is the one
-        # outcome that cannot be told apart from a row that was never run.
-        try:
-            binary = Path(json.loads(out)["target_directory"])
-        except (ValueError, KeyError, TypeError):
-            record("R0.3b protocol mismatch offers a runnable relation", UNAVAILABLE,
-                   f"cargo did not report a target directory (exit {code}); the "
-                   f"relation surface an agent reads could not be asked")
-            return
-    asv = binary / "debug" / "asv"
+    # Prefer the binary the worktree that owns this gate just built. The
+    # fallback (`cargo metadata --manifest-path REPO/Cargo.toml`) reports the
+    # target directory of the workspace root, which is shared between worktrees
+    # and is the wrong file when `REPO` is a release-pinned worktree. Reading
+    # the wrong binary here is the bug R0.4 names: a green that cannot go red
+    # because the gate measured a different SHA than the one the row claims to
+    # measure. The fix is a file-system lookup, not a metadata lookup, because
+    # the metadata lookup inherits the workspace's shared target.
+    asv = REPO / "target" / "debug" / "asv"
+    if not asv.is_file():
+        target = os.environ.get("CARGO_TARGET_DIR") or ""
+        binary = (Path(target) if target else None)
+        if binary is None:
+            code, out = run(["cargo", "metadata", "--format-version", "1", "--no-deps",
+                             "--manifest-path", str(REPO / "Cargo.toml")], timeout=300)
+            # Guarded rather than trusted: a `cargo metadata` that exits zero having
+            # printed something else used to take this gate down with a traceback,
+            # and a gate that crashes reports nothing at all — which is the one
+            # outcome that cannot be told apart from a row that was never run.
+            try:
+                binary = Path(json.loads(out)["target_directory"])
+            except (ValueError, KeyError, TypeError):
+                record("R0.3b protocol mismatch offers a runnable relation", UNAVAILABLE,
+                       f"cargo did not report a target directory (exit {code}); the "
+                       f"relation surface an agent reads could not be asked")
+                return
+        asv = binary / "debug" / "asv"
     if not asv.is_file():
         record("R0.3b protocol mismatch offers a runnable relation", UNAVAILABLE,
                f"no built asv at {asv}; the relation surface an agent reads "
