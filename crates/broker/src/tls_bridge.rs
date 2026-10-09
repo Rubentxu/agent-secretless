@@ -583,34 +583,31 @@ pub struct TrustBinding {
     pub env_value: PathBuf,
 }
 
-/// The trust-injection trait. Each concrete adapter knows how to make a
-/// specific runtime trust the session CA.
-pub trait TrustInjector {
-    /// Adapter name (stable identifier for the audit log).
-    fn name(&self) -> &'static str;
-
-    /// Emit the trust binding. Writes the CA material to a session
-    /// directory and returns the env var the broker sets when spawning
-    /// the agent's process tree.
-    fn inject(&self, ca: &SessionCa, session_dir: &Path) -> Result<TrustBinding, InjectError>;
-}
-
-/// Adapter for OpenSSL and the libcurl / Git / Go-runtime stacks that
-/// honour `SSL_CERT_FILE` (or its platform-specific aliases).
+/// The trust-injection shape for OpenSSL and the libcurl / Git /
+/// Go-runtime stacks that honour `SSL_CERT_FILE`. The trait was
+/// removed: production code only ever called the concrete type, and
+/// a second implementer would have no caller either, because the
+/// adapter list is closed by `SslCertFileAdapter::for_runtime`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpenSslEnvInjector;
 
 impl OpenSslEnvInjector {
     /// File name inside `session_dir` where the root DER is written.
     pub const PEM_FILE: &'static str = "ssl-cert.pem";
-}
 
-impl TrustInjector for OpenSslEnvInjector {
-    fn name(&self) -> &'static str {
+    /// Adapter name (stable identifier for the audit log).
+    pub fn name(&self) -> &'static str {
         "openssl"
     }
 
-    fn inject(&self, ca: &SessionCa, session_dir: &Path) -> Result<TrustBinding, InjectError> {
+    /// Emit the trust binding. Writes the CA material to a session
+    /// directory and returns the env var the broker sets when spawning
+    /// the agent's process tree.
+    pub fn inject(
+        &self,
+        ca: &SessionCa,
+        session_dir: &Path,
+    ) -> Result<TrustBinding, InjectError> {
         if ca.root_der.is_empty() {
             return Err(InjectError::EmptyCa(ca.session_id.clone()));
         }

@@ -13,13 +13,13 @@
 //! superseded UAT and a different requirement in the same breath is worse
 //! than claiming nothing, because the gate counts it as coverage.
 //!
-//! M9-R4 specifies that a `TrustInjector` adapter writes the session CA to a
+//! M9-R4 specifies that `OpenSslEnvInjector` writes the session CA to a
 //! session-scoped path and returns a binding the broker uses to spawn the
 //! agent's process tree with the right env vars.
 
 use asv_broker::tls_bridge::{
     AuthorityEndpoint, Bridge, ConnectPolicy, InjectError, OpenSslEnvInjector, SessionCa,
-    TrustInjector, DEFAULT_SESSION_CA_TTL,
+    DEFAULT_SESSION_CA_TTL,
 };
 use asv_domain::Authority;
 
