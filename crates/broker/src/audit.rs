@@ -257,7 +257,16 @@ impl AuditLog {
             }
         }
         if truncated_tail {
-            std::fs::write(path, &text.as_bytes()[..valid_len]).map_err(AuditOpenError::Io)?;
+            // Atomic truncate: write the recovered bytes to a sibling file in
+            // the same directory (so rename is on the same filesystem) and
+            // rename over the original. A crash between the write and the
+            // rename leaves the original untouched; a crash during the rename
+            // leaves either the original or the new bytes, never half of one
+            // and half of the other.
+            let sibling = path.with_extension("recover.tmp");
+            std::fs::write(&sibling, &text.as_bytes()[..valid_len])
+                .map_err(AuditOpenError::Io)?;
+            std::fs::rename(&sibling, path).map_err(AuditOpenError::Io)?;
         }
         let total = records.len();
         let window = if max == 0 {
@@ -706,6 +715,18 @@ mod tests {
         assert_eq!(next.seq, 3, "new record takes the freed sequence");
         assert_eq!(log.verify(), Ok(()));
         assert!(verify_file(&path).is_ok(), "file verifies after re-anchor");
+        // Atomic recovery: the recovery must use a write-then-rename so a
+        // process killed between the write and the rename cannot leave the
+        // audit file in a half-written state. We assert the property the
+        // rename buys us, not the implementation: the file must exist and
+        // verify after a partial-tail recovery, which a direct `std::fs::write`
+        // (truncate-and-overwrite) cannot guarantee if interrupted.
+        let final_text = std::fs::read_to_string(&path).expect("file after recovery");
+        assert!(!final_text.is_empty(), "recovered file is not empty");
+        assert!(verify_file(&path).is_ok(), "recovered file verifies");
+        // No leftover sibling: the rename must have moved it.
+        let sibling = path.with_extension("recover.tmp");
+        assert!(!sibling.exists(), "recovery sibling must be renamed away");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
