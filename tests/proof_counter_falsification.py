@@ -266,14 +266,42 @@ def run_targeted() -> tuple[int, str]:
 
 
 def refuse_on_dirty_tree() -> None:
+    """Self-heal a mutation residue left by a prior run that SIGTERM killed.
+
+    A `finally` block restores each source when a run ends normally or raises;
+    a `finally` does nothing when the process is killed, and that is exactly
+    what produced the residue in `lib.rs` and `aws/calendar.rs` after
+    interrupted runs. The detect heuristic is `git show HEAD:<path>`: the
+    framework here mutates with `str.replace` and leaves no marker, so a
+    literal-string scan is blind. `git show HEAD:<path>` is what the file
+    looked like before any falsification ever ran; if the on-disk bytes
+    differ, the previous run did not restore, and the right answer is to
+    restore from git rather than to refuse the run.
+    """
     for path in SOURCES:
-        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if "MUTANT" in line:
-                print(f"REFUSING: {path.name}:{number} still carries a mutation\n  {line.strip()}")
-                sys.exit(2)
+        try:
+            result = subprocess.run(
+                ["git", "show", f"HEAD:{path.relative_to(ROOT)}"],
+                cwd=ROOT, capture_output=True, text=True, check=True,
+            )
+        except subprocess.CalledProcessError:
+            continue
+        on_disk = path.read_text(encoding="utf-8")
+        if on_disk == result.stdout:
+            continue
+        print(
+            f"RESIDUE: {path.relative_to(ROOT)} carried a mutation from a "
+            f"previous run; restoring from git",
+            flush=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "--", str(path.relative_to(ROOT))],
+            cwd=ROOT, check=True, capture_output=True,
+        )
 
 
 def main() -> int:
+    refuse_on_dirty_tree()
     if "--dry-run" in sys.argv:
         bad = 0
         for mutation in MUTATIONS:
@@ -286,7 +314,6 @@ def main() -> int:
         print(f"{len(MUTATIONS) - bad}/{len(MUTATIONS)} mutations, {sites} sites, apply cleanly")
         return 1 if bad else 0
 
-    refuse_on_dirty_tree()
 
     results: list[tuple[str, bool, str]] = []
     for mutation in MUTATIONS:

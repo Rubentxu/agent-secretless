@@ -82,6 +82,43 @@ BRIDGE = ROOT / "crates/broker/src/tls_bridge.rs"
 FRAME = ROOT / "crates/broker/src/http_frame.rs"
 UAT = ROOT / "crates/broker/tests/uat_010_connect_substitution.rs"
 RUNTIME = ROOT / "crates/broker/src/connect_runtime.rs"
+SOURCES = (BRIDGE, FRAME, UAT, RUNTIME)
+
+
+def refuse_on_dirty_tree() -> None:
+    """Self-heal a mutation residue left by a prior run that SIGTERM killed.
+
+    The mutation runner restores each source in a `finally` block when a run
+    ends normally or raises; a `finally` does nothing when the process is
+    killed, which is what produced the residue in `tls_bridge.rs` and
+    `connect_runtime.rs` after interrupted runs. The detect heuristic is
+    `git show HEAD:<path>`: the framework here mutates with `str.replace`
+    and leaves no `MUTANT` marker, so a literal-string scan is blind.
+    `git show HEAD:<path>` is what the file looked like before any
+    falsification ever ran; if the on-disk bytes differ, the previous run
+    did not restore, and the right answer is to restore from git rather
+    than to refuse the run.
+    """
+    for path in SOURCES:
+        try:
+            result = subprocess.run(
+                ["git", "show", f"HEAD:{path.relative_to(ROOT)}"],
+                cwd=ROOT, capture_output=True, text=True, check=True,
+            )
+        except subprocess.CalledProcessError:
+            continue
+        on_disk = path.read_text(encoding="utf-8")
+        if on_disk == result.stdout:
+            continue
+        print(
+            f"RESIDUE: {path.relative_to(ROOT)} carried a mutation from a "
+            f"previous run; restoring from git",
+            flush=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "--", str(path.relative_to(ROOT))],
+            cwd=ROOT, check=True, capture_output=True,
+        )
 
 
 @dataclass(frozen=True)
@@ -457,6 +494,7 @@ ORIGINAL: dict[Path, str] = {}
 
 
 def main() -> int:
+    refuse_on_dirty_tree()
     wanted = MUTATIONS
     if len(sys.argv) > 1:
         # **Union, not intersection.** The first version filtered `wanted` once

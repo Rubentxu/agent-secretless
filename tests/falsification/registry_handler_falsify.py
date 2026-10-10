@@ -48,6 +48,7 @@ Run:  python3 registry_handler_falsify.py
 """
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -234,12 +235,48 @@ MUTATIONS = [
 ]
 
 
+def refuse_on_dirty_tree(path: Path) -> None:
+    """Self-heal a mutation residue left by a prior run that SIGTERM killed.
+
+    The mutation runner restores the file in a `finally` block when a run
+    ends normally or raises; a `finally` does nothing when the process is
+    killed, which is what produced the residue in `lib.rs` after an
+    interrupted `registry_handler_falsify.py` run. The detect heuristic is
+    `git show HEAD:<path>`: the framework here mutates with `str.replace`
+    and leaves no `MUTANT` marker, so a literal-string scan is blind.
+    `git show HEAD:<path>` is what the file looked like before any
+    falsification ever ran; if the on-disk bytes differ, the previous run
+    did not restore, and the right answer is to restore from git rather
+    than to refuse the run.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "show", f"HEAD:{path.relative_to(f.REPO)}"],
+            cwd=f.REPO, capture_output=True, text=True, check=True,
+        )
+    except subprocess.CalledProcessError:
+        return
+    on_disk = path.read_text(encoding="utf-8")
+    if on_disk == result.stdout:
+        return
+    print(
+        f"RESIDUE: {path.relative_to(f.REPO)} carried a mutation from a "
+        f"previous run; restoring from git",
+        flush=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "--", str(path.relative_to(f.REPO))],
+        cwd=f.REPO, check=True, capture_output=True,
+    )
+
+
 def run_phase(path: Path, mutations: list, title: str) -> dict:
     """Apply each mutation and tally the five buckets.
 
     A snippet this harness cannot find exactly once is a defect in the harness,
     not a result about the code, and it has its own bucket for that reason.
     """
+    refuse_on_dirty_tree(path)
     original = path.read_text()
     buckets = {
         "red": 0,

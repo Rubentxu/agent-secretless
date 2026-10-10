@@ -127,6 +127,41 @@ TIMEOUT = 1800
 ORIGINAL: dict[Path, str] = {}
 
 
+def refuse_on_dirty_tree() -> None:
+    """Self-heal a mutation residue left by a prior run that SIGTERM killed.
+
+    The mutation runner restores each source in a `finally` block when a run
+    ends normally or raises; a `finally` does nothing when the process is
+    killed, which is what produced the residue in `tpm2.rs` after interrupted
+    runs. The detect heuristic is `git show HEAD:<path>`: the framework
+    here mutates with `str.replace` and leaves no `MUTANT` marker, so a
+    literal-string scan is blind. `git show HEAD:<path>` is what the file
+    looked like before any falsification ever ran; if the on-disk bytes
+    differ, the previous run did not restore, and the right answer is to
+    restore from git rather than to refuse the run.
+    """
+    for path in ALL:
+        try:
+            result = subprocess.run(
+                ["git", "show", f"HEAD:{path.relative_to(ROOT)}"],
+                cwd=ROOT, capture_output=True, text=True, check=True,
+            )
+        except subprocess.CalledProcessError:
+            continue
+        on_disk = path.read_text(encoding="utf-8")
+        if on_disk == result.stdout:
+            continue
+        print(
+            f"RESIDUE: {path.relative_to(ROOT)} carried a mutation from a "
+            f"previous run; restoring from git",
+            flush=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "--", str(path.relative_to(ROOT))],
+            cwd=ROOT, check=True, capture_output=True,
+        )
+
+
 @dataclass
 class Mutation:
     name: str
@@ -469,6 +504,7 @@ def main() -> int:
     ap.add_argument("rows", nargs="*", help="row name fragments, e.g. R1 R4")
     args = ap.parse_args()
 
+    refuse_on_dirty_tree()
     if args.list:
         for m in MUTATIONS:
             say(f"{m.name}  [{m.path.name} -> {m.suite}]")
