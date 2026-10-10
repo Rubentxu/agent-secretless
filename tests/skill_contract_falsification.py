@@ -84,7 +84,7 @@ def _run(fn, *args) -> tuple[bool, list[str]]:
 #: here indistinguishable from a change to the product.
 STUB_TRUTH = {
     "rels": {f"V{i}": f"asv://rels/v{i}" for i in range(18)},
-    "operational": [f"V{i}" for i in range(13)],
+    "operational": [f"V{i}" for i in range(16)],
     "argv": {f"V{i}": ["x"] for i in range(18)},
     "codes": {"a", "b", "c", "d", "e"},
     "warn_codes": {"f"},
@@ -106,7 +106,7 @@ CASES = [
     (
         "a skill stating the right number passes",
         lambda: _run(sc.c5b_the_stated_count_is_the_published_count,
-                     _skill("El runtime publica trece y sólo trece."),
+                     _skill("El runtime publica dieciséis y sólo dieciséis."),
                      STUB_TRUTH),
         True,
     ),
@@ -120,7 +120,7 @@ CASES = [
     (
         "two different counts are a defect, not a choice for the check",
         lambda: _run(sc.c5b_the_stated_count_is_the_published_count,
-                     _skill("Uno: nueve y sólo nueve. Otro: trece y sólo trece."),
+                     _skill("Uno: nueve y sólo nueve. Otro: dieciséis y sólo dieciséis."),
                      STUB_TRUTH),
         False,
     ),
@@ -164,7 +164,7 @@ def main() -> int:
         ok, failures = _run(sc.c5b_the_stated_count_is_the_published_count,
                             _skill("El runtime publica nueve y sólo nueve."),
                             STUB_TRUTH)
-    names_both = any("9" in f and "13" in f for f in failures)
+    names_both = any("9" in f and "16" in f for f in failures)
     print(f"  {'PASS' if names_both else 'FAIL'}  "
           f"the wrong-number failure names both numbers")
     if names_both:
