@@ -272,6 +272,14 @@ impl ApiRequest<'_> {
         let mut path = String::with_capacity(resource.len() + 32);
         match self.scope {
             Scope::Namespaced { namespace } => {
+                // `checked_label` is the refusal that does the work: a 64-byte
+                // namespace is one the API server will refuse, and a proxy
+                // that builds it anyway produces a 404 that says nothing about
+                // the real cause. The earlier form of this function called
+                // `checked_label` and assigned its result; the lifetime
+                // broadening that removed `Box::leak` dropped the call.
+                // Restoring it here keeps the request's *and* the response's
+                // failures on the same side of the boundary.
                 let namespace = checked_label("namespace", namespace)?;
                 path.push_str("/api/v1/namespaces/");
                 path.push_str(&namespace);

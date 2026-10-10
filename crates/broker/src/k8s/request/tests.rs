@@ -361,12 +361,14 @@ fn a_name_longer_than_the_bound_is_refused() {
 
 #[test]
 fn a_namespace_longer_than_a_label_is_refused() {
-    let long = "a".repeat(64);
+    // 64 `a`s exceeds the 63-byte label limit. The test was leaving the
+    // namespace as a `&'static str` via `Box::leak` before the lifetime
+    // broadening removed that requirement; a `&'static str` is now reachable
+    // through a `const` built at compile time, with no runtime allocation.
+    const LONG: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let r = ApiRequest {
         verb: Verb::List,
-        scope: Scope::Namespaced {
-            namespace: Box::leak(long.into_boxed_str()),
-        },
+        scope: Scope::Namespaced { namespace: LONG },
         resource: "pods",
         name: None,
     };
