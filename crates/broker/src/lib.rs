@@ -2667,9 +2667,7 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                 Err(error) => {
                     return Response::Error {
                         code: ErrorCode::Denied,
-                        message: format!(
-                            "mtls_sign: the declared identity is unusable: {error}"
-                        ),
+                        message: format!("mtls_sign: the declared identity is unusable: {error}"),
                     };
                 }
             };
@@ -2696,7 +2694,10 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                 crate::tls_bridge::DEFAULT_SESSION_CA_TTL,
             );
             let issued = match crate::tls_bridge::mtls::issue::issue_client_certificate(
-                &ca, &grant, &csr, Instant::now(),
+                &ca,
+                &grant,
+                &csr,
+                Instant::now(),
             ) {
                 Ok(issued) => issued,
                 Err(error) => {
@@ -2760,13 +2761,21 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                 if value.is_empty() {
                     return Response::Error {
                         code: ErrorCode::InvalidRequest,
-                        message: format!("{what} is empty, and an empty segment changes what the path means"),
+                        message: format!(
+                            "{what} is empty, and an empty segment changes what the path means"
+                        ),
                     };
                 }
-                if value.contains('/') || value.contains('%') || value.contains('?') || value.contains('#') {
+                if value.contains('/')
+                    || value.contains('%')
+                    || value.contains('?')
+                    || value.contains('#')
+                {
                     return Response::Error {
                         code: ErrorCode::InvalidRequest,
-                        message: format!("{what} {value:?} is not a name this proxy will place in a path"),
+                        message: format!(
+                            "{what} {value:?} is not a name this proxy will place in a path"
+                        ),
                     };
                 }
             }
@@ -2791,11 +2800,10 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                 resource: &resource,
                 name: Some(&name),
             };
-            match binding.client().send(
-                binding.port(),
-                &credential.to_wire(),
-                &api_request,
-            ) {
+            match binding
+                .client()
+                .send(binding.port(), &credential.to_wire(), &api_request)
+            {
                 Ok(reply) => Response::K8sRead {
                     status: reply.status,
                     body: String::from_utf8_lossy(&reply.body).into_owned(),
@@ -8063,13 +8071,14 @@ mod e2e {
                         assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
                         assert!(
                             message.contains(&format!("{which} "))
-                                && message.contains("is not a name this proxy will place in a path"),
+                                && message
+                                    .contains("is not a name this proxy will place in a path"),
                             "expected a traversal refusal for {which}={bad:?}, got {message}"
                         );
                     }
-                    other => panic!(
-                        "expected a traversal refusal for {which}={bad:?}, got {other:?}"
-                    ),
+                    other => {
+                        panic!("expected a traversal refusal for {which}={bad:?}, got {other:?}")
+                    }
                 }
             }
         }
@@ -8137,14 +8146,12 @@ mod e2e {
     #[test]
     fn mtls_sign_with_a_configured_signer_and_permitted_policy_signs_the_requested_csr() {
         let mut state = bare();
-        state.mtls_signers = vec![
-            crate::tls_bridge::mtls::deployment::SigningBinding::new(
-                "11111111-2222-3333-4444-555555555555",
-                "svc-a.internal",
-                std::time::Duration::from_secs(3600),
-            )
-            .expect("canonical pair"),
-        ];
+        state.mtls_signers = vec![crate::tls_bridge::mtls::deployment::SigningBinding::new(
+            "11111111-2222-3333-4444-555555555555",
+            "svc-a.internal",
+            std::time::Duration::from_secs(3600),
+        )
+        .expect("canonical pair")];
         state.policy = asv_policy::PolicyEngine::from_policy_text(
             r#"permit (principal, action == Action::"mtls_sign", resource);"#,
         )
@@ -8306,14 +8313,12 @@ mod e2e {
     #[test]
     fn mtls_sign_with_a_configured_signer_reaches_the_policy_gate() {
         let mut state = bare();
-        state.mtls_signers = vec![
-            crate::tls_bridge::mtls::deployment::SigningBinding::new(
-                "11111111-2222-3333-4444-555555555555",
-                "svc-a.internal",
-                std::time::Duration::from_secs(3600),
-            )
-            .expect("canonical pair"),
-        ];
+        state.mtls_signers = vec![crate::tls_bridge::mtls::deployment::SigningBinding::new(
+            "11111111-2222-3333-4444-555555555555",
+            "svc-a.internal",
+            std::time::Duration::from_secs(3600),
+        )
+        .expect("canonical pair")];
         let peer = self_peer();
         let session = sess(&state).create("/repo".into(), &peer);
         match handle(

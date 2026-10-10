@@ -110,11 +110,7 @@ impl SigningBinding {
     /// string) for the same reason [`ClientBinding`] canonicalizes: the value
     /// enters the program here, and a declaration that *exists* is a
     /// declaration that already passed the only check worth running on it.
-    pub fn new(
-        credential: &str,
-        identity: &str,
-        ttl: Duration,
-    ) -> Result<Self, DeploymentError> {
+    pub fn new(credential: &str, identity: &str, ttl: Duration) -> Result<Self, DeploymentError> {
         let credential = CredentialId::from_wire(credential)
             .map_err(|_| DeploymentError::UnusableCredential(credential.to_string()))?;
         Ok(Self {
@@ -267,9 +263,7 @@ impl MtlsDeployment {
     /// for a credential the operator did not register gets nothing, and the
     /// dispatch path turns that into a `Denied` with the configured list.
     pub fn signer_for(&self, credential: &CredentialId) -> Option<&SigningBinding> {
-        self.signers
-            .iter()
-            .find(|signer| signer.serves(credential))
+        self.signers.iter().find(|signer| signer.serves(credential))
     }
 }
 

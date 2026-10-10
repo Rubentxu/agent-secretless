@@ -1763,7 +1763,8 @@ mod tests {
                 body: r#"{"metadata":{"name":"web"},"spec":{}}"#.into(),
             },
             Response::MTlsSign {
-                certificate_pem: "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----".into(),
+                certificate_pem: "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"
+                    .into(),
             },
         ] {
             let json = serde_json::to_string(&response).expect("serializes");
