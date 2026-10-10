@@ -332,6 +332,10 @@ fn certificate_params(
     // certificate has no use for, and `keyCertSign` is precisely the usage
     // that would let its holder issue certificates of their own.
     params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    // `clientAuth` is the EKU that says "this certificate is a client of an
+    // mTLS endpoint". Without it a strict verifier can refuse the chain even
+    // when the issuer and signature are sound, because the certificate's
+    // purpose is not the one the connection needs.
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
     params.not_before = not_before;
     params.not_after = not_before + remaining;
