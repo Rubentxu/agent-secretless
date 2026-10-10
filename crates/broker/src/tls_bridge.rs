@@ -603,11 +603,7 @@ impl OpenSslEnvInjector {
     /// Emit the trust binding. Writes the CA material to a session
     /// directory and returns the env var the broker sets when spawning
     /// the agent's process tree.
-    pub fn inject(
-        &self,
-        ca: &SessionCa,
-        session_dir: &Path,
-    ) -> Result<TrustBinding, InjectError> {
+    pub fn inject(&self, ca: &SessionCa, session_dir: &Path) -> Result<TrustBinding, InjectError> {
         if ca.root_der.is_empty() {
             return Err(InjectError::EmptyCa(ca.session_id.clone()));
         }

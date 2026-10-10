@@ -2750,7 +2750,11 @@ mod r2_d_e_audience_carveout {
         )
         .expect("the documented rule loads and is valid");
         let verdict = engine
-            .authorize(&request(Action::K8sRead, "kubernetes.default.svc"), None, None)
+            .authorize(
+                &request(Action::K8sRead, "kubernetes.default.svc"),
+                None,
+                None,
+            )
             .decision;
         assert!(verdict.is_allowed(), "{verdict:?}");
     }
@@ -2771,10 +2775,8 @@ mod r2_d_e_audience_carveout {
 
     #[test]
     fn the_first_party_audience_check_still_refuses_unapproved_hosts() {
-        let engine = PolicyEngine::from_policy_text(
-            r#"permit (principal, action, resource);"#,
-        )
-        .expect("the most permissive policy is valid");
+        let engine = PolicyEngine::from_policy_text(r#"permit (principal, action, resource);"#)
+            .expect("the most permissive policy is valid");
         let verdict = engine
             .authorize(
                 &request(Action::GitHubIssueRead, "evil.example"),

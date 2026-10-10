@@ -99,7 +99,11 @@ fn the_document_never_points_at_the_private_broker() {
             // is the state in which the broker cannot be reached, and that
             // is the state in which the recovery relation is the one that
             // actually points at a runnable command.
-            ["asv://rels/doctor", "asv://rels/setup", "asv://rels/upgrade"],
+            [
+                "asv://rels/doctor",
+                "asv://rels/setup",
+                "asv://rels/upgrade"
+            ],
             "{socket_state}"
         );
     }

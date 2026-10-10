@@ -643,10 +643,7 @@ mod tests {
             ],
             // R2.E.3. The mTLS sign surface — the CSR is read from stdin, so
             // the completion is just the credential reference.
-            "asv://rels/mtls/sign" => &[
-                "--credential",
-                "00000000-0000-4000-8000-000000000000",
-            ],
+            "asv://rels/mtls/sign" => &["--credential", "00000000-0000-4000-8000-000000000000"],
             _ => return None,
         })
     }
@@ -834,7 +831,11 @@ mod tests {
         let uris: Vec<&str> = published.iter().map(|r| r.uri()).collect();
         assert_eq!(
             uris,
-            ["asv://rels/doctor", "asv://rels/setup", "asv://rels/upgrade"]
+            [
+                "asv://rels/doctor",
+                "asv://rels/setup",
+                "asv://rels/upgrade"
+            ]
         );
 
         for rel in &published {

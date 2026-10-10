@@ -1034,7 +1034,11 @@ async fn main() -> std::io::Result<()> {
         // R0.3b. Reachable even when the broker is not: protocol mismatch is
         // the state in which the broker cannot be asked, and the relation
         // `asv://rels/upgrade` is published from `publishable_for(false)`.
-        Command::Upgrade { check, install, json } => {
+        Command::Upgrade {
+            check,
+            install,
+            json,
+        } => {
             return run_upgrade(*check, *install, *json);
         }
         Command::Doctor { json } => return run_doctor(&socket, *json),
@@ -1439,7 +1443,7 @@ fn run_upgrade(check: bool, install: bool, json: bool) -> std::io::Result<()> {
             "update_available": update_available,
             "published_version_known": latest.is_ok(),
             "fetch_error": latest.as_ref().err().map(|e| e.as_str()),
-            "installer_command": installer_command_line(),
+            "installer_command": installer_command_line(published),
             "check_only": !perform_install,
         });
         let mut envelope = Envelope::new(Status::Ready, data);
@@ -1454,15 +1458,20 @@ fn run_upgrade(check: bool, install: bool, json: bool) -> std::io::Result<()> {
         Ok(v) => println!("published latest: {v}"),
         Err(e) => println!("published latest: <not retrievable: {e}>"),
     }
-    println!("update available: {}", if update_available { "yes" } else { "no" });
+    println!(
+        "update available: {}",
+        if update_available { "yes" } else { "no" }
+    );
     println!();
     println!("installer command:");
-    println!("    {}", installer_command_line());
+    println!("    {}", installer_command_line(published));
 
     if perform_install {
         if !update_available {
             eprintln!();
-            eprintln!("asv upgrade: refused, the running tree is at or above the published version");
+            eprintln!(
+                "asv upgrade: refused, the running tree is at or above the published version"
+            );
             eprintln!("  remove --install to print the command without running it");
             std::process::exit(1);
         }
@@ -1473,7 +1482,7 @@ fn run_upgrade(check: bool, install: bool, json: bool) -> std::io::Result<()> {
         // failure mode that nothing in this binary can recover from.
         let status = std::process::Command::new("sh")
             .arg("-c")
-            .arg(installer_command_line())
+            .arg(installer_command_line(published))
             .status();
         return match status {
             Ok(s) if s.success() => Ok(()),
@@ -1526,8 +1535,8 @@ fn fetch_latest_release() -> Result<String, String> {
     let body = fetch_url(url, 8_192, 5_000)?;
     // `tag_name` is the field GitHub returns; the body may not be JSON if a
     // rate-limit page came back, so parse defensively and name what failed.
-    let parsed: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| format!("response was not JSON: {e}"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("response was not JSON: {e}"))?;
     let tag = parsed
         .get("tag_name")
         .and_then(|v| v.as_str())
@@ -1611,10 +1620,17 @@ fn fetch_url(url: &str, max_bytes: usize, timeout_ms: u64) -> Result<String, Str
 /// the drift class that left six releases unable to install their own
 /// archive (`tests/r0_gate.py::r0_2b_documented_install` is the gate that
 /// catches it).
-fn installer_command_line() -> String {
+///
+/// `version_override` lets the caller pin the version the command installs
+/// (the published release, not the running binary's version). When the caller
+/// passes `None` the command pins to the running binary's version, which is
+/// the right thing for "reinstall this" but the wrong thing for "upgrade to
+/// the latest" — and that is the difference between `--check` and `--install`.
+fn installer_command_line(version_override: Option<&str>) -> String {
+    let version = version_override.unwrap_or_else(|| build_version());
     format!(
         "curl -LsSf https://raw.githubusercontent.com/Rubentxu/agent-secretless/main/scripts/install.sh | sh -s -- --version {}",
-        build_version()
+        version
     )
 }
 
