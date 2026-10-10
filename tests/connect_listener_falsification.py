@@ -203,14 +203,21 @@ def refuse_to_run_on_a_dirty_tree() -> None:
         if "MUTANT" in text:
             for number, line in enumerate(text.splitlines(), 1):
                 if "MUTANT" in line:
+                    # Self-heal instead of refusing. The `finally` block in
+                    # the mutation runner restores the file when a run ends
+                    # normally or raises, but it does nothing when the
+                    # process is killed by SIGTERM (which is what produced
+                    # this residue). Restoring from git here turns a manual
+                    # recovery into an automatic one, and the next mutation
+                    # then runs against a clean tree.
                     print(
-                        f"REFUSING: {path.name}:{number} still carries a mutation\n"
-                        f"  {line.strip()}\n"
-                        "A previous run was interrupted before it could restore the file.\n"
-                        "Revert that line before re-running, or every verdict below is about\n"
-                        "a tree that was already mutated."
+                        f"RESIDUE: {path.name}:{number} carried a mutation from a previous run; "
+                        f"restoring from git"
                     )
-                    sys.exit(2)
+            subprocess.run(
+                ["git", "checkout", "--", str(path.relative_to(ROOT))],
+                cwd=ROOT, check=True, capture_output=True,
+            )
 
 
 def run_suite() -> tuple[int, str]:
