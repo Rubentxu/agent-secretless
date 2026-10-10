@@ -1005,6 +1005,9 @@ fn probe_landlock() -> TriState {
     // LANDLOCK_CREATE_RULESET_VERSION
     const VERSION_FLAG: u32 = 1;
 
+    // SAFETY: `syscall` for landlock_create_ruleset with a null pointer and
+    // size 0 returns the ABI version. The kernel documents this exact
+    // invocation as the way to probe for landlock support.
     let ret = unsafe {
         libc::syscall(
             SYS_LANDLOCK_CREATE_RULESET,

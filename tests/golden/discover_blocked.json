@@ -3,7 +3,7 @@
     "broker": {
       "compatible": false,
       "hardening": null,
-        "identity": null,
+      "identity": null,
       "reachable": false,
       "version": null
     },
@@ -50,6 +50,20 @@
       "rel": "asv://rels/setup",
       "requires_human": false,
       "safety": "local-configuration"
+    },
+    {
+      "description": "Report the running version and the published one",
+      "invoke": {
+        "argv": [
+          "upgrade",
+          "--check"
+        ],
+        "program": "asv"
+      },
+      "operation": "system.upgrade",
+      "rel": "asv://rels/upgrade",
+      "requires_human": false,
+      "safety": "read-only"
     }
   ],
   "product_version": "<product_version>",

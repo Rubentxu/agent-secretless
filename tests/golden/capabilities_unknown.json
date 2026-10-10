@@ -8,7 +8,10 @@
       "asv://rels/status",
       "asv://rels/doctor",
       "asv://rels/setup",
-      "asv://rels/capabilities"
+      "asv://rels/capabilities",
+      "asv://rels/upgrade",
+      "asv://rels/k8s/read",
+      "asv://rels/mtls/sign"
     ]
   },
   "links": [
@@ -39,6 +42,20 @@
       "rel": "asv://rels/setup",
       "requires_human": false,
       "safety": "local-configuration"
+    },
+    {
+      "description": "Report the running version and the published one",
+      "invoke": {
+        "argv": [
+          "upgrade",
+          "--check"
+        ],
+        "program": "asv"
+      },
+      "operation": "system.upgrade",
+      "rel": "asv://rels/upgrade",
+      "requires_human": false,
+      "safety": "read-only"
     }
   ],
   "product_version": "<product_version>",

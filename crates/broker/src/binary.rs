@@ -514,6 +514,10 @@ mod tests {
                 tv_nsec: 0,
             },
         ];
+        // SAFETY: `c` is a NUL-terminated CString for the path; `times`
+        // points to a 2-element stack array of `timespec` and is read-only
+        // by the kernel. AT_FDCWD with a relative path is the documented
+        // way to address a path relative to the caller's cwd.
         let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
         assert_eq!(rc, 0, "could not set the fixture's timestamp");
     }

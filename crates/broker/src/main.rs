@@ -101,6 +101,10 @@ fn install_ordered_shutdown(
     // `sighandler_t` is `size_t` on this target, which is why the cast looks
     // like a number at all.
     let handler = on_shutdown_signal as *const () as libc::sighandler_t;
+    // SAFETY: `signal` installs a function pointer as a C signal handler.
+    // The two SIGTERM/SIGINT signals are documented to be safe to handle
+    // with a function that only sets an atomic, which is what
+    // `on_shutdown_signal` does.
     unsafe {
         libc::signal(libc::SIGTERM, handler);
         libc::signal(libc::SIGINT, handler);
@@ -195,6 +199,8 @@ fn main() -> std::io::Result<()> {
     // exempt from the scan, may override it. Both land on the same path
     // whenever the runtime directory is the spec default.
     let mut args = std::env::args_os().skip(1);
+    // SAFETY: `getuid` takes no arguments and has no failure mode; the
+    // return value is the real uid of the calling process.
     let mut socket_path: PathBuf =
         asv_ipc_protocol::socket::default_socket_path(unsafe { libc::getuid() });
     let mut vault_path: Option<PathBuf> = None;
@@ -470,6 +476,9 @@ fn main() -> std::io::Result<()> {
     // its own identity should refuse before it has touched any of them. A
     // refusal that arrives after the passphrase has been read is a refusal
     // that has already had the secret.
+    // SAFETY: `getuid` and `geteuid` take no arguments and have no failure
+    // mode; the return values are the real and effective uids of the
+    // calling process.
     let identity_verdict = match asv_broker::identity::check(
         unsafe { libc::getuid() },
         unsafe { libc::geteuid() },
@@ -1401,6 +1410,9 @@ fn disable_core_dumps() {
         rlim_cur: 0,
         rlim_max: 0,
     };
+    // SAFETY: `setrlimit` with a stack-allocated `rlimit` pointer; the
+    // rlim_cur and rlim_max values are the desired soft and hard limits
+    // for the resource, both 0 in this case to disable core dumps.
     let rc = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &rlimit) };
     if rc != 0 {
         let err = std::io::Error::last_os_error();

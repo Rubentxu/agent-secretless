@@ -103,6 +103,9 @@ impl std::fmt::Display for MemfdSecretSupport {
 /// closes it, so the result reflects the whole path including seal support
 /// rather than just the syscall existing.
 pub fn probe() -> MemfdSecretSupport {
+    // SAFETY: `memfd_secret_syscall` is an `unsafe fn` that returns a
+    // raw fd. The probe owns that fd exclusively and closes it before
+    // returning, so the lifetime is bounded to this function.
     let fd = unsafe { memfd_secret_syscall() };
     if fd < 0 {
         return MemfdSecretSupport {
@@ -111,9 +114,13 @@ pub fn probe() -> MemfdSecretSupport {
             kernel_release: kernel_release(),
         };
     }
+    // SAFETY: `fd` is the open descriptor returned by the syscall above;
+    // the bitmask argument is a documented seal combination.
     let allow_sealing =
         unsafe { fcntl_seal(fd, F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE) } == 0;
     // The probe fd is closed either way; the caller only wanted the verdict.
+    // SAFETY: `fd` is the same descriptor created at the top of this
+    // function and is not used again after this call.
     unsafe { close_fd(fd) };
 
     MemfdSecretSupport {

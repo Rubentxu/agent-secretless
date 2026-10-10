@@ -311,6 +311,9 @@ pub fn install_with(paths: InstallPaths) -> Result<HardenConfig, HardenError> {
 /// can assert the post-condition.
 pub fn dumpable_is_zero() -> bool {
     #[cfg(target_os = "linux")]
+    // SAFETY: prctl with PR_GET_DUMPABLE takes no pointers; the only output
+    // is the integer return value, and it is well-defined on Linux for any
+    // process regardless of privilege.
     unsafe {
         // PR_GET_DUMPABLE returns 0 (SUID_DUMP_DISABLE) on a process
         // that called PR_SET_DUMPABLE = 0.
@@ -332,6 +335,9 @@ pub fn dumpable_is_zero() -> bool {
 /// True if `install` would have set `PR_SET_NO_NEW_PRIVS`.
 pub fn no_new_privs_is_set() -> bool {
     #[cfg(target_os = "linux")]
+    // SAFETY: prctl with PR_GET_NO_NEW_PRIVS takes no pointers; the only
+    // output is the integer return value, and it is well-defined on Linux
+    // for any process regardless of privilege.
     unsafe {
         // PR_GET_NO_NEW_PRIVS returns 1 on a process that called
         // PR_SET_NO_NEW_PRIVS = 1.
@@ -385,10 +391,17 @@ pub fn landlock_supported() -> bool {
 fn kernel_supports_landlock() -> bool {
     // Linux ≥ 5.13 introduced Landlock. Detect via uname release.
     let mut utsname = std::mem::MaybeUninit::<libc::utsname>::uninit();
+    // SAFETY: uname takes a pointer to a `utsname` struct the caller
+    // owns. The struct lives on the stack above; the kernel only writes
+    // the fields, never reads them, so uninitialised memory is fine.
     let ret = unsafe { libc::uname(utsname.as_mut_ptr()) };
     if ret != 0 {
         return false;
     }
+    // SAFETY: a zero return from uname means the kernel initialised every
+    // field of `utsname`, so `assume_init` no longer reads uninitialised
+    // memory. The `if ret != 0 { return false; }` above is the only path
+    // that could skip this, and on that path we never read `utsname`.
     let utsname = unsafe { utsname.assume_init() };
     let release_bytes: Vec<u8> = utsname
         .release
@@ -408,6 +421,9 @@ fn kernel_supports_landlock() -> bool {
 
 #[cfg(target_os = "linux")]
 fn set_dumpable_zero() -> Result<(), HardenError> {
+    // SAFETY: prctl with PR_SET_DUMPABLE takes no pointers; the four
+    // remaining args are unsigned values whose semantics are defined by
+    // the operation (PR_SET_DUMPABLE ignores them, per Linux man page).
     let ret = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
@@ -418,6 +434,9 @@ fn set_dumpable_zero() -> Result<(), HardenError> {
 
 #[cfg(target_os = "linux")]
 fn set_no_new_privs() -> Result<(), HardenError> {
+    // SAFETY: prctl with PR_SET_NO_NEW_PRIVS takes no pointers; the four
+    // remaining args are unsigned values whose semantics are defined by
+    // the operation (PR_SET_NO_NEW_PRIVS ignores them, per Linux man page).
     let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if ret != 0 {
         let err = std::io::Error::last_os_error();

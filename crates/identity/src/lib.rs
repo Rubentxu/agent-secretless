@@ -147,6 +147,9 @@ pub fn peer_credentials(
 ) -> Result<PeerCredentials, IdentityError> {
     use std::os::fd::AsRawFd;
 
+    // SAFETY: `libc::ucred` is a POD struct of three `c_int` fields. Zeroing
+    // a stack allocation of POD is well-defined and gives a known initial
+    // state for the getsockopt out-parameter below.
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
 

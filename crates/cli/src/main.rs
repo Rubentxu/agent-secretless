@@ -1688,6 +1688,8 @@ fn run_setup(json: bool) -> std::io::Result<()> {
 /// The literal that used to live here was `/run/user/1000/...`, which resolved
 /// only for the account that wrote it.
 fn default_socket() -> PathBuf {
+    // SAFETY: `getuid` takes no arguments and has no failure mode; the
+    // return value is the real uid of the calling process.
     asv_ipc_protocol::socket::resolve_socket_path(
         std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
         unsafe { libc::getuid() },
@@ -7411,6 +7413,8 @@ fn authorize_over_ipc(
             // The intent's digest is what the policy evaluated against, so a
             // decision can be tied back to the exact request that produced it.
             request_digest: intent.digest().ok(),
+            // SAFETY: `geteuid` takes no arguments and has no failure mode;
+            // the return value is the effective uid of the calling process.
             peer_uid: unsafe { libc::geteuid() },
         },
     };

@@ -267,6 +267,8 @@ fn rejection(path: &Path) -> Option<Refusal> {
     }
     // Owner check. `setup` writes a unit that will run this as a long-lived
     // process holding vault keys, so "somebody made this file" is not enough.
+    // SAFETY: `geteuid` takes no arguments and has no failure mode; the
+    // return value is the effective uid of the calling process.
     let me = unsafe { libc::geteuid() };
     if meta.uid() != me {
         return Some(Refusal::NotOwnedByThisUser {

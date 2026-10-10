@@ -468,6 +468,11 @@ pub fn spawn(
     // exec. Any failure aborts before exec (M10R-R2/R4 fail-closed).
     let binary = template.binary.clone();
     let landlock = template.landlock_profile.clone();
+    // SAFETY: `pre_exec` runs in the forked child between fork and exec,
+    // when only async-signal-safe operations are permitted. The closure
+    // calls a child_isolation_hook (which is documented to be safe in
+    // that context) and on failure writes a single byte to a CLOEXEC
+    // descriptor owned by this closure; both are async-signal-safe.
     unsafe {
         cmd.pre_exec(move || match child_isolation_hook(&binary, &landlock) {
             Ok(()) => Ok(()),

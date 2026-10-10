@@ -328,6 +328,8 @@ pub fn run_with(layout: &Layout, kdf: crate::vaultops::Kdf) -> std::io::Result<S
 /// a broker that starts against the wrong vault is worse than one that does
 /// not start.
 pub fn render_unit(template: &str, layout: &Layout, broker: &std::path::Path) -> String {
+    // SAFETY: `getuid` takes no arguments and has no failure mode; the
+    // return value is the real uid of the calling process.
     let socket = asv_ipc_protocol::socket::resolve_socket_path(
         std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
         unsafe { libc::getuid() },
@@ -509,6 +511,8 @@ fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
 /// two from disagreeing on a machine where `XDG_RUNTIME_DIR` is not the
 /// spec default.
 fn socket_dir() -> std::path::PathBuf {
+    // SAFETY: `getuid` takes no arguments and has no failure mode; the
+    // return value is the real uid of the calling process.
     asv_ipc_protocol::socket::resolve_socket_path(
         std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
         unsafe { libc::getuid() },
