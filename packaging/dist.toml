@@ -19,7 +19,7 @@
 name = "agent-secretless"
 # Checked against the workspace Cargo.toml by check-release-config.py. dist
 # requires a literal here, so it cannot be inherited.
-version = "0.37.0"
+version = "0.38.0"
 repository = "https://github.com/Rubentxu/agent-secretless"
 license = "MIT"
 description = "Local credential control plane for AI agents"
