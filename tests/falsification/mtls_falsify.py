@@ -125,6 +125,7 @@ Run:  python3 mtls_falsify.py
 """
 
 import sys
+import subprocess
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -551,7 +552,44 @@ PHASES = [
 ]
 
 
+def refuse_on_dirty_tree() -> None:
+    """Self-heal a mutation residue left by a prior run that SIGTERM killed.
+
+    `run_phase` restores the file in a `finally` block when a run ends
+    normally or raises; a `finally` does nothing when the process is
+    killed, and that is what produced a residue after an interrupted
+    `port_falsify.py` run. The heuristic is the same as in `sts_falsify`:
+    `git show HEAD:<path>` is what the file looked like before any
+    falsification ever ran, and a difference is what a half-finished
+    run leaves behind. R2.E has three source files, so the check is
+    per-path rather than per-Singleton.
+    """
+    for path, _, _, _ in PHASES:
+        if not path.is_file():
+            continue
+        try:
+            result = subprocess.run(
+                ["git", "show", f"HEAD:{path.relative_to(f.REPO)}"],
+                cwd=f.REPO, capture_output=True, text=True, check=True,
+            )
+        except subprocess.CalledProcessError:
+            continue
+        on_disk = path.read_text(encoding="utf-8")
+        if on_disk == result.stdout:
+            continue
+        print(
+            f"RESIDUE: {path.relative_to(f.REPO)} carried a mutation from a "
+            f"previous run; restoring from git",
+            flush=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "--", str(path.relative_to(f.REPO))],
+            cwd=f.REPO, check=True, capture_output=True,
+        )
+
+
 def main() -> int:
+    refuse_on_dirty_tree()
     f.CARGO_TARGET = "--lib"
     f.MUTATIONS[:] = MUTATIONS
     f.STS = ISSUE

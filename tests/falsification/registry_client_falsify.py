@@ -120,6 +120,7 @@ Run:  python3 registry_client_falsify.py
 """
 
 import sys
+import subprocess
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -535,7 +536,40 @@ PHASES = [
 ]
 
 
+def refuse_on_dirty_tree() -> None:
+    """Self-heal a mutation residue left by a prior run that SIGTERM killed.
+
+    `run_phase` restores the file in a `finally` block when a run ends
+    normally or raises; a `finally` does nothing when the process is
+    killed, and that is what produced a residue after an interrupted
+    run of the same shape. R2.F has one source file, so the check is
+    per-path rather than per-phase.
+    """
+    if not CLIENT.is_file():
+        return
+    try:
+        result = subprocess.run(
+            ["git", "show", f"HEAD:{CLIENT.relative_to(f.REPO)}"],
+            cwd=f.REPO, capture_output=True, text=True, check=True,
+        )
+    except subprocess.CalledProcessError:
+        return
+    on_disk = CLIENT.read_text(encoding="utf-8")
+    if on_disk == result.stdout:
+        return
+    print(
+        f"RESIDUE: {CLIENT.relative_to(f.REPO)} carried a mutation from a "
+        f"previous run; restoring from git",
+        flush=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "--", str(CLIENT.relative_to(f.REPO))],
+        cwd=f.REPO, check=True, capture_output=True,
+    )
+
+
 def main() -> int:
+    refuse_on_dirty_tree()
     f.CARGO_TARGET = "--lib"
     f.PACKAGE = "asv-connector-http"
     f.MUTATIONS[:] = REFERENCE_MUTATIONS
