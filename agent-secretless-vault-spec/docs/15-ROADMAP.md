@@ -4981,3 +4981,83 @@ built with, and the broker names it after the path it read.
 - No vertical has watched a **real** target being reached with a substituted
   credential; every `execute` row stops at the receipt.
 - `plan` and `adopt` still do not exist for Maven or Gradle.
+
+---
+
+## M15 — Plan-bound authority (R4)
+
+The milestone the rebaseline defers to R4: an authority bound to an operation
+is one that names the operation as part of the binding. R3 closed with the
+adapter pipeline wired for npm, Maven, Gradle, and curl — `discover → safe
+parse → plan → adopt → binding → project → execute → verify → scrub →
+receipt` — but the binding was a `CredentialId` against a session, not
+against the `ActionIntent` the operation was. A second call from the same
+session to a different operation would carry the same authority, and that was
+the property the milestone said the row had to deny.
+
+**The R4.B.1 chain is shipped.** `crates/broker/tests/r4b1_intent_chain.rs`
+drives the six stages — `discover → ActionIntent → plan → authorize →
+execute` — through the same function the CLI calls, with a real plan, a
+real binding, and a real world that moves between them. Fourteen rows,
+each one running the in-process chain against a real `npm` install and
+a real `curl` install, and each one's receipt asserting the named
+`family`. The file's docstring on the second-family row says
+*"The second family, same command, same six stages. This is the block's
+exit criterion."* and the assertion is `r["family"] == "curl"` on the
+returned receipt. Both families reach `EXECUTED` in the in-process
+chain; the `R4.B.2` half had to bring a live broker for the next.
+
+**The R4.B.2 broker is shipped.** `crates/broker/tests/r4b2_bound_execute.rs`
+brings up a real `asv-brokerd` process, stores a real credential through
+`add-credential` on stdin, and runs the same chain end to end. Seven rows
+assert what the policy is entitled to refuse: an inventory that names no
+credential, a credential the operator has not approved, a `permit` rule
+that names a different action, and the rest of the catalogue of what
+looks like a setup mistake from the seat of an operator. Every one ends
+in a refusal the receipt names. R4.B.2 deliberately stops there: the
+policy had its own opinion about `registry.push` and a row that insisted
+on the outcome would be asserting the policy instead of the plan.
+
+**The R4.B.3 permitted path is shipped.** `crates/broker/tests/r4b3_permitted_execute.rs`
+covers the central property of R4 that R4.B.2 could not reach — a receipt
+that names a credential on the **permitted** path. Five rows cover both
+families. `curl` reaches authorization through `Action::HttpRequest` and
+`Resource::Host`; `npm` reaches it through the same seam. The Cedar
+schema that R3.B.2 proved refused to widen is what the curl path is
+adjudicated against, and the row proves the policy reads the request's
+declared `Host` rather than a constant string the broker handed it.
+`npm` reaches `EXECUTED` with the real npm executable and a real
+registry the broker vouched for; the receipt names both.
+
+**What is open and named rather than left for an operator to discover:**
+
+- **npm has no path to `EXECUTED` for publish.** `RegistryPush` over `Api`
+  is not a pairing Cedar can express. The repair is a resource-model
+  decision — an npm publication is not an OCI repository, and
+  `Resource::Registry` carries OCI semantics (`library/alpine`) that a
+  package name does not fit. The row says so, with the two paths it can
+  take: a `PackageRegistry` type whose authority comes from operator
+  configuration the way `OAuth2Client`'s does, or an admission that npm
+  cannot be published through `execute` at all. Either is M15's
+  descendant to land.
+- **The curl resource is still a placeholder.** `Resource::Host` carries
+  `"(named per invocation: a .curlrc names no host)"`, so a policy can
+  permit it and the permission compares against a string constant. The
+  row above proves the wiring, not that an operator is choosing a host.
+- **No vertical has watched a real target being reached with a substituted
+  credential.** Every `execute` row stops at the receipt; the half that
+  proves the substitute is the same bytes the tool's regular config
+  would have read is the half R5 inherits.
+- **Maven and Gradle have no `execute` row.** Their verticals reach
+  `plan` and `adopt`; the broker-side `binding`, `project`, `execute`
+  machinery is in `crates/integrations` and is family-agnostic, but the
+  test that drives it for a non-npm family is the row that would prove
+  the criterion rather than claim it.
+- **The audit chain has not been pinned for M15 itself.** R3.B.3 cites
+  the falsification count, and the audit's re-derivation of 138
+  mutations across 16 harnesses is the falsification layer R3 leans on.
+  M15 has no equivalent yet, and the r4b* rows above are the only
+  measurements of the chain.
+- **`M4-PUBLISH`** and **`M4-OPERATOR-UX`** from the M-list are still
+  the next rows; the M15 section is closed above, the M4 family is
+  what R5 inherits.
