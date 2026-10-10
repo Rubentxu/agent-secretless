@@ -159,15 +159,38 @@ def main() -> int:
     def bad_metadata(args, cwd=None, timeout=1800):
         return 0, "cargo: not a workspace"
 
-    exercise(gate, ROWR0_3B,
-             "cargo metadata printing no JSON is UNAVAILABLE, not a crash",
-             bad_metadata, gate.UNAVAILABLE)
+    # The fix that made r0_3b_upgrade_relation read `REPO/target/debug/asv`
+    # first means a mutation of `cargo metadata` no longer reaches the row
+    # when the primary path is in place. The drift harness has to remove the
+    # primary path before it stubs the fallback, so the row actually runs
+    # against the mutated metadata. The primary path is restored in `finally`
+    # so a failing mutation does not leave the workspace in a state the next
+    # mutation cannot observe.
+    asv_primary = REPO / "target" / "debug" / "asv"
+    saved = asv_primary.read_bytes() if asv_primary.is_file() else None
+    try:
+        if saved is not None:
+            asv_primary.unlink()
+        exercise(gate, ROWR0_3B,
+                 "cargo metadata printing no JSON is UNAVAILABLE, not a crash",
+                 bad_metadata, gate.UNAVAILABLE)
+    finally:
+        if saved is not None:
+            asv_primary.write_bytes(saved)
+            asv_primary.chmod(0o755)
 
     def no_binary(args, cwd=None, timeout=1800):
         return 0, json.dumps({"target_directory": "/tmp/r0-gate-no-binaries-here"})
 
-    exercise(gate, ROWR0_3B, "a missing binary is UNAVAILABLE, never a pass",
-             no_binary, gate.UNAVAILABLE)
+    try:
+        if saved is not None:
+            asv_primary.unlink()
+        exercise(gate, ROWR0_3B, "a missing binary is UNAVAILABLE, never a pass",
+                 no_binary, gate.UNAVAILABLE)
+    finally:
+        if saved is not None:
+            asv_primary.write_bytes(saved)
+            asv_primary.chmod(0o755)
 
     print(f"\n{PASSED}/{PASSED + FAILED} behaviours confirmed")
     return 1 if FAILED else 0
