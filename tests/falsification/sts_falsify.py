@@ -343,7 +343,46 @@ def run_test(short_name: str) -> tuple[str, str]:
     return "red", out
 
 
+def refuse_on_dirty_tree() -> None:
+    """Self-heal a mutation residue left by a prior run that SIGTERM killed.
+
+    A `finally` block restores `STS` when a run ends normally or raises; a
+    `finally` does nothing when the process is killed, and that is exactly
+    what produced a residue in `aws/port.rs` after one interrupted
+    `port_falsify.py` run. The detect heuristic is the same one
+    `connect_*_falsification.py` uses, except the marker is the diff
+    against the committed tree rather than a `// MUTANT:` comment: the
+    framework here mutates the file by `str.replace` and leaves no
+    marker. `git show HEAD:<path>` is what the file looked like before
+    any falsification ever ran; if the on-disk bytes differ, the
+    previous run did not restore, and the right answer is to restore
+    from git rather than to refuse the run.
+    """
+    if not STS.is_file():
+        return
+    try:
+        result = subprocess.run(
+            ["git", "show", f"HEAD:{STS.relative_to(REPO)}"],
+            cwd=REPO, capture_output=True, text=True, check=True,
+        )
+    except subprocess.CalledProcessError:
+        return
+    on_disk = STS.read_text(encoding="utf-8")
+    if on_disk == result.stdout:
+        return
+    print(
+        f"RESIDUE: {STS.relative_to(REPO)} carried a mutation from a previous "
+        f"run; restoring from git",
+        flush=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "--", str(STS.relative_to(REPO))],
+        cwd=REPO, check=True, capture_output=True,
+    )
+
+
 def main() -> int:
+    refuse_on_dirty_tree()
     original = STS.read_text()
     # The backup lives beside the harness, not in a directory named on one
     # machine. `tempfile` picks the system temp unless TMPDIR says otherwise,
