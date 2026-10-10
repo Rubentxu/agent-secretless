@@ -121,7 +121,19 @@ ALLOWLIST = [
         # whatever the attribute contains.
         "approve an unapproved audience because the rule matched",
         "        if let Resource::Api { audience } = &request.resource {\n"
-        "            if !audience_is_approved(audience) {\n"
+        "            // R2.D and R2.E carry the *declared* audience on `Resource::Api`,\n"
+        "            // not a request-chosen one. The deployment is the operator's\n"
+        "            // `k8s_bindings` entry or `mtls_signers` entry, and the broker\n"
+        "            // builds the request from the binding — so the audience is\n"
+        "            // non-request-supplied exactly the way OAuth2's is, and the\n"
+        "            // same structural guarantee D6 buys for OAuth2 (a policy can\n"
+        "            // only allow or deny a set the policy did not choose) holds\n"
+        "            // here too. Skipping the allowlist for these two actions is\n"
+        "            // therefore safe; the test row `deployment_backed_audience_is_not_allowlisted_but_evaluates`\n"
+        "            // pins the property.\n"
+        "            if !matches!(request.action, Action::K8sRead | Action::MTlsSign)\n"
+        "                && !audience_is_approved(audience)\n"
+        "            {\n"
         "                return Ok(false);\n"
         "            }\n"
         "        }",
@@ -138,7 +150,19 @@ ALLOWLIST = [
         # edit would plausibly take while trying to make a rule more flexible.
         "let the policy answer the approval question instead of rust",
         "        if let Resource::Api { audience } = &request.resource {\n"
-        "            if !audience_is_approved(audience) {\n"
+        "            // R2.D and R2.E carry the *declared* audience on `Resource::Api`,\n"
+        "            // not a request-chosen one. The deployment is the operator's\n"
+        "            // `k8s_bindings` entry or `mtls_signers` entry, and the broker\n"
+        "            // builds the request from the binding — so the audience is\n"
+        "            // non-request-supplied exactly the way OAuth2's is, and the\n"
+        "            // same structural guarantee D6 buys for OAuth2 (a policy can\n"
+        "            // only allow or deny a set the policy did not choose) holds\n"
+        "            // here too. Skipping the allowlist for these two actions is\n"
+        "            // therefore safe; the test row `deployment_backed_audience_is_not_allowlisted_but_evaluates`\n"
+        "            // pins the property.\n"
+        "            if !matches!(request.action, Action::K8sRead | Action::MTlsSign)\n"
+        "                && !audience_is_approved(audience)\n"
+        "            {\n"
         "                return Ok(false);\n"
         "            }\n"
         "        }",

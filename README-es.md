@@ -17,14 +17,14 @@ agente ──(sustituto / socket)──▶ broker ──(credencial real)──�
 > **Estado: pre-1.0, en v0.36.0. Certificado en este árbol por la fila R11; la
 > release aún no se ha publicado, y los gates lo dicen.**
 >
-> El workspace compila y hay **2124 tests enumerados**. Con `cargo test`, 2123
+> El workspace compila y hay **2137 tests enumerados**. Con `cargo test`, 2136
 > se ejecutan y pasan y 1 queda fuera de las compilaciones de depuración por
 > construcción: el presupuesto de latencia p95 lleva
 > `#[cfg_attr(debug_assertions, ignore)]`, porque un presupuesto de latencia
 > medido contra ed25519 en depuración es una afirmación sobre
 > `debug_assertions`, no sobre el producto. Ese test se afirma con `--release`,
 > y por eso la corrida en release de abajo — con los dos filtros `--skip` que
-> documenta — ejecuta 2122 de ellos. Medido en el host de certificación sobre
+> documenta — ejecuta 2135 de ellos. Medido en el host de certificación sobre
 > este árbol, ese presupuesto pasa con **p95=5332us frente a 6000us** — 11% de
 > margen, sobre un Xeon E5-2682 v4. Revisiones anteriores de este fichero
 > afirmaban 1490us; la cifra nunca se volvió a derivar y la fila había dejado de
@@ -226,14 +226,14 @@ permisos de fichero. Es una carencia registrada para cerrar antes de 1.0.
 cargo build --release --workspace
 cargo test --workspace --release -- --test-threads=1 \
     --skip uat_028 --skip one_hundred_brokered_reads
-# esperado: passed=2122 failed=0 ignored=0
+# esperado: passed=2135 failed=0 ignored=0
 ```
 
-2122 y no 2124 porque el comando de arriba se salta dos: `uat_028` levanta un
+2135 y no 2137 porque el comando de arriba se salta dos: `uat_028` levanta un
 `sshd` real y necesita un host donde correr, y el presupuesto p95 se afirma por
 separado en `--release` para que el inicio rápido siga siendo rápido. Los dos
-saltos se cuentan como filtrados, no como ignorados, así que 2122 + 2
-filtrados son los 2124 enumerados.
+saltos se cuentan como filtrados, no como ignorados, así que 2135 + 2
+filtrados son los 2137 enumerados.
 
 Los dos perfiles se *midieron* por última vez en la certificación de `5873aa4`,
 que enumeraba 2049: depuración 114 bloques / 2048 pasadas / 0 fallidas /

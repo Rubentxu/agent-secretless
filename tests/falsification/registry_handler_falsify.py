@@ -81,17 +81,12 @@ MUTATIONS = [
         # declaration. The allowlist becomes decorative and every row about an
         # undeclared host fails -- which is the point of running them.
         "serve an undeclared registry with the first credential in the vault",
-        "        let declaration = self\n"
-        "            .registries\n"
-        "            .credential_for(&requested)\n"
-        "            .ok_or_else(|| {\n"
-        "                Box::new(Response::Error {\n"
-        "                    code: ErrorCode::Denied,\n"
-        "                    message: format!(\n"
-        "                        \"this deployment does not declare the registry {requested}\"\n"
-        "                    ),\n"
-        "                })\n"
-        "            })?;",
+        "        let declaration = self.registries.credential_for(&requested).ok_or_else(|| {\n"
+        "            Box::new(Response::Error {\n"
+        "                code: ErrorCode::Denied,\n"
+        "                message: format!(\"this deployment does not declare the registry {requested}\"),\n"
+        "            })\n"
+        "        })?;",
         "        const FALLBACK: &str = \"3f7c1d92-4a6b-4c1e-9d3f-2b8e5a7c0d14\";\n"
         "        let chosen: Option<CredentialId> = self\n"
         "            .registries\n"
