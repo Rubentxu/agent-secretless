@@ -7348,6 +7348,72 @@ fn run_integrations_execute(
         &verdict,
     );
 
+    // --- 7b. actually run the binary ---------------------------------------
+    // **R4.B.1 left this out.** The receipt used to be built straight from
+    // `decide`'s outcome, which on a `Permit` was `Executed` and travelled
+    // into the document as if the binary had run. v0.39.0 splits the verdict
+    // (AuthorizedForExecution) from the attempt (Executed/NotExecuted), and
+    // the only place that upgrade happens is here. **If the resolve lost the
+    // path, refusing to run is the point** — a plan without a tool has
+    // nothing to execute, and a `Command::new("")` is a fork that may or may
+    // not surface as the error the operator needs to see.
+    let outcome = match outcome {
+        asv_integrations::ExecuteOutcome::AuthorizedForExecution => {
+            // The argv is the part of the user-supplied command that names the
+            // binary and its arguments. **An empty argv is a refusal, not a
+            // success**: `Command::new("")` may fork successfully on some
+            // platforms and surface as `Os error 2` on others, and a receipt
+            // that records a refusal-by-typo is a receipt an operator can act
+            // on.
+            let argv = match argv_for(tool_command) {
+                Some(argv) => argv,
+                None => {
+                    let outcome = asv_integrations::ExecuteOutcome::NotExecuted {
+                        reason: format!(
+                            "the command string {tool_command:?} did not split into a binary and arguments"
+                        ),
+                        reason_code: "CommandUnparseable".into(),
+                    };
+                    let receipt = asv_integrations::ExecuteReceipt::new(
+                        family,
+                        &intent,
+                        &binding,
+                        &plan,
+                        &planned_tool,
+                        &observed_tool,
+                        verdict,
+                        outcome,
+                    );
+                    write_receipt_and_decide_exit(&receipt, json);
+                }
+            };
+            match run_resolved_binary(&argv) {
+                Ok(attempt) => {
+                    if attempt.succeeded() {
+                        asv_integrations::ExecuteOutcome::Executed { execution: attempt }
+                    } else {
+                        asv_integrations::ExecuteOutcome::NotExecuted {
+                            reason: attempt.spawn_error.clone().unwrap_or_else(|| {
+                                format!(
+                                    "the binary exited with code {:?} and did not produce 0",
+                                    attempt.exit_code
+                                )
+                            }),
+                            reason_code: "ExecutionFailed".into(),
+                        }
+                    }
+                }
+                Err(spawn_error) => asv_integrations::ExecuteOutcome::NotExecuted {
+                    reason: spawn_error,
+                    reason_code: "SpawnFailed".into(),
+                },
+            }
+        }
+        // The world said no (Unauthorized, PlanInvalidated). The receipt
+        // carries the verdict forward; no binary is invoked.
+        other => other,
+    };
+
     let receipt = asv_integrations::ExecuteReceipt::new(
         family,
         &intent,
@@ -7358,20 +7424,101 @@ fn run_integrations_execute(
         verdict,
         outcome,
     );
+    write_receipt_and_decide_exit(&receipt, json)
+}
+
+fn write_receipt_and_decide_exit(
+    receipt: &asv_integrations::ExecuteReceipt,
+    json: bool,
+) -> ! {
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&receipt).expect("the receipt serialises")
+            serde_json::to_string_pretty(receipt).expect("the receipt serialises")
         );
     } else {
-        print_execute_prose(&receipt);
+        print_execute_prose(receipt);
     }
     if receipt.is_executed() {
-        Ok(())
+        std::process::exit(0)
     } else {
         // A refusal is a refusal whether or not a receipt was written.
-        std::process::exit(1);
+        std::process::exit(1)
     }
+}
+
+/// Split the user-supplied command string into `[executable, arg1, arg2, ...]`.
+///
+/// **A command that does not name a binary is the input, not the output, of
+/// a refusal.** `Command::new` on an empty string is a fork that may or may
+/// not surface as `Os error 2`; the row that prevented R4.B.1 from noticing
+/// the bug was a row that ran the empty case by accident.
+fn argv_for(command: &str) -> Option<Vec<String>> {
+    let mut parts = command.split_whitespace();
+    let first = parts.next()?;
+    let mut argv = Vec::with_capacity(1 + parts.clone().count());
+    argv.push(first.to_string());
+    argv.extend(parts.map(str::to_string));
+    if argv[0].is_empty() {
+        None
+    } else {
+        Some(argv)
+    }
+}
+
+/// Run a command line that has already been split, and capture the result as
+/// an [`asv_integrations::ExecutionAttempt`].
+///
+/// The truncation budgets (`EXECUTE_STDOUT_CAP` and `EXECUTE_STDERR_CAP`)
+/// are deliberately small: the receipt is the artefact an operator triages
+/// with, not the log. A megabyte of npm output is not what the row that
+/// prints it is for; a kilobyte of stderr is.
+const EXECUTE_STDOUT_CAP: usize = 8 * 1024;
+const EXECUTE_STDERR_CAP: usize = 8 * 1024;
+
+fn run_resolved_binary(argv: &[String]) -> Result<asv_integrations::ExecutionAttempt, String> {
+    if argv.is_empty() {
+        return Err("argv is empty".to_string());
+    }
+    let output = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .output()
+        .map_err(|e| format!("could not spawn {}: {e}", argv[0]))?;
+    let stdout_truncated = truncate_utf8(&output.stdout, EXECUTE_STDOUT_CAP);
+    let stderr_truncated = truncate_utf8(&output.stderr, EXECUTE_STDERR_CAP);
+    let exit_code = output.status.code();
+    let signal = if output.status.success() {
+        None
+    } else if let Some(code) = output.status.code() {
+        Some(format!("exit:{code}"))
+    } else {
+        // Unix: a process terminated by a signal has no exit code on the
+        // `ExitStatus`. The signal number is `signal()` on platforms that
+        // expose it; we report the platform's `ExitStatus` debug form so a
+        // reader can see *something* about why the process died.
+        Some(format!("signal:{:?}", output.status))
+    };
+    Ok(asv_integrations::ExecutionAttempt {
+        exit_code,
+        signal,
+        stdout_truncated,
+        stderr_truncated,
+        spawn_error: None,
+        argv: argv.to_vec(),
+    })
+}
+
+fn truncate_utf8(bytes: &[u8], cap: usize) -> Option<String> {
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    let n = bytes.len().min(cap);
+    // Walk back to a UTF-8 boundary so we never cut a code point in half.
+    let mut cut = n;
+    while cut > 0 && (bytes[cut] & 0b1100_0000) == 0b1000_0000 {
+        cut -= 1;
+    }
+    String::from_utf8(bytes[..cut].to_vec()).ok()
 }
 
 /// The domain action a family's operations authorise.

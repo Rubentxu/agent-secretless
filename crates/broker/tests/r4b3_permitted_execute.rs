@@ -482,7 +482,7 @@ fn a_permitted_execution_names_the_credential_it_would_spend() {
     // that the operator's policy was reached and applied, which is a fact about
     // the wiring rather than about the policy's content.
     assert!(
-        r["outcome"] == "executed",
+        r["outcome"]["executed"].is_object(),
         "the execution was not permitted:\n{stdout}\nstderr: {stderr}"
     );
     assert!(
@@ -580,7 +580,7 @@ fn npm_cannot_be_permitted_by_any_policy_the_schema_accepts() {
                 let (stdout, stderr, _) = fixture.execute("npm", &["--json"]);
                 let r = receipt(&stdout);
                 assert!(
-                    r["outcome"] != "executed",
+                    !r["outcome"]["executed"].is_object(),
                     "a policy permitted npm, which this row says is impossible:\n{stdout}"
                 );
                 // The binding still happened. What is missing is the authority,
@@ -636,11 +636,11 @@ fn the_same_policy_permits_curl_and_refuses_npm() {
     let npm = receipt(&npm_out);
 
     assert!(
-        curl["outcome"] == "executed",
+        curl["outcome"]["executed"].is_object(),
         "curl was not permitted by the policy that permits it:\n{curl_out}"
     );
     assert!(
-        npm["outcome"] != "executed",
+        !npm["outcome"]["executed"].is_object(),
         "npm was permitted:\n{npm_out}"
     );
     assert_eq!(curl_code, 0);
@@ -687,7 +687,7 @@ fn the_receipt_names_the_policy_that_decided_rather_than_the_built_in() {
 
     let (stdout, stderr, _) = fixture.execute("curl", &["--json"]);
     let r = receipt(&stdout);
-    assert_eq!(r["outcome"], "executed", "stderr: {stderr}");
+    assert!(r["outcome"]["executed"].is_object(), "stderr: {stderr}");
 
     let decision = r["authorization"]["permit"]["decision"]
         .as_str()

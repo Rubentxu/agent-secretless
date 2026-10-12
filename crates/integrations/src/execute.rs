@@ -71,12 +71,72 @@ impl AuthorizationVerdict {
     }
 }
 
+/// What the CLI actually attempted, after `decide` cleared the way.
+///
+/// Carries the result of one [`std::process::Command`] invocation: the exit
+/// code if the process ran, the truncated output if it produced any, and the
+/// error string if it never started. **The attempt is the contract**: a
+/// receipt that says `Executed` without this is a receipt that claims
+/// "ran" without evidence that anything ran, which is the bug R4.B.1 left
+/// behind and what the v0.39.0 fix removes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ExecutionAttempt {
+    /// The exit code of the spawned process, or `None` if it never exited
+    /// (e.g. it was killed by a signal or the process table refused to wait).
+    pub exit_code: Option<i32>,
+    /// The process exit status as the platform reports it. Same meaning as
+    /// `exit_code` on Unix: the raw `ExitStatus`. Kept alongside the `i32`
+    /// because a reader that only has the JSON does not have `ExitStatus`.
+    pub signal: Option<String>,
+    /// `stdout`, truncated to a small budget. The point of the truncation is
+    /// the receipt, not the log: a multi-megabyte stream is not what an
+    /// operator reads while triaging.
+    pub stdout_truncated: Option<String>,
+    /// `stderr`, truncated identically.
+    pub stderr_truncated: Option<String>,
+    /// `Some(message)` if the process never started (fork failed, executable
+    /// not found, permission denied). `None` if it ran, regardless of its
+    /// exit code.
+    pub spawn_error: Option<String>,
+    /// The arguments passed to the executable, in order, with the executable
+    /// itself as `argv[0]`. **A receipt without the argv is a receipt that
+    /// cannot be replayed**, which is the same class of disagreement this
+    /// whole module exists to make impossible.
+    pub argv: Vec<String>,
+}
+
+impl ExecutionAttempt {
+    /// Whether the process ran to completion with a zero exit code. A receipt
+    /// that says `executed` and returns `true` here is the only receipt that
+    /// means "the world actually saw the command".
+    pub fn succeeded(&self) -> bool {
+        self.exit_code == Some(0) && self.spawn_error.is_none()
+    }
+}
+
 /// What happened when the execution was checked against the plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecuteOutcome {
-    /// The world still matched and the broker permitted it.
-    Executed,
+    /// **R4.B.1 split "the broker said yes" from "the process ran."** Before
+    /// v0.39.0, `decide` produced `Executed` on a `Permit`, and the CLI
+    /// carried that forward into the receipt without invoking the binary.
+    /// The split makes that failure mode unrepresentable: an outcome that has
+    /// not run yet cannot carry an `ExecutionAttempt`, and one that has must.
+    ///
+    /// `AuthorizedForExecution` is the verdict `decide` reaches when the
+    /// world still matches and the broker permits. The CLI then attempts the
+    /// execution and upgrades the outcome to `Executed` or downgrades it to
+    /// `NotExecuted`; the receipt carries the final form.
+    AuthorizedForExecution,
+    /// The process ran. Carries the attempt so a reader can see what
+    /// happened, not only that `decide` cleared the way.
+    Executed { execution: ExecutionAttempt },
+    /// The process was authorised but never ran. The reason is the
+    /// platform's own (`os error 13 (permission denied)`, `No such file or
+    /// directory`) so an operator can act on it without re-running.
+    NotExecuted { reason: String, reason_code: String },
     /// The broker refused.
     Unauthorized { reason: String, reason_code: String },
     /// The world moved, and this names how.
@@ -96,15 +156,37 @@ pub enum ExecuteOutcome {
 }
 
 impl ExecuteOutcome {
-    /// Whether the execution may proceed.
+    /// Whether the binary actually ran. **Renamed from the v0.38.0 meaning,
+    /// which was "the broker said yes":** a receipt that wants the old
+    /// meaning now needs [`Self::was_authorized`].
+    ///
+    /// The rename is the fix. A `Permit` verdict without an `ExecutionAttempt`
+    /// cannot pass this gate, because the type no longer admits one.
     pub fn is_executed(&self) -> bool {
-        matches!(self, Self::Executed)
+        matches!(self, Self::Executed { .. })
+    }
+
+    /// Whether the broker said yes and the world still matched. The CLI uses
+    /// this to decide whether to attempt the execution; the receipt uses it
+    /// to decide whether to carry an attempt at all.
+    pub fn was_authorized(&self) -> bool {
+        matches!(self, Self::AuthorizedForExecution | Self::Executed { .. })
     }
 
     /// The one-line form an operator reads.
     pub fn headline(&self) -> String {
         match self {
-            Self::Executed => "executed".into(),
+            Self::AuthorizedForExecution => "authorized (not yet executed)".into(),
+            Self::Executed { execution } => {
+                if execution.succeeded() {
+                    "executed (exit 0)".into()
+                } else if let Some(ref e) = execution.spawn_error {
+                    format!("NOT_EXECUTED: {e}")
+                } else {
+                    format!("executed (exit {:?})", execution.exit_code)
+                }
+            }
+            Self::NotExecuted { reason, .. } => format!("NOT_EXECUTED: {reason}"),
             Self::Unauthorized { reason, .. } => format!("UNAUTHORIZED: {reason}"),
             Self::PlanInvalidated { invalidation, .. } => invalidation.to_string(),
         }
@@ -305,7 +387,7 @@ pub fn decide(
         };
     }
     match authorization {
-        AuthorizationVerdict::Permit { .. } => ExecuteOutcome::Executed,
+        AuthorizationVerdict::Permit { .. } => ExecuteOutcome::AuthorizedForExecution,
         AuthorizationVerdict::Deny {
             reason,
             reason_code,

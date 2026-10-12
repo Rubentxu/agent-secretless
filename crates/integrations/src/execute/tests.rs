@@ -23,6 +23,22 @@ fn permit() -> AuthorizationVerdict {
     }
 }
 
+/// A `ExecutionAttempt` for tests that exercise the *shape* of a receipt, not
+/// the result of a real process. `exit_code: Some(0)` and an argv with the
+/// command name. **A test that builds an `Executed` outcome without an attempt
+/// would be a test that re-introduces the bug this v0.39.0 fix removes**, and
+/// the helper is the wall against that.
+fn attempt_zero(argv: &[&str]) -> ExecutionAttempt {
+    ExecutionAttempt {
+        exit_code: Some(0),
+        signal: None,
+        stdout_truncated: Some(String::new()),
+        stderr_truncated: Some(String::new()),
+        spawn_error: None,
+        argv: argv.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
 fn deny() -> AuthorizationVerdict {
     AuthorizationVerdict::Deny {
         reason: "origin retrieved_content may not publish to production".into(),
@@ -125,8 +141,16 @@ fn a_hijacked_tool_is_refused_before_anything_executes() {
 }
 
 /// The unchanged world executes. A check that always refuses is not a check.
+///
+/// **v0.39.0: this row proves the fix.** Before the split, `decide` returned
+/// `ExecuteOutcome::Executed` on a `Permit` and the receipt carried it
+/// forward as if the binary had run. The fix makes `decide` return
+/// `AuthorizedForExecution`, which `is_executed()` now correctly reports as
+/// `false`. The CLI is the only thing that can produce `Executed { .. }`, and
+/// it does so by running the binary. A row that confuses the two is the row
+/// that hid the bug.
 #[test]
-fn an_unchanged_world_and_a_permit_execute() {
+fn an_unchanged_world_and_a_permit_authorize_only() {
     let intent = intent();
     let binding = binding_for(&intent);
     let digest = intent.digest().expect("digests");
@@ -139,8 +163,9 @@ fn an_unchanged_world_and_a_permit_execute() {
         1_700_000_000,
         &permit(),
     );
-    assert_eq!(outcome, ExecuteOutcome::Executed);
-    assert!(outcome.is_executed());
+    assert_eq!(outcome, ExecuteOutcome::AuthorizedForExecution);
+    assert!(!outcome.is_executed(), "decide alone does not execute");
+    assert!(outcome.was_authorized());
 }
 
 /// A broker refusal is carried in the broker's own words, not paraphrased.
@@ -244,14 +269,21 @@ fn the_receipt_carries_the_intent_the_binding_and_the_outcome() {
         &planned,
         &planned,
         permit(),
-        ExecuteOutcome::Executed,
+        ExecuteOutcome::Executed {
+            execution: attempt_zero(&["npm"]),
+        },
     );
     assert_eq!(receipt.schema, EXECUTE_SCHEMA);
     assert_eq!(receipt.family, "npm");
     assert_eq!(receipt.intent, intent);
     assert_eq!(receipt.origin, IntentOrigin::RetrievedContent);
     assert_eq!(receipt.binding, binding);
-    assert_eq!(receipt.outcome, ExecuteOutcome::Executed);
+    assert_eq!(
+        receipt.outcome,
+        ExecuteOutcome::Executed {
+            execution: attempt_zero(&["npm"]),
+        }
+    );
     assert_eq!(
         receipt.config_digest(),
         intent.config_fingerprint.as_deref()
@@ -277,7 +309,9 @@ fn the_receipt_carries_both_the_planned_and_the_observed_resolution() {
         &planned,
         &observed,
         permit(),
-        ExecuteOutcome::Executed,
+        ExecuteOutcome::Executed {
+            execution: attempt_zero(&["the real npm"]),
+        },
     );
     assert_eq!(receipt.planned_tool, observed);
     let json = serde_json::to_string(&receipt).expect("serialises");
@@ -305,7 +339,9 @@ fn the_receipt_holds_no_secret_material() {
         &planned,
         &observed,
         permit(),
-        ExecuteOutcome::Executed,
+        ExecuteOutcome::Executed {
+            execution: attempt_zero(&["npm"]),
+        },
     );
     intent
         .contains_no_secret_material()
@@ -419,7 +455,9 @@ fn the_receipt_declares_its_own_schema() {
             resolved: None,
         },
         permit(),
-        ExecuteOutcome::Executed,
+        ExecuteOutcome::Executed {
+            execution: attempt_zero(&["npm"]),
+        },
     );
     let json = serde_json::to_string(&receipt).expect("serialises");
     let parsed: serde_json::Value = serde_json::from_str(&json).expect("parses");
@@ -462,7 +500,9 @@ fn the_receipt_carries_the_plan_it_was_checked_against() {
         &none,
         &none,
         permit(),
-        ExecuteOutcome::Executed,
+        ExecuteOutcome::Executed {
+            execution: attempt_zero(&["npm"]),
+        },
     );
     assert_eq!(receipt.plan, plan, "the receipt lost the plan");
     assert_eq!(receipt.plan.inventory_size, 3, "and its inventory with it");
@@ -496,7 +536,9 @@ fn an_execution_that_binds_nothing_says_so() {
         &none,
         &none,
         permit(),
-        ExecuteOutcome::Executed,
+        ExecuteOutcome::Executed {
+            execution: attempt_zero(&["npm"]),
+        },
     );
     assert!(
         !receipt.bound_anything(),
@@ -557,7 +599,9 @@ fn bound_receipt(inventory: &[asv_domain::CredentialMetadata]) -> ExecuteReceipt
         &none,
         &none,
         permit(),
-        ExecuteOutcome::Executed,
+        ExecuteOutcome::Executed {
+            execution: attempt_zero(&["curl"]),
+        },
     )
 }
 

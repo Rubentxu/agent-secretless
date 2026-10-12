@@ -387,7 +387,13 @@ fn a_hijacked_npm_invalidates_a_real_bound_plan() {
         decision: "allow".into(),
     };
 
-    // Unchanged: it executes.
+    // Unchanged: it authorizes the CLI to run the binary. **v0.39.0 rename:**
+    // before the split, `is_executed()` meant "the broker said yes" and a row
+    // that asserted it was asserting authorization. The split changed the
+    // meaning to "the binary actually ran and returned 0", which in-process
+    // `decide` can never produce. The right name now is `was_authorized`:
+    // the verdict cleared the way, and only the CLI can turn that into an
+    // execution.
     assert!(
         decide(
             &intent,
@@ -398,8 +404,26 @@ fn a_hijacked_npm_invalidates_a_real_bound_plan() {
             1_700_000_000,
             &verdict,
         )
+        .was_authorized(),
+        "an unchanged world must authorize the CLI to run the binary"
+    );
+    // And a row that says "is_executed returns false on a fresh `decide`" is
+    // exactly the falsification the v0.38.0 bug was hiding: the old row
+    // asserted `is_executed()` was `true` and passed, but `true` meant
+    // "authorized", not "ran". The new `is_executed()` makes that
+    // misunderstanding impossible to write.
+    assert!(
+        !decide(
+            &intent,
+            &digest,
+            &binding,
+            Some(&planned),
+            Some(plan.config_digest()).as_deref(),
+            1_700_000_000,
+            &verdict,
+        )
         .is_executed(),
-        "an unchanged world must execute"
+        "decide() alone must never claim an execution happened"
     );
 
     // The world moves: the very same call refuses, and names both sides.
