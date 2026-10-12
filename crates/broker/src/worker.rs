@@ -930,13 +930,23 @@ fn audit_worker(
     let Ok(mut log) = audit.chain.lock() else {
         return;
     };
-    log.append(
+    // **v0.39.0: the durable write is a hard requirement.** A worker
+    // spawn that the chain verifier cannot reach on a restart is a record
+    // that the operator cannot reconcile with the run logs; the same row
+    // exists in the in-memory ring, but the ring is not what is shipped
+    // off-host. `tracing::error!` is the documented behaviour: this is
+    // the broker's last chance to surface the gap, and swallowing it
+    // would re-introduce the v0.38.0 bug the row that flipped the audit
+    // signature exists to fix.
+    if let Err(err) = log.append(
         event,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
-    );
+    ) {
+        tracing::error!(%err, "worker spawn audit durable write failed");
+    }
 }
 
 #[cfg(test)]

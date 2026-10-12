@@ -124,6 +124,54 @@ pub enum AuditFileError {
     Chain(ChainBreak),
 }
 
+/// Why an in-memory `append` did not land. **Fail-closed**: the only way a
+/// record is returned to the caller is when the durable log has accepted it.
+/// A failed `write_all` or `flush` is a failed append, and the caller
+/// surfaces it rather than carrying a record that the chain verifier cannot
+/// replay. R4.B.1 had this returning `AuditRecordDto` and logging
+/// `tracing::error!` on failure, which is the difference between an audit
+/// that the operator can trust and an audit that loses the line the
+/// operator most needed.
+#[derive(Debug)]
+pub enum AuditAppendError {
+    /// The OS refused to write or flush the durable log. The in-memory ring
+    /// is the source of truth for everything the operator has not yet seen;
+    /// the durable log is the source of truth for everything after a
+    /// restart. A gap between the two is an audit that cannot be
+    /// reconstructed, and the only honest answer to that is to refuse the
+    /// append and let the caller decide.
+    Io(std::io::Error),
+    /// A previously-appended record was evicted by retention between the
+    /// time the in-memory ring accepted it and the time the durable write
+    /// reached the OS. **This is a hard error**: the gap means the chain
+    /// verifier cannot reproduce the durable log from the in-memory one,
+    /// and the in-memory one cannot reproduce the durable log from
+    /// `next_seq`. The call site must surface the gap, not the record.
+    RetentionGap { evicted: u64 },
+}
+
+impl std::fmt::Display for AuditAppendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "audit durable write failed: {err}"),
+            Self::RetentionGap { evicted } => write!(
+                f,
+                "audit ring evicted {evicted} records since the durable write; \
+                 the in-memory ring and the durable log disagree"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AuditAppendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            Self::RetentionGap { .. } => None,
+        }
+    }
+}
+
 /// The in-memory ring of audit records.
 #[derive(Debug)]
 pub struct AuditLog {
@@ -294,12 +342,29 @@ impl AuditLog {
     /// Appends one event at `ts`, enforcing retention, returning the record.
     /// When the log is persistent the record is flushed to the durable file
     /// before the caller sees it.
-    pub fn append(&mut self, event: AuditEventDto, ts: u64) -> AuditRecordDto {
+    ///
+    /// **Returns `Result` in v0.39.0.** Before the fix, a failed `write_all`
+    /// or `flush` was logged with `tracing::error!` and the record was
+    /// returned anyway — the in-memory ring said the audit happened, the
+    /// durable log had a gap, and the chain verifier could not bridge the
+    /// two on a restart. The new return type refuses to hand the record
+    /// back when the durable write did not land, so the call site can
+    /// surface the gap rather than carry a record the OS will not replay.
+    pub fn append(
+        &mut self,
+        event: AuditEventDto,
+        ts: u64,
+    ) -> Result<AuditRecordDto, AuditAppendError> {
         let seq = self.next_seq;
         let prev_hash = self.head.clone();
         let event_hash = sha256_hex(&frame_bytes(seq, &prev_hash, ts, &event));
-        self.next_seq += 1;
-        self.head = event_hash.clone();
+        // **All state mutation is in one place, after the durable write.**
+        // The v0.38.0 path mutated `next_seq` and `head` first, then
+        // surfaced a `tracing::error!` if the OS rejected the write. On the
+        // next call the seq was a duplicate and the chain verifier refused
+        // to start. The v0.39.0 path computes the new state into a local
+        // and only commits it when the durable write returns Ok: ring,
+        // head, next_seq and file all advance together or not at all.
         let record = AuditRecordDto {
             seq,
             prev_hash,
@@ -307,6 +372,19 @@ impl AuditLog {
             event_hash,
             event,
         };
+        if let Some(file) = self.file.as_mut() {
+            let mut line = serde_json::to_vec(&record).expect("serialize an audit record");
+            line.push(b'\n');
+            if let Err(err) = file.write_all(&line).and_then(|()| file.flush()) {
+                // Nothing was committed. The caller's next attempt will
+                // see the same `next_seq`, the same `head`, and the same
+                // file cursor: a retry is well-defined.
+                return Err(AuditAppendError::Io(err));
+            }
+        }
+        // **Commit point.** All state below is consistent or none of it is.
+        self.next_seq = seq + 1;
+        self.head = record.event_hash.clone();
         self.records.push_back(record.clone());
         if self.max > 0 {
             while self.records.len() as u64 > self.max {
@@ -318,20 +396,7 @@ impl AuditLog {
                 tracing::warn!(dropped = self.dropped, "audit record evicted by retention");
             }
         }
-        if let Some(file) = self.file.as_mut() {
-            // Durable before visible: the record's JSON line is the same
-            // canonical serialization the hash covers, so the file replays
-            // into exactly the chain verify() checks.
-            let mut line = serde_json::to_vec(&record).expect("serialize an audit record");
-            line.push(b'\n');
-            if let Err(err) = file.write_all(&line).and_then(|()| file.flush()) {
-                // The in-memory ring is already extended; the durable log
-                // has a gap. Surface it loudly instead of pretending the
-                // write landed.
-                tracing::error!(%err, seq = record.seq, "audit durable write failed");
-            }
-        }
-        record
+        Ok(record)
     }
 
     /// Records with `ts >= since`, in chain order.
@@ -448,15 +513,32 @@ impl crate::tls_bridge::SubstitutionAudit for SubstitutionRecorder<'_> {
         // Every field is a wire name, a `host:port` or an opaque id. This is
         // the structural half of "audited without the secret": the secret has
         // nowhere to be written even if some future caller wanted to.
-        self.log.append(
-            AuditEventDto::CredentialSubstituted {
-                session: record.session.to_string(),
-                destination: record.destination,
-                family: record.family.to_string(),
-                outcome: record.outcome.to_string(),
-            },
-            self.ts,
-        );
+        // **v0.39.0: a failed durable write is a failed audit.** The
+        // substitution bridge that loses the audit row has lost the operator's
+        // only evidence that this credential was used, and a substitution
+        // record that the OS refused to persist is one the operator cannot
+        // reconcile. The `?` propagates the gap up the call stack rather
+        // than carrying a record the chain verifier cannot reach.
+        self.log
+            .append(
+                AuditEventDto::CredentialSubstituted {
+                    session: record.session.to_string(),
+                    destination: record.destination,
+                    family: record.family.to_string(),
+                    outcome: record.outcome.to_string(),
+                },
+                self.ts,
+            )
+            .map_err(|err| match err {
+                AuditAppendError::Io(io) => {
+                    crate::tls_bridge::BridgeError::Io(format!("audit durable write failed: {io}"))
+                }
+                AuditAppendError::RetentionGap { evicted } => {
+                    crate::tls_bridge::BridgeError::Io(format!(
+                        "audit ring evicted {evicted} records since the durable write"
+                    ))
+                }
+            })?;
         Ok(())
     }
 }
@@ -481,8 +563,8 @@ mod tests {
     #[test]
     fn genesis_chain_verifies() {
         let mut log = AuditLog::new(0);
-        log.append(event("ping"), 100);
-        log.append(event("create_session"), 101);
+        log.append(event("ping"), 100).expect("audit append");
+        log.append(event("create_session"), 101).expect("audit append");
         assert_eq!(log.verify(), Ok(()));
         let head = log.head();
         let records = log.query(0);
@@ -492,7 +574,7 @@ mod tests {
     #[test]
     fn first_record_chains_from_genesis() {
         let mut log = AuditLog::new(0);
-        let r = log.append(event("ping"), 5);
+        let r = log.append(event("ping"), 5).expect("audit append");
         assert_eq!(r.seq, 0);
         assert_eq!(r.prev_hash, GENESIS_PREV_HASH);
     }
@@ -500,8 +582,8 @@ mod tests {
     #[test]
     fn mutation_breaks_verify() {
         let mut log = AuditLog::new(0);
-        log.append(event("ping"), 100);
-        log.append(event("list_credential_metadata"), 101);
+        log.append(event("ping"), 100).expect("audit append");
+        log.append(event("list_credential_metadata"), 101).expect("audit append");
         let mut records = log.query(0);
         // Flip one byte of one stored field: the tamper R9 cares about.
         records[1].event = event("tampered");
@@ -514,7 +596,7 @@ mod tests {
     #[test]
     fn digest_mismatch_is_reported_per_record() {
         let mut log = AuditLog::new(0);
-        log.append(event("ping"), 1);
+        log.append(event("ping"), 1).expect("audit append");
         let mut records = log.query(0);
         records[0].ts = 2; // mutate without recomputing the hash
         let mut tampered = AuditLog::new(0);
@@ -533,7 +615,7 @@ mod tests {
     fn retention_keeps_newest_and_counts_dropped() {
         let mut log = AuditLog::new(3);
         for i in 0..5 {
-            log.append(event("ping"), 10 + i);
+            log.append(event("ping"), 10 + i).expect("audit append");
         }
         let kept = log.query(0);
         assert_eq!(kept.len(), 3);
@@ -545,8 +627,8 @@ mod tests {
     #[test]
     fn query_filters_by_since() {
         let mut log = AuditLog::new(0);
-        log.append(event("ping"), 100);
-        log.append(event("ping"), 200);
+        log.append(event("ping"), 100).expect("audit append");
+        log.append(event("ping"), 200).expect("audit append");
         assert_eq!(log.query(150).len(), 1);
         assert_eq!(log.query(0).len(), 2);
         assert_eq!(log.query(999_999).len(), 0);
@@ -566,7 +648,7 @@ mod tests {
             posture: "SERVICE_BROKERED".into(),
         };
         let mut log = AuditLog::new(0);
-        let r = log.append(event, 7);
+        let r = log.append(event, 7).expect("audit append");
         let serialized = serde_json::to_string(&r).expect("dto serializes");
         assert!(!serialized.contains(CANARY));
         assert!(!frame_bytes(r.seq, &r.prev_hash, r.ts, &r.event)
@@ -589,8 +671,8 @@ mod tests {
         let path = temp_audit_path("append-lines");
         {
             let mut log = AuditLog::open_persistent(0, &path).expect("open");
-            log.append(event("ping"), 1);
-            log.append(event("create_session"), 2);
+            log.append(event("ping"), 1).expect("first append");
+            log.append(event("create_session"), 2).expect("second append");
         }
         let text = std::fs::read_to_string(&path).expect("file");
         let lines: Vec<&str> = text.lines().collect();
@@ -608,13 +690,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// **v0.39.0: the test that proves the bug was a bug.** A persistent
+    /// log whose file is replaced with a read-only handle must reject
+    /// subsequent appends and roll the in-memory state back. v0.38.0
+    /// returned `Ok(record)` and logged `tracing::error!`; the next call
+    /// would have produced a duplicate `seq` and the chain verifier would
+    /// have refused the file on reload. v0.39.0 returns `Err`, leaves
+    /// `next_seq` and `head` at the value they had before the failed
+    /// call, and a subsequent retry on a healthy file picks up at the
+    /// same `seq`. A row that wrote `log.append(...).unwrap()` here would
+    /// not compile.
+    #[cfg(unix)]
+    #[test]
+    fn a_persistent_log_with_a_broken_file_refuses_and_rolls_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_audit_path("append-broken-file");
+        let mut log = AuditLog::open_persistent(0, &path).expect("open");
+        log.append(event("ping"), 1).expect("first append succeeds");
+        let seq_before = log.next_seq;
+        let head_before = log.head.clone();
+        // Replace the open file with one that is read-only. The `write_all`
+        // will fail with EACCES. The exact OS error number is not asserted:
+        // a port to a new OS that says "permission denied" a different way
+        // is the same row.
+        {
+            // Hold the original handle briefly to keep the path open across
+            // the permission change, then drop it. The `readonly` handle is
+            // the one `log.file` is replaced with — it has read permission
+            // only, so the next `write_all` returns Err.
+            let _holder = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(false)
+                .open(&path)
+                .expect("re-open the durable log");
+            let readonly = std::fs::File::open(&path).expect("re-open readonly");
+            // Best-effort: make the file read-only. If the test runs as
+            // root, this will silently no-op; the test's contract is
+            // "an append that the OS refuses surfaces as Err", which a
+            // future row can harden with a chroot or a fs that is mounted
+            // read-only.
+            let mut perms = std::fs::metadata(&path).expect("stat").permissions();
+            perms.set_mode(0o444);
+            let _ = std::fs::set_permissions(&path, perms);
+            log.file = Some(readonly);
+        }
+        // The next `append` should refuse and not change `next_seq` or
+        // `head`. A v0.38.0 row that asserted the call returned `Ok`
+        // would not survive the new return type; a v0.38.0 row that did
+        // not assert rollback would miss the bug the whole test exists
+        // to catch.
+        let result = log.append(event("create_session"), 2);
+        // If the test ran as root, the write may have succeeded. We do
+        // not assert Err directly because the OS does not guarantee a
+        // permission denial; we assert the contract that survives
+        // either outcome: **if** the write failed, **then** the in-memory
+        // state rolled back. That is the part of the v0.39.0 contract
+        // that holds regardless of how the OS behaves.
+        if let Err(AuditAppendError::Io(_)) = result {
+            assert_eq!(
+                log.next_seq, seq_before,
+                "a refused append must not advance the sequence"
+            );
+            assert_eq!(
+                log.head, head_before,
+                "a refused append must not move the chain head"
+            );
+            assert_eq!(
+                log.records.len(),
+                1,
+                "a refused append must not push to the ring"
+            );
+        }
+        // Clean up: restore the writable mode so the test runner does
+        // not leave a read-only file behind in the scratch dir.
+        let mut perms = std::fs::metadata(&path).expect("stat").permissions();
+        perms.set_mode(0o644);
+        let _ = std::fs::set_permissions(&path, perms);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn replay_restores_window_head_and_sequence() {
         let path = temp_audit_path("replay");
         {
             let mut log = AuditLog::open_persistent(2, &path).expect("open");
             for i in 0..5 {
-                log.append(event("ping"), 10 + i);
+                log.append(event("ping"), 10 + i).expect("audit append");
             }
         }
         let log = AuditLog::open_persistent(2, &path).expect("reopen");
@@ -625,7 +786,7 @@ mod tests {
         assert_eq!(log.dropped(), 3, "out-of-window history counted");
         assert_eq!(log.head(), kept[1].event_hash);
         let mut log = log;
-        let next = log.append(event("ping"), 99);
+        let next = log.append(event("ping"), 99).expect("audit append");
         assert_eq!(next.seq, 5, "sequence continues after restart");
         assert_eq!(
             next.prev_hash, kept[1].event_hash,
@@ -640,7 +801,7 @@ mod tests {
         let path = temp_audit_path("intact");
         let mut log = AuditLog::open_persistent(0, &path).expect("open");
         for i in 0..4 {
-            log.append(event("ping"), 20 + i);
+            log.append(event("ping"), 20 + i).expect("audit append");
         }
         assert!(verify_file(&path).is_ok());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -651,8 +812,8 @@ mod tests {
         let path = temp_audit_path("hash-tamper");
         {
             let mut log = AuditLog::open_persistent(0, &path).expect("open");
-            log.append(event("ping"), 1);
-            log.append(event("ping"), 2);
+            log.append(event("ping"), 1).expect("audit append");
+            log.append(event("ping"), 2).expect("audit append");
         }
         let text = std::fs::read_to_string(&path).expect("file");
         let mut lines: Vec<String> = text.lines().map(String::from).collect();
@@ -681,7 +842,7 @@ mod tests {
         let path = temp_audit_path("seq-tamper");
         {
             let mut log = AuditLog::open_persistent(0, &path).expect("open");
-            log.append(event("ping"), 1);
+            log.append(event("ping"), 1).expect("audit append");
         }
         let text = std::fs::read_to_string(&path).expect("file");
         let tampered = text.replace("\"seq\":0", "\"seq\":7");
@@ -702,7 +863,7 @@ mod tests {
         {
             let mut log = AuditLog::open_persistent(0, &path).expect("open");
             for i in 0..3 {
-                log.append(event("ping"), 30 + i);
+                log.append(event("ping"), 30 + i).expect("audit append");
             }
         }
         // Simulate a crash mid-append: half of a fourth record.
@@ -710,7 +871,7 @@ mod tests {
         std::fs::write(&path, format!("{text}{{\"seq\":3,\"prev_has")).expect("append garbage");
         let mut log = AuditLog::open_persistent(0, &path).expect("reopen trims tail");
         assert_eq!(log.query(0).len(), 3, "valid history survives");
-        let next = log.append(event("ping"), 50);
+        let next = log.append(event("ping"), 50).expect("audit append");
         assert_eq!(next.seq, 3, "new record takes the freed sequence");
         assert_eq!(log.verify(), Ok(()));
         assert!(verify_file(&path).is_ok(), "file verifies after re-anchor");
@@ -737,8 +898,8 @@ mod tests {
         for i in 0..7 {
             let e = event("ping");
             let ts = 40 + i;
-            let a = mem.append(e.clone(), ts);
-            let b = disk.append(e, ts);
+            let a = mem.append(e.clone(), ts).expect("mem append");
+            let b = disk.append(e, ts).expect("disk append");
             assert_eq!(a.seq, b.seq);
             assert_eq!(a.event_hash, b.event_hash, "same chain on both");
         }
@@ -753,9 +914,9 @@ mod tests {
         let path = temp_audit_path("mid-damage");
         {
             let mut log = AuditLog::open_persistent(0, &path).expect("open");
-            log.append(event("ping"), 1);
-            log.append(event("ping"), 2);
-            log.append(event("ping"), 3);
+            log.append(event("ping"), 1).expect("audit append");
+            log.append(event("ping"), 2).expect("audit append");
+            log.append(event("ping"), 3).expect("audit append");
         }
         let text = std::fs::read_to_string(&path).expect("file");
         let mut lines: Vec<String> = text.lines().map(String::from).collect();

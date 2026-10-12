@@ -505,7 +505,17 @@ impl SubstitutionAudit for SharedSubstitutionAudit {
                 outcome: outcome.to_string(),
             },
             self.ts,
-        );
+        )
+        .map_err(|err| match err {
+            crate::audit::AuditAppendError::Io(io) => {
+                BridgeError::Io(format!("audit durable write failed: {io}"))
+            }
+            crate::audit::AuditAppendError::RetentionGap { evicted } => {
+                BridgeError::Io(format!(
+                    "audit ring evicted {evicted} records since the durable write"
+                ))
+            }
+        })?;
         Ok(())
     }
 }
@@ -577,21 +587,27 @@ impl ListenerReport for ChainReport {
         // never said where it was going. `None` is a fact here; `""` would be a
         // value a reader could mistake for a host.
         match self.log.lock() {
-            Ok(mut log) => {
-                log.append(
-                    asv_ipc_protocol::AuditEventDto::ConnectHandled {
-                        destination: outcome
-                            .target
-                            .as_ref()
-                            .map(|t| format!("{}:{}", t.authority, t.port))
-                            .unwrap_or_default(),
-                        session: outcome.session.clone(),
-                        outcome: verdict.to_string(),
-                        detail,
-                    },
-                    crate::surrogate::now_secs(),
-                );
-            }
+            Ok(mut log) => match log.append(
+                asv_ipc_protocol::AuditEventDto::ConnectHandled {
+                    destination: outcome
+                        .target
+                        .as_ref()
+                        .map(|t| format!("{}:{}", t.authority, t.port))
+                        .unwrap_or_default(),
+                    session: outcome.session.clone(),
+                    outcome: verdict.to_string(),
+                    detail,
+                },
+                crate::surrogate::now_secs(),
+            ) {
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::error!(
+                        %err,
+                        "CONNECT outcome recorded in ring but durable write failed"
+                    );
+                }
+            },
             Err(_) => {
                 tracing::error!(
                     "the audit chain is poisoned; a CONNECT outcome was produced and \
