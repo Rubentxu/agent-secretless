@@ -92,7 +92,16 @@ def install_block(readme: Path) -> str:
     told to run.
     """
     text = readme.read_text(encoding="utf-8")
-    start = re.search(r"^##+\s+Installing a release\s*$", text, re.MULTILINE)
+    # Accept both the English and the Spanish install heading so a localized
+    # README does not silently lose the gate. The heading text is the only
+    # part that varies (the article is "a" in English and "una" in Spanish);
+    # the structure (`##+` + the rest of the line) is the part that picks the
+    # same bash fence a reader would run.
+    start = re.search(
+        r"^##+\s+(?:Installing|Instalar)\s+(?:a|una)\s+release\s*$",
+        text,
+        re.MULTILINE,
+    )
     if not start:
         return ""
     rest = text[start.end():]
