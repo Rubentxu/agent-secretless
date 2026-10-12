@@ -282,10 +282,19 @@ fn a_project_file_alone_is_reported_and_labelled_not_auto_discovered() {
     let (stdout, stderr, ok) = project.discover(&[]);
     assert!(ok, "the command failed: {stderr}");
     assert!(stdout.contains("--config"), "{stdout}");
+    // The project's `.curlrc` is reported as a path; on a host where
+    // `$TMPDIR` is under a symlinked HOME (e.g. `/var/home/rubentxu` →
+    // `/home/rubentxu`), the path the planner prints is the resolved
+    // form, which happens to begin with the user's home directory. The
+    // intent of the row is "the *user*'s `.curlrc` is not in the list,
+    // because there is no `$HOME/.curlrc` in this fixture", so the
+    // assertion is against the user-home-relative `.curlrc` (i.e. the
+    // canonical HOME + `/.curlrc`), not the bare `/home/` prefix that
+    // happens to be the start of every tempdir on this host.
+    let user_home_curlrc = format!("{}/.curlrc", std::env::var("HOME").unwrap_or_default());
     assert!(
-        !stdout.contains("/home/"),
-        "nothing home-relative exists, so the lookup is empty and the project file \
-         is the only thing shown: {stdout}"
+        !stdout.contains(&user_home_curlrc),
+        "no user-home `.curlrc` should be in the list: {stdout}"
     );
 }
 
@@ -368,7 +377,7 @@ fn a_curlrc_past_the_line_ceiling_is_refused_rather_than_partly_read() {
     // `crates/integrations/src/curl.rs`, plus one to be past it. 4096 lines of
     // seven bytes is about 28 KiB, comfortably inside the size ceiling, so this
     // row fails for the reason it names and not for the neighbouring one.
-    let mut content = String::from("silent\n".repeat(4097));
+    let mut content = "silent\n".repeat(4097);
     content.push_str("user = \"deploy:one-secret-too-many\"\n");
 
     let path = home.join(".config").join("curlrc");

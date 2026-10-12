@@ -350,7 +350,17 @@ fn a_refused_candidate_does_not_stop_the_search() {
         resolution.resolved.is_some(),
         "the search must continue past a refusal"
     );
-    assert_eq!(resolution.resolved.expect("found").path, b.join("npm"));
+    // `resolve_tool` returns the resolved path of the executable, which
+    // is the canonical form on hosts where `$TMPDIR` is under a
+    // symlinked HOME (e.g. `/var/home/rubentxu` → `/home/rubentxu`).
+    // The tempdir's `path()` returns the un-resolved form, so the
+    // comparison has to be against the canonical form of `b` too.
+    assert_eq!(
+        resolution.resolved.expect("found").path,
+        b.canonicalize()
+            .expect("canonicalize tempdir b")
+            .join("npm")
+    );
 }
 
 /// An empty entry in `PATH` means the current directory, to every tool that
@@ -462,8 +472,10 @@ fn the_size_cap_is_a_refusal_and_not_a_truncation() {
     );
 
     // And the shipped entry point uses the documented constant.
-    assert!(
-        MAX_TOOL_BYTES >= 4096,
-        "the shipped cap must admit a real tool"
-    );
+    const {
+        assert!(
+            MAX_TOOL_BYTES >= 4096,
+            "the shipped cap must admit a real tool"
+        )
+    };
 }

@@ -97,7 +97,7 @@ impl Project {
 fn an_operator_types_the_command_and_gets_a_report_with_no_credential_in_it() {
     let project = Project::new();
 
-    for rendering in [&["--json"][..], &[].as_slice()] {
+    for rendering in [&["--json"][..], [].as_slice()] {
         let label = if rendering.is_empty() {
             "prose"
         } else {
@@ -240,7 +240,15 @@ fn a_symlinked_configuration_is_refused_until_a_root_is_named() {
         .arg("--home")
         .arg(&home)
         .args(["--allow-symlink-root"])
-        .arg(root.path())
+        // Canonicalise the path: when `$TMPDIR` is under a symlinked
+        // HOME (e.g. `/var/home/rubentxu` → `/home/rubentxu`), the
+        // planner will resolve the symlink target against the
+        // canonicalised root, so the comparison is only correct if the
+        // argument is the canonicalised form. Without this, the
+        // `allowing_symlink_root` allowance registers under one path
+        // and the symlink check is run against the resolved path under
+        // a different one, and the refusal stays in effect.
+        .arg(root.path().canonicalize().expect("canonicalize tempdir"))
         .output()
         .expect("run");
     let stdout = String::from_utf8_lossy(&allowed.stdout);

@@ -529,8 +529,15 @@ mod tests {
         );
 
         // Naming the root is the decision the default refuses to make for them.
+        // The path is canonicalised before being passed to the policy: on a
+        // host where `$TMPDIR` is under a symlinked HOME (e.g.
+        // `/var/home/rubentxu` → `/home/rubentxu`), `dir.path()` is the
+        // un-resolved form, but the symlink-resolver inside
+        // `FingerprintPolicy` resolves against the canonical form. The
+        // allowance and the check have to use the same form, or the
+        // allowance does not take effect.
         let allowed = FingerprintPolicy::strict()
-            .allowing_symlink_root(dir.path())
+            .allowing_symlink_root(dir.path().canonicalize().expect("canonicalize tempdir"))
             .fingerprint(&link)
             .expect("a symlink inside a named root is allowed");
         assert_eq!(allowed.digest.len(), "sha256:".len() + 64);

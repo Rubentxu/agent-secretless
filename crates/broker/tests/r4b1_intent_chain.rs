@@ -82,7 +82,18 @@ impl Project {
     }
 
     fn bin(&self) -> PathBuf {
-        self.root.path().join("bin")
+        // Canonicalise so the comparison against the resolved path the
+        // planner reports survives hosts where `$TMPDIR` is under a
+        // symlinked HOME (e.g. `/var/home/rubentxu` → `/home/rubentxu`).
+        // The tempdir's `path()` returns the un-resolved form, but the
+        // shell that runs the script will resolve it, so the planner
+        // records the resolved form; matching the test against the
+        // resolved form is the only fix that is correct on every host.
+        self.root
+            .path()
+            .canonicalize()
+            .expect("canonicalize tempdir")
+            .join("bin")
     }
 
     /// The `PATH` this project would be executed under.
