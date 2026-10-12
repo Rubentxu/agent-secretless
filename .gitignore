@@ -19,6 +19,13 @@ __pycache__/
 *.sqlite
 *.sqlite-journal
 
+# Local agent runtime caches. `.guard/` is a graph-analysis cache emitted
+# by some analysis skills (~20 MB JSON of nodes/edges per run); it is
+# deterministic given the source but expensive to regenerate, and the
+# output is keyed by content hash, so ignoring it is safe and saves a
+# several-MB diff every time the cache is repopulated.
+.guard/
+
 # Local scratch
 *.sock
 .DS_Store

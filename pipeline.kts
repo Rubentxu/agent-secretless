@@ -152,10 +152,24 @@ pipeline {
             // between releases needs a stage that refuses to ignore it.
             // `cargo audit` is the standard tool; it is optional
             // (installed by `rustup component add cargo-audit` on the
-            // CI runner) and the `|| true` keeps the pipeline green on
-            // a runner that has not installed it, with the gating run
-            // happening on a runner that has.
-            sh("(command -v cargo-audit >/dev/null && cargo audit --deny warnings) || echo 'cargo-audit not installed; skipping'")
+            // CI runner) and the `if/else` keeps the pipeline green on a
+            // runner that has not installed it, with the gating run happening
+            // on a runner that has. The earlier `(A && B) || C` form masked
+            // any failure of `cargo audit --deny warnings` as the "not
+            // installed" branch — reproduced in 2026-10-12, tracked as
+            // V1P-G1-T9; the `if` makes the two cases disjoint.
+            sh("if command -v cargo-audit >/dev/null; then cargo audit --deny warnings; else echo 'cargo-audit not installed; skipping'; fi")
+        }
+
+        // The release law, executable. `check-release-bump.py` classifies
+        // every commit since the last tag by its Conventional Commit type
+        // and derives the next version; it fails if any commit lacks a type
+        // or if the version in the tree does not match the derivation. This
+        // is the same law `check-release-authority.py` enforces at release
+        // time, run here on every change so a missed classification is
+        // caught before a release build, not during one.
+        stage("release-law") {
+            sh("python3 scripts/check-release-bump.py")
         }
 
         // Compiles the product and, as a side effect the adversarial harness

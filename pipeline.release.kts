@@ -91,6 +91,26 @@ pipeline {
             sh("scripts/release-tag-check.sh")
         }
 
+        // The test-counts receipt. `check-test-counts.py` is the check that
+        // the `cargo test` runs below did not just pass, but pass with the
+        // same arithmetic the documents transcribe -- debug and release
+        // agreeing on the enumerated set, no profile carrying a failure, and
+        // the filtered count matching the `--skip` flags the command carried.
+        // Both profiles are written to a log first; the check reads the logs.
+        // Five numbers per profile is exactly the kind of thing that is wrong
+        // without anybody noticing, and a release whose own documents disagree
+        // with its own runs is the failure this repository already produced
+        // once (the V1-C0 rebaseline found a 174-test drift between docs and
+        // tree, the pipeline comment at L92-99 of pipeline.kts records).
+        stage("test-counts") {
+            timeout(time = 30, unit = "MINUTES") {
+                sh("cargo test --workspace --locked --no-run 2>&1 | tail -5")
+                sh("cargo test --workspace --locked --profile=dev > target/test-counts-debug.log 2>&1 || true")
+                sh("cargo test --workspace --locked --profile=release -- --skip live_pg --skip live_substrate > target/test-counts-release.log 2>&1 || true")
+                sh("python3 scripts/check-test-counts.py --debug target/test-counts-debug.log --release target/test-counts-release.log")
+            }
+        }
+
         // The build. Slow by construction: `--profile=dist` is a release build
         // with thin LTO, and `codegen-units = 1` in the inherited release
         // profile makes it slower still. That is the cost of shipping the
