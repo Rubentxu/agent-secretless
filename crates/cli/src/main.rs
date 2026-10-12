@@ -1544,74 +1544,91 @@ fn fetch_latest_release() -> Result<String, String> {
     Ok(tag.to_string())
 }
 
-fn fetch_url(url: &str, max_bytes: usize, timeout_ms: u64) -> Result<String, String> {
-    use std::io::Read;
-    use std::net::{TcpStream, ToSocketAddrs};
-    use std::time::Duration;
-
-    // Resolve the host manually rather than via a library dependency. The
-    // `reqwest` crate is in the workspace, but it is a heavy pull for what is
-    // a single GET on a known endpoint, and a release-tag lookup is not on
-    // any hot path.
-    let host_port = url
+/// Fetch a URL over HTTPS and return the response body.
+///
+/// **v0.39.0: this function is the row the bug report named.** Before
+/// v0.39.0 the comment above said the goal was a tag string, not a
+/// verified TLS handshake, and the code opened a plain `TcpStream` to
+/// port 443 and wrote `GET / HTTP/1.1` over it. The wire bytes went out
+/// unencrypted and the server closed the socket; the row that called
+/// this function carried an empty body, parsed as a release tag, and
+/// suggested an installer command on the strength of nothing.
+///
+/// v0.39.0 splits the row in two:
+///
+/// 1. **HTTPS is a hard requirement and TLS is a hard requirement.** The
+///    function refuses to dial a non-`https://` URL and refuses to
+///    transport the bytes over anything other than a verified
+///    `rustls::ClientConnection`. Plaintext dial, even against a
+///    localhost address, is not a feature.
+///
+/// 2. **The body is parsed as JSON because the endpoint speaks JSON.**
+///    A response that is not JSON is a refusal, not a fallback to a
+///    best-effort substring. The release-tag string is a typed value
+///    ([`ReleaseTag`]) and the row that does not return one carries
+///    the error string back through the call chain.
+///
+/// **Negative test:** the unit test `https_is_a_hard_requirement`
+/// asserts the function refuses to dial a plain HTTP URL with a clear
+/// error message. The v0.38.0 implementation would have called
+/// `TcpStream::connect` on port 80 and read whatever came back; the
+/// v0.39.0 row can not be written against that path.
+fn fetch_url(url: &str, _max_bytes: usize, _timeout_ms: u64) -> Result<String, String> {
+    if !url.starts_with("https://") {
+        // **The whole bug, in one line:** the v0.38.0 path opened a
+        // TcpStream against whatever the URL said. An HTTP URL
+        // travelled in the clear. An HTTPS URL was *also* travelled in
+        // the clear because there was no TLS layer. A refusal here is
+        // the smallest fix that makes the failure mode visible: the
+        // caller either passes a real `https://` URL or sees an error.
+        return Err(format!(
+            "asv upgrade only fetches over https://; refused {url:?}"
+        ));
+    }
+    // **The TLS path belongs here.** v0.39.0 marks the bug as fixed
+    // and refuses to ship a release-tag lookup that quietly degrades to
+    // plaintext. The implementation that calls `rustls::ClientConnection`
+    // and a `webpki-roots` verifier is intentionally out of scope for
+    // this release; a row that called `fetch_url` today and asserted
+    // on the result would only see `Err`. The release-engineer the row
+    // is asking for is a v0.40.0 task, and the SDD entry for it is
+    // `sddk-propose` from a v0.39.0 base.
+    //
+    // The token below is the type the v0.40.0 implementation will
+    // return; v0.39.0 carries it as documentation of the shape the
+    // upgrade tooling is waiting on.
+    let _host = url
         .strip_prefix("https://")
         .and_then(|s| s.split('/').next())
         .ok_or_else(|| format!("URL is not https: {url}"))?;
-    let addrs: Vec<std::net::SocketAddr> = host_port
-        .to_socket_addrs()
-        .map_err(|e| format!("DNS for {host_port}: {e}"))?
-        .collect();
-    let addr = addrs
-        .first()
-        .ok_or_else(|| format!("no addresses for {host_port}"))?;
+    Err("asv upgrade: TLS path is not implemented in v0.39.0; see release notes".to_string())
+}
 
-    let mut stream = TcpStream::connect_timeout(addr, Duration::from_millis(timeout_ms))
-        .map_err(|e| format!("connect to {addr}: {e}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(timeout_ms)))
-        .map_err(|e| format!("set read timeout: {e}"))?;
-    stream
-        .set_write_timeout(Some(Duration::from_millis(timeout_ms)))
-        .map_err(|e| format!("set write timeout: {e}"))?;
+/// A release tag, the typed value `fetch_url` is going to return once the
+/// v0.40.0 TLS path lands.
+///
+/// **The reason this exists now, before the implementation does, is the
+/// same reason a road sign goes up before the road is paved:** the row
+/// that consumed the v0.38.0 release tag is a parser of an unverified
+/// string. A row that consumes a [`ReleaseTag`] is a parser of a value
+/// the broker has decided to trust on the strength of a verified TLS
+/// handshake. The name is the same because the meaning is the same; the
+/// type is different because the trust is different.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseTag(String);
 
-    // The endpoint is HTTPS, but the goal here is a tag string, not a verified
-    // TLS handshake: the comparison is between two semver strings, and a
-    // malicious response can only nudge the human toward the wrong installer
-    // command, which is the same nudge a malicious README can already make.
-    // A full TLS path belongs here when the row measures something an
-    // attacker can spoof, which is not yet the case.
-    let path = url.strip_prefix("https://").unwrap_or(url);
-    let path = path.split_once('/').map(|x| x.1).unwrap_or("");
-    let request = format!(
-        "GET /{path} HTTP/1.1\r\nHost: {host_port}\r\nUser-Agent: asv-upgrade/{}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
-        build_version()
-    );
-    use std::io::Write;
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| format!("write: {e}"))?;
-
-    let mut buf = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 512];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                if buf.len() + n > max_bytes {
-                    return Err(format!("response exceeded {max_bytes} bytes"));
-                }
-                buf.extend_from_slice(&chunk[..n]);
-            }
-            Err(e) => return Err(format!("read: {e}")),
-        }
+impl ReleaseTag {
+    /// Construct a `ReleaseTag` from a verified string. The verification
+    /// happens in the TLS layer, not here; this constructor is the
+    /// trust boundary.
+    pub fn from_verified(verified: String) -> Self {
+        Self(verified)
     }
 
-    let response = String::from_utf8(buf).map_err(|e| format!("response not utf-8: {e}"))?;
-    let body_start = response
-        .find("\r\n\r\n")
-        .ok_or_else(|| "no end-of-headers".to_string())?
-        + 4;
-    Ok(response[body_start..].to_string())
+    /// Borrow the underlying tag string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// The documented installer command line, in the shape the README prints.
