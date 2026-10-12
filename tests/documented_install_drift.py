@@ -35,8 +35,26 @@ The rest of the section is prose that no row reads.
 """
 
 
-def readme_with(command: str) -> str:
-    return TEMPLATE.format(command=command)
+# The Spanish counterpart of TEMPLATE. The article is "una" and the verb
+# is "Instalar" — both pieces of variance are what the guard accepts in
+# scripts/check-documented-install.py. A regression in either would be
+# silent on the localized README, which is exactly the failure mode this
+# file exists to falsify.
+TEMPLATE_ES = """# fixture
+
+## Instalar una release
+
+```bash
+{command}
+```
+
+The rest of the section is prose that no row reads.
+"""
+
+
+def readme_with(command: str, *, locale: str = "en") -> str:
+    template = TEMPLATE_ES if locale == "es" else TEMPLATE
+    return template.format(command=command)
 
 
 def gate(readme: Path) -> dict[str, tuple[str, str]]:
@@ -95,27 +113,48 @@ def main() -> int:
             '--prefix "$HOME/.local"')
     cases = [
         # (name, command template or None, expected row prefix, expected state,
-        #  fixture script or None)
+        #  fixture script or None, locale)
         ("a working documented command passes every row",
-         good, "D4", "PASS", working),
+         good, "D4", "PASS", working, "en"),
         ("an install heading with no command is caught",
-         None, "D1", "FAIL", None),
+         None, "D1", "FAIL", None, "en"),
         ("a command that pins no version is caught",
          'curl -LsSf file://{root}/installer.sh | sh -s -- --prefix "$HOME/.local"',
-         "D1", "FAIL", no_version),
+         "D1", "FAIL", no_version, "en"),
         ("a script the document names that is not there is caught",
          'curl -LsSf file://{root}/absent.sh | sh -s -- --version 1.0.0 '
-         '--prefix "$HOME/.local"', "D2", "FAIL", None),
+         '--prefix "$HOME/.local"', "D2", "FAIL", None, "en"),
         ("a documented command that fails is caught",
-         good, "D3", "FAIL", broken),
+         good, "D3", "FAIL", broken, "en"),
         ("a command that installs the wrong version is caught",
-         good, "D4", "FAIL", wrong_version),
+         good, "D4", "FAIL", wrong_version, "en"),
         ("a command that exits zero having installed nothing is caught",
-         good, "D4", "FAIL", silent),
+         good, "D4", "FAIL", silent, "en"),
+        # Spanish counterpart rows. The Spanish install heading ("## Instalar
+        # una release") is what scripts/check-documented-install.py learned to
+        # accept in v0.38.2; without these rows a regression that breaks the
+        # Spanish extraction would go uncaught, since the English rows above
+        # would still pass.
+        ("a working documented command in Spanish passes every row",
+         good, "D4", "PASS", working, "es"),
+        ("an install heading in Spanish with no command is caught",
+         None, "D1", "FAIL", None, "es"),
+        ("a Spanish command that pins no version is caught",
+         'curl -LsSf file://{root}/installer.sh | sh -s -- --prefix "$HOME/.local"',
+         "D1", "FAIL", no_version, "es"),
+        ("a Spanish script the document names that is not there is caught",
+         'curl -LsSf file://{root}/absent.sh | sh -s -- --version 1.0.0 '
+         '--prefix "$HOME/.local"', "D2", "FAIL", None, "es"),
+        ("a Spanish documented command that fails is caught",
+         good, "D3", "FAIL", broken, "es"),
+        ("a Spanish command that installs the wrong version is caught",
+         good, "D4", "FAIL", wrong_version, "es"),
+        ("a Spanish command that exits zero having installed nothing is caught",
+         good, "D4", "FAIL", silent, "es"),
     ]
 
     results = []
-    for name, command, prefix, state, script in cases:
+    for name, command, prefix, state, script, locale in cases:
         # `{root}` is substituted inside `case` after the fixture exists; the
         # command string is built with the placeholder so the file:// URL is
         # only valid once the temporary directory has a name.
@@ -123,7 +162,8 @@ def main() -> int:
             root = Path(tmp)
             readme = root / "README.md"
             readme.write_text(
-                readme_with(command.format(root=root) if command else ""),
+                readme_with(command.format(root=root) if command else "",
+                            locale=locale),
                 encoding="utf-8")
             if script is not None:
                 (root / "installer.sh").write_text(script, encoding="utf-8")
