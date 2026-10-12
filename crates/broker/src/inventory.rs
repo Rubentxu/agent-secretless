@@ -259,9 +259,9 @@ mod tests {
             (UUID_A, asv_vault::CredentialKind::BearerToken),
             (UUID_B, asv_vault::CredentialKind::DatabasePassword),
         ]);
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
 
-        let result = load(&mut state, &store);
+        let result = load(&state, &store);
 
         assert_eq!(
             result,
@@ -298,9 +298,9 @@ mod tests {
                 asv_vault::CredentialKind::DatabasePassword,
             ),
         ]);
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
 
-        let result = load(&mut state, &store);
+        let result = load(&state, &store);
 
         assert_eq!(
             result,
@@ -334,9 +334,9 @@ mod tests {
             .collect();
         assert_eq!(source_ids.len(), 2);
         assert!(source_ids.contains(&uppercase) && source_ids.contains(&compact));
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
 
-        let result = load(&mut state, &store);
+        let result = load(&state, &store);
 
         assert_eq!(result.loaded, 0);
         assert_eq!(result.skipped, 2);
@@ -446,9 +446,9 @@ mod tests {
                 SecretBytes::new(CANARY.as_bytes().to_vec()),
             )
             .expect("insert");
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
 
-        load(&mut state, &store);
+        load(&state, &store);
 
         let rendered = format!("{:?}", state.credentials);
         assert!(

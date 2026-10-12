@@ -74,7 +74,7 @@ fn protected_push(session: asv_domain::AgentSessionId, peer_uid: u32) -> Authori
 
 #[test]
 fn the_protected_push_blocks_until_the_operator_approves_it() {
-    let mut state = BrokerState {
+    let state = BrokerState {
         control_plane: enrolment_of_this_binary(),
         ..BrokerState::default()
     };
@@ -86,7 +86,7 @@ fn the_protected_push_blocks_until_the_operator_approves_it() {
         .expect("this fixture must be admitted, or every assertion below is vacuous");
 
     let session = match handle(
-        &mut state,
+        &state,
         &operator,
         Request::CreateSession {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -100,7 +100,7 @@ fn the_protected_push_blocks_until_the_operator_approves_it() {
 
     // 1. Blocked: no human has approved anything yet.
     let blocked = match handle(
-        &mut state,
+        &state,
         &operator,
         Request::Authorize {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -123,7 +123,7 @@ fn the_protected_push_blocks_until_the_operator_approves_it() {
 
     // 2. The operator approves exactly this request, and gets the approval.
     let approval = match handle(
-        &mut state,
+        &state,
         &operator,
         Request::SubmitApproval {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -144,7 +144,7 @@ fn the_protected_push_blocks_until_the_operator_approves_it() {
 
     // 3. The agent presents the id: the push goes through.
     let spent = match handle(
-        &mut state,
+        &state,
         &operator,
         Request::Authorize {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -164,7 +164,7 @@ fn the_protected_push_blocks_until_the_operator_approves_it() {
 
     // 4. "Allow once" cannot be replayed after use.
     let replay = match handle(
-        &mut state,
+        &state,
         &operator,
         Request::Authorize {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -188,7 +188,7 @@ fn the_protected_push_blocks_until_the_operator_approves_it() {
 
 #[test]
 fn an_approval_is_spent_only_on_the_request_it_describes() {
-    let mut state = BrokerState {
+    let state = BrokerState {
         control_plane: enrolment_of_this_binary(),
         ..BrokerState::default()
     };
@@ -197,7 +197,7 @@ fn an_approval_is_spent_only_on_the_request_it_describes() {
         .expect("this fixture must be admitted");
 
     let session = match handle(
-        &mut state,
+        &state,
         &operator,
         Request::CreateSession {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -214,7 +214,7 @@ fn an_approval_is_spent_only_on_the_request_it_describes() {
     let mut other = protected_push(session, operator.credentials.uid);
     other.context.request_digest = Some("other-digest".into());
     let other_approval = match handle(
-        &mut state,
+        &state,
         &operator,
         Request::SubmitApproval {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -227,7 +227,7 @@ fn an_approval_is_spent_only_on_the_request_it_describes() {
     };
 
     let mismatch = match handle(
-        &mut state,
+        &state,
         &operator,
         Request::Authorize {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -255,11 +255,11 @@ fn a_peer_that_is_not_enrolled_can_neither_approve_nor_read_audit() {
     // with no enrolment is refused at the admission, and the refusal names
     // the ADR-0015 condition that failed rather than asserting a reason this
     // broker cannot evaluate.
-    let mut state = BrokerState::default();
+    let state = BrokerState::default();
     let stranger = operator_peer();
 
     match handle(
-        &mut state,
+        &state,
         &stranger,
         Request::SubmitApproval {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -275,7 +275,7 @@ fn a_peer_that_is_not_enrolled_can_neither_approve_nor_read_audit() {
     }
 
     match handle(
-        &mut state,
+        &state,
         &stranger,
         Request::AuditQuery {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,

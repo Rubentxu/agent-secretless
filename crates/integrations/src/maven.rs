@@ -417,7 +417,7 @@ fn parse_settings(text: &str) -> Result<Settings, MavenError> {
     let document = roxmltree::Document::parse_with_options(text, options).map_err(|error| {
         use roxmltree::Error as E;
         match error {
-            E::DtdDetected { .. } => MavenError::DtdRefused {
+            E::DtdDetected => MavenError::DtdRefused {
                 reason: "a DOCTYPE is present".to_string(),
             },
             E::NodesLimitReached => MavenError::TooDeep {

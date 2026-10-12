@@ -383,7 +383,7 @@ fn a_malformed_unicode_escape_is_left_literal_rather_than_guessed_at() {
     let report = discover(&home, &cwd);
     // The value is reported at the length of what the file literally holds.
     assert!(report.files[0].undescribed[0].len > 0);
-    assert!(report.files.is_empty() == false);
+    assert!(!report.files.is_empty());
 }
 
 /// An empty value is empty, not a zero-byte secret.

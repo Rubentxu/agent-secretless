@@ -218,26 +218,23 @@ impl Broker {
             .with_margin(Duration::from_secs(60)),
         );
 
-        let mut state = BrokerState::default();
-        state.vault_writer = Some(Arc::new(VaultWritePort::new(
-            Arc::clone(&store),
-            Arc::clone(&key),
-        )));
-        // The routing port behind a trait object: the shape `DeleteCredential`
-        // can only reach through the method this change added.
-        state.secrets = Some(Arc::new(RoutingSecretPort::new(
-            Arc::clone(&oauth2) as Arc<dyn asv_connector_http::SecretPort>,
-            Arc::clone(&vault),
-        )));
-
-        // The real admission predicate, satisfied the same way
-        // `credential_create_path` satisfies it: by enrolling the binary that is
-        // actually running. Faking the third condition instead would make this
-        // file a test of a bypass.
-        let exe = std::fs::canonicalize(std::env::current_exe().expect("current_exe"))
-            .expect("canonical");
-        let bytes = std::fs::read(&exe).expect("read exe");
-        state.control_plane = Enrolment::empty().enrol(exe, admission::sha256(&bytes));
+        let state = BrokerState {
+            vault_writer: Some(Arc::new(VaultWritePort::new(
+                Arc::clone(&store),
+                Arc::clone(&key),
+            ))),
+            secrets: Some(Arc::new(RoutingSecretPort::new(
+                Arc::clone(&oauth2) as Arc<dyn asv_connector_http::SecretPort>,
+                Arc::clone(&vault),
+            ))),
+            control_plane: {
+                let exe = std::fs::canonicalize(std::env::current_exe().expect("current_exe"))
+                    .expect("canonical");
+                let bytes = std::fs::read(&exe).expect("read exe");
+                Enrolment::empty().enrol(exe, admission::sha256(&bytes))
+            },
+            ..BrokerState::default()
+        };
 
         let mut peer = WorkloadIdentity::from_peer(asv_identity::PeerCredentials {
             pid: std::process::id() as i32,
@@ -278,7 +275,7 @@ impl Broker {
 
     fn delete(&mut self, id: &str) -> Response {
         asv_broker::handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::DeleteCredential {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,

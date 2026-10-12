@@ -234,11 +234,11 @@ fn a_name_too_short_to_be_one_is_refused_here_and_not_at_aws() {
     // session name through, which AWS rejects.
     assert!(AssumeRole::new("x", SESSION_NAME, 3600, None).is_err());
     assert!(AssumeRole::new(ROLE_ARN, "a", 3600, None).is_err());
-    assert!(AssumeRole::new(ROLE_ARN, &"a".repeat(65), 3600, None).is_err());
+    assert!(AssumeRole::new(ROLE_ARN, "a".repeat(65), 3600, None).is_err());
     assert!(AssumeRole::new(ROLE_ARN, SESSION_NAME, 3600, Some("x".into())).is_err());
     // A role ARN one character under the documented minimum.
-    assert!(AssumeRole::new(&"a".repeat(19), SESSION_NAME, 3600, None).is_err());
-    assert!(AssumeRole::new(&"a".repeat(20), SESSION_NAME, 3600, None).is_ok());
+    assert!(AssumeRole::new("a".repeat(19), SESSION_NAME, 3600, None).is_err());
+    assert!(AssumeRole::new("a".repeat(20), SESSION_NAME, 3600, None).is_ok());
 }
 
 #[test]

@@ -265,7 +265,7 @@ impl SigV4Signer {
         );
 
         let signature = hex(&hmac_sha256(
-            &self.signing_key(&date_stamp),
+            &self.signing_key(date_stamp),
             string_to_sign.as_bytes(),
         ));
 
@@ -279,7 +279,7 @@ impl SigV4Signer {
             // the same header. The published vector is what caught it.
             authorization: format!(
                 "{ALGORITHM} Credential={}, SignedHeaders={signed_headers}, Signature={signature}",
-                self.credential_scope(&date_stamp)
+                self.credential_scope(date_stamp)
             ),
             amz_date: amz_date.to_string(),
             signed_headers,

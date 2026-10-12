@@ -206,7 +206,7 @@ impl Fixture {
                 SecretBytes::new(CANARY.as_bytes().to_vec()),
             )
             .expect("insert credential");
-        asv_broker::inventory::load(&mut state, &store);
+        asv_broker::inventory::load(&state, &store);
 
         state.secrets = Some(Arc::new(VaultSecretPort::new(
             Arc::new(std::sync::Mutex::new(store)),
@@ -236,7 +236,7 @@ impl Fixture {
             .create("/repo".to_string(), &peer);
 
         let minted = handle(
-            &mut state,
+            &state,
             &peer,
             Request::MintSurrogate {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -268,7 +268,7 @@ impl Fixture {
         let token = self.mint_token();
         let start = Instant::now();
         let response = handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::ReadIssue {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -290,7 +290,7 @@ impl Fixture {
     fn mint_token(&mut self) -> String {
         let credential = self.state.credentials.lock().expect("not poisoned")[0].id;
         match handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::MintSurrogate {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -462,7 +462,7 @@ fn a_teardown_leaves_no_sessions_no_surrogates_and_no_grants() {
     );
 
     let ended = handle(
-        &mut fixture.state,
+        &fixture.state,
         &fixture.peer,
         Request::EndSession {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -564,7 +564,7 @@ fn a_hundred_brokered_reads_leave_zero_live_pins_after_teardown() {
     );
 
     let ended = handle(
-        &mut fixture.state,
+        &fixture.state,
         &fixture.peer,
         Request::EndSession {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -634,7 +634,7 @@ fn a_token_minted_before_teardown_is_useless_after_it() {
     let token = fixture.mint_token();
 
     handle(
-        &mut fixture.state,
+        &fixture.state,
         &fixture.peer,
         Request::EndSession {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -643,7 +643,7 @@ fn a_token_minted_before_teardown_is_useless_after_it() {
     );
 
     let response = handle(
-        &mut fixture.state,
+        &fixture.state,
         &fixture.peer,
         Request::ReadIssue {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -668,7 +668,7 @@ fn a_surrogate_is_spent_exactly_once() {
     let token = fixture.mint_token();
 
     let first = handle(
-        &mut fixture.state,
+        &fixture.state,
         &fixture.peer,
         Request::ReadIssue {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -684,7 +684,7 @@ fn a_surrogate_is_spent_exactly_once() {
     );
 
     let second = handle(
-        &mut fixture.state,
+        &fixture.state,
         &fixture.peer,
         Request::ReadIssue {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,

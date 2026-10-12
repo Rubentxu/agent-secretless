@@ -54,7 +54,7 @@ struct Harness {
 /// belongs to that peer, and the credential exists in the mirror. A mint that
 /// is refused from here is refused by policy and by nothing else.
 fn harness(kind: CredentialKind) -> Harness {
-    let mut state = BrokerState::default();
+    let state = BrokerState::default();
     let mut peer = WorkloadIdentity::from_peer(PeerCredentials {
         pid: std::process::id() as i32,
         uid: unsafe { libc::getuid() },
@@ -86,7 +86,7 @@ fn harness(kind: CredentialKind) -> Harness {
 impl Harness {
     fn mint(&mut self) -> Response {
         handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::MintSurrogate {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,

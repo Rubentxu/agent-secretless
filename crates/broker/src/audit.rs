@@ -264,8 +264,7 @@ impl AuditLog {
             // leaves either the original or the new bytes, never half of one
             // and half of the other.
             let sibling = path.with_extension("recover.tmp");
-            std::fs::write(&sibling, &text.as_bytes()[..valid_len])
-                .map_err(AuditOpenError::Io)?;
+            std::fs::write(&sibling, &text.as_bytes()[..valid_len]).map_err(AuditOpenError::Io)?;
             std::fs::rename(&sibling, path).map_err(AuditOpenError::Io)?;
         }
         let total = records.len();

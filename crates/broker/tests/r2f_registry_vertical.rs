@@ -323,7 +323,7 @@ impl Vertical {
         // Projected through the same inventory pass the broker runs at startup,
         // so this fixture cannot pass by seeding a field production never
         // writes.
-        let loaded = asv_broker::inventory::load(&mut state, &store);
+        let loaded = asv_broker::inventory::load(&state, &store);
         assert_eq!(
             (loaded.loaded, loaded.skipped, loaded.collisions),
             (2, 0, 0),
@@ -453,7 +453,7 @@ impl Vertical {
     /// Mints, returning the raw answer so a row can observe a refusal.
     fn try_mint(&mut self, credential: CredentialId, max_uses: u32) -> Response {
         handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::MintSurrogate {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -486,7 +486,7 @@ impl Vertical {
         reference: &str,
     ) -> Response {
         handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::PullManifest {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -507,7 +507,7 @@ impl Vertical {
         digest: &str,
     ) -> Response {
         handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::PullBlob {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -534,7 +534,7 @@ impl Vertical {
         bytes: &[u8],
     ) -> Response {
         handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::PushBlob {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -557,7 +557,7 @@ impl Vertical {
         manifest: &[u8],
     ) -> Response {
         handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::PushManifest {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -1335,9 +1335,9 @@ fn a_digest_that_is_not_a_content_address_is_refused() {
 /// `every_operational_relation_parses_as_a_real_command`.
 #[test]
 fn an_agent_asking_what_the_broker_can_do_is_told_about_registry() {
-    let mut v = Vertical::declared();
+    let v = Vertical::declared();
     let response = handle(
-        &mut v.state,
+        &v.state,
         &v.peer,
         Request::AgentInfo {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -1373,9 +1373,9 @@ fn an_agent_asking_what_the_broker_can_do_is_told_about_registry() {
 /// it.
 #[test]
 fn a_manifest_and_a_blob_are_advertised_as_two_operations() {
-    let mut v = Vertical::declared();
+    let v = Vertical::declared();
     let response = handle(
-        &mut v.state,
+        &v.state,
         &v.peer,
         Request::AgentInfo {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -1425,9 +1425,9 @@ fn a_manifest_and_a_blob_are_advertised_as_two_operations() {
 /// which cannot tell "both present" from "one present and one stranger".
 #[test]
 fn a_push_is_advertised_as_two_more_operations() {
-    let mut v = Vertical::declared();
+    let v = Vertical::declared();
     let response = handle(
-        &mut v.state,
+        &v.state,
         &v.peer,
         Request::AgentInfo {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,

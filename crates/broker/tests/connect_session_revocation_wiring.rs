@@ -98,7 +98,7 @@ fn ending_a_session_revokes_the_tunnels_it_authorised() {
 
     assert_eq!(
         handle(
-            &mut state,
+            &state,
             &peer(0),
             Request::EndSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -130,7 +130,7 @@ fn ending_one_session_does_not_revoke_another() {
 
     assert_eq!(
         handle(
-            &mut state,
+            &state,
             &peer(0),
             Request::EndSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -171,7 +171,7 @@ fn a_refused_end_session_revokes_nothing() {
     let session = open(&mut state, &owner);
 
     let refused = handle(
-        &mut state,
+        &state,
         &stranger,
         Request::EndSession {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -192,7 +192,7 @@ fn a_refused_end_session_revokes_nothing() {
     // be satisfied by a handler that revoked nothing ever.
     assert_eq!(
         handle(
-            &mut state,
+            &state,
             &owner,
             Request::EndSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,

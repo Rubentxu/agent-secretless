@@ -133,7 +133,7 @@ fn write_world_writable(path: &Path, contents: &str) {
 fn an_operator_types_the_command_and_gets_a_report_with_no_credential_in_it() {
     let account = Account::with_settings();
 
-    for rendering in [&["--json"][..], &[].as_slice()] {
+    for rendering in [&["--json"][..], [].as_slice()] {
         let label = if rendering.is_empty() {
             "prose"
         } else {

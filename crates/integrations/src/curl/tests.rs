@@ -188,7 +188,7 @@ fn the_credential_splits_on_the_first_colon_not_the_last() {
 fn a_user_with_no_colon_authenticates_with_an_empty_password() {
     let (credentials, _) = classify(parse("user = alice\n"));
     assert_eq!(credentials[0].user_len, 5);
-    assert_eq!(credentials[0].has_password, false);
+    assert!(!credentials[0].has_password);
     assert_eq!(credentials[0].password_len, 0);
 }
 
@@ -196,7 +196,7 @@ fn a_user_with_no_colon_authenticates_with_an_empty_password() {
 fn a_password_with_no_username_is_still_a_password() {
     let (credentials, _) = classify(parse("user = \":secret\"\n"));
     assert_eq!(credentials[0].user_len, 0);
-    assert_eq!(credentials[0].has_password, true);
+    assert!(credentials[0].has_password);
     assert_eq!(credentials[0].password_len, 6);
 }
 
@@ -208,7 +208,7 @@ fn both_credential_options_are_named_and_nothing_else_is() {
     assert_eq!(credentials[1].kind, CurlCredential::ProxyUser);
     assert_eq!(rest.len(), 1);
     assert_eq!(rest[0].option, "silent");
-    assert_eq!(rest[0].has_value, false);
+    assert!(!rest[0].has_value);
 }
 
 /// **No env-reference column exists here, and this is why.** npm, Maven and
@@ -218,7 +218,7 @@ fn both_credential_options_are_named_and_nothing_else_is() {
 fn a_dollar_brace_in_a_curlrc_is_part_of_the_password_not_a_variable() {
     let (credentials, _) = classify(parse("user = \"alice:${HOME}\"\n"));
     assert_eq!(credentials[0].password_len, 7);
-    assert_eq!(credentials[0].has_password, true);
+    assert!(credentials[0].has_password);
 }
 
 // ------------------------------------------------------------------ ceilings

@@ -158,13 +158,13 @@ mod tests {
         );
     }
 
-    /// Panic messages format their payload with Debug. This must stay clean
-    /// even on the unwind path.
-    ///
-    /// Note the ownership dance: the secret is moved into the closure and
-    /// cannot be inspected afterwards, precisely because it does not implement
-    /// `Clone`. The canary is therefore checked against a freshly created
-    /// secret, which is a stronger statement than reusing one.
+    // Panic messages format their payload with Debug. This must stay clean
+    // even on the unwind path.
+    //
+    // Note the ownership dance: the secret is moved into the closure and
+    // cannot be inspected afterwards, precisely because it does not implement
+    // `Clone`. The canary is therefore checked against a freshly created
+    // secret, which is a stronger statement than reusing one.
     thread_local! {
         /// True only on the thread running a deliberate panic, and only while
         /// its body is running. See [`catch_deliberate_panic`].

@@ -792,7 +792,7 @@ fn main() -> std::io::Result<()> {
         // `MintSurrogate` refuses every real credential as unknown — a broker
         // that cannot see its own vault. Loaded here, while the store is still
         // owned by this function; the lending port below only lends by id.
-        let inventory = asv_broker::inventory::load(&mut state, &store);
+        let inventory = asv_broker::inventory::load(&state, &store);
 
         // ADR-0015/0016: the enrolment record lives beside the vault and is
         // read here, at start, so it survives a restart and names principals

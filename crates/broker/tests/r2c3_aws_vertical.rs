@@ -137,7 +137,7 @@ impl Vertical {
         let mut state = BrokerState::default();
         // Through the same inventory pass the broker runs at startup, so this
         // fixture cannot pass by seeding a field production never writes.
-        let loaded = asv_broker::inventory::load(&mut state, &store);
+        let loaded = asv_broker::inventory::load(&state, &store);
         assert_eq!(
             (loaded.loaded, loaded.skipped, loaded.collisions),
             (1, 0, 0),
@@ -228,7 +228,7 @@ impl Vertical {
 
     fn whoami(&mut self, credential: &str) -> Response {
         handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::AwsCallerIdentity {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -389,9 +389,9 @@ fn a_stock_policy_refuses_the_operation_before_any_socket() {
 /// is what the CLI-reachability file is for.
 #[test]
 fn a_session_this_peer_does_not_own_is_refused_before_any_socket() {
-    let mut vertical = Vertical::permitting();
+    let vertical = Vertical::permitting();
     let response = handle(
-        &mut vertical.state,
+        &vertical.state,
         &vertical.peer,
         Request::AwsCallerIdentity {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -439,7 +439,7 @@ fn ending_the_session_stops_further_aws_calls() {
         Response::AwsCallerIdentity { .. }
     ));
     handle(
-        &mut vertical.state,
+        &vertical.state,
         &vertical.peer,
         Request::EndSession {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -543,9 +543,9 @@ fn a_binding_printed_never_prints_a_session() {
 /// the request `asv capabilities` and `asv discover` actually make.
 #[test]
 fn an_agent_asking_what_the_broker_can_do_is_told_about_aws() {
-    let mut vertical = Vertical::permitting();
+    let vertical = Vertical::permitting();
     let response = handle(
-        &mut vertical.state,
+        &vertical.state,
         &vertical.peer,
         Request::AgentInfo {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -568,9 +568,9 @@ fn an_agent_asking_what_the_broker_can_do_is_told_about_aws() {
 /// and it is asserted here because the increment above added a name to it.
 #[test]
 fn the_advertised_aws_capability_does_not_name_a_retrieval() {
-    let mut vertical = Vertical::permitting();
+    let vertical = Vertical::permitting();
     let response = handle(
-        &mut vertical.state,
+        &vertical.state,
         &vertical.peer,
         Request::AgentInfo {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,

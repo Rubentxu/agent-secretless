@@ -282,7 +282,7 @@ impl K8sClient {
                     .and_then(|value| target.join(value).ok());
 
                 if let Some(next) = next {
-                    if status >= 300 && status < 400 {
+                    if (300..400).contains(&status) {
                         return Ok(Redirect::Hop(next));
                     }
                 }

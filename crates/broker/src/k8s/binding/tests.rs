@@ -259,13 +259,11 @@ fn a_deployment_that_is_correct_would_not_pass_a_check_that_refused_everything()
 }
 
 /// # The binding
-///
 /// These need a `K8sBinding`, which the first version of this module could not
 /// build in a row: `K8sBinding::new` constructed the client, and constructing a
 /// client performs the DNS pin. Taking the client instead — the split
 /// `AwsBinding::new` already uses — makes the wiring testable without a
 /// network, and these are the rows that say so.
-
 fn binding(deployment: K8sDeployment) -> K8sBinding {
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;

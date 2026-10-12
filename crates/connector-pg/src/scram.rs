@@ -362,13 +362,6 @@ impl Scram {
             (true, true) => "complete",
         }
     }
-
-    /// The keys an operator would need to see if a bug report said the
-    /// exchange failed. Exposed for tests only.
-    #[cfg(test)]
-    fn client_nonce(&self) -> &str {
-        &self.client_nonce
-    }
 }
 
 /// `Hi`: PBKDF2-HMAC-SHA-256 with a single output block.

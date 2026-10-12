@@ -2404,7 +2404,7 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                 &repository,
             ) {
                 Ok(grant) => grant,
-                Err(refusal) => return refusal,
+                Err(refusal) => return *refusal,
             };
             // Parsed here rather than in the grant because only a manifest is
             // addressed by a reference; a blob is addressed by a digest and the
@@ -2466,7 +2466,7 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                 &repository,
             ) {
                 Ok(grant) => grant,
-                Err(refusal) => return refusal,
+                Err(refusal) => return *refusal,
             };
             let digest = match ContentDigest::parse(&digest) {
                 Ok(digest) => digest,
@@ -2519,7 +2519,7 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                 &repository,
             ) {
                 Ok(grant) => grant,
-                Err(refusal) => return refusal,
+                Err(refusal) => return *refusal,
             };
             let digest = match ContentDigest::parse(&digest) {
                 Ok(digest) => digest,
@@ -2572,7 +2572,7 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                 &repository,
             ) {
                 Ok(grant) => grant,
-                Err(refusal) => return refusal,
+                Err(refusal) => return *refusal,
             };
             let reference = match ImageReference::parse(&reference) {
                 Ok(reference) => reference,
@@ -2686,7 +2686,7 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
             // from "the broker signed this CSR" to "this session asked"
             // is the same string in both places.
             let ca = crate::tls_bridge::SessionCa::new(
-                &session.to_string(),
+                session.to_string(),
                 SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .map(|d| d.as_nanos() as u64)
@@ -3646,7 +3646,7 @@ impl BrokerState {
         )?;
         Ok(crate::registry_declaration::RegistryDeclaration {
             authority: requested,
-            credential: declaration.clone(),
+            credential: *declaration,
         })
     }
 
@@ -3685,7 +3685,7 @@ impl BrokerState {
         action: Action,
         registry: &str,
         repository: &str,
-    ) -> Result<RegistryGrant, Response> {
+    ) -> Result<RegistryGrant, Box<Response>> {
         let declaration = self
             .authorize_registry_action(session, peer, action, registry, repository)
             .map_err(|denial| *denial)?;
@@ -3698,13 +3698,13 @@ impl BrokerState {
             Ok(mut guard) => {
                 match guard.redeem_for(surrogate, session, OperationFamily::Registry, now_secs()) {
                     Ok(credential) => credential,
-                    Err(error) => return Err(surrogate_failure(error)),
+                    Err(error) => return Err(Box::new(surrogate_failure(error))),
                 }
             }
-            Err(poisoned) => return Err(Response::from(poisoned)),
+            Err(poisoned) => return Err(Box::new(Response::from(poisoned))),
         };
         if credential != declaration.credential {
-            return Err(Response::Error {
+            return Err(Box::new(Response::Error {
                 code: ErrorCode::Denied,
                 message: format!(
                     "this surrogate stands for {}, and the registry {} is served by {}",
@@ -3712,19 +3712,16 @@ impl BrokerState {
                     declaration.authority,
                     declaration.credential.to_wire()
                 ),
-            });
+            }));
         }
-        let client = match self.registry_client(&declaration) {
-            Ok(client) => client,
-            Err(failure) => return Err(*failure),
-        };
+        let client = self.registry_client(&declaration)?;
         let audience = match self.connectors.resolve_registry(&declaration.authority) {
             Ok(audience) => audience,
             Err(error) => {
-                return Err(Response::Error {
+                return Err(Box::new(Response::Error {
                     code: registry_code(&error),
                     message: format!("{} is not reachable: {error}", declaration.authority),
-                })
+                }))
             }
         };
         // The repository was parsed inside `authorize_registry_action` to
@@ -3736,10 +3733,10 @@ impl BrokerState {
         let repository = match RepositoryName::parse(repository) {
             Ok(repository) => repository,
             Err(error) => {
-                return Err(Response::Error {
+                return Err(Box::new(Response::Error {
                     code: ErrorCode::InvalidRequest,
                     message: format!("the repository is not an OCI name: {error}"),
-                })
+                }))
             }
         };
         Ok(RegistryGrant {
@@ -4385,7 +4382,7 @@ impl BrokerState {
         self.connectors
             .registry(
                 declaration.authority.clone(),
-                declaration.credential.clone(),
+                declaration.credential,
                 Arc::clone(secrets),
             )
             .map_err(|error| Box::new(registry_failure(error)))
@@ -5055,9 +5052,9 @@ mod tests {
     /// key it was bound to.
     #[test]
     fn the_session_owner_binds_its_key_and_a_stranger_cannot() {
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
         let session = match handle(
-            &mut state,
+            &state,
             &peer(),
             Request::CreateSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5069,7 +5066,7 @@ mod tests {
         };
 
         let refused = handle(
-            &mut state,
+            &state,
             &stranger(),
             Request::RegisterSessionKey {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5094,7 +5091,7 @@ mod tests {
         );
 
         let accepted = handle(
-            &mut state,
+            &state,
             &peer(),
             Request::RegisterSessionKey {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5112,9 +5109,9 @@ mod tests {
 
     #[test]
     fn a_live_session_never_changes_the_key_it_was_bound_to() {
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
         let session = match handle(
-            &mut state,
+            &state,
             &peer(),
             Request::CreateSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5125,7 +5122,7 @@ mod tests {
             other => panic!("expected a session, got {other:?}"),
         };
         handle(
-            &mut state,
+            &state,
             &peer(),
             Request::RegisterSessionKey {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5137,7 +5134,7 @@ mod tests {
         // Even the owner cannot re-point a session the bridge has already
         // issued proofs for.
         let second = handle(
-            &mut state,
+            &state,
             &peer(),
             Request::RegisterSessionKey {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5164,10 +5161,10 @@ mod tests {
 
     #[test]
     fn registering_a_key_for_a_session_that_does_not_exist_is_refused() {
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
         let ghost = AgentSessionId::new();
         let outcome = handle(
-            &mut state,
+            &state,
             &peer(),
             Request::RegisterSessionKey {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5190,23 +5187,23 @@ mod tests {
 
     #[test]
     fn every_handled_request_is_audited_once() {
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
         handle(
-            &mut state,
+            &state,
             &peer(),
             Request::Ping {
                 protocol: PROTOCOL_VERSION,
             },
         );
         handle(
-            &mut state,
+            &state,
             &peer(),
             Request::ListCredentialMetadata {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             },
         );
         handle(
-            &mut state,
+            &state,
             &peer(),
             Request::EndSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5230,9 +5227,9 @@ mod tests {
 
     #[test]
     fn audit_query_is_denied_for_every_agent_peer() {
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
         let resp = handle(
-            &mut state,
+            &state,
             &peer(),
             Request::AuditQuery {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5262,7 +5259,7 @@ mod tests {
     /// this verb has no write path in reach.
     #[test]
     fn an_admitted_peer_reads_the_audit_chain_and_it_still_verifies() {
-        let mut state = BrokerState {
+        let state = BrokerState {
             control_plane: enrolment_of_this_binary(),
             ..BrokerState::default()
         };
@@ -5274,7 +5271,7 @@ mod tests {
         // itself: query(0) returns every record, including the one this
         // request just wrote.
         let _ = handle(
-            &mut state,
+            &state,
             &operator,
             Request::CreateSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5282,7 +5279,7 @@ mod tests {
             },
         );
         match handle(
-            &mut state,
+            &state,
             &operator,
             Request::AuditQuery {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5324,9 +5321,9 @@ mod tests {
     #[test]
     fn canary_in_request_fields_never_reaches_audit_records() {
         const CANARY: &str = "ASV-CANARY-7f3c9a11-BROKER-AUDIT";
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
         handle(
-            &mut state,
+            &state,
             &peer(),
             Request::CreateSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5341,9 +5338,9 @@ mod tests {
 
     #[test]
     fn ping_reports_the_broker_protocol_version() {
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
         let resp = handle(
-            &mut state,
+            &state,
             &peer(),
             Request::Ping {
                 protocol: PROTOCOL_VERSION,
@@ -5360,8 +5357,8 @@ mod tests {
     /// A stale client must be rejected, not served in a degraded mode.
     #[test]
     fn version_mismatch_is_an_error_response() {
-        let mut state = BrokerState::default();
-        let resp = handle(&mut state, &peer(), Request::Ping { protocol: 0 });
+        let state = BrokerState::default();
+        let resp = handle(&state, &peer(), Request::Ping { protocol: 0 });
         match resp {
             Response::Error { code, .. } => assert_eq!(code, ErrorCode::VersionMismatch),
             other => panic!("expected an error, got {other:?}"),
@@ -5370,9 +5367,9 @@ mod tests {
 
     #[test]
     fn session_lifecycle_is_observable() {
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
         let session = match handle(
-            &mut state,
+            &state,
             &peer(),
             Request::CreateSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5386,7 +5383,7 @@ mod tests {
 
         assert_eq!(
             handle(
-                &mut state,
+                &state,
                 &peer(),
                 Request::EndSession {
                     protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5399,7 +5396,7 @@ mod tests {
 
         // Second revoke must report honestly instead of pretending.
         match handle(
-            &mut state,
+            &state,
             &peer(),
             Request::EndSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5420,7 +5417,7 @@ mod tests {
     /// somebody else, which is not the same answer as "no such session".
     #[test]
     fn ending_another_peers_session_is_denied_and_leaves_it_alive() {
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
         let owner = peer();
         let intruder = WorkloadIdentity::from_peer(PeerCredentials {
             pid: owner.credentials.pid + 1,
@@ -5430,7 +5427,7 @@ mod tests {
         let session = sess(&state).create("/repo".into(), &owner);
 
         match handle(
-            &mut state,
+            &state,
             &intruder,
             Request::EndSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5455,7 +5452,7 @@ mod tests {
         // And the rightful owner can still end it.
         assert_eq!(
             handle(
-                &mut state,
+                &state,
                 &owner,
                 Request::EndSession {
                     protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5469,10 +5466,10 @@ mod tests {
 
     #[test]
     fn protected_push_requires_exact_single_use_approval() {
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
         let peer = peer();
         let session = match handle(
-            &mut state,
+            &state,
             &peer,
             Request::CreateSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5499,7 +5496,7 @@ mod tests {
 
         // The agent path cannot mint an approval, so the gate holds closed.
         let unapproved = handle(
-            &mut state,
+            &state,
             &peer,
             Request::Authorize {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5518,7 +5515,7 @@ mod tests {
         let approval = state.policy.issue_approval(&request, 60, 1);
 
         let first = handle(
-            &mut state,
+            &state,
             &peer,
             Request::Authorize {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5532,7 +5529,7 @@ mod tests {
         );
 
         let replay = handle(
-            &mut state,
+            &state,
             &peer,
             Request::Authorize {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5552,10 +5549,10 @@ mod tests {
     /// agent supplies it. If this test fails, an agent can approve itself.
     #[test]
     fn agent_cannot_submit_its_own_approval() {
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
         let agent_peer = peer();
         let session = match handle(
-            &mut state,
+            &state,
             &agent_peer,
             Request::CreateSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5580,7 +5577,7 @@ mod tests {
             },
         };
         match handle(
-            &mut state,
+            &state,
             &agent_peer,
             Request::SubmitApproval {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5622,7 +5619,7 @@ mod tests {
         // a high-risk request is blocked until an admitted control-plane peer
         // approves it; the approval binds the exact request; one use; the
         // replay is refused as consumed.
-        let mut state = BrokerState {
+        let state = BrokerState {
             control_plane: enrolment_of_this_binary(),
             ..BrokerState::default()
         };
@@ -5640,7 +5637,7 @@ mod tests {
         // both sides. Custody of the enrolment is what makes the operator the
         // operator; the socket is shared by design (see admission docs).
         let session = match handle(
-            &mut state,
+            &state,
             &operator,
             Request::CreateSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5668,7 +5665,7 @@ mod tests {
         // 1. Without an approval the high-risk request is blocked, with a
         //    decision that names what it wants.
         let blocked = match handle(
-            &mut state,
+            &state,
             &operator,
             Request::Authorize {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5692,7 +5689,7 @@ mod tests {
         // 2. The admitted operator submits the approval for exactly this
         //    request and gets the minted approval back.
         let approval = match handle(
-            &mut state,
+            &state,
             &operator,
             Request::SubmitApproval {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5710,7 +5707,7 @@ mod tests {
 
         // 3. The agent presents the approval id: the push goes through, once.
         let spent = match handle(
-            &mut state,
+            &state,
             &operator,
             Request::Authorize {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5731,7 +5728,7 @@ mod tests {
         // 4. Allow once: the replay is refused as consumed, and the refusal
         //    is the policy's own reason, reached over the same handler.
         let replay = match handle(
-            &mut state,
+            &state,
             &operator,
             Request::Authorize {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5759,7 +5756,7 @@ mod tests {
         let mut other_request = request.clone();
         other_request.context.request_digest = Some("other-digest".into());
         let other_approval = match handle(
-            &mut state,
+            &state,
             &operator,
             Request::SubmitApproval {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5771,7 +5768,7 @@ mod tests {
             other => panic!("the second mint must also succeed: {other:?}"),
         };
         let mismatch = match handle(
-            &mut state,
+            &state,
             &operator,
             Request::Authorize {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5800,10 +5797,10 @@ mod tests {
     /// would be decided against a lie the caller invented.
     #[test]
     fn policy_context_peer_uid_is_overwritten_by_kernel_evidence() {
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
         let agent_peer = peer();
         let session = match handle(
-            &mut state,
+            &state,
             &agent_peer,
             Request::CreateSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5850,7 +5847,7 @@ mod tests {
         );
 
         let resp = handle(
-            &mut state,
+            &state,
             &peer(),
             Request::ListCredentialMetadata {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -5899,7 +5896,7 @@ mod tests {
         let mut refusals = Vec::new();
         for (label, id) in [("known", known), ("ghost", ghost)] {
             match handle(
-                &mut state,
+                &state,
                 &peer(),
                 Request::DeleteCredential {
                     protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6054,7 +6051,7 @@ mod tests {
         // it, so these tests start from the state a real broker is in rather
         // than from a hand-built mirror that could be wrong in a way the test
         // would then happily confirm.
-        crate::inventory::load(&mut state, &store.lock().expect("lock"));
+        crate::inventory::load(&state, &store.lock().expect("lock"));
         state.vault_writer = Some(Arc::new(VaultWritePort::new(
             Arc::clone(&store),
             Arc::clone(&key),
@@ -6088,7 +6085,7 @@ mod tests {
     /// mistake this test exists to avoid.
     #[test]
     fn an_admitted_delete_reaches_the_vault_file() {
-        let (_dir, path, mut state, id) = wired_vault();
+        let (_dir, path, state, id) = wired_vault();
         let pass = secrecy::SecretString::from("delete-write-through".to_string());
         let peer = admitted_peer();
 
@@ -6097,7 +6094,7 @@ mod tests {
         assert_eq!(before.list().len(), 1, "the fixture holds one credential");
 
         match handle(
-            &mut state,
+            &state,
             &peer,
             Request::DeleteCredential {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6129,11 +6126,11 @@ mod tests {
     /// has. The mirror image of the create path's original defect.
     #[test]
     fn an_admitted_delete_takes_the_credential_out_of_the_inventory() {
-        let (_dir, _path, mut state, id) = wired_vault();
+        let (_dir, _path, state, id) = wired_vault();
         let peer = admitted_peer();
 
         handle(
-            &mut state,
+            &state,
             &peer,
             Request::DeleteCredential {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6151,7 +6148,7 @@ mod tests {
             "the mirror still advertises a deleted credential"
         );
         match handle(
-            &mut state,
+            &state,
             &peer,
             Request::ListCredentialMetadata {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6303,7 +6300,7 @@ mod tests {
         assert_eq!(reg(&state).len(), 1, "a token is in flight");
 
         match handle(
-            &mut state,
+            &state,
             &peer,
             Request::DeleteCredential {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6348,7 +6345,7 @@ mod tests {
     /// pass against a registry still lying about what is live.
     #[test]
     fn tokens_minted_before_a_revocation_stop_working_and_stop_counting() {
-        let (_dir, _path, mut state, id) = wired_vault();
+        let (_dir, _path, state, id) = wired_vault();
         let peer = admitted_peer();
 
         let session = sess(&state).create("/repo".to_string(), &peer);
@@ -6372,7 +6369,7 @@ mod tests {
         }
 
         handle(
-            &mut state,
+            &state,
             &peer,
             Request::DeleteCredential {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6414,12 +6411,12 @@ mod tests {
     /// dishonest option here.
     #[test]
     fn an_admitted_caller_is_told_a_ghost_id_does_not_exist() {
-        let (_dir, _path, mut state, id) = wired_vault();
+        let (_dir, _path, state, id) = wired_vault();
         let peer = admitted_peer();
         let ghost = CredentialId::new();
 
         let response = handle(
-            &mut state,
+            &state,
             &peer,
             Request::DeleteCredential {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6455,9 +6452,9 @@ mod tests {
     #[test]
     fn no_refusal_claims_a_capability_the_broker_actually_has() {
         // An unpinned peer, which is the state every other test runs in.
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
         let message = match handle(
-            &mut state,
+            &state,
             &peer(),
             Request::DeleteCredential {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6483,12 +6480,12 @@ mod tests {
         // there genuinely is no writer. Built in one expression rather than
         // assigned after `default()`, so the state under test is visible in
         // the fixture rather than one line away from it.
-        let mut unwired = BrokerState {
+        let unwired = BrokerState {
             control_plane: enrolment_of_this_binary(),
             ..BrokerState::default()
         };
         let message = match handle(
-            &mut unwired,
+            &unwired,
             &admitted_peer(),
             Request::DeleteCredential {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6526,7 +6523,7 @@ mod tests {
         let mut messages = Vec::new();
         for (label, target) in [("known", id), ("ghost", ghost)] {
             match handle(
-                &mut state,
+                &state,
                 &peer,
                 Request::DeleteCredential {
                     protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6581,9 +6578,9 @@ mod tests {
     #[test]
     fn canary_never_crosses_the_response_boundary() {
         const CANARY: &str = "ASV-CANARY-5b2f8a31-DO-NOT-LEAK";
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
         let resp = handle(
-            &mut state,
+            &state,
             &peer(),
             Request::CreateSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6696,8 +6693,8 @@ mod surrogate_tests {
             )
             .expect("insert");
 
-        let mut state = BrokerState::default();
-        let loaded = crate::inventory::load(&mut state, &store);
+        let state = BrokerState::default();
+        let loaded = crate::inventory::load(&state, &store);
         assert_eq!(
             loaded,
             crate::inventory::InventoryLoad {
@@ -6718,7 +6715,7 @@ mod surrogate_tests {
         );
 
         match handle(
-            &mut state,
+            &state,
             &peer,
             Request::MintSurrogate {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6738,14 +6735,14 @@ mod surrogate_tests {
     /// inventory did not turn the check into a rubber stamp.
     #[test]
     fn minting_still_refuses_a_credential_the_broker_does_not_hold() {
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
         let peer = pinned_peer();
         let session = sess(&state).create("/repo".to_string(), &peer);
         let unknown = CredentialId::new();
         let unknown_wire = unknown.to_wire();
 
         match handle(
-            &mut state,
+            &state,
             &peer,
             Request::MintSurrogate {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6774,10 +6771,10 @@ mod surrogate_tests {
     /// Without this test, "directed" is indistinguishable from "global deny".
     #[test]
     fn an_unpinned_session_can_still_create_and_end_sessions() {
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
         let peer = unpinned_peer();
         let session = match handle(
-            &mut state,
+            &state,
             &peer,
             Request::CreateSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6793,7 +6790,7 @@ mod surrogate_tests {
         );
         assert_eq!(
             handle(
-                &mut state,
+                &state,
                 &peer,
                 Request::EndSession {
                     protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6808,11 +6805,11 @@ mod surrogate_tests {
     /// And the narrow refusal that D4 actually asks for.
     #[test]
     fn an_unpinned_peer_cannot_mint_a_surrogate() {
-        let (mut state, credential) = state_with_credential();
+        let (state, credential) = state_with_credential();
         let peer = unpinned_peer();
         let session = sess(&state).create("/repo".to_string(), &peer);
         match handle(
-            &mut state,
+            &state,
             &peer,
             Request::MintSurrogate {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6845,7 +6842,7 @@ mod surrogate_tests {
         // makes the session a real boundary rather than bookkeeping.
         assert_eq!(
             handle(
-                &mut state,
+                &state,
                 &peer,
                 Request::EndSession {
                     protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6867,7 +6864,7 @@ mod surrogate_tests {
     /// confirm the id exists.
     #[test]
     fn a_session_cannot_be_used_by_a_stranger() {
-        let (mut state, credential) = state_with_credential();
+        let (state, credential) = state_with_credential();
         let owner = pinned_peer();
         let session = sess(&state).create("/repo".to_string(), &owner);
 
@@ -6878,7 +6875,7 @@ mod surrogate_tests {
             gid: unsafe { libc::getgid() },
         });
         match handle(
-            &mut state,
+            &state,
             &stranger,
             Request::MintSurrogate {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6899,11 +6896,11 @@ mod surrogate_tests {
     /// a client error.
     #[test]
     fn an_unknown_credential_is_refused_at_mint_time() {
-        let mut state = BrokerState::default();
+        let state = BrokerState::default();
         let peer = pinned_peer();
         let session = sess(&state).create("/repo".to_string(), &peer);
         match handle(
-            &mut state,
+            &state,
             &peer,
             Request::MintSurrogate {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6924,11 +6921,11 @@ mod surrogate_tests {
     /// real number instead of the one it asked for.
     #[test]
     fn a_client_cannot_widen_its_own_surrogate_budget() {
-        let (mut state, credential) = state_with_credential();
+        let (state, credential) = state_with_credential();
         let peer = pinned_peer();
         let session = sess(&state).create("/repo".to_string(), &peer);
         match handle(
-            &mut state,
+            &state,
             &peer,
             Request::MintSurrogate {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6962,7 +6959,7 @@ mod surrogate_tests {
         // A stranger's revoke, under their own session, must not touch it.
         let other_session = sess(&state).create("/other".to_string(), &peer);
         match handle(
-            &mut state,
+            &state,
             &peer,
             Request::RevokeSurrogate {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -6978,7 +6975,7 @@ mod surrogate_tests {
         // The owner can.
         assert_eq!(
             handle(
-                &mut state,
+                &state,
                 &peer,
                 Request::RevokeSurrogate {
                     protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7033,7 +7030,7 @@ mod surrogate_tests {
                 body: "b".into(),
             },
         ] {
-            match handle(&mut state, &peer, request) {
+            match handle(&state, &peer, request) {
                 Response::Error { code, message } => {
                     assert_eq!(code, ErrorCode::Denied, "got {message:?}");
                     // The refusal has to say *why*, or an operator reads
@@ -7063,7 +7060,7 @@ mod surrogate_tests {
         let session = sess(&state).create("/repo".to_string(), &peer);
 
         let response = handle(
-            &mut state,
+            &state,
             &peer,
             Request::MintSurrogate {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7094,7 +7091,7 @@ mod surrogate_tests {
         let (session, _) = mint(&mut state, &peer);
         assert_eq!(reg(&state).len(), 1, "one token is live");
         handle(
-            &mut state,
+            &state,
             &peer,
             Request::EndSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7263,7 +7260,7 @@ mod e2e {
         peer.pin_pidfd().expect("pidfd_open on self");
         let session = sess(&state).create("/repo".to_string(), &peer);
         let token = match handle(
-            &mut state,
+            &state,
             &peer,
             Request::MintSurrogate {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7297,10 +7294,10 @@ mod e2e {
     /// the provider answers, and the agent gets the three promised fields.
     #[test]
     fn a_read_issue_sends_the_credential_and_returns_only_the_promised_fields() {
-        let (mut state, peer, session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
+        let (state, peer, session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
 
         let response = handle(
-            &mut state,
+            &state,
             &peer,
             Request::ReadIssue {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7345,7 +7342,7 @@ mod e2e {
     /// the same token fails as exhausted.
     #[test]
     fn a_create_issue_spends_one_use_and_a_second_attempt_is_exhausted() {
-        let (mut state, peer, session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
+        let (state, peer, session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
         let request = |surrogate: String| Request::CreateIssue {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
             session,
@@ -7355,7 +7352,7 @@ mod e2e {
             body: "b".into(),
         };
 
-        let first = handle(&mut state, &peer, request(token.clone()));
+        let first = handle(&state, &peer, request(token.clone()));
         assert_eq!(
             first,
             Response::IssueCreated {
@@ -7364,14 +7361,14 @@ mod e2e {
             }
         );
 
-        let second = handle(&mut state, &peer, request(token.clone()));
+        let second = handle(&state, &peer, request(token.clone()));
         // max_uses was 2, so the second call is the last one that can work.
         assert!(
             !matches!(second, Response::Error { .. }),
             "the second use was refused: {second:?}"
         );
 
-        let third = handle(&mut state, &peer, request(token));
+        let third = handle(&state, &peer, request(token));
         assert_eq!(
             third,
             Response::Error {
@@ -7397,11 +7394,11 @@ mod e2e {
     /// is not owned by the caller) and has its own test above.
     #[test]
     fn a_surrogate_from_another_session_of_the_same_peer_is_refused() {
-        let (mut state, peer, _session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
+        let (state, peer, _session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
         let other = sess(&state).create("/other".to_string(), &peer);
 
         let response = handle(
-            &mut state,
+            &state,
             &peer,
             Request::ReadIssue {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7432,7 +7429,7 @@ mod e2e {
     /// A session belonging to another process is refused before anything else.
     #[test]
     fn a_session_belonging_to_another_process_is_refused() {
-        let (mut state, peer, _session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
+        let (state, peer, _session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
         // A different pid, which is what `belongs_to` actually compares. A
         // same-pid-different-uid fixture would not exercise the check: the
         // broker records the pid at session creation and compares pids, so
@@ -7448,7 +7445,7 @@ mod e2e {
         let foreign = sess(&state).create("/theirs".to_string(), &stranger);
 
         let response = handle(
-            &mut state,
+            &state,
             &peer,
             Request::ReadIssue {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7496,7 +7493,7 @@ mod e2e {
         state.surrogates = Arc::new(Mutex::new(SurrogateRegistry::default()));
         let credential = state.credentials.lock().expect("not poisoned")[0].id;
         let token = match handle(
-            &mut state,
+            &state,
             &peer,
             Request::MintSurrogate {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7511,7 +7508,7 @@ mod e2e {
         };
 
         let refused = handle(
-            &mut state,
+            &state,
             &peer,
             Request::ReadIssue {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7538,7 +7535,7 @@ mod e2e {
         // The one use is still there. If the broker validated after redeeming,
         // this would be `SurrogateExhausted`.
         let ok = handle(
-            &mut state,
+            &state,
             &peer,
             Request::ReadIssue {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7558,10 +7555,10 @@ mod e2e {
     /// says nothing about what does exist.
     #[test]
     fn an_unknown_token_never_reaches_the_provider() {
-        let (mut state, peer, session, _token, origin, _dir) = brokered(Reply::Json(issue_json()));
+        let (state, peer, session, _token, origin, _dir) = brokered(Reply::Json(issue_json()));
 
         let response = handle(
-            &mut state,
+            &state,
             &peer,
             Request::ReadIssue {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7586,10 +7583,10 @@ mod e2e {
     /// was valid a moment ago is now refused.
     #[test]
     fn ending_a_session_revokes_its_surrogates() {
-        let (mut state, peer, session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
+        let (state, peer, session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
 
         let before = handle(
-            &mut state,
+            &state,
             &peer,
             Request::ReadIssue {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7605,7 +7602,7 @@ mod e2e {
         );
 
         handle(
-            &mut state,
+            &state,
             &peer,
             Request::EndSession {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7614,7 +7611,7 @@ mod e2e {
         );
 
         let after = handle(
-            &mut state,
+            &state,
             &peer,
             Request::ReadIssue {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7647,13 +7644,13 @@ mod e2e {
     /// provider's own body is not.
     #[test]
     fn an_upstream_failure_is_reported_as_upstream_and_carries_no_body() {
-        let (mut state, peer, session, token, origin, _dir) = brokered(Reply::Status {
+        let (state, peer, session, token, origin, _dir) = brokered(Reply::Status {
             status: 404,
             body: "{\"message\":\"MUST-NOT-BE-FORWARDED\"}".into(),
         });
 
         let response = handle(
-            &mut state,
+            &state,
             &peer,
             Request::ReadIssue {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7685,7 +7682,7 @@ mod e2e {
     /// broker forwards only the two identity fields back.
     #[test]
     fn a_create_release_sends_the_tag_and_returns_only_tag_and_url() {
-        let (mut state, peer, session, token, origin, _dir) = brokered(Reply::Json(
+        let (state, peer, session, token, origin, _dir) = brokered(Reply::Json(
             serde_json::json!({
                 "tag_name": "v1.2.3",
                 "html_url": "https://github.com/o/r/releases/v1.2.3",
@@ -7695,7 +7692,7 @@ mod e2e {
         ));
 
         let response = handle(
-            &mut state,
+            &state,
             &peer,
             Request::CreateRelease {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7736,10 +7733,10 @@ mod e2e {
     /// could redirect the credential elsewhere.
     #[test]
     fn the_request_cannot_choose_the_audience() {
-        let (mut state, peer, session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
+        let (state, peer, session, token, origin, _dir) = brokered(Reply::Json(issue_json()));
 
         let response = handle(
-            &mut state,
+            &state,
             &peer,
             Request::ReadIssue {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7810,7 +7807,7 @@ mod e2e {
         let session = sess(&state).create("/repo".into(), &peer);
         state.secrets = Some(Arc::new(RefusingPort));
         let response = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresConnect {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7839,7 +7836,7 @@ mod e2e {
         let peer = self_peer();
         state.secrets = Some(Arc::new(RefusingPort));
         let response = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresQuery {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7858,11 +7855,11 @@ mod e2e {
         // A PostgreSQL server that would accept an anonymous connection is not
         // a reason to try one. The broker holds the credential or it does
         // nothing.
-        let mut state = bare();
+        let state = bare();
         let peer = self_peer();
         let session = sess(&state).create("/repo".into(), &peer);
         let response = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresQuery {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7887,7 +7884,7 @@ mod e2e {
         let port = Arc::new(CountingPort::default());
         state.secrets = Some(port.clone());
         let response = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresConnect {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7924,7 +7921,7 @@ mod e2e {
         let session = sess(&state).create("/repo".into(), &peer);
         state.secrets = Some(Arc::new(RefusingPort));
         let response = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresRevoke {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7948,7 +7945,7 @@ mod e2e {
         state.secrets = Some(Arc::new(RefusingPort));
         state.runtime = Some(test_runtime());
         let response = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresQuery {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -7969,11 +7966,11 @@ mod e2e {
     /// credential, which is not the same as being unauthorised.
     #[test]
     fn k8s_read_refuses_a_credential_that_is_not_a_vault_id() {
-        let mut state = bare();
+        let state = bare();
         let peer = self_peer();
         let session = sess(&state).create("/repo".into(), &peer);
         match handle(
-            &mut state,
+            &state,
             &peer,
             Request::K8sRead {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -8025,10 +8022,10 @@ mod e2e {
                 },
             ),
         ] {
-            let mut state = bare();
+            let state = bare();
             let session = sess(&state).create("/repo".into(), &peer);
             req.session = session;
-            let response = handle(&mut state, &peer, req.into());
+            let response = handle(&state, &peer, req.into());
             match response {
                 Response::Error { code, message } => {
                     assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
@@ -8055,7 +8052,7 @@ mod e2e {
                 ("resource", "resource"),
                 ("name", "name"),
             ] {
-                let mut state = bare();
+                let state = bare();
                 let session = sess(&state).create("/repo".into(), &peer);
                 let mut req = K8sReadReq::ok("default", "configmap", "app");
                 *match field {
@@ -8065,7 +8062,7 @@ mod e2e {
                     _ => unreachable!(),
                 } = format!("seg{bad}ment");
                 req.session = session;
-                let response = handle(&mut state, &peer, req.into());
+                let response = handle(&state, &peer, req.into());
                 match response {
                     Response::Error { code, message } => {
                         assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
@@ -8100,11 +8097,11 @@ mod e2e {
     /// configured-but-unsigned message go unnoticed.
     #[test]
     fn k8s_read_without_a_binding_refuses_by_credential() {
-        let mut state = bare();
+        let state = bare();
         let peer = self_peer();
         let session = sess(&state).create("/repo".into(), &peer);
         match handle(
-            &mut state,
+            &state,
             &peer,
             Request::K8sRead {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -8170,7 +8167,7 @@ mod e2e {
             .pem()
             .expect("the request PEM-encodes");
         let response = handle(
-            &mut state,
+            &state,
             &peer,
             Request::MTlsSign {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -8241,11 +8238,11 @@ mod e2e {
     /// deployment is `InvalidRequest`, not `Denied`.
     #[test]
     fn mtls_sign_refuses_a_credential_that_is_not_a_vault_id() {
-        let mut state = bare();
+        let state = bare();
         let peer = self_peer();
         let session = sess(&state).create("/repo".into(), &peer);
         match handle(
-            &mut state,
+            &state,
             &peer,
             Request::MTlsSign {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -8275,10 +8272,10 @@ mod e2e {
             ("missing-end", &"x".repeat(80)),
             ("missing-begin", &"x".repeat(80)),
         ] {
-            let mut state = bare();
+            let state = bare();
             let session = sess(&state).create("/repo".into(), &peer);
             match handle(
-                &mut state,
+                &state,
                 &peer,
                 Request::MTlsSign {
                     protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -8322,7 +8319,7 @@ mod e2e {
         let peer = self_peer();
         let session = sess(&state).create("/repo".into(), &peer);
         match handle(
-            &mut state,
+            &state,
             &peer,
             Request::MTlsSign {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -8359,11 +8356,11 @@ mod e2e {
     /// configured-but-unsigned message go unnoticed.
     #[test]
     fn mtls_sign_without_a_signer_refuses_by_credential() {
-        let mut state = bare();
+        let state = bare();
         let peer = self_peer();
         let session = sess(&state).create("/repo".into(), &peer);
         match handle(
-            &mut state,
+            &state,
             &peer,
             Request::MTlsSign {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,

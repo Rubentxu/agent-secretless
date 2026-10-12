@@ -158,7 +158,7 @@ impl Fixture {
                 SecretBytes::new(OLD_TOKEN.as_bytes().to_vec()),
             )
             .expect("insert credential");
-        asv_broker::inventory::load(&mut state, &store);
+        asv_broker::inventory::load(&state, &store);
 
         // One store instance behind a lock, the shape `main.rs` builds: the
         // lending port takes `&self` and a writer would need `&mut self`.
@@ -213,7 +213,7 @@ impl Fixture {
     fn mint(&mut self, max_uses: u32) -> String {
         let credential = self.credential_id();
         match handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::MintSurrogate {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -232,7 +232,7 @@ impl Fixture {
     /// actually received for it.
     fn read_authorization(&mut self, surrogate: &str) -> Option<String> {
         let response = handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::ReadIssue {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,

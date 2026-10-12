@@ -128,9 +128,10 @@ fn template(name: &str, binary: &str, args: &[&str]) -> WorkerTemplate {
 }
 
 fn state_with(workers: Vec<WorkerTemplate>) -> BrokerState {
-    let mut state = BrokerState::default();
-    state.workers = std::sync::Arc::new(WorkerRegistry::new(workers));
-    state
+    BrokerState {
+        workers: std::sync::Arc::new(WorkerRegistry::new(workers)),
+        ..BrokerState::default()
+    }
 }
 
 /// A broker that declares no workers at all, which is the state of every real
@@ -234,7 +235,7 @@ fn r1_a_request_on_the_public_surface_runs_a_real_isolated_process() {
     let session = open_session(&mut state, &peer);
 
     let response = handle(
-        &mut state,
+        &state,
         &peer,
         request(session, "echoer", &["hello-from-r1"]),
     );
@@ -281,7 +282,7 @@ fn r1_caller_arguments_reach_the_child_as_arguments() {
     let session = open_session(&mut state, &peer);
 
     let hostile = "sh -c 'id > /tmp/asv-r1-should-not-exist'";
-    let response = handle(&mut state, &peer, request(session, "echoer", &[hostile]));
+    let response = handle(&state, &peer, request(session, "echoer", &[hostile]));
 
     match response {
         Response::IsolatedResult { stdout, .. } => {
@@ -309,7 +310,7 @@ fn r1_an_unregistered_worker_is_refused_before_anything_executes() {
     let mut state = state_with(vec![template("echoer", "/bin/echo", &[])]);
     let session = open_session(&mut state, &peer);
 
-    let response = handle(&mut state, &peer, request(session, "not-registered", &[]));
+    let response = handle(&state, &peer, request(session, "not-registered", &[]));
 
     match response {
         Response::Error { code, message } => {
@@ -332,7 +333,7 @@ fn r1_a_broker_with_no_declared_workers_runs_nothing() {
     let mut state = state_without_workers();
     let session = open_session(&mut state, &peer);
 
-    match handle(&mut state, &peer, request(session, "echoer", &[])) {
+    match handle(&state, &peer, request(session, "echoer", &[])) {
         Response::Error { code, .. } => assert_eq!(code, ErrorCode::InvalidRequest),
         other => panic!("expected a refusal, got {other:?}"),
     }
@@ -347,7 +348,7 @@ fn r1_an_unpinned_session_is_refused() {
     let mut state = state_with(vec![template("echoer", "/bin/echo", &[])]);
     let session = open_session(&mut state, &peer);
 
-    match handle(&mut state, &peer, request(session, "echoer", &["nope"])) {
+    match handle(&state, &peer, request(session, "echoer", &["nope"])) {
         Response::Error { code, message } => {
             assert_eq!(code, ErrorCode::Denied);
             assert!(
@@ -369,7 +370,7 @@ fn r1_a_session_the_peer_does_not_own_is_refused() {
     let mut state = state_with(vec![template("echoer", "/bin/echo", &[])]);
     let session = open_session(&mut state, &owner);
 
-    match handle(&mut state, &stranger, request(session, "echoer", &["nope"])) {
+    match handle(&state, &stranger, request(session, "echoer", &["nope"])) {
         Response::Error { code, .. } => assert_eq!(code, ErrorCode::Denied),
         other => panic!("expected a refusal, got {other:?}"),
     }
@@ -386,7 +387,7 @@ fn r1_an_isolated_run_is_recorded_in_the_audit_chain() {
     let mut state = state_with(vec![template("echoer", "/bin/echo", &[])]);
     let session = open_session(&mut state, &peer);
 
-    let _ = handle(&mut state, &peer, request(session, "echoer", &["audited"]));
+    let _ = handle(&state, &peer, request(session, "echoer", &["audited"]));
 
     let records = state.audit.lock().expect("audit lock").query(0);
     let spawns: Vec<_> = records
@@ -422,7 +423,7 @@ fn r1_a_refused_isolated_run_is_also_audited() {
     let mut state = state_with(vec![template("echoer", "/bin/echo", &[])]);
     let session = open_session(&mut state, &peer);
 
-    let _ = handle(&mut state, &peer, request(session, "not-registered", &[]));
+    let _ = handle(&state, &peer, request(session, "not-registered", &[]));
 
     let records = state.audit.lock().expect("audit lock").query(0);
     // The refusal is recorded by the dispatcher's own wrapper before the
@@ -483,7 +484,7 @@ fn r1_a_lent_credential_does_not_come_back_in_the_response() {
     let session = open_session(&mut state, &peer);
 
     let response = handle(
-        &mut state,
+        &state,
         &peer,
         Request::RunIsolated {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -537,7 +538,7 @@ fn r1_the_injected_credential_reaches_the_child() {
     let session = open_session(&mut state, &peer);
 
     let response = handle(
-        &mut state,
+        &state,
         &peer,
         Request::RunIsolated {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,

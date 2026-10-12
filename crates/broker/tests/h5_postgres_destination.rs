@@ -139,7 +139,7 @@ fn harness() -> Harness {
 impl Harness {
     fn connect(&mut self, host: &str, host_addr: &str) -> Response {
         handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::PostgresConnect {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,

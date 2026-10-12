@@ -75,7 +75,7 @@ fn state_with_session_id() -> (
     String,
     asv_domain::AgentSessionId,
 ) {
-    let mut state = BrokerState::default();
+    let state = BrokerState::default();
     // The inventory is projected from a real vault record rather than seeded
     // through a test-only helper, so the credential a minted surrogate is
     // bound to came from the same path production uses. The vault is then
@@ -105,7 +105,7 @@ fn state_with_session_id() -> (
                 SecretBytes::new(CANARY.as_bytes().to_vec()),
             )
             .expect("insert");
-        asv_broker::inventory::load(&mut state, &store);
+        asv_broker::inventory::load(&state, &store);
     }
     assert_eq!(
         state.credentials.lock().expect("not poisoned").len(),
@@ -121,7 +121,7 @@ fn state_with_session_id() -> (
         .create("uat017".into(), &peer);
 
     let minted = handle(
-        &mut state,
+        &state,
         &peer,
         Request::MintSurrogate {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -234,7 +234,7 @@ fn a_broker_that_dies_mid_request_yields_no_response() {
 /// only thing missing is a credential. The test pins that it does not.
 #[test]
 fn a_live_broker_without_a_vault_refuses_instead_of_degrading() {
-    let (mut state, peer, token, session) = state_with_live_session();
+    let (state, peer, token, session) = state_with_live_session();
     assert!(
         state.secrets.is_none(),
         "the default state must have no vault, or this test proves nothing"
@@ -268,7 +268,7 @@ fn a_live_broker_without_a_vault_refuses_instead_of_degrading() {
             body: "b".into(),
         },
     ] {
-        let response = handle(&mut state, &peer, request.clone());
+        let response = handle(&state, &peer, request.clone());
         assert!(
             matches!(
                 response,
@@ -290,10 +290,10 @@ fn a_live_broker_without_a_vault_refuses_instead_of_degrading() {
 /// canary or any path to it.
 #[test]
 fn the_refusal_explains_the_missing_vault_without_leaking() {
-    let (mut state, peer, token, session) = state_with_live_session();
+    let (state, peer, token, session) = state_with_live_session();
 
     let response = handle(
-        &mut state,
+        &state,
         &peer,
         Request::ReadIssue {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -329,10 +329,10 @@ fn a_dead_broker_leaves_nothing_printable_behind() {
     // test in this crate proves production code never reads it.
     std::env::set_var("GITHUB_TOKEN", CANARY);
 
-    let (mut state, peer, token, session) = state_with_live_session();
+    let (state, peer, token, session) = state_with_live_session();
 
     let response = handle(
-        &mut state,
+        &state,
         &peer,
         Request::ReadIssue {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -388,7 +388,7 @@ fn state_loss_does_not_resurrect_a_session_or_surrogate() {
     // broker could plausibly reload its metadata from disk while having no
     // authority to redeem anything, and that is the closest thing to a real
     // restart this suite can build.
-    let mut restarted = BrokerState {
+    let restarted = BrokerState {
         credentials: std::sync::Arc::new(std::sync::Mutex::new(
             first.credentials.lock().expect("not poisoned").clone(),
         )),
@@ -396,7 +396,7 @@ fn state_loss_does_not_resurrect_a_session_or_surrogate() {
     };
 
     let response = handle(
-        &mut restarted,
+        &restarted,
         &peer,
         Request::ReadIssue {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -444,13 +444,13 @@ fn state_loss_does_not_resurrect_a_session_or_surrogate() {
 /// the retry is precisely the moment a naive implementation falls back.
 #[test]
 fn retrying_after_the_broker_restarts_is_still_denied() {
-    let (mut original, peer, token, session) = state_with_live_session();
+    let (original, peer, token, session) = state_with_live_session();
 
     // Control: the refusal must be attributable to the missing vault, not to
     // a malformed request. If this one ever stops being `Denied`, every
     // assertion below it is vacuous.
     let control = handle(
-        &mut original,
+        &original,
         &peer,
         Request::ReadIssue {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -472,9 +472,9 @@ fn retrying_after_the_broker_restarts_is_still_denied() {
     );
 
     // Broker restarts. Same token, same session id, same request.
-    let mut restarted = BrokerState::default();
+    let restarted = BrokerState::default();
     let second = handle(
-        &mut restarted,
+        &restarted,
         &peer,
         Request::ReadIssue {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,

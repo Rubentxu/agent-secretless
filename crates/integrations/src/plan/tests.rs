@@ -394,7 +394,7 @@ fn a_client_certificate_is_read_only() {
 #[test]
 fn the_entry_names_credential_audience_and_operations() {
     let credential = metadata("npm-registry", CredentialKind::BearerToken);
-    let plan = plan_npm(&token_discovery(), &[credential.clone()]);
+    let plan = plan_npm(&token_discovery(), std::slice::from_ref(&credential));
     let json = serde_json::to_string(&plan).expect("serialises");
 
     assert!(

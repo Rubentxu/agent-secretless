@@ -187,7 +187,7 @@ impl AwsSecretSink for SessionCall<'_> {
             )],
         );
         let signed = sign_with(&signer, &headers, BODY.as_bytes(), &amz_date)
-            .map_err(|error| StsError::IncompleteRequest(&leak_free(error)))?;
+            .map_err(|error| StsError::IncompleteRequest(leak_free(error)))?;
 
         self.answered = Some(
             self.client

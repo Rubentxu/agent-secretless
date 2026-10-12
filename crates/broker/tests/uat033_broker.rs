@@ -221,11 +221,11 @@ fn runtime() -> PgRuntime {
 with_substrate!(
     the_broker_connects_queries_and_revokes,
     |substrate: Substrate| {
-        let (mut state, peer, session, _dir) = brokered(&substrate);
+        let (state, peer, session, _dir) = brokered(&substrate);
 
         // Connect. The response names the pair the broker chose and nothing else.
         let connected = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresConnect {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -247,7 +247,7 @@ with_substrate!(
 
         // Query. The value comes from the server, not from the broker.
         let result = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresQuery {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -265,7 +265,7 @@ with_substrate!(
 
         // Revoke, and the answer must be an *observed* teardown.
         let revoked = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresRevoke {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -297,9 +297,9 @@ with_substrate!(
 with_substrate!(
     the_broker_process_never_carries_the_password,
     |substrate: Substrate| {
-        let (mut state, peer, session, _dir) = brokered(&substrate);
+        let (state, peer, session, _dir) = brokered(&substrate);
         let connected = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresConnect {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -337,7 +337,7 @@ with_substrate!(
         );
 
         let _ = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresRevoke {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -352,13 +352,13 @@ with_substrate!(
 with_substrate!(
     no_response_carries_the_credential,
     |substrate: Substrate| {
-        let (mut state, peer, session, _dir) = brokered(&substrate);
+        let (state, peer, session, _dir) = brokered(&substrate);
 
         // A wrong role names a credential the vault does not hold, so this is the
         // failure path: the broker asked, the vault said no, and the answer still
         // must not leak anything.
         let refused = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresConnect {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -374,7 +374,7 @@ with_substrate!(
 
         // And the success path, for the same reason.
         let connected = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresConnect {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -392,7 +392,7 @@ with_substrate!(
             "the response carried the credential: {rendered}"
         );
         let _ = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresRevoke {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -408,10 +408,10 @@ with_substrate!(
 with_substrate!(
     the_agent_cannot_substitute_a_role,
     |substrate: Substrate| {
-        let (mut state, peer, session, _dir) = brokered(&substrate);
+        let (state, peer, session, _dir) = brokered(&substrate);
 
         let wrong = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresConnect {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -480,7 +480,7 @@ with_substrate!(
         .expect("the M6-R5 policy parses and validates against the schema");
 
         let connected = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresConnect {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -500,7 +500,7 @@ with_substrate!(
         // The allowed half. If this fails, the gate is not selective, it is
         // just broken, and the denial below would prove nothing.
         let read = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresQuery {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -520,7 +520,7 @@ with_substrate!(
         // create_table, so the table is never created.
         let table = format!("m6_r5_denied_{}", unique_suffix());
         let create = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresQuery {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -543,7 +543,7 @@ with_substrate!(
         // a denial it invented. Asking through the allowed verb is the only
         // way left to ask.
         let probe = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresQuery {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -588,7 +588,7 @@ with_substrate!(
         assert!(
             matches!(
                 handle(
-                    &mut state,
+                    &state,
                     &peer,
                     Request::PostgresConnect {
                         protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -611,7 +611,7 @@ with_substrate!(
             "vacuum",
         ] {
             let response = handle(
-                &mut state,
+                &state,
                 &peer,
                 Request::PostgresQuery {
                     protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -653,7 +653,7 @@ with_substrate!(
         assert!(
             matches!(
                 handle(
-                    &mut state,
+                    &state,
                     &peer,
                     Request::PostgresConnect {
                         protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -675,7 +675,7 @@ with_substrate!(
         assert!(
             matches!(
                 handle(
-                    &mut state,
+                    &state,
                     &peer,
                     Request::PostgresQuery {
                         protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -698,7 +698,7 @@ with_substrate!(
             format!("explain analyze create table {prefix}b (id int)"),
         ] {
             let response = handle(
-                &mut state,
+                &state,
                 &peer,
                 Request::PostgresQuery {
                     protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -723,7 +723,7 @@ with_substrate!(
         // a lie, and asking through the permitted verb is the only way left to
         // ask.
         let probe = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresQuery { protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
@@ -761,7 +761,7 @@ with_substrate!(
         assert!(
             matches!(
                 handle(
-                    &mut state,
+                    &state,
                     &peer,
                     Request::PostgresConnect {
                         protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -783,7 +783,7 @@ with_substrate!(
         assert!(
             matches!(
                 handle(
-                    &mut state,
+                    &state,
                     &peer,
                     Request::PostgresQuery {
                         protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -810,7 +810,7 @@ with_substrate!(
         assert!(
             matches!(
                 handle(
-                    &mut state,
+                    &state,
                     &peer,
                     Request::PostgresQuery {
                         protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -830,7 +830,7 @@ with_substrate!(
         assert!(
             matches!(
                 handle(
-                    &mut state,
+                    &state,
                     &peer,
                     Request::PostgresQuery {
                         protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -882,7 +882,7 @@ with_substrate!(
         });
 
         let response = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresConnect {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -909,10 +909,10 @@ with_substrate!(
 with_substrate!(
     an_undeclared_host_is_refused_before_any_socket_is_opened,
     |substrate: Substrate| {
-        let (mut state, peer, session, _dir) = brokered(&substrate);
+        let (state, peer, session, _dir) = brokered(&substrate);
 
         let response = handle(
-            &mut state,
+            &state,
             &peer,
             Request::PostgresConnect {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,

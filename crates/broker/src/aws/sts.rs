@@ -650,7 +650,7 @@ fn parse_rfc3339(raw: &str) -> Result<SystemTime, StsError> {
     // Days since the epoch, by the civil-from-days inverse, so no date library
     // and no 32-bit-second overflow on a date after 2038.
     let days = super::calendar::days_from_civil(year as i64, month, day);
-    let seconds = days as i64 * 86_400 + (hour * 3600 + minute * 60 + second) as i64;
+    let seconds = days * 86_400 + (hour * 3600 + minute * 60 + second) as i64;
     if seconds < 0 {
         return Err(malformed());
     }

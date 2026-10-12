@@ -285,7 +285,7 @@ impl Vertical {
         let mut state = BrokerState::default();
         // Through the same inventory pass the broker runs at startup, so this
         // fixture cannot pass by seeding a field production never writes.
-        let loaded = asv_broker::inventory::load(&mut state, &store);
+        let loaded = asv_broker::inventory::load(&state, &store);
         assert_eq!(
             (loaded.loaded, loaded.skipped, loaded.collisions),
             (1, 0, 0),
@@ -398,7 +398,7 @@ impl Vertical {
 
     fn whoami(&mut self, credential: &str) -> Response {
         handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::OAuth2Identity {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -423,9 +423,9 @@ impl Vertical {
 /// is what this asserts. Genuinely another peer needs a second process.
 #[test]
 fn a_session_this_peer_does_not_own_is_refused_before_any_socket() {
-    let mut vertical = Vertical::permitting();
+    let vertical = Vertical::permitting();
     let response = handle(
-        &mut vertical.state,
+        &vertical.state,
         &vertical.peer,
         Request::OAuth2Identity {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -479,7 +479,7 @@ fn ending_the_session_stops_further_oauth2_calls() {
         Response::OAuth2Identity { .. }
     ));
     handle(
-        &mut vertical.state,
+        &vertical.state,
         &vertical.peer,
         Request::EndSession {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -544,7 +544,7 @@ fn a_broker_with_no_vault_open_refuses_before_any_socket() {
 /// yields invalid bytes is the only way to see the difference.
 #[test]
 fn a_token_that_is_not_a_bearer_token_is_refused_rather_than_substituted() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let _dir = tempfile::tempdir().expect("tempdir");
     let server = AuthorizationServer::start(AsClient::awkward());
     let host = Authority::canonicalize(server.host()).expect("canonical host");
 
@@ -620,7 +620,7 @@ fn a_token_that_is_not_a_bearer_token_is_refused_rather_than_substituted() {
 /// status says no.
 #[test]
 fn a_resource_answered_with_a_refusal_is_reported_as_one() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let _dir = tempfile::tempdir().expect("tempdir");
     let server = AuthorizationServer::start(AsClient::awkward());
     let host = Authority::canonicalize(server.host()).expect("canonical host");
 
@@ -887,10 +887,8 @@ fn a_deployment_pointing_at_another_audience_is_refused() {
     // The deployment asks the IdP for a token bound to a different resource than
     // the one it will present it to.
     let mut vertical = Vertical::new(
-        &format!(
-            r#"permit (principal, action == Action::"oauth2_identity",
-                   resource is OAuth2Client);"#
-        ),
+        r#"permit (principal, action == Action::"oauth2_identity",
+                   resource is OAuth2Client);"#,
         SCOPE,
     );
     // Re-point the deployment's declared audience at one the client is entitled

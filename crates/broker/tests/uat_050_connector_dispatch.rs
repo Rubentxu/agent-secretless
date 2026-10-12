@@ -97,10 +97,10 @@ fn reached_postgres(response: &Response) -> bool {
 #[test]
 fn m6_r1_a_postgres_request_routes_to_postgres() {
     let peer = self_peer();
-    let (mut state, session) = broker_with_session(&peer);
+    let (state, session) = broker_with_session(&peer);
 
     let response = handle(
-        &mut state,
+        &state,
         &peer,
         Request::PostgresConnect {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -134,13 +134,13 @@ fn m6_r1_a_postgres_request_routes_to_postgres() {
 #[test]
 fn m6_r1_an_http_request_naming_a_provider_does_not_route_to_postgres() {
     let peer = self_peer();
-    let (mut state, session) = broker_with_session(&peer);
+    let (state, session) = broker_with_session(&peer);
 
     // The repo is named after the provider this must NOT route to, and the
     // surrogate is a well-formed value so the request is refused for the
     // reason a real one would be, not for a malformed field.
     let response = handle(
-        &mut state,
+        &state,
         &peer,
         Request::CreateRelease {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -170,9 +170,9 @@ fn m6_r1_routing_follows_the_request_variant() {
     let peer = self_peer();
 
     // Same peer, same session-owning broker, two different request families.
-    let (mut pg_state, pg_session) = broker_with_session(&peer);
+    let (pg_state, pg_session) = broker_with_session(&peer);
     let pg_response = handle(
-        &mut pg_state,
+        &pg_state,
         &peer,
         Request::PostgresConnect {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -185,9 +185,9 @@ fn m6_r1_routing_follows_the_request_variant() {
         },
     );
 
-    let (mut http_state, http_session) = broker_with_session(&peer);
+    let (http_state, http_session) = broker_with_session(&peer);
     let http_response = handle(
-        &mut http_state,
+        &http_state,
         &peer,
         // The repo carries the same host the PostgreSQL request used.
         Request::ReadIssue {

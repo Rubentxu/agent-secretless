@@ -130,7 +130,7 @@ fn live() -> (Fixture, AgentSessionId, String) {
             SecretBytes::new(CANARY.as_bytes().to_vec()),
         )
         .expect("insert");
-    let loaded = asv_broker::inventory::load(&mut state, &store);
+    let loaded = asv_broker::inventory::load(&state, &store);
     assert_eq!(
         (loaded.loaded, loaded.skipped, loaded.collisions),
         (1, 0, 0),
@@ -168,7 +168,7 @@ fn live() -> (Fixture, AgentSessionId, String) {
         .create("/repo".into(), &peer);
 
     let minted = handle(
-        &mut state,
+        &state,
         &peer,
         Request::MintSurrogate {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -199,7 +199,7 @@ fn live() -> (Fixture, AgentSessionId, String) {
 /// the UAT is end-to-end and so the provider boundary is part of the claim.
 #[test]
 fn a_surrogate_copied_into_another_session_buys_nothing() {
-    let (mut fixture, _session, surrogate) = live();
+    let (fixture, _session, surrogate) = live();
     let other = fixture
         .state
         .sessions
@@ -208,7 +208,7 @@ fn a_surrogate_copied_into_another_session_buys_nothing() {
         .create("/other".into(), &fixture.peer);
 
     let response = handle(
-        &mut fixture.state,
+        &fixture.state,
         &fixture.peer,
         Request::ReadIssue {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -242,12 +242,12 @@ fn a_surrogate_copied_into_another_session_buys_nothing() {
 /// be, and the origin is a stand-in for GitHub's own validation.
 #[test]
 fn a_surrogate_sent_straight_to_the_provider_is_not_a_credential() {
-    let (mut fixture, session, surrogate) = live();
+    let (fixture, session, surrogate) = live();
 
     // Use the surrogate once legitimately, so we can see what the provider
     // actually received on the wire.
     let ok = handle(
-        &mut fixture.state,
+        &fixture.state,
         &fixture.peer,
         Request::ReadIssue {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -300,14 +300,14 @@ fn a_surrogate_in_an_ordinary_shell_is_inert() {
     // And the broker is the only thing that accepts it, which is the
     // property that makes the shell case harmless. A token with no broker
     // behind it has no session, and therefore no authority.
-    let mut without_broker = BrokerState::default();
+    let without_broker = BrokerState::default();
     let orphan_peer = WorkloadIdentity::from_peer(PeerCredentials {
         pid: std::process::id() as i32,
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
     });
     let response = handle(
-        &mut without_broker,
+        &without_broker,
         &orphan_peer,
         Request::ReadIssue {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -334,7 +334,7 @@ fn a_surrogate_in_an_ordinary_shell_is_inert() {
 /// error messages a wrong-session replay produces.
 #[test]
 fn no_replay_path_exposes_the_real_credential() {
-    let (mut fixture, _session, surrogate) = live();
+    let (fixture, _session, surrogate) = live();
     let other = fixture
         .state
         .sessions
@@ -343,7 +343,7 @@ fn no_replay_path_exposes_the_real_credential() {
         .create("/other".into(), &fixture.peer);
 
     let response = handle(
-        &mut fixture.state,
+        &fixture.state,
         &fixture.peer,
         Request::ReadIssue {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -379,10 +379,10 @@ fn no_replay_path_exposes_the_real_credential() {
 /// failure path is clean, and the success path was the one nobody looked at.
 #[test]
 fn a_successful_operation_leaks_the_credential_to_nothing_it_renders() {
-    let (mut fixture, session, surrogate) = live();
+    let (fixture, session, surrogate) = live();
 
     let response = handle(
-        &mut fixture.state,
+        &fixture.state,
         &fixture.peer,
         Request::ReadIssue {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -433,10 +433,10 @@ fn a_successful_operation_leaks_the_credential_to_nothing_it_renders() {
 /// not carry the credential.
 #[test]
 fn a_credentialed_operation_is_audited_without_the_credential() {
-    let (mut fixture, session, surrogate) = live();
+    let (fixture, session, surrogate) = live();
 
     let response = handle(
-        &mut fixture.state,
+        &fixture.state,
         &fixture.peer,
         Request::ReadIssue {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,

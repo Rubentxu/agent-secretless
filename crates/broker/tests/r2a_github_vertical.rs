@@ -160,7 +160,7 @@ impl Vertical {
         // Projected through the same inventory pass the broker runs at startup,
         // so this fixture cannot pass by seeding a field production never
         // writes.
-        let loaded = asv_broker::inventory::load(&mut state, &store);
+        let loaded = asv_broker::inventory::load(&state, &store);
         assert_eq!(
             (loaded.loaded, loaded.skipped, loaded.collisions),
             (1, 0, 0),
@@ -218,7 +218,7 @@ impl Vertical {
     /// Mints, returning the raw answer so a row can observe a refusal.
     fn try_mint(&mut self, max_uses: u32) -> Response {
         handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::MintSurrogate {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -240,7 +240,7 @@ impl Vertical {
 
     fn read_issue(&mut self, surrogate: &str, repo: &str, number: u64) -> Response {
         handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::ReadIssue {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -254,7 +254,7 @@ impl Vertical {
 
     fn create_issue(&mut self, surrogate: &str, title: &str, body: &str) -> Response {
         handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::CreateIssue {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -269,7 +269,7 @@ impl Vertical {
 
     fn create_release(&mut self, surrogate: &str, tag: &str) -> Response {
         handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::CreateRelease {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -540,7 +540,7 @@ fn a_grant_does_not_outlive_the_session_it_was_minted_in() {
     let surrogate = vertical.mint(5);
 
     let ended = handle(
-        &mut vertical.state,
+        &vertical.state,
         &vertical.peer,
         Request::EndSession {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -663,12 +663,12 @@ fn a_cross_origin_redirect_never_reaches_the_second_origin() {
 /// when the port reports `NotFound`, and this fails.
 #[test]
 fn a_mint_for_a_credential_the_vault_does_not_hold_spends_nothing() {
-    let mut vertical = Vertical::reading();
+    let vertical = Vertical::reading();
     let absent = CredentialId::from_wire("00000000-0000-4000-8000-00000000dead")
         .expect("canonical wire form");
 
     let response = handle(
-        &mut vertical.state,
+        &vertical.state,
         &vertical.peer,
         Request::MintSurrogate {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,

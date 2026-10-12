@@ -322,14 +322,14 @@ pub struct CurlDiscovery {
 
 impl From<CurlDiscovery> for crate::AnyReport {
     fn from(report: CurlDiscovery) -> Self {
-        Self::Curl(report)
+        Self::Curl(Box::new(report))
     }
 }
 
 impl CurlDiscovery {
     /// Wraps this family's report in the shape the CLI prints.
     pub fn into_discovery(self) -> crate::Discovery {
-        crate::Discovery::new(Curl::FAMILY, crate::AnyReport::Curl(self))
+        crate::Discovery::new(Curl::FAMILY, crate::AnyReport::Curl(Box::new(self)))
     }
 
     /// The one file curl would actually read, if one was found and readable.

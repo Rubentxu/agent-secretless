@@ -244,7 +244,13 @@ pub enum AnyReport {
     Npm(NpmDiscovery),
     Maven(MavenDiscovery),
     Gradle(GradleDiscovery),
-    Curl(CurlDiscovery),
+    // CurlDiscovery is the largest variant by a margin (256 B vs the next at
+    // 48 B), so it is boxed here to keep the enum at the size of its largest
+    // reference rather than its largest payload. The cost is one extra
+    // indirection on every match; the benefit is that cloning and moving
+    // `Discovery` stops dragging 256 B through the call sites that only need
+    // to know the family.
+    Curl(Box<CurlDiscovery>),
 }
 
 /// Something discovery noticed that the operator should see.

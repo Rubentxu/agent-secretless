@@ -90,7 +90,7 @@ impl Broker {
             VaultStore::create(&path, &pass(), KdfParams::fast_for_tests()).expect("create");
         let key = Arc::new(store.header().unlock(&pass()).expect("unlock"));
         let mut state = BrokerState::default();
-        asv_broker::inventory::load(&mut state, &store);
+        asv_broker::inventory::load(&state, &store);
         let store = Arc::new(Mutex::new(store));
 
         state.vault_writer = Some(Arc::new(VaultWritePort::new(
@@ -144,9 +144,9 @@ impl Broker {
 /// broker slice because this test process is not in one.
 #[test]
 fn an_admitted_principal_can_create() {
-    let mut b = Broker::new(true);
+    let b = Broker::new(true);
     let response = asv_broker::handle(
-        &mut b.state,
+        &b.state,
         &b.handle,
         create_request(CredentialKind::BearerToken),
     );
@@ -170,9 +170,9 @@ fn an_admitted_principal_can_create() {
 /// fix either.
 #[test]
 fn an_unenrolled_caller_is_refused_by_name() {
-    let mut b = Broker::new(false);
+    let b = Broker::new(false);
     let response = asv_broker::handle(
-        &mut b.state,
+        &b.state,
         &b.handle,
         create_request(CredentialKind::BearerToken),
     );
@@ -200,10 +200,10 @@ fn an_unenrolled_caller_is_refused_by_name() {
 /// Condition 3 through the verb: no pin, no credential, even enrolled.
 #[test]
 fn an_unpinned_caller_is_refused_even_when_enrolled() {
-    let mut b = Broker::new(true);
+    let b = Broker::new(true);
     let unpinned = peer();
     let response = asv_broker::handle(
-        &mut b.state,
+        &b.state,
         &unpinned,
         create_request(CredentialKind::BearerToken),
     );
@@ -227,9 +227,9 @@ fn an_unpinned_caller_is_refused_even_when_enrolled() {
 /// reading through the writer's own handle would pass either way.
 #[test]
 fn a_created_credential_survives_a_fresh_open_of_the_vault() {
-    let mut b = Broker::new(true);
+    let b = Broker::new(true);
     let response = asv_broker::handle(
-        &mut b.state,
+        &b.state,
         &b.handle,
         create_request(CredentialKind::BearerToken),
     );
@@ -256,11 +256,11 @@ fn a_created_credential_survives_a_fresh_open_of_the_vault() {
 /// between "wrote the file" and "remembered it".
 #[test]
 fn a_created_credential_advances_the_files_revision() {
-    let mut b = Broker::new(true);
+    let b = Broker::new(true);
     let before = b.reopen().header().revision;
 
     let response = asv_broker::handle(
-        &mut b.state,
+        &b.state,
         &b.handle,
         create_request(CredentialKind::BearerToken),
     );
@@ -284,9 +284,9 @@ fn a_created_credential_advances_the_files_revision() {
 /// broker is one the broker can mint against, with no restart in between.
 #[test]
 fn a_created_credential_can_mint_a_surrogate_immediately() {
-    let mut b = Broker::new(true);
+    let b = Broker::new(true);
     let response = asv_broker::handle(
-        &mut b.state,
+        &b.state,
         &b.handle,
         create_request(CredentialKind::BearerToken),
     );
@@ -296,7 +296,7 @@ fn a_created_credential_can_mint_a_surrogate_immediately() {
     };
 
     let session = match asv_broker::handle(
-        &mut b.state,
+        &b.state,
         &b.handle,
         Request::CreateSession {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -308,7 +308,7 @@ fn a_created_credential_can_mint_a_surrogate_immediately() {
     };
 
     let minted = asv_broker::handle(
-        &mut b.state,
+        &b.state,
         &b.handle,
         Request::MintSurrogate {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -333,9 +333,9 @@ fn a_created_credential_can_mint_a_surrogate_immediately() {
 /// write path leaked the secret before encrypting it.
 #[test]
 fn the_secret_appears_in_no_response_and_in_no_vault_file() {
-    let mut b = Broker::new(true);
+    let b = Broker::new(true);
     let response = asv_broker::handle(
-        &mut b.state,
+        &b.state,
         &b.handle,
         create_request(CredentialKind::BearerToken),
     );
@@ -390,7 +390,7 @@ fn the_secret_wrapper_exposes_only_through_the_named_read_path() {
 /// the round trip is checked and not merely the acceptance.
 #[test]
 fn a_kind_without_a_storage_class_is_stored_and_read_back_as_itself() {
-    let mut b = Broker::new(true);
+    let b = Broker::new(true);
     let mut planted = Vec::new();
     for kind in [
         CredentialKind::ApiKey,
@@ -398,7 +398,7 @@ fn a_kind_without_a_storage_class_is_stored_and_read_back_as_itself() {
         CredentialKind::X509ClientIdentity,
         CredentialKind::AwsAccessKey,
     ] {
-        let response = asv_broker::handle(&mut b.state, &b.handle, create_request(kind));
+        let response = asv_broker::handle(&b.state, &b.handle, create_request(kind));
         match response {
             Response::CredentialCreated { id, .. } => planted.push((kind, id)),
             other => panic!("{kind:?} was refused rather than stored: {other:?}"),
@@ -409,7 +409,7 @@ fn a_kind_without_a_storage_class_is_stored_and_read_back_as_itself() {
     // the broker's in-memory list, so a label held only in memory cannot pass.
     let reopened = b.reopen();
     let listed = match asv_broker::handle(
-        &mut b.state,
+        &b.state,
         &b.handle,
         asv_ipc_protocol::Request::ListCredentialMetadata {
             protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -436,7 +436,7 @@ fn a_kind_without_a_storage_class_is_stored_and_read_back_as_itself() {
 /// The five that do survive must come back as themselves, not as a neighbour.
 #[test]
 fn every_storable_kind_survives_the_round_trip() {
-    let mut b = Broker::new(true);
+    let b = Broker::new(true);
     for kind in [
         CredentialKind::BearerToken,
         CredentialKind::UsernamePassword,
@@ -444,7 +444,7 @@ fn every_storable_kind_survives_the_round_trip() {
         CredentialKind::DatabaseCredential,
         CredentialKind::GenericSecret,
     ] {
-        let response = asv_broker::handle(&mut b.state, &b.handle, create_request(kind));
+        let response = asv_broker::handle(&b.state, &b.handle, create_request(kind));
         let id = match response {
             Response::CredentialCreated { id, .. } => id,
             other => panic!("{kind:?} should be storable: {other:?}"),
@@ -473,14 +473,14 @@ fn every_storable_kind_survives_the_round_trip() {
 /// creates cannot collide.
 #[test]
 fn two_creates_never_collide() {
-    let mut b = Broker::new(true);
+    let b = Broker::new(true);
     let first = asv_broker::handle(
-        &mut b.state,
+        &b.state,
         &b.handle,
         create_request(CredentialKind::BearerToken),
     );
     let second = asv_broker::handle(
-        &mut b.state,
+        &b.state,
         &b.handle,
         create_request(CredentialKind::BearerToken),
     );
@@ -508,7 +508,7 @@ fn a_broker_with_no_write_path_refuses_rather_than_buffering() {
     let mut b = Broker::new(true);
     b.state.vault_writer = None;
     let response = asv_broker::handle(
-        &mut b.state,
+        &b.state,
         &b.handle,
         create_request(CredentialKind::BearerToken),
     );
@@ -530,9 +530,9 @@ fn a_broker_with_no_write_path_refuses_rather_than_buffering() {
 /// could carry the secret — so this is about the record existing at all.
 #[test]
 fn a_create_is_audited_without_its_secret() {
-    let mut b = Broker::new(true);
+    let b = Broker::new(true);
     asv_broker::handle(
-        &mut b.state,
+        &b.state,
         &b.handle,
         create_request(CredentialKind::BearerToken),
     );

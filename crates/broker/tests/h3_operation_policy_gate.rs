@@ -188,7 +188,7 @@ fn harness(kind: CredentialKind) -> Harness {
     .expect("create the vault");
     let key: VaultKey = store.header().unlock(&passphrase).expect("unlock");
 
-    let mut state = BrokerState {
+    let state = BrokerState {
         // A vault is open but empty. Nothing in this file lends a secret: the
         // deny cases are refused before the vault is consulted, and the permit
         // cases are answered by the factory, which refuses before it would
@@ -245,7 +245,7 @@ impl Harness {
     /// through a helper that panics on it.
     fn try_mint(&mut self) -> Response {
         handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::MintSurrogate {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -266,7 +266,7 @@ impl Harness {
 
     fn read_issue(&mut self, surrogate: &str) -> Response {
         handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::ReadIssue {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -280,7 +280,7 @@ impl Harness {
 
     fn create_issue(&mut self, surrogate: &str) -> Response {
         handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::CreateIssue {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -295,7 +295,7 @@ impl Harness {
 
     fn create_release(&mut self, surrogate: &str) -> Response {
         handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::CreateRelease {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
@@ -311,7 +311,7 @@ impl Harness {
 
     fn postgres_connect(&mut self) -> Response {
         handle(
-            &mut self.state,
+            &self.state,
             &self.peer,
             Request::PostgresConnect {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,

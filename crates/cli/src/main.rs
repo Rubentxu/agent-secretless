@@ -1581,7 +1581,7 @@ fn fetch_url(url: &str, max_bytes: usize, timeout_ms: u64) -> Result<String, Str
     // A full TLS path belongs here when the row measures something an
     // attacker can spoof, which is not yet the case.
     let path = url.strip_prefix("https://").unwrap_or(url);
-    let path = path.splitn(2, '/').nth(1).unwrap_or("");
+    let path = path.split_once('/').map(|x| x.1).unwrap_or("");
     let request = format!(
         "GET /{path} HTTP/1.1\r\nHost: {host_port}\r\nUser-Agent: asv-upgrade/{}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
         build_version()
@@ -2013,20 +2013,17 @@ fn run_github(socket: &std::path::Path, command: &GithubCommand) -> std::io::Res
     // Bodies are read before the session exists, for the same reason
     // `add-credential` reads its secret first: a payload this process is
     // holding should not be sitting in a live grant's lifetime.
-    let body = match github_body_arg(command) {
-        Some(spec) => Some(match read_github_body(&spec) {
-            Ok(text) => text,
-            Err(error) => {
-                // The path is named because the operator supplied it and the
-                // kernel's `No such file or directory` does not say which of
-                // the three flags it was about. A body that is silently
-                // missing is a release published with empty notes.
-                eprintln!("asv: cannot read the body from {spec:?}: {error}");
-                std::process::exit(2);
-            }
-        }),
-        None => None,
-    };
+    let body = github_body_arg(command).map(|spec| match read_github_body(spec) {
+        Ok(text) => text,
+        Err(error) => {
+            // The path is named because the operator supplied it and the
+            // kernel's `No such file or directory` does not say which of
+            // the three flags it was about. A body that is silently
+            // missing is a release published with empty notes.
+            eprintln!("asv: cannot read the body from {spec:?}: {error}");
+            std::process::exit(2);
+        }
+    });
 
     let session = match github_call(
         socket,
@@ -2325,18 +2322,18 @@ fn run_integrations(
             label,
             allow_symlink_root,
             from_plan,
-        } => run_integrations_adopt(
+        } => run_integrations_adopt(AdoptArgs {
             socket,
             family,
-            *json,
-            file.as_deref(),
-            home.as_deref(),
+            json: *json,
+            file: file.as_deref(),
+            home: home.as_deref(),
             audience,
             field,
             label,
-            allow_symlink_root.as_deref(),
-            from_plan.as_deref(),
-        ),
+            allow_symlink_root: allow_symlink_root.as_deref(),
+            from_plan: from_plan.as_deref(),
+        }),
         IntegrationsCommand::Project {
             family,
             json,
@@ -3282,24 +3279,24 @@ impl Selector<'_> {
         &self,
         session: asv_domain::AgentSessionId,
         surrogate: String,
-        registry: &String,
-        repository: &String,
+        registry: &str,
+        repository: &str,
     ) -> Request {
         match self {
             Selector::Reference(reference) => Request::PullManifest {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 surrogate,
-                registry: registry.clone(),
-                repository: repository.clone(),
+                registry: registry.to_string(),
+                repository: repository.to_string(),
                 reference: (*reference).clone(),
             },
             Selector::Digest(digest) => Request::PullBlob {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
                 session,
                 surrogate,
-                registry: registry.clone(),
-                repository: repository.clone(),
+                registry: registry.to_string(),
+                repository: repository.to_string(),
                 digest: (*digest).clone(),
             },
         }
@@ -5279,18 +5276,39 @@ mod tests {
 /// exists in this process there is no longer a question of which credential to
 /// take. That ordering is the whole of the safety argument, and it is why
 /// `NpmAdoption::extract` takes a selector rather than returning candidates.
-fn run_integrations_adopt(
-    socket: &std::path::Path,
-    family: &str,
+///
+/// All ten fields live on `AdoptArgs` rather than as positional arguments
+/// because a positional list that long is what `clippy::too_many_arguments`
+/// refuses. The struct is local to the function's module and is built at the
+/// one dispatch site, so the call site stays short and the function's
+/// parameter list stays under the lint's threshold.
+#[derive(Debug)]
+struct AdoptArgs<'a> {
+    socket: &'a std::path::Path,
+    family: &'a str,
     json: bool,
-    file: Option<&str>,
-    home: Option<&str>,
-    audience: &str,
-    field: &str,
-    label: &str,
-    allow_symlink_root: Option<&str>,
-    from_plan: Option<&str>,
-) -> std::io::Result<()> {
+    file: Option<&'a str>,
+    home: Option<&'a str>,
+    audience: &'a str,
+    field: &'a str,
+    label: &'a str,
+    allow_symlink_root: Option<&'a str>,
+    from_plan: Option<&'a str>,
+}
+
+fn run_integrations_adopt(args: AdoptArgs<'_>) -> std::io::Result<()> {
+    let AdoptArgs {
+        socket,
+        family,
+        json,
+        file,
+        home,
+        audience,
+        field,
+        label,
+        allow_symlink_root,
+        from_plan,
+    } = args;
     use asv_integrations::{AdoptReceipt, AdoptSelector, NpmAdoption};
 
     if family != "npm" {
@@ -6869,7 +6887,7 @@ fn negative_probe(
 /// How an exit status is spelled, because `None` is not a pass.
 fn exit_spelling(outcome: &NpmOutcome) -> String {
     match outcome.code {
-        Some(code) if code == 0 => "0".to_string(),
+        Some(0) => "0".to_string(),
         Some(code) => format!("{code} (failure)"),
         None => "no status, killed by a signal (failure)".to_string(),
     }
@@ -7519,10 +7537,7 @@ fn print_execute_prose(receipt: &asv_integrations::ExecuteReceipt) {
         "  tool:    {}",
         describe_tool(receipt.binding.tool.as_ref())
     );
-    println!(
-        "  config:  {}",
-        receipt.config_digest().unwrap_or("(none)").to_string()
-    );
+    println!("  config:  {}", receipt.config_digest().unwrap_or("(none)"));
     match &receipt.planned_tool.resolved {
         Some(planned) => println!("  resolved: {}", planned.path.display()),
         None => println!("  resolved: (nothing)"),
