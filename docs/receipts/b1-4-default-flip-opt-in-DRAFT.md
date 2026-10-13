@@ -1,10 +1,10 @@
-# B1.4 DRAFT spec — default-flip opt-in for runtime-aware posture
+# B1.4 — default-flip opt-in for runtime-aware posture (DRAFT, approved)
 
-**Status**: DRAFT, awaiting implementation
+**Status**: DRAFT (design approved by user on 2026-10-13; implementation in flight)
 **Branch**: `b1/default-flip-opt-in`
 **Worktree**: `/var/home/rubentxu/Proyectos/rust/agent-secretless-b1-4`
 **Off**: `b1/worker-lifetime` HEAD `9f867b8` (B1.1 + B1.2 + B1.3 merged)
-**Author**: Jcode (autonomous, user pre-approved with "adelante apruebo, intenta paralelizar")
+**Author**: Jcode (autonomous, user pre-approved with "adelante apruebo, intenta paralelizar"; user said "si" on 2026-10-13 to proceed with the design as drafted, including the 3 open questions)
 
 ## What B1.4 ships
 
