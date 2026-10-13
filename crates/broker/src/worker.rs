@@ -27,7 +27,7 @@ use asv_ipc_protocol::AuditEventDto;
 
 use crate::audit::AuditLog;
 use crate::isolated_exec::{
-    EgressPolicy, SecretInjectionPlan, WorkerRegistry, WorkerTemplate, POSTURE_LABEL,
+    EgressPolicy, PostureLabel, SecretInjectionPlan, WorkerRegistry, WorkerTemplate,
 };
 
 /// Why a worker run did not happen or did not finish cleanly. Every
@@ -466,6 +466,15 @@ pub fn spawn(
 
     // Pre-exec isolation hook: runs in the child after fork, before
     // exec. Any failure aborts before exec (M10R-R2/R4 fail-closed).
+    //
+    // The hook ALSO calls `setsid(2)` so the worker is the leader of
+    // a fresh process group. The leader's PID is then its PGID, and
+    // `terminate_with_grace` can use `killpg` to reap every descendant
+    // the worker forked (not just the leader). That is the B1.1 fix
+    // for the "leader exits, sleeper inherits stdout FD, read_bounded
+    // hangs" surface: a `kill(pid)` only stops the leader, and the
+    // FD stays open in the sleeper. `killpg` reaps every member, the
+    // FDs close, the bounded reader returns.
     let binary = template.binary.clone();
     let landlock = template.landlock_profile.clone();
     // SAFETY: `pre_exec` runs in the forked child between fork and exec,
@@ -473,15 +482,31 @@ pub fn spawn(
     // calls a child_isolation_hook (which is documented to be safe in
     // that context) and on failure writes a single byte to a CLOEXEC
     // descriptor owned by this closure; both are async-signal-safe.
+    // `libc::setsid` is itself async-signal-safe.
     unsafe {
-        cmd.pre_exec(move || match child_isolation_hook(&binary, &landlock) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                // SAFETY: write(2) is async-signal-safe; this private
-                // descriptor remains open until exec because it is CLOEXEC.
+        cmd.pre_exec(move || {
+            // setsid(2) BEFORE the isolation hook: the hook may fork
+            // helpers (e.g. landlock probe) and we want the new group
+            // to contain them. setsid is documented to fail with EPERM
+            // only if the calling process is already a session leader;
+            // after fork the child is never a session leader, so the
+            // error path is unreachable. We still match on it and
+            // route through the same hook-status marker so a
+            // pathological platform surfaces as IsolationUnavailable.
+            if libc::setsid() == -1 {
                 let marker = [PRE_EXEC_FAILURE_MARKER];
                 let _ = libc::write(hook_status_fd, marker.as_ptr().cast(), marker.len());
-                Err(error)
+                return Err(std::io::Error::last_os_error());
+            }
+            match child_isolation_hook(&binary, &landlock) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    // SAFETY: write(2) is async-signal-safe; this private
+                    // descriptor remains open until exec because it is CLOEXEC.
+                    let marker = [PRE_EXEC_FAILURE_MARKER];
+                    let _ = libc::write(hook_status_fd, marker.as_ptr().cast(), marker.len());
+                    Err(error)
+                }
             }
         });
     }
@@ -564,6 +589,36 @@ pub fn spawn(
     });
     let waited = wait_with_timeout(&mut child, timeout);
     let duration = started.elapsed();
+
+    // **B1.1: reaper safety net.** `wait_with_timeout` only signals the
+    // process group if the leader is still alive when the cap fires.
+    // The leader may have exited cleanly well before the cap while
+    // leaving a forked descendant (e.g. `sleep &`) holding the
+    // stdout/stderr pipes open. The bounded reader would then block
+    // on the join below, indefinitely. To prevent that, an
+    // unconditional process-group reap happens here, BEFORE we join
+    // the readers. The bounded reader's loop notices EOF and returns
+    // because the kernel closes the pipe ends when the last process
+    // with them open dies.
+    //
+    // The PGID of the leader is its PID by construction (`pre_exec`
+    // called `setsid(2)`). We use the cached PID rather than asking
+    // the kernel for `getpgid(pid)` because the leader may already
+    // have been reaped by the time this code runs, in which case
+    // `getpgid` would return -1/ESRCH and we'd fall back to a
+    // `kill(pid)` that no longer targets a live process.
+    {
+        let pid = child.id() as libc::pid_t;
+        // SAFETY: killpg(2) is an async-signal-safe syscall. SIGKILL
+        // is the only signal that cannot be ignored, so a descendant
+        // that traps SIGTERM (e.g. `trap '' TERM; sleep &`) is still
+        // reaped. Best-effort: a -1 return from killpg on an
+        // already-reaped group is not a failure of the run.
+        let _ = unsafe { libc::killpg(pid, libc::SIGKILL) };
+        // Reap the leader so it does not become a zombie if the
+        // group signal raced the natural exit.
+        let _ = child.wait();
+    }
 
     let (outcome, exit_code, timed_out) = match waited {
         WaitResult::Exited(code) if code == 0 => (RunOutcome::Completed, Some(code), false),
@@ -855,10 +910,29 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(1);
 
 /// Ask the worker to shut down first, then enforce the deadline with
 /// SIGKILL and reap it. A timeout remains a timeout even if SIGTERM works.
+///
+/// **Process-group signal.** The broker always spawns workers via
+/// `pre_exec` with `setsid(2)`, so the leader's PID equals its PGID.
+/// This function then signals the whole group, so any descendant the
+/// worker forked (e.g. a `sleep &` sleeper that inherited stdout) is
+/// reaped together with the leader. A `kill(pid)` only stops the
+/// leader and the sleeper keeps the FD open, hanging the broker's
+/// bounded reader.
+///
+/// **Caller contract.** The child passed in MUST be the leader of its
+/// process group. The broker satisfies this in `spawn` via
+/// `pre_exec`+`setsid`. Unit tests that exercise this helper with a
+/// raw `Command` MUST install their own `pre_exec` (or `setsid`) for
+/// the assertion to hold. Sending a process-group signal to a
+/// non-leader is undefined behaviour: it would target the runner's
+/// own process group and tear the test process down.
 fn terminate_with_grace(child: &mut std::process::Child) {
-    // SAFETY: child.id() is the live child pid owned by `child`.
+    let pid = child.id() as libc::pid_t;
+    // The PGID of a process that called setsid(2) in pre_exec is
+    // its own PID; that is the invariant the broker relies on.
+    // SAFETY: kill(2) and killpg(2) are async-signal-safe syscalls.
     unsafe {
-        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        libc::killpg(pid, libc::SIGTERM);
     }
     let deadline = Instant::now() + TERMINATION_GRACE;
     loop {
@@ -870,7 +944,11 @@ fn terminate_with_grace(child: &mut std::process::Child) {
             Ok(None) | Err(_) => break,
         }
     }
-    let _ = child.kill(); // SIGKILL after the grace period
+    // SIGKILL after the grace period, on the same group.
+    // SAFETY: see above.
+    unsafe {
+        libc::killpg(pid, libc::SIGKILL);
+    }
     let _ = child.wait(); // reap even when signaling failed
 }
 
@@ -911,7 +989,12 @@ fn audit_worker(
         worker: worker.to_string(),
         egress: egress.to_string(),
         injection: injection.to_string(),
-        posture: POSTURE_LABEL.to_string(),
+        // B1.1: the posture is now a typed enum, but the wire stays a
+        // string for backwards compatibility with stored audit records.
+        // `PostureLabel::default()` is the single decision point (see
+        // its docs); when B1.3 lights up the cgroup probe, only that
+        // accessor has to change.
+        posture: PostureLabel::default().wire_name().to_string(),
         outcome: outcome.to_string(),
         exit_code,
         bytes_stdout,
@@ -1218,10 +1301,23 @@ mod tests {
 
     #[test]
     fn timeout_sends_term_before_kill_and_reaps_worker() {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "trap 'exit 0' TERM; while :; do :; done"])
-            .spawn()
-            .expect("spawn signal-aware child");
+        // B1.1: `terminate_with_grace` uses process-group signaling,
+        // so the child must be the leader of its group. The broker's
+        // own `pre_exec` calls `setsid(2)`; this test, which spawns
+        // a raw `Command`, has to do the same.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "trap 'exit 0' TERM; while :; do :; done"]);
+        // SAFETY: pre_exec runs in the child between fork and exec;
+        // setsid(2) is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("spawn signal-aware child");
         assert!(matches!(
             wait_with_timeout(&mut child, Duration::from_millis(50)),
             WaitResult::TimedOut
