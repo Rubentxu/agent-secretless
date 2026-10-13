@@ -533,11 +533,9 @@ impl crate::tls_bridge::SubstitutionAudit for SubstitutionRecorder<'_> {
                 AuditAppendError::Io(io) => {
                     crate::tls_bridge::BridgeError::Io(format!("audit durable write failed: {io}"))
                 }
-                AuditAppendError::RetentionGap { evicted } => {
-                    crate::tls_bridge::BridgeError::Io(format!(
-                        "audit ring evicted {evicted} records since the durable write"
-                    ))
-                }
+                AuditAppendError::RetentionGap { evicted } => crate::tls_bridge::BridgeError::Io(
+                    format!("audit ring evicted {evicted} records since the durable write"),
+                ),
             })?;
         Ok(())
     }
@@ -564,7 +562,8 @@ mod tests {
     fn genesis_chain_verifies() {
         let mut log = AuditLog::new(0);
         log.append(event("ping"), 100).expect("audit append");
-        log.append(event("create_session"), 101).expect("audit append");
+        log.append(event("create_session"), 101)
+            .expect("audit append");
         assert_eq!(log.verify(), Ok(()));
         let head = log.head();
         let records = log.query(0);
@@ -583,7 +582,8 @@ mod tests {
     fn mutation_breaks_verify() {
         let mut log = AuditLog::new(0);
         log.append(event("ping"), 100).expect("audit append");
-        log.append(event("list_credential_metadata"), 101).expect("audit append");
+        log.append(event("list_credential_metadata"), 101)
+            .expect("audit append");
         let mut records = log.query(0);
         // Flip one byte of one stored field: the tamper R9 cares about.
         records[1].event = event("tampered");
@@ -672,7 +672,8 @@ mod tests {
         {
             let mut log = AuditLog::open_persistent(0, &path).expect("open");
             log.append(event("ping"), 1).expect("first append");
-            log.append(event("create_session"), 2).expect("second append");
+            log.append(event("create_session"), 2)
+                .expect("second append");
         }
         let text = std::fs::read_to_string(&path).expect("file");
         let lines: Vec<&str> = text.lines().collect();
