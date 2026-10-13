@@ -126,6 +126,8 @@ fn uat_040_unregistered_name_is_refused_and_audited() {
         "bash",
         SpawnOptions::default(),
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect_err("arbitrary binaries are refused before any exec");
     assert!(matches!(err, SpawnError::UnknownWorker(ref n) if n == "bash"));
@@ -160,6 +162,8 @@ fn uat_040_allow_policy_is_refused_not_downgraded() {
         "net-worker",
         SpawnOptions::default(),
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect_err("an Allow policy without the M9 bridge is a lie; refuse it");
     assert!(matches!(err, SpawnError::EgressAllowUnsupported));
@@ -185,6 +189,8 @@ fn uat_040_deny_worker_sees_only_loopback_and_cannot_reach_out() {
         "net-probe",
         completion_opts(),
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect("run");
     let out = String::from_utf8_lossy(&run.stdout_redacted);
@@ -227,6 +233,8 @@ fn uat_040_pre_exec_isolation_failure_is_classified_and_audited() {
         "blocked-isolation",
         SpawnOptions::default(),
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect_err("a namespace setup failure must prevent exec");
     assert!(
@@ -269,6 +277,8 @@ fn uat_040_exec_failure_without_hook_marker_remains_io_error() {
         "invalid-exec",
         SpawnOptions::default(),
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect_err("an invalid executable image must fail exec");
     assert!(matches!(error, SpawnError::Io(_)), "{error:?}");
@@ -296,6 +306,8 @@ fn uat_040_env_injection_reaches_child_only() {
         "env-worker",
         completion_opts_with_secret(Box::new(|| b"sekrit".to_vec())),
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect("run");
     assert_eq!(run.exit_code, Some(0));
@@ -352,6 +364,8 @@ fn uat_040_file_injection_is_refused_and_leaves_nothing_on_the_host() {
         "file-worker",
         completion_opts_with_secret(Box::new(|| b"file-secret".to_vec())),
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect_err("a File plan must be refused, not served");
 
@@ -418,6 +432,8 @@ fn uat_040_landlock_profile_denies_unlisted_paths() {
         "ll-worker",
         completion_opts(),
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect("run");
     let out = String::from_utf8_lossy(&run.stdout_redacted);
@@ -461,6 +477,8 @@ fn uat_040_read_allow_does_not_grant_execute() {
         "read-only-worker",
         completion_opts(),
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect("run under read-only profile");
     let out = String::from_utf8_lossy(&run.stdout_redacted);
@@ -498,6 +516,8 @@ fn uat_040_large_stdout_and_stderr_are_drained_concurrently() {
         "chatty-worker",
         completion_opts(),
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect("large output must not deadlock");
     assert_eq!(run.exit_code, Some(0));
@@ -534,6 +554,8 @@ fn uat_040_seccomp_bite_kills_worker_calling_bpf() {
         "bite-worker",
         completion_opts(),
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect("run");
     // The worker main thread must die from SIGSYS before bpf(2) returns.
@@ -562,6 +584,8 @@ fn uat_040_runaway_worker_is_killed_at_timeout() {
             ..Default::default()
         },
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect_err("a runaway worker is killed, not adopted");
     assert!(matches!(err, SpawnError::Timeout(_)));
@@ -603,6 +627,8 @@ fn uat_040_secret_in_stdout_is_redacted_transformed_is_not() {
         "leaky",
         completion_opts_with_secret(Box::new(|| b"topsecret".to_vec())),
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect("run");
     let out = String::from_utf8_lossy(&run.stdout_redacted);
@@ -643,6 +669,8 @@ fn uat_040_completed_run_is_audited_with_metadata_only() {
         "ok-worker",
         completion_opts(),
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect("run");
     assert_eq!(run.exit_code, Some(0));
@@ -688,6 +716,8 @@ fn uat_040_missing_binary_refusal_is_audited() {
         "ghost",
         SpawnOptions::default(),
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect_err("a registry entry pointing nowhere is an install-time bug");
     assert!(
@@ -785,6 +815,8 @@ fn uat_040_descendant_holding_stdout_does_not_block_join() {
             ..Default::default()
         },
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect("the shell exits; the run record is not an Err");
     let elapsed = started.elapsed();
@@ -832,6 +864,8 @@ fn uat_040_runaway_grandchild_is_killed_with_the_group() {
             ..Default::default()
         },
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect("the shell exits; the run is not an Err");
     // The run must return in well under the sleeper's lifetime.
@@ -878,6 +912,8 @@ fn uat_040_sigterm_trapping_descendant_is_killed_at_grace() {
             ..Default::default()
         },
         &AuditWriter::new(&audit),
+        None,
+        false,
     ) {
         Ok(run) => run,
         Err(SpawnError::Timeout(_)) => {
@@ -915,6 +951,8 @@ fn uat_040_completing_worker_is_not_blocked_by_postwait_killpg() {
         "quiet",
         SpawnOptions::default(),
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect("a quiet worker runs");
     let elapsed = started.elapsed();
@@ -949,6 +987,8 @@ fn uat_040_posture_label_remains_isolated_process_exposure_in_test_path() {
         "audited-ok",
         completion_opts(),
         &AuditWriter::new(&audit),
+        None,
+        false,
     )
     .expect("run");
     assert_eq!(run.exit_code, Some(0));
@@ -970,5 +1010,116 @@ fn uat_040_posture_label_remains_isolated_process_exposure_in_test_path() {
             );
         }
         other => panic!("unexpected audit variant: {other:?}"),
+    }
+}
+
+/// B1.4: the production-path opt-in flips the audit row's posture.
+///
+/// This is the only test in UAT-040 that exercises the B1.4
+/// production wiring end-to-end. The test calls
+/// `asv_broker::worker::spawn` directly with a synthetic
+/// `HardenConfig` so it does not depend on the kernel actually
+/// having cgroup v2 — the harness is a unit test, not a
+/// `harden::install` round-trip. The first call passes
+/// `opt_in = false`; the second passes `opt_in = true` against
+/// the same registry and the same audit chain. The posture in
+/// the first row must be the B1.1 default
+/// (`ISOLATED_PROCESS_EXPOSURE`); the posture in the second row
+/// must be `STRONG_SECRETLESS` (because the synthetic
+/// `HardenConfig` reports `cgroup_v2 = true, slice_created =
+/// true`, which is the strong path through
+/// `effective_posture`).
+///
+/// The test fails if either:
+///   - the opt-in flag has no effect (the off and on rows carry
+///     the same posture), which is the regression guard for the
+///     `BrokerState.harden_config` / `runtime_posture_aware`
+///     threading; or
+///   - the off row carries a non-default posture, which is the
+///     regression guard for the B1.1 contract (no default-flip,
+///     pinned by the B1.3
+///     `default_posture_label_is_still_isolated_process_exposure`
+///     unit test).
+#[test]
+fn uat_040_runtime_posture_opt_in_flips_audit_row() {
+    use asv_broker::harden::HardenConfig;
+    let r = WorkerRegistry::new(vec![deny_template("audited-ok", "/bin/true", &[])]);
+    // Synthetic HardenConfig: cgroup v2 mounted, slice created.
+    // This is the strong-path input to effective_posture.
+    let harden = HardenConfig {
+        cgroup_v2: true,
+        landlock_capable: true,
+        landlock_installed: true,
+        seccomp_installed: true,
+        slice_created: true,
+        slice_path: Some(std::path::PathBuf::from(
+            "/sys/fs/cgroup/asv-broker.session.uat_040",
+        )),
+    };
+    // First run: opt-in OFF. The audit row must keep the B1.1
+    // honest label regardless of the synthetic harden profile.
+    {
+        let audit = std::sync::Mutex::new(AuditLog::new(16));
+        let run = spawn(
+            &r,
+            "audited-ok",
+            completion_opts(),
+            &AuditWriter::new(&audit),
+            Some(&harden),
+            false,
+        )
+        .expect("run");
+        assert_eq!(run.exit_code, Some(0));
+        let recs = audit.lock().expect("not poisoned").query(0);
+        match &recs[0].event {
+            asv_ipc_protocol::AuditEventDto::WorkerSpawned {
+                posture,
+                degraded_reason,
+                ..
+            } => {
+                assert_eq!(
+                    posture, "ISOLATED_PROCESS_EXPOSURE",
+                    "opt-in OFF must keep the B1.1 honest label even when harden reports a cgroup fence"
+                );
+                assert_eq!(
+                    degraded_reason, &None,
+                    "opt-in OFF must suppress the degraded_reason even when harden reports a cgroup fence"
+                );
+            }
+            other => panic!("unexpected audit variant: {other:?}"),
+        }
+    }
+    // Second run: opt-in ON. The audit row must reflect the
+    // runtime decision: STRONG_SECRETLESS on a cgroup-fence host.
+    {
+        let audit = std::sync::Mutex::new(AuditLog::new(16));
+        let run = spawn(
+            &r,
+            "audited-ok",
+            completion_opts(),
+            &AuditWriter::new(&audit),
+            Some(&harden),
+            true,
+        )
+        .expect("run");
+        assert_eq!(run.exit_code, Some(0));
+        let recs = audit.lock().expect("not poisoned").query(0);
+        match &recs[0].event {
+            asv_ipc_protocol::AuditEventDto::WorkerSpawned {
+                posture,
+                degraded_reason,
+                ..
+            } => {
+                assert_eq!(
+                    posture, "STRONG_SECRETLESS",
+                    "opt-in ON with a cgroup-fence HardenConfig must reflect the runtime posture"
+                );
+                assert_eq!(
+                    degraded_reason, &None,
+                    "strong path must not carry a degraded_reason"
+                );
+            }
+            other => panic!("unexpected audit variant: {other:?}"),
+        }
     }
 }
