@@ -27,7 +27,7 @@ use asv_ipc_protocol::AuditEventDto;
 
 use crate::audit::AuditLog;
 use crate::isolated_exec::{
-    EgressPolicy, PostureLabel, SecretInjectionPlan, WorkerRegistry, WorkerTemplate,
+    EgressPolicy, SecretInjectionPlan, WorkerRegistry, WorkerTemplate,
 };
 
 /// Why a worker run did not happen or did not finish cleanly. Every
@@ -317,17 +317,33 @@ impl<'a> AuditWriter<'a> {
 /// Spawn a registered worker through the isolation pipeline and wait
 /// for it. Appends exactly one audit record on every terminal path
 /// (including refusals) — M10R-R6.
+///
+/// B1.4: `harden` is the [`crate::harden::HardenConfig`] the broker
+/// measured at startup (or `None` if `--harden` was not set).
+/// `opt_in` is the operator's `--runtime-posture-aware` flag. Both
+/// are passed to every `audit_worker` call site in this function so
+/// the audit row can call `effective_posture_for_audit(harden,
+/// opt_in)` to decide what posture label to write. `opt_in` is the
+/// *only* thing that decides whether the audit row reflects the
+/// runtime posture; `harden` is the *what the kernel measured* half
+/// of the decision. `None` for harden keeps the B1.1 audit contract
+/// (posture `ISOLATED_PROCESS_EXPOSURE`, no degraded reason)
+/// regardless of `opt_in`, which is the same fail-closed reading
+/// `SelfReport::default()` takes: absent hardening is reported as
+/// "no fence", not as "unknown fence".
 pub fn spawn(
     registry: &WorkerRegistry,
     name: &str,
     opts: SpawnOptions,
     audit: &AuditWriter<'_>,
+    harden: Option<&crate::harden::HardenConfig>,
+    opt_in: bool,
 ) -> Result<WorkerRun, SpawnError> {
     let started = Instant::now();
     let template = match registry.get(name) {
         Some(t) => t,
         None => {
-            audit_worker(audit, None, name, None, None, "refused", None, None);
+            audit_worker(audit, harden, opt_in, name, None, None, "refused", None, None);
             return Err(SpawnError::UnknownWorker(name.to_string()));
         }
     };
@@ -337,7 +353,8 @@ pub fn spawn(
     if matches!(template.egress_policy, EgressPolicy::Allow(_)) {
         audit_worker(
             audit,
-            None,
+            harden,
+            opt_in,
             name,
             Some(template),
             None,
@@ -355,7 +372,8 @@ pub fn spawn(
     if !template.seccomp_profile.is_production() {
         audit_worker(
             audit,
-            None,
+            harden,
+            opt_in,
             name,
             Some(template),
             None,
@@ -372,7 +390,8 @@ pub fn spawn(
     if !is_executable_file(&template.binary) {
         audit_worker(
             audit,
-            None,
+            harden,
+            opt_in,
             name,
             Some(template),
             None,
@@ -425,7 +444,8 @@ pub fn spawn(
         // that was just refused.
         audit_worker(
             audit,
-            None,
+            harden,
+            opt_in,
             name,
             Some(template),
             None,
@@ -442,7 +462,7 @@ pub fn spawn(
     {
         Ok(pair) => pair,
         Err(error) => {
-            audit_worker(audit, None, name, Some(template), None, "error", None, None);
+            audit_worker(audit, harden, opt_in, name, Some(template), None, "error", None, None);
             return Err(error.into());
         }
     };
@@ -580,7 +600,8 @@ pub fn spawn(
             // guess based on std's generic EINVAL is necessary.
             audit_worker(
                 audit,
-                None,
+                harden,
+                opt_in,
                 name,
                 Some(template),
                 Some(&plan),
@@ -593,7 +614,8 @@ pub fn spawn(
         Err(e) => {
             audit_worker(
                 audit,
-                None,
+                harden,
+                opt_in,
                 name,
                 Some(template),
                 Some(&plan),
@@ -690,7 +712,8 @@ pub fn spawn(
         Err(error) => {
             audit_worker(
                 audit,
-                None,
+                harden,
+                opt_in,
                 name,
                 Some(template),
                 Some(&plan),
@@ -706,7 +729,8 @@ pub fn spawn(
         Err(error) => {
             audit_worker(
                 audit,
-                None,
+                harden,
+                opt_in,
                 name,
                 Some(template),
                 Some(&plan),
@@ -721,7 +745,8 @@ pub fn spawn(
     if timed_out {
         audit_worker(
             audit,
-            None,
+            harden,
+            opt_in,
             name,
             Some(template),
             Some(&plan),
@@ -752,7 +777,8 @@ pub fn spawn(
 
     audit_worker(
         audit,
-        None,
+        harden,
+        opt_in,
         name,
         Some(template),
         Some(&plan),
@@ -1161,17 +1187,28 @@ fn zeroize_buf(buf: &mut [u8]) {
 /// the right test-side default: the test harness has no real
 /// harden profile, so any posture it produces would be a lie.
 ///
-/// B1.3 takes the function from 7 to 8 arguments, which crosses
-/// clippy's `too_many_arguments` threshold. The honest answer to
-/// that complaint is to bundle the per-run fields
-/// (template, plan, outcome, exit_code, output) into a struct,
-/// but that is a refactor bigger than the B1.3 scope and would
-/// change every call site for no semantic gain. The allow is
-/// narrow and the function is internal (private).
+/// B1.4 takes the function from 8 to 9 arguments, which crosses
+/// clippy's `too_many_arguments` threshold even further. The
+/// honest answer to that complaint is still to bundle the per-run
+/// fields (template, plan, outcome, exit_code, output) into a
+/// struct, but that is a refactor bigger than the B1.4 scope and
+/// would change every call site for no semantic gain. The allow
+/// is narrow and the function is internal (private).
+///
+/// `opt_in` is the operator's `--runtime-posture-aware` flag,
+/// threaded from `spawn` (which reads it from `BrokerState`). It
+/// is the *only* thing that decides whether the audit row
+/// reflects the measured runtime posture or the B1.1 default. The
+/// split between `harden` and `opt_in` is deliberate: `harden`
+/// is what the kernel measured, `opt_in` is what the operator
+/// asked the audit row to show. A `Some(harden)` with `opt_in =
+/// false` keeps the B1.1 audit row, which is the B1.3 deferred
+/// behaviour that B1.4 finally wires through.
 #[allow(clippy::too_many_arguments)]
 fn audit_worker(
     audit: &AuditWriter<'_>,
     harden: Option<&crate::harden::HardenConfig>,
+    opt_in: bool,
     worker: &str,
     template: Option<&WorkerTemplate>,
     plan: Option<&SecretInjectionPlan>,
@@ -1188,30 +1225,41 @@ fn audit_worker(
     let (bytes_stdout, bytes_stderr, output_limit_hit) = output
         .map(|(out, err, hit)| (Some(out), Some(err), Some(hit)))
         .unwrap_or((None, None, None));
-    // B1.3: runtime posture. The HardenConfig is read here once per
-    // audit row, which is fine — the broker is single-threaded for
-    // audit appends, and the field is read by `&` only. When `harden`
-    // is `None` (test paths), fall back to the B1.1 default; this
-    // preserves the existing uat_040 contract that the B1.1 receipt
-    // pinned (`assert_eq!(posture, "ISOLATED_PROCESS_EXPOSURE")`).
-    let (posture, degraded_reason) = match harden {
-        Some(h) => {
-            let (label, reason) = crate::isolated_exec::effective_posture(h);
-            (
-                label.wire_name().to_string(),
-                reason.map(|r| r.as_str().to_string()),
-            )
-        }
-        None => (PostureLabel::default().wire_name().to_string(), None),
+    // B1.4: runtime posture for the audit row. The decision is:
+    //   - harden is None → B1.1 default (IsolatedProcessExposure,
+    //     no degraded reason). The broker never measured the
+    //     kernel, so the runtime posture is unknown.
+    //   - harden is Some + opt_in is false → B1.1 default
+    //     (same as above). The operator did not opt in.
+    //   - harden is Some + opt_in is true → runtime decision
+    //     (StrongSecretless on a cgroup-fence host, otherwise
+    //     IsolatedProcessExposure with a DegradedReason).
+    //
+    // `effective_posture_for_audit` is the policy wrapper; the
+    // posture decision itself is in `effective_posture(harden)`
+    // and is unit-tested in `isolated_exec::tests`. The wrapper
+    // is the production-side switch.
+    let (posture, degraded_reason) = {
+        let (label, reason) =
+            crate::isolated_exec::effective_posture_for_audit(harden, opt_in);
+        (
+            label.wire_name().to_string(),
+            reason.map(|r| r.as_str().to_string()),
+        )
     };
     let event = AuditEventDto::WorkerSpawned {
         worker: worker.to_string(),
         egress: egress.to_string(),
         injection: injection.to_string(),
-        // B1.3: posture is now runtime-aware (cgroup fence in place
-        // -> STRONG_SECRETLESS, otherwise ISOLATED_PROCESS_EXPOSURE).
-        // B1.1's `PostureLabel::default()` is still the test-side
-        // fallback when no HardenConfig is available.
+        // B1.4: posture is now policy-gated. See
+        // `effective_posture_for_audit` for the off/on contract.
+        // B1.1's `PostureLabel::default()` is the test-side and
+        // opt-out fallback; B1.3's `effective_posture(harden)` is
+        // the posture decision that fires when the operator opts
+        // in. The split is documented on `Default for PostureLabel`
+        // and pinned by the
+        // `default_posture_label_is_still_isolated_process_exposure`
+        // unit test.
         posture,
         degraded_reason,
         outcome: outcome.to_string(),
@@ -1300,11 +1348,19 @@ mod tests {
     fn unknown_worker_is_refused_and_audited() {
         let r = WorkerRegistry::new(vec![template("kubectl-worker", "/bin/true")]);
         let audit = std::sync::Mutex::new(AuditLog::new(16));
+        // B1.4: the test path passes no harden profile (None) and
+        // does not opt in (false), so the audit row carries the
+        // B1.1 default posture (IsolatedProcessExposure, no
+        // degraded reason). The B1.3 test
+        // default_posture_label_is_still_isolated_process_exposure
+        // pins this default; B1.4 does not change it.
         let err = spawn(
             &r,
             "bash",
             SpawnOptions::default(),
             &AuditWriter::new(&audit),
+            None,
+            false,
         )
         .expect_err("unregistered name must be refused");
         assert!(matches!(err, SpawnError::UnknownWorker(n) if n == "bash"));
@@ -1330,6 +1386,8 @@ mod tests {
             "ghost",
             SpawnOptions::default(),
             &AuditWriter::new(&audit),
+            None,
+            false,
         )
         .expect_err("missing binary must be refused");
         assert!(matches!(err, SpawnError::BinaryMissing(_)));
@@ -1346,6 +1404,8 @@ mod tests {
             "net-worker",
             SpawnOptions::default(),
             &AuditWriter::new(&audit),
+            None,
+            false,
         )
         .expect_err("Allow policy must be refused until M9 lands");
         assert!(matches!(err, SpawnError::EgressAllowUnsupported));
@@ -1365,6 +1425,8 @@ mod tests {
             "debug-worker",
             SpawnOptions::default(),
             &AuditWriter::new(&audit),
+            None,
+            false,
         )
         .expect_err("a debug-only seccomp profile must be refused");
         assert!(matches!(err, SpawnError::SeccompProfileNotProduction));
@@ -1393,6 +1455,8 @@ mod tests {
             "env-worker",
             SpawnOptions::default(),
             &AuditWriter::new(&audit),
+            None,
+            false,
         )
         .expect_err("env plan without provider must be refused");
         assert!(matches!(err, SpawnError::InjectionMismatch(_)));
@@ -1408,6 +1472,8 @@ mod tests {
                 ..Default::default()
             },
             &AuditWriter::new(&audit2),
+            None,
+            false,
         )
         .expect_err("provider without plan must be refused");
         assert!(matches!(err2, SpawnError::InjectionMismatch(_)));
@@ -1443,6 +1509,8 @@ mod tests {
                 },
             },
             &AuditWriter::new(&audit),
+            None,
+            false,
         )
         .expect("a capped run is a run, not a spawn failure");
 
@@ -1509,6 +1577,8 @@ mod tests {
                 },
             },
             &AuditWriter::new(&audit),
+            None,
+            false,
         )
         .expect("a quiet worker runs");
         assert_eq!(run.outcome, RunOutcome::Completed);
@@ -1794,7 +1864,7 @@ mod tests {
         // (which is host-endian inside and is fragile to
         // swap on big-endian kernels).
         let script = r#"awk '/^SigCgt:/{print $2; exit}' /proc/self/status | python3 -c 'import sys; print(int(sys.stdin.read().strip(), 16))'"#;
-        let out = run_with_signal_reset_pre_exec(script, || reset_signal_state_for_worker());
+        let out = run_with_signal_reset_pre_exec(script, reset_signal_state_for_worker);
         let mask: u64 = out
             .trim()
             .parse()
