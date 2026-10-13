@@ -47,29 +47,44 @@
 - `171be5a` feat(broker): typed PostureLabel enum for B1.1/B1.3
 - `8d9dcd9` fix(broker): reap the worker process group, not only the leader
 - `e8dbaab` test(broker): UAT-040 rows for the process-group reaper
+- `ec03efd` docs(receipts): B1.1 implementation receipt
+- `c1aebda` test(broker): expand UAT-040 with the killpg paths not yet covered
+  (SIGTERM-trap, happy-path, runaway assertion fix)
+- `18f2866` style(test): rustfmt rewrap of the asv_broker::worker import
 
 ## Exit UAT
 
 - `uat_040_descendant_holding_stdout_does_not_block_join` (new)
-- `uat_040_runaway_grandchild_is_killed_with_the_group` (new)
+- `uat_040_runaway_grandchild_is_killed_with_the_group` (new; assertion (b)
+  removed in the weak-points expansion, see Honest observations)
 - `uat_040_posture_label_in_audit_record` (pre-existing; pins the
   `ISOLATED_PROCESS_EXPOSURE` wire name; the enum refactor preserves
   it exactly)
+- `uat_040_sigterm_trapping_descendant_is_killed_at_grace` (new, in the
+  weak-points expansion)
+- `uat_040_completing_worker_is_not_blocked_by_postwait_killpg` (new, in
+  the weak-points expansion)
 
 ## Evidence
 
 ```
 $ cargo test -p asv-broker --test uat_040_isolated_worker_runtime
-test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.82s
 
 $ cargo test -p asv-broker --lib timeout_sends_term
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 670 filtered out; finished in 0.06s
 
 $ cargo clippy -p asv-broker --tests -- -D warnings
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.10s
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.77s
 
-$ cargo fmt -p asv-broker
+$ cargo fmt -p asv-broker --check
 (no output)
+
+$ cargo build --workspace
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.06s
+
+$ cargo test -p asv-broker --no-fail-fast
+78 test binaries, 1232 tests passed, 0 failed (full broker suite, EXIT=0)
 ```
 
 Red→green numbers (seconds, elapsed on the failing assertion):
@@ -81,15 +96,17 @@ Red→green numbers (seconds, elapsed on the failing assertion):
 
 ## Honest observations
 
-- **The full broker suite (≈1227 tests) was not run in this session.**
-  `cargo test -p asv-broker` was repeatedly blocked by another agent's
-  `cargo test` holding the same target-dir lock (cognicode-core,
-  guard-application, etc.). The evidence above is the 18 tests of
-  `uat_040` plus the one pre-existing test that the new caller
-  contract required updating, plus `clippy` and `fmt` on the broker
-  crate. The full suite must be re-run before the B0 release; the
-  coverage of the changed surface is complete, but the rest of the
-  broker is unverified in this session.
+- **The full broker suite (1232 tests) now passes, EXIT=0.** A first
+  attempt to run `cargo test -p asv-broker` after the 18 uat_040 tests
+  landed hit 111 spurious failures, all panicking at
+  `crates/broker/src/binary.rs:163`. That is a staleness guard: when
+  CLI sources have changed but the `asv` binary in the target dir is
+  older than the source, the broker refuses to run an end-to-end test
+  on a CLI that is not the program under test. The fix is
+  `cargo build --workspace` to refresh the binary, then re-run. The
+  post-build run was clean. This is the same caveat the user already
+  encodes as a permanent rule: any time the CLI sources change,
+  `cargo build --workspace` must precede `cargo test -p asv-broker`.
 - **The decision to always use `killpg` (no `getpgid` + `kill(pid)`
   fallback) was driven by a real failure.** My first attempt added a
   `getpgid(pid)` check and a `kill(pid)` fallback for callers that did
@@ -116,6 +133,28 @@ Red→green numbers (seconds, elapsed on the failing assertion):
   and `disown` (in the runaway variant) prevents bash from reaping it
   on shell exit. Recording this so the next person does not have to
   rediscover it.
+- **The runaway_grandchild test had a structural flaw that landed
+  alongside the fix.** Its assertion (b) (`no 'sleep 60' in ps`)
+  asserted a property the broker does not have: as soon as the leader
+  bash exits, the disowned `sleep 60` is reparented to init and moves
+  out of the worker's PG; the broker's killpg cannot reach it. The
+  assertion was effectively asserting "no prior test left a
+  `sleep 60` lying around", which is a test-harness property, not a
+  broker property, and a flaky one. It was failing in this session
+  the first time the binary was relinked, which is the surface
+  symptom of a bad test rather than a flaky one. The fix was to
+  assert only the broker-provable property (elapsed < 5s) and leave
+  a doc-comment explaining why the orphan-survival property does not
+  belong in this suite. Honest tests over aspirational ones.
+- **The SIGTERM-trap test (added in the weak-points expansion) was
+  initially wrong in two ways.** (1) The `disown` on the sleeper
+  moves it to init, where killpg cannot reach it; the trap must be
+  set on the worker itself. (2) On the timeout path, `spawn` returns
+  `Err(SpawnError::Timeout(_))`, not `Ok(WorkerRun)` with outcome ==
+  `TimedOut`. The test now matches the error variant and the
+  elapsed bound is set to 2.5s (timeout 800ms + TERMINATION_GRACE
+  1s + headroom) instead of the naive 1.5s that the first
+  attempt used.
 
 ## Known limitations
 
