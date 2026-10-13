@@ -1864,7 +1864,7 @@ mod tests {
         // (which is host-endian inside and is fragile to
         // swap on big-endian kernels).
         let script = r#"awk '/^SigCgt:/{print $2; exit}' /proc/self/status | python3 -c 'import sys; print(int(sys.stdin.read().strip(), 16))'"#;
-        let out = run_with_signal_reset_pre_exec(script, || reset_signal_state_for_worker());
+        let out = run_with_signal_reset_pre_exec(script, reset_signal_state_for_worker);
         let mask: u64 = out
             .trim()
             .parse()
