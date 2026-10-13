@@ -198,9 +198,7 @@ pub fn effective_posture_for_audit(
         // runtime posture is unknown; (Some, false): harden profile
         // installed but operator did not opt in. Both fall through
         // to the B1.1 default.
-        (None, _) | (Some(_), false) => {
-            (PostureLabel::default(), None)
-        }
+        (None, _) | (Some(_), false) => (PostureLabel::default(), None),
     }
 }
 
@@ -761,5 +759,86 @@ mod tests {
             PostureLabel::default(),
             PostureLabel::IsolatedProcessExposure
         );
+    }
+
+    // --- B1.4: production-side policy wrapper ---
+    //
+    // The wrapper is a 2x2 truth table over (harden, opt_in). The
+    // B1.3 tests above exercise the posture decision itself
+    // (effective_posture(harden)); the tests below exercise the
+    // policy that decides what the audit row actually shows
+    // (effective_posture_for_audit(harden, opt_in)). The split is
+    // deliberate — see the wrapper's doc-comment.
+
+    #[test]
+    fn effective_posture_for_audit_with_no_harden_returns_b11_default() {
+        // A broker launched without --harden has no HardenConfig.
+        // The runtime posture is unknown, and the audit row keeps
+        // the B1.1 honest label regardless of opt_in. The opt-in
+        // is a no-op without the measurement.
+        let (label, reason) = effective_posture_for_audit(None, false);
+        assert_eq!(label, PostureLabel::IsolatedProcessExposure);
+        assert_eq!(reason, None);
+        let (label, reason) = effective_posture_for_audit(None, true);
+        assert_eq!(label, PostureLabel::IsolatedProcessExposure);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn effective_posture_for_audit_with_opt_in_off_returns_b11_default() {
+        // The opt-in is off. The broker measured cgroup v2 + slice,
+        // but the operator did not ask for the runtime posture on
+        // the audit row. The audit row keeps the B1.1 honest
+        // label. This is the B1.3 deferred behaviour that B1.4
+        // finally wires through.
+        let (label, reason) =
+            effective_posture_for_audit(Some(&synthetic_harden(true, true)), false);
+        assert_eq!(label, PostureLabel::IsolatedProcessExposure);
+        assert_eq!(reason, None);
+        // Even on a host without the fence, opt_in = false is the
+        // B1.1 default; the degraded reason is suppressed.
+        let (label, reason) =
+            effective_posture_for_audit(Some(&synthetic_harden(false, false)), false);
+        assert_eq!(label, PostureLabel::IsolatedProcessExposure);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn effective_posture_for_audit_with_opt_in_on_reflects_strong() {
+        // The opt-in is on, the kernel measured cgroup v2 + slice
+        // creation. The audit row carries STRONG_SECRETLESS + no
+        // degraded reason. This is the new opt-in behaviour.
+        let (label, reason) =
+            effective_posture_for_audit(Some(&synthetic_harden(true, true)), true);
+        assert_eq!(label, PostureLabel::StrongSecretless);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn effective_posture_for_audit_with_opt_in_on_reflects_degraded() {
+        // The opt-in is on, the kernel is missing cgroup v2. The
+        // audit row carries ISOLATED_PROCESS_EXPOSURE +
+        // CgroupV2Unavailable. The degraded reason is what the
+        // operator opted in to see.
+        let (label, reason) =
+            effective_posture_for_audit(Some(&synthetic_harden(false, false)), true);
+        assert_eq!(label, PostureLabel::IsolatedProcessExposure);
+        #[cfg(target_os = "linux")]
+        assert_eq!(reason, Some(DegradedReason::CgroupV2Unavailable));
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(reason, Some(DegradedReason::NonLinux));
+    }
+
+    #[test]
+    fn effective_posture_for_audit_with_opt_in_on_reflects_slice_failure() {
+        // The opt-in is on, cgroup v2 is mounted but the slice
+        // creation failed. The audit row carries
+        // ISOLATED_PROCESS_EXPOSURE + SliceCreationFailed (NOT
+        // CgroupV2Unavailable, because the kernel has cgroup v2;
+        // the broker failed to set up the slice).
+        let (label, reason) =
+            effective_posture_for_audit(Some(&synthetic_harden(true, false)), true);
+        assert_eq!(label, PostureLabel::IsolatedProcessExposure);
+        assert_eq!(reason, Some(DegradedReason::SliceCreationFailed));
     }
 }

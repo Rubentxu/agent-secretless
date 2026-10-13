@@ -1012,3 +1012,114 @@ fn uat_040_posture_label_remains_isolated_process_exposure_in_test_path() {
         other => panic!("unexpected audit variant: {other:?}"),
     }
 }
+
+/// B1.4: the production-path opt-in flips the audit row's posture.
+///
+/// This is the only test in UAT-040 that exercises the B1.4
+/// production wiring end-to-end. The test calls
+/// `asv_broker::worker::spawn` directly with a synthetic
+/// `HardenConfig` so it does not depend on the kernel actually
+/// having cgroup v2 — the harness is a unit test, not a
+/// `harden::install` round-trip. The first call passes
+/// `opt_in = false`; the second passes `opt_in = true` against
+/// the same registry and the same audit chain. The posture in
+/// the first row must be the B1.1 default
+/// (`ISOLATED_PROCESS_EXPOSURE`); the posture in the second row
+/// must be `STRONG_SECRETLESS` (because the synthetic
+/// `HardenConfig` reports `cgroup_v2 = true, slice_created =
+/// true`, which is the strong path through
+/// `effective_posture`).
+///
+/// The test fails if either:
+///   - the opt-in flag has no effect (the off and on rows carry
+///     the same posture), which is the regression guard for the
+///     `BrokerState.harden_config` / `runtime_posture_aware`
+///     threading; or
+///   - the off row carries a non-default posture, which is the
+///     regression guard for the B1.1 contract (no default-flip,
+///     pinned by the B1.3
+///     `default_posture_label_is_still_isolated_process_exposure`
+///     unit test).
+#[test]
+fn uat_040_runtime_posture_opt_in_flips_audit_row() {
+    use asv_broker::harden::HardenConfig;
+    let r = WorkerRegistry::new(vec![deny_template("audited-ok", "/bin/true", &[])]);
+    // Synthetic HardenConfig: cgroup v2 mounted, slice created.
+    // This is the strong-path input to effective_posture.
+    let harden = HardenConfig {
+        cgroup_v2: true,
+        landlock_capable: true,
+        landlock_installed: true,
+        seccomp_installed: true,
+        slice_created: true,
+        slice_path: Some(std::path::PathBuf::from(
+            "/sys/fs/cgroup/asv-broker.session.uat_040",
+        )),
+    };
+    // First run: opt-in OFF. The audit row must keep the B1.1
+    // honest label regardless of the synthetic harden profile.
+    {
+        let audit = std::sync::Mutex::new(AuditLog::new(16));
+        let run = spawn(
+            &r,
+            "audited-ok",
+            completion_opts(),
+            &AuditWriter::new(&audit),
+            Some(&harden),
+            false,
+        )
+        .expect("run");
+        assert_eq!(run.exit_code, Some(0));
+        let recs = audit.lock().expect("not poisoned").query(0);
+        match &recs[0].event {
+            asv_ipc_protocol::AuditEventDto::WorkerSpawned {
+                posture,
+                degraded_reason,
+                ..
+            } => {
+                assert_eq!(
+                    posture, "ISOLATED_PROCESS_EXPOSURE",
+                    "opt-in OFF must keep the B1.1 honest label even when harden reports a cgroup fence"
+                );
+                assert_eq!(
+                    degraded_reason, &None,
+                    "opt-in OFF must suppress the degraded_reason even when harden reports a cgroup fence"
+                );
+            }
+            other => panic!("unexpected audit variant: {other:?}"),
+        }
+    }
+    // Second run: opt-in ON. The audit row must reflect the
+    // runtime decision: STRONG_SECRETLESS on a cgroup-fence host.
+    {
+        let audit = std::sync::Mutex::new(AuditLog::new(16));
+        let run = spawn(
+            &r,
+            "audited-ok",
+            completion_opts(),
+            &AuditWriter::new(&audit),
+            Some(&harden),
+            true,
+        )
+        .expect("run");
+        assert_eq!(run.exit_code, Some(0));
+        let recs = audit.lock().expect("not poisoned").query(0);
+        match &recs[0].event {
+            asv_ipc_protocol::AuditEventDto::WorkerSpawned {
+                posture,
+                degraded_reason,
+                ..
+            } => {
+                assert_eq!(
+                    posture, "STRONG_SECRETLESS",
+                    "opt-in ON with a cgroup-fence HardenConfig must reflect the runtime posture"
+                );
+                assert_eq!(
+                    degraded_reason, &None,
+                    "strong path must not carry a degraded_reason"
+                );
+            }
+            other => panic!("unexpected audit variant: {other:?}"),
+        }
+    }
+}
