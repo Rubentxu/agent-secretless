@@ -17,6 +17,56 @@ use crate::tls_bridge::AuthorityEndpoint;
 /// label to the user so the exposure is visible.
 pub const POSTURE_LABEL: &str = "ISOLATED_PROCESS_EXPOSURE";
 
+/// B1.1: posture label as a typed enum, so the audit log, the UI,
+/// and the wire (`AuditEventDto::WorkerSpawned { posture }`) all
+/// share one source of truth and a future post-cgroup recovery (B1.3)
+/// can flip a variant without stringly-typed branches across the
+/// codebase.
+///
+/// The mapping to the wire string is a total `match` with no wildcard
+/// arm: adding a variant forces every call site to acknowledge it.
+/// `degraded_reason` is reserved for B1.3 (cgroup-probe enabled,
+/// `IsolatedProcessExposure` becomes a fall-back label rather than the
+/// steady state). Today it is always `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostureLabel {
+    /// B1.3 target: a fully namespace-isolated worker with a cgroup
+    /// fence. The label the user-facing UI is allowed to call
+    /// "strong". Not reachable until B1.3 lands.
+    StrongSecretless,
+    /// B1.1 honest posture: a fresh user/network namespace, Landlock
+    /// rules, seccomp deny-list, and a per-run process-group reaper,
+    /// but NO cgroup fence. The worker still holds the secret in its
+    /// own memory for the run's lifetime. The UI must surface this
+    /// to the operator.
+    IsolatedProcessExposure,
+}
+
+impl PostureLabel {
+    /// Wire name (`AuditEventDto::WorkerSpawned { posture }`). Total:
+    /// adding a variant breaks the build until the wire name is
+    /// declared here.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            PostureLabel::StrongSecretless => "STRONG_SECRETLESS",
+            PostureLabel::IsolatedProcessExposure => "ISOLATED_PROCESS_EXPOSURE",
+        }
+    }
+}
+
+impl Default for PostureLabel {
+    /// **B1.1 decision (user-authorised option A):** with the cgroup
+    /// probe deliberately out of scope, the steady-state posture is
+    /// `IsolatedProcessExposure`. B1.3 will read a feature flag (or a
+    /// runtime probe) and switch this to `StrongSecretless` when the
+    /// cgroup fence is in place. The default keeps the
+    /// `strong_secretless_enabled()` accessor in B1.3 as the single
+    /// place where the flip lives; no other call site has to change.
+    fn default() -> Self {
+        PostureLabel::IsolatedProcessExposure
+    }
+}
+
 /// What the broker will inject into the worker process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecretInjectionPlan {
