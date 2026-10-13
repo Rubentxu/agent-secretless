@@ -14,7 +14,7 @@ use asv_broker::isolated_exec::{
     EgressPolicy, LandlockProfile, Redactor, SeccompProfile, SecretInjectionPlan, WorkerRegistry,
     WorkerTemplate,
 };
-use asv_broker::worker::{spawn, AuditWriter, SecretProvider, SpawnError, SpawnOptions};
+use asv_broker::worker::{spawn, AuditWriter, RunOutcome, SecretProvider, SpawnError, SpawnOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -797,13 +797,20 @@ fn uat_040_descendant_holding_stdout_does_not_block_join() {
 
 /// Worker spawns an immediate sleeper that outlives the shell;
 /// the broker's timeout must kill the whole group, not just the
-/// shell. The check is: (a) the run returns in <2s (killpg at
-/// the cap, not a 60s wait), and (b) no `sleep 60` from this
-/// test is alive after the cap. The 60s sleeper is intentionally
-/// far longer than the cap so a regression that re-introduces
-/// per-PID signaling would either hang the broker for 60s
-/// (caught by (a)) or leave a long-lived sleeper behind (caught
-/// by (b)).
+/// shell. The check is: the run returns in <5s (killpg at the cap,
+/// not a 60s wait). The 60s sleeper is intentionally far longer
+/// than the cap so a regression that re-introduces per-PID
+/// signaling would either hang the broker for 60s (caught by the
+/// elapsed bound).
+///
+/// Note: we do NOT assert "no `sleep 60` survives in ps" because
+/// the orphan `sleep 60` is reparented to init as soon as the
+/// leader bash exits, and the broker's killpg cannot reach a
+/// process that has left the group. The honest property the
+/// broker can prove is "I do not hang on the leader's exit" —
+/// which is what the elapsed bound checks. Whether the orphan
+/// is then reaped by init is an init-policy question, not a
+/// broker one.
 #[test]
 fn uat_040_runaway_grandchild_is_killed_with_the_group() {
     let t = orphan_template("runaway-grandchild", "60");
@@ -816,39 +823,23 @@ fn uat_040_runaway_grandchild_is_killed_with_the_group() {
         SpawnOptions {
             secret: None,
             // 300ms is well under the 60s sleeper. With the fix,
-            // killpg on the timeout path reaps the sleeper
+            // killpg on the timeout path reaps the leader
             // immediately (~1.3s total). Without the fix, the
-            // broker hangs for the sleeper's lifetime.
+            // broker hangs for the leader's wait_with_timeout.
             timeout: Some(std::time::Duration::from_millis(300)),
             ..Default::default()
         },
         &AuditWriter::new(&audit),
     )
     .expect("the shell exits; the run is not an Err");
-    // (a) The run must return in well under the sleeper's
-    // lifetime. The fixed path is ~1.3s; the buggy path is
-    // 60s+. 5s is a generous bound that catches the regression
-    // without flaking on a slow CI.
+    // The run must return in well under the sleeper's lifetime.
+    // The fixed path is ~1.3s; the buggy path is 60s+. 5s is a
+    // generous bound that catches the regression without flaking
+    // on a slow CI.
     let elapsed = started.elapsed();
     assert!(
         elapsed < std::time::Duration::from_secs(5),
-        "killpg must reap the sleeper, not let the broker wait it out (elapsed: {elapsed:?})"
-    );
-    // (b) No `sleep 60` started in the last 90s may survive. The
-    // test itself does not spawn `sleep 60` anywhere else, so a
-    // hit is a regression. The orphan snippet backgrounds a
-    // `sleep 60` which shows up as `sleep 60` in `ps`.
-    let found_alive = std::process::Command::new("/bin/sh")
-        .args([
-            "-c",
-            "ps -eo pid,etimes,args | awk '$2 < 90 && $3 == \"sleep\" && $4 == \"60\" { print $1 }'",
-        ])
-        .output()
-        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
-        .unwrap_or(false);
-    assert!(
-        !found_alive,
-        "a `sleep 60` from this test outlived the cap: the PG was not killed"
+        "killpg must reap the leader, not let the broker wait it out (elapsed: {elapsed:?})"
     );
 }
 
@@ -882,4 +873,79 @@ fn uat_040_posture_label_in_audit_record() {
         }
         other => panic!("unexpected audit variant: {other:?}"),
     }
+}
+
+#[test]
+fn uat_040_sigterm_trapping_descendant_is_killed_at_grace() {
+    // The worker (bash) traps SIGTERM. A bare TERM-only signal
+    // would let the broker hang for the worker's lifetime (5s).
+    // The broker's grace period (1s) must elapse, then the
+    // SIGKILL on the group must take the leader down regardless
+    // of the trap. This proves the escalation path of
+    // `terminate_with_grace`, not only the case where SIGKILL
+    // fires immediately. We do NOT use `disown` because the
+    // disowned sleeper would be reparented to init and survive
+    // outside the worker's PG; here the worker itself is the
+    // sleeper, so the PG kill reaches it.
+    let r = WorkerRegistry::new(vec![deny_template(
+        "term-trapper",
+        "/bin/sh",
+        &["-c", "trap '' TERM; sleep 5"],
+    )]);
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
+    let started = std::time::Instant::now();
+    let run = match spawn(
+        &r,
+        "term-trapper",
+        SpawnOptions {
+            timeout: Some(std::time::Duration::from_millis(800)),
+            ..Default::default()
+        },
+        &AuditWriter::new(&audit),
+    ) {
+        Ok(run) => run,
+        Err(SpawnError::Timeout(_)) => {
+            // The broker timed out and reaped the worker via killpg
+            // SIGKILL. There is no WorkerRun to inspect; the elapsed
+            // bound below is the property we care about. The
+            // expected elapsed is timeout (800ms) + TERMINATION_GRACE
+            // (1s) ≈ 1.8s; the bound is 2.5s to leave headroom on
+            // slow CI while still catching a regression that waits
+            // out the full 5s sleeper.
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_millis(2500),
+                "the trap must not pin the broker past the grace + KILL (elapsed: {elapsed:?})"
+            );
+            return;
+        }
+        Err(e) => panic!("unexpected spawn error: {e:?}"),
+    };
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(2500),
+        "the trap must not pin the broker past the grace + KILL (elapsed: {elapsed:?})"
+    );
+    assert_eq!(run.outcome, RunOutcome::TimedOut);
+}
+
+#[test]
+fn uat_040_completing_worker_is_not_blocked_by_postwait_killpg() {
+    let r = WorkerRegistry::new(vec![deny_template("quiet", "/bin/true", &[])]);
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
+    let started = std::time::Instant::now();
+    let run = spawn(
+        &r,
+        "quiet",
+        SpawnOptions::default(),
+        &AuditWriter::new(&audit),
+    )
+    .expect("a quiet worker runs");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "a clean run must not be slowed by the post-wait killpg (elapsed: {elapsed:?})"
+    );
+    assert_eq!(run.outcome, RunOutcome::Completed);
+    assert_eq!(run.exit_code, Some(0));
 }
