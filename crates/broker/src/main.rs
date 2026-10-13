@@ -206,6 +206,13 @@ fn main() -> std::io::Result<()> {
     let mut vault_path: Option<PathBuf> = None;
     let mut passphrase_path: Option<PathBuf> = None;
     let mut harden = false;
+    // B1.4: the operator's opt-in for the runtime-aware posture on
+    // the audit row. A flag, not an env var, for the same reason
+    // every other operator setting here is a flag (uat_017
+    // env-quarantine forbids std::env::var* in production sources).
+    // Default false: a broker that was not told to reflect the
+    // runtime posture keeps the B1.1 audit contract on every row.
+    let mut runtime_posture_aware = false;
     // C1-R: the identity this installation declared, and whether the operator
     // made the guarantee a condition of starting. See `identity.rs` for why
     // this is a declaration measured against a syscall rather than an inference
@@ -289,6 +296,21 @@ fn main() -> std::io::Result<()> {
                 // seccomp. Opt-in so a dev box or an old kernel can still run
                 // the broker; a packaged install (M7) passes it by default.
                 harden = true;
+            }
+            "--runtime-posture-aware" => {
+                // B1.4: opt-in for the runtime-aware posture on the
+                // audit row. Without --harden this flag is a no-op
+                // (the broker never measured cgroup v2, so there is
+                // no runtime posture to reflect); with --harden, the
+                // audit row carries StrongSecretless on a
+                // cgroup-fence host and IsolatedProcessExposure +
+                // a DegradedReason otherwise. The default is off,
+                // which keeps the B1.1 honest label on every row.
+                // Coupling this flag to --harden is deliberately
+                // out of scope; the two are independent operator
+                // decisions and a future change can decide
+                // otherwise.
+                runtime_posture_aware = true;
             }
             "--audit-max-records" => {
                 let value = args.next().and_then(|v| v.into_string().ok());
@@ -539,6 +561,12 @@ fn main() -> std::io::Result<()> {
     // broker run with `--no-harden` is exactly the case that must report
     // none of them.
     let mut self_report: Option<asv_broker::selfreport::SelfReport> = None;
+    // B1.4: stash the measured HardenConfig here so we can put it
+    // on BrokerState after the state is constructed. None if
+    // --harden was not set; Some(cfg) otherwise. The audit-row
+    // path reads state.harden_config on every worker spawn; the
+    // value is the same one the existing log line below prints.
+    let mut measured_harden: Option<asv_broker::harden::HardenConfig> = None;
 
     if harden {
         // The Landlock ruleset is irreversible, so the paths the broker is
@@ -596,6 +624,11 @@ fn main() -> std::io::Result<()> {
         if !cfg.seccomp_installed {
             tracing::warn!("kernel rejected seccomp filter; syscall filtering NOT active");
         }
+        // B1.4: keep the measured HardenConfig for the audit-row
+        // path. Cloned because the local `cfg` is consumed by
+        // the log lines above; the state field is what
+        // `worker::spawn` reads on every request.
+        measured_harden = Some(cfg.clone());
     }
 
     // Refuse to clobber an existing socket: that would either hijack a running
@@ -730,6 +763,15 @@ fn main() -> std::io::Result<()> {
     if let Some(report) = self_report {
         state.self_report = report;
     }
+    // B1.4: populate the audit-row state fields. harden_config is
+    // what the kernel measured (None if --harden was not set);
+    // runtime_posture_aware is the operator's opt-in. Both
+    // unconditional, mirroring how self_report.identity is set
+    // unconditionally below: a broker run without --harden has
+    // measured nothing and the field is None, which is the
+    // fail-closed reading for runtime_posture_for_audit.
+    state.harden_config = measured_harden;
+    state.runtime_posture_aware = runtime_posture_aware;
     {
         // Set unconditionally, and **after** the conditional block above: a
         // broker run without `--harden` has no Landlock ruleset and no
