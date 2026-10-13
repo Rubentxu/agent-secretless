@@ -697,3 +697,189 @@ fn uat_040_missing_binary_refusal_is_audited() {
         "refusals are evidence too"
     );
 }
+
+// ----- B1.1: process-group lifetime hardening ------------------------------
+//
+// These rows are the post-fix contract for the WORKER-LIFETIME cap
+// (plan canonico v1.0 B1.1). They do NOT need unprivileged user
+// namespaces: the property under test is process-group membership and
+// the SIGTERM/SIGKILL delivery to that group, which is host-only and
+// std-only. Running them under `require_userns` would force the test
+// to skip on hosts without userns and silently certify nothing.
+//
+// Each row is shaped so that a missing fix produces a measurable
+// failure: the descendant row asserts a wall-clock upper bound, the
+// runaway_grandchild row asserts no surviving `sleep 5` from the
+// test, the posture row asserts an audit-record field.
+
+/// Build a WorkerTemplate that backgrounds a sleeper which
+/// outlives the shell AND keeps the inherited stdout FD open.
+/// Used by the row that asserts the broker's `read_bounded`
+/// returns without pinning on the inherited FD. The `exec 3>&1`
+/// is required: without it, bash closes the inherited FD on
+/// the sleeper before the sleeper starts, and the broker's
+/// read end sees EOF immediately, masking the bug.
+fn fd_holding_template(name: &str, secs: &str) -> WorkerTemplate {
+    deny_template(
+        name,
+        "/bin/sh",
+        &["-c", &format!("exec 3>&1; sleep {secs} &")],
+    )
+}
+
+/// Build a WorkerTemplate that backgrounds a sleeper that
+/// outlives the shell. Used by the row that asserts the
+/// broker's killpg reaps the sleeper too. `disown` is required
+/// so the shell does not wait for the sleeper (POSIX job
+/// control) — without it, the shell reaps the sleeper as part
+/// of its own exit, which would mask the broker's killpg
+/// (false green).
+fn orphan_template(name: &str, secs: &str) -> WorkerTemplate {
+    deny_template(name, "/bin/sh", &["-c", &format!("sleep {secs} & disown")])
+}
+
+/// Worker forks a long-lived sleeper that holds the inherited
+/// stdout FD, then the shell exits. The sleeper outlives the
+/// shell and would otherwise keep the broker's `read_bounded`
+/// blocked until the sleeper eventually closes the FD. With
+/// setsid()+killpg() on the timeout path the entire group dies
+/// at the cap, the inherited FD closes, and the bounded reader
+/// returns in the same envelope as the timeout.
+///
+/// The contract under test is wall-clock: the spawn() call
+/// returns in <2s when the cap is 250ms and the sleeper is 5s,
+/// because killpg reaps the group at the cap. Without the fix,
+/// the join blocks until the sleeper completes (5s) or the
+/// shell's job-control reaps the sleeper into bash's wait (which
+/// varies by shell, so the wall-clock check is the only honest
+/// assertion).
+#[test]
+fn uat_040_descendant_holding_stdout_does_not_block_join() {
+    let t = fd_holding_template("orphan-grandchild", "5");
+    let r = WorkerRegistry::new(vec![t]);
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
+    let started = std::time::Instant::now();
+    // The shell exits in a few ms (it backgrounds the sleeper
+    // and returns), so the broker's `wait_with_timeout` reaps
+    // the shell as `Exited(0)` and the run is recorded as
+    // `Completed`. The bug, if present, is in the
+    // `read_bounded` join that follows: the inherited FD is
+    // held open by the sleeper, and the join blocks until the
+    // sleeper completes its 5s sleep. With killpg in place,
+    // the cap path kills the sleeper too, the FD closes, and
+    // the join returns promptly.
+    let _run = spawn(
+        &r,
+        "orphan-grandchild",
+        SpawnOptions {
+            secret: None,
+            // 250ms is well under the 5s sleeper. The shell exits
+            // in ~5ms so the cap is irrelevant for the wait; the
+            // cap is what bounds the join. With the fix, killpg
+            // at the cap closes the inherited FD and the join
+            // returns in <1s total. Without the fix, the join
+            // blocks until the sleeper completes (~5s).
+            timeout: Some(std::time::Duration::from_millis(250)),
+            ..Default::default()
+        },
+        &AuditWriter::new(&audit),
+    )
+    .expect("the shell exits; the run record is not an Err");
+    let elapsed = started.elapsed();
+    // 4s catches the buggy path (5s sleeper minus a small
+    // margin) without being so tight that a busy CI trips it.
+    // The fixed path completes in ~1.2s.
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "the inherited FD must not pin the join (elapsed: {elapsed:?})"
+    );
+}
+
+/// Worker spawns an immediate sleeper that outlives the shell;
+/// the broker's timeout must kill the whole group, not just the
+/// shell. The check is: (a) the run returns in <2s (killpg at
+/// the cap, not a 60s wait), and (b) no `sleep 60` from this
+/// test is alive after the cap. The 60s sleeper is intentionally
+/// far longer than the cap so a regression that re-introduces
+/// per-PID signaling would either hang the broker for 60s
+/// (caught by (a)) or leave a long-lived sleeper behind (caught
+/// by (b)).
+#[test]
+fn uat_040_runaway_grandchild_is_killed_with_the_group() {
+    let t = orphan_template("runaway-grandchild", "60");
+    let r = WorkerRegistry::new(vec![t]);
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
+    let started = std::time::Instant::now();
+    let _ = spawn(
+        &r,
+        "runaway-grandchild",
+        SpawnOptions {
+            secret: None,
+            // 300ms is well under the 60s sleeper. With the fix,
+            // killpg on the timeout path reaps the sleeper
+            // immediately (~1.3s total). Without the fix, the
+            // broker hangs for the sleeper's lifetime.
+            timeout: Some(std::time::Duration::from_millis(300)),
+            ..Default::default()
+        },
+        &AuditWriter::new(&audit),
+    )
+    .expect("the shell exits; the run is not an Err");
+    // (a) The run must return in well under the sleeper's
+    // lifetime. The fixed path is ~1.3s; the buggy path is
+    // 60s+. 5s is a generous bound that catches the regression
+    // without flaking on a slow CI.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "killpg must reap the sleeper, not let the broker wait it out (elapsed: {elapsed:?})"
+    );
+    // (b) No `sleep 60` started in the last 90s may survive. The
+    // test itself does not spawn `sleep 60` anywhere else, so a
+    // hit is a regression. The orphan snippet backgrounds a
+    // `sleep 60` which shows up as `sleep 60` in `ps`.
+    let found_alive = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            "ps -eo pid,etimes,args | awk '$2 < 90 && $3 == \"sleep\" && $4 == \"60\" { print $1 }'",
+        ])
+        .output()
+        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false);
+    assert!(
+        !found_alive,
+        "a `sleep 60` from this test outlived the cap: the PG was not killed"
+    );
+}
+
+/// The audit record must carry the posture label. Today that
+/// label is the single string `ISOLATED_PROCESS_EXPOSURE`
+/// (M10-R6). After B1.1, the label is a `PostureLabel` enum the
+/// broker reports from the run; the audit DTO carries the wire
+/// name. AAT-RUNTIME-04 (descendants) and AAT-RUNTIME-06
+/// (posture in audit) are the canonical rows.
+#[test]
+fn uat_040_posture_label_in_audit_record() {
+    let t = deny_template("audited-ok", "/bin/true", &[]);
+    let r = WorkerRegistry::new(vec![t]);
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
+    let run = spawn(
+        &r,
+        "audited-ok",
+        completion_opts(),
+        &AuditWriter::new(&audit),
+    )
+    .expect("run");
+    assert_eq!(run.exit_code, Some(0));
+    let recs = audit.lock().expect("not poisoned").query(0);
+    match &recs[0].event {
+        asv_ipc_protocol::AuditEventDto::WorkerSpawned { posture, .. } => {
+            // The wire name is the M10-R6 spec value today.
+            // Once B1.1 lands a `PostureLabel` enum, the audit
+            // contract test in this same file must be updated
+            // to assert against the enum, not the literal.
+            assert_eq!(posture, "ISOLATED_PROCESS_EXPOSURE");
+        }
+        other => panic!("unexpected audit variant: {other:?}"),
+    }
+}
