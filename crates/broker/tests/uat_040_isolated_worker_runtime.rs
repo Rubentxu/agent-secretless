@@ -14,7 +14,9 @@ use asv_broker::isolated_exec::{
     EgressPolicy, LandlockProfile, Redactor, SeccompProfile, SecretInjectionPlan, WorkerRegistry,
     WorkerTemplate,
 };
-use asv_broker::worker::{spawn, AuditWriter, RunOutcome, SecretProvider, SpawnError, SpawnOptions};
+use asv_broker::worker::{
+    spawn, AuditWriter, RunOutcome, SecretProvider, SpawnError, SpawnOptions,
+};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
