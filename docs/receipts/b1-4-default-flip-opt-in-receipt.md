@@ -4,7 +4,7 @@
 **Branch**: `b1/default-flip-opt-in`
 **Worktree**: `/var/home/rubentxu/Proyectos/rust/agent-secretless-b1-4`
 **Off**: `b1/worker-lifetime` HEAD `9f867b8` (B1.1 + B1.2 + B1.3 merged)
-**Commits**: 5 — `f276f3e` (DRAFT spec), `4dcc589` (spec approved), `4b6f6e2` (code 1/2: plumbing), `39d1b6b` (code 2/2: tests + fmt fix), plus the housekeeping commit that pays the B1.2 clippy ratchet drift (see "Honest observations" below)
+**Commits**: 6 — `f276f3e` (DRAFT spec), `4dcc589` (spec approved), `4b6f6e2` (code 1/2: plumbing), `39d1b6b` (code 2/2: tests + fmt fix), `28b93e6` (housekeeping: pay B1.2 redundant-closure lint), `b1f72b1` (this receipt)
 
 ## What B1.4 ships
 
