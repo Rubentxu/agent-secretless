@@ -1159,8 +1159,37 @@ pub enum AuditEventDto {
         egress: String,
         /// SecretInjectionPlan wire name ("env_var" | "file" | "none").
         injection: String,
-        /// Always `ISOLATED_PROCESS_EXPOSURE` for worker runs.
+        /// B1.3: posture is now runtime-aware.
+        /// `STRONG_SECRETLESS` when the broker measured a cgroup
+        /// fence at startup (cgroup v2 mounted AND a session slice
+        /// successfully created); `ISOLATED_PROCESS_EXPOSURE`
+        /// otherwise. The M10-R6 contract that the broker never
+        /// under-states the residual risk still holds: the UI is
+        /// told every demotion.
         posture: String,
+        /// B1.3: why the broker had to fall back from
+        /// `STRONG_SECRETLESS` to `ISOLATED_PROCESS_EXPOSURE` for
+        /// this run, when applicable.
+        ///
+        /// Closed vocabulary (the broker never builds a value from
+        /// a raw string at runtime, so a malformed value cannot
+        /// reach an audit row by construction):
+        /// - `"cgroup_v2_unavailable"` — cgroup v2 was not mounted
+        ///   at `/sys/fs/cgroup` (kernel or distro).
+        /// - `"slice_creation_failed"` — cgroup v2 was found but
+        ///   the broker could not create its session slice
+        ///   (e.g. write permission denied).
+        /// - `"non_linux"` — the broker is running on a non-Linux
+        ///   host (the cgroup probe is Linux-only).
+        ///
+        /// `None` on the strong path (when `posture ==
+        /// "STRONG_SECRETLESS"`) so the field does not grow a
+        /// column the strong case never uses.
+        ///
+        /// B1.3 ships with a feature-flag policy: the broker still
+        /// emits `None` in test paths because tests do not
+        /// install a real harden profile.
+        degraded_reason: Option<String>,
         /// "ok" | "failed" | "timeout" | "refused" | "error" | "signaled".
         /// `signaled` means the child died from a signal (e.g. SIGSYS under
         /// the seccomp deny-list, or SIGKILL after the timeout grace). It was

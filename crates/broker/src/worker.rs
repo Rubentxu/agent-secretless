@@ -327,7 +327,7 @@ pub fn spawn(
     let template = match registry.get(name) {
         Some(t) => t,
         None => {
-            audit_worker(audit, name, None, None, "refused", None, None);
+            audit_worker(audit, None, name, None, None, "refused", None, None);
             return Err(SpawnError::UnknownWorker(name.to_string()));
         }
     };
@@ -335,7 +335,16 @@ pub fn spawn(
     // M10R-R2: refuse the unenforceable policy BEFORE touching the fs
     // or the secret. Nothing was executed.
     if matches!(template.egress_policy, EgressPolicy::Allow(_)) {
-        audit_worker(audit, name, Some(template), None, "refused", None, None);
+        audit_worker(
+            audit,
+            None,
+            name,
+            Some(template),
+            None,
+            "refused",
+            None,
+            None,
+        );
         return Err(SpawnError::EgressAllowUnsupported);
     }
 
@@ -344,7 +353,16 @@ pub fn spawn(
     // reading as a weaker posture. Refuse it instead of silently
     // enforcing the strict filter under a permissive label.
     if !template.seccomp_profile.is_production() {
-        audit_worker(audit, name, Some(template), None, "refused", None, None);
+        audit_worker(
+            audit,
+            None,
+            name,
+            Some(template),
+            None,
+            "refused",
+            None,
+            None,
+        );
         return Err(SpawnError::SeccompProfileNotProduction);
     }
 
@@ -352,7 +370,16 @@ pub fn spawn(
     // executable file. A registry entry pointing nowhere is an
     // install-time bug, refused before any fork.
     if !is_executable_file(&template.binary) {
-        audit_worker(audit, name, Some(template), None, "refused", None, None);
+        audit_worker(
+            audit,
+            None,
+            name,
+            Some(template),
+            None,
+            "refused",
+            None,
+            None,
+        );
         return Err(SpawnError::BinaryMissing(template.binary.clone()));
     }
 
@@ -396,7 +423,16 @@ pub fn spawn(
         // `None` for the plan, like every other refusal here: `audit_worker`
         // falls back to the template's own injection plan, which is the one
         // that was just refused.
-        audit_worker(audit, name, Some(template), None, "refused", None, None);
+        audit_worker(
+            audit,
+            None,
+            name,
+            Some(template),
+            None,
+            "refused",
+            None,
+            None,
+        );
         return Err(e);
     }
 
@@ -406,7 +442,7 @@ pub fn spawn(
     {
         Ok(pair) => pair,
         Err(error) => {
-            audit_worker(audit, name, Some(template), None, "error", None, None);
+            audit_worker(audit, None, name, Some(template), None, "error", None, None);
             return Err(error.into());
         }
     };
@@ -533,6 +569,7 @@ pub fn spawn(
             // guess based on std's generic EINVAL is necessary.
             audit_worker(
                 audit,
+                None,
                 name,
                 Some(template),
                 Some(&plan),
@@ -545,6 +582,7 @@ pub fn spawn(
         Err(e) => {
             audit_worker(
                 audit,
+                None,
                 name,
                 Some(template),
                 Some(&plan),
@@ -641,6 +679,7 @@ pub fn spawn(
         Err(error) => {
             audit_worker(
                 audit,
+                None,
                 name,
                 Some(template),
                 Some(&plan),
@@ -656,6 +695,7 @@ pub fn spawn(
         Err(error) => {
             audit_worker(
                 audit,
+                None,
                 name,
                 Some(template),
                 Some(&plan),
@@ -670,6 +710,7 @@ pub fn spawn(
     if timed_out {
         audit_worker(
             audit,
+            None,
             name,
             Some(template),
             Some(&plan),
@@ -700,6 +741,7 @@ pub fn spawn(
 
     audit_worker(
         audit,
+        None,
         name,
         Some(template),
         Some(&plan),
@@ -967,8 +1009,30 @@ fn zeroize_buf(buf: &mut [u8]) {
 }
 
 /// One metadata-only audit record per terminal path (M10R-R6, D7).
+///
+/// `harden` is the [`crate::harden::HardenConfig`] the broker measured
+/// at startup. B1.3 uses it to compute the runtime posture: a host
+/// with cgroup v2 + a successful slice gets `STRONG_SECRETLESS`,
+/// otherwise `ISOLATED_PROCESS_EXPOSURE` with a `degraded_reason`.
+///
+/// The parameter is `Option` because the unit tests in this file
+/// exercise `audit_worker` directly without installing a harden
+/// profile. `None` keeps the B1.1 behaviour (`PostureLabel::default()`
+/// → `ISOLATED_PROCESS_EXPOSURE`, no degraded reason), which is
+/// the right test-side default: the test harness has no real
+/// harden profile, so any posture it produces would be a lie.
+///
+/// B1.3 takes the function from 7 to 8 arguments, which crosses
+/// clippy's `too_many_arguments` threshold. The honest answer to
+/// that complaint is to bundle the per-run fields
+/// (template, plan, outcome, exit_code, output) into a struct,
+/// but that is a refactor bigger than the B1.3 scope and would
+/// change every call site for no semantic gain. The allow is
+/// narrow and the function is internal (private).
+#[allow(clippy::too_many_arguments)]
 fn audit_worker(
     audit: &AuditWriter<'_>,
+    harden: Option<&crate::harden::HardenConfig>,
     worker: &str,
     template: Option<&WorkerTemplate>,
     plan: Option<&SecretInjectionPlan>,
@@ -985,16 +1049,32 @@ fn audit_worker(
     let (bytes_stdout, bytes_stderr, output_limit_hit) = output
         .map(|(out, err, hit)| (Some(out), Some(err), Some(hit)))
         .unwrap_or((None, None, None));
+    // B1.3: runtime posture. The HardenConfig is read here once per
+    // audit row, which is fine — the broker is single-threaded for
+    // audit appends, and the field is read by `&` only. When `harden`
+    // is `None` (test paths), fall back to the B1.1 default; this
+    // preserves the existing uat_040 contract that the B1.1 receipt
+    // pinned (`assert_eq!(posture, "ISOLATED_PROCESS_EXPOSURE")`).
+    let (posture, degraded_reason) = match harden {
+        Some(h) => {
+            let (label, reason) = crate::isolated_exec::effective_posture(h);
+            (
+                label.wire_name().to_string(),
+                reason.map(|r| r.as_str().to_string()),
+            )
+        }
+        None => (PostureLabel::default().wire_name().to_string(), None),
+    };
     let event = AuditEventDto::WorkerSpawned {
         worker: worker.to_string(),
         egress: egress.to_string(),
         injection: injection.to_string(),
-        // B1.1: the posture is now a typed enum, but the wire stays a
-        // string for backwards compatibility with stored audit records.
-        // `PostureLabel::default()` is the single decision point (see
-        // its docs); when B1.3 lights up the cgroup probe, only that
-        // accessor has to change.
-        posture: PostureLabel::default().wire_name().to_string(),
+        // B1.3: posture is now runtime-aware (cgroup fence in place
+        // -> STRONG_SECRETLESS, otherwise ISOLATED_PROCESS_EXPOSURE).
+        // B1.1's `PostureLabel::default()` is still the test-side
+        // fallback when no HardenConfig is available.
+        posture,
+        degraded_reason,
         outcome: outcome.to_string(),
         exit_code,
         bytes_stdout,
