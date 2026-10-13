@@ -852,32 +852,6 @@ fn uat_040_runaway_grandchild_is_killed_with_the_group() {
 /// name. AAT-RUNTIME-04 (descendants) and AAT-RUNTIME-06
 /// (posture in audit) are the canonical rows.
 #[test]
-fn uat_040_posture_label_in_audit_record() {
-    let t = deny_template("audited-ok", "/bin/true", &[]);
-    let r = WorkerRegistry::new(vec![t]);
-    let audit = std::sync::Mutex::new(AuditLog::new(16));
-    let run = spawn(
-        &r,
-        "audited-ok",
-        completion_opts(),
-        &AuditWriter::new(&audit),
-    )
-    .expect("run");
-    assert_eq!(run.exit_code, Some(0));
-    let recs = audit.lock().expect("not poisoned").query(0);
-    match &recs[0].event {
-        asv_ipc_protocol::AuditEventDto::WorkerSpawned { posture, .. } => {
-            // The wire name is the M10-R6 spec value today.
-            // Once B1.1 lands a `PostureLabel` enum, the audit
-            // contract test in this same file must be updated
-            // to assert against the enum, not the literal.
-            assert_eq!(posture, "ISOLATED_PROCESS_EXPOSURE");
-        }
-        other => panic!("unexpected audit variant: {other:?}"),
-    }
-}
-
-#[test]
 fn uat_040_sigterm_trapping_descendant_is_killed_at_grace() {
     // The worker (bash) traps SIGTERM. A bare TERM-only signal
     // would let the broker hang for the worker's lifetime (5s).
@@ -950,4 +924,51 @@ fn uat_040_completing_worker_is_not_blocked_by_postwait_killpg() {
     );
     assert_eq!(run.outcome, RunOutcome::Completed);
     assert_eq!(run.exit_code, Some(0));
+}
+
+#[test]
+fn uat_040_posture_label_remains_isolated_process_exposure_in_test_path() {
+    // B1.3: the B1.1 audit contract — a `WorkerSpawned` row's
+    // `posture` is `ISOLATED_PROCESS_EXPOSURE` — still holds in
+    // the test path, because the test harness does not install a
+    // real `HardenConfig` and the broker falls back to
+    // `PostureLabel::default()`. The runtime-aware posture is
+    // exercised in the unit tests at `isolated_exec::tests`;
+    // this row is the integration-level anchor that the audit
+    // wire format is unchanged for current consumers.
+    //
+    // B1.3 ALSO adds a `degraded_reason: None` on the audit row
+    // in the test path. Pinning that here too so a future change
+    // that fills the field from the test harness (a lie) is
+    // caught.
+    let t = deny_template("audited-ok", "/bin/true", &[]);
+    let r = WorkerRegistry::new(vec![t]);
+    let audit = std::sync::Mutex::new(AuditLog::new(16));
+    let run = spawn(
+        &r,
+        "audited-ok",
+        completion_opts(),
+        &AuditWriter::new(&audit),
+    )
+    .expect("run");
+    assert_eq!(run.exit_code, Some(0));
+    let recs = audit.lock().expect("not poisoned").query(0);
+    match &recs[0].event {
+        asv_ipc_protocol::AuditEventDto::WorkerSpawned {
+            posture,
+            degraded_reason,
+            ..
+        } => {
+            assert_eq!(posture, "ISOLATED_PROCESS_EXPOSURE");
+            // B1.3: degraded_reason is `None` in the test path
+            // because the harness has no real HardenConfig. The
+            // runtime-aware populate is exercised in the unit
+            // tests at `isolated_exec::tests::effective_posture_*`.
+            assert_eq!(
+                degraded_reason, &None,
+                "test path must not invent a degraded_reason (the harness has no real HardenConfig)"
+            );
+        }
+        other => panic!("unexpected audit variant: {other:?}"),
+    }
 }

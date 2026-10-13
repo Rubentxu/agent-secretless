@@ -57,13 +57,106 @@ impl PostureLabel {
 impl Default for PostureLabel {
     /// **B1.1 decision (user-authorised option A):** with the cgroup
     /// probe deliberately out of scope, the steady-state posture is
-    /// `IsolatedProcessExposure`. B1.3 will read a feature flag (or a
-    /// runtime probe) and switch this to `StrongSecretless` when the
-    /// cgroup fence is in place. The default keeps the
-    /// `strong_secretless_enabled()` accessor in B1.3 as the single
-    /// place where the flip lives; no other call site has to change.
+    /// `IsolatedProcessExposure`. B1.3 introduces
+    /// `PostureLabel::effective(harden_config)` (the runtime-aware
+    /// accessor) and the default stays `IsolatedProcessExposure` for
+    /// one more cycle, by deliberate choice: a flip in `Default` would
+    /// change every audit row on a cgroup-fence host without an
+    /// operator opt-in. The opt-in is a follow-up.
     fn default() -> Self {
         PostureLabel::IsolatedProcessExposure
+    }
+}
+
+/// B1.3: why a worker run had to fall back to
+/// `IsolatedProcessExposure` instead of `StrongSecretless`.
+///
+/// The wire representation is a `&'static str` produced by
+/// [`DegradedReason::as_str`]; the broker never builds a value of this
+/// type from a raw string at runtime, so a malformed value cannot reach
+/// an audit row by construction. The enum is `Copy` so it sits in a
+/// `WorkerSpawned` audit row without allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DegradedReason {
+    /// `harden::install` did not find cgroup v2 mounted at
+    /// `/sys/fs/cgroup`. Either the kernel was built without it
+    /// (`CONFIG_CGROUP_*` absent) or the distro never set it up.
+    CgroupV2Unavailable,
+    /// cgroup v2 was found but the broker could not create its
+    /// session slice (e.g. write permission denied on
+    /// `/sys/fs/cgroup/asv-broker.session.*`).
+    SliceCreationFailed,
+    /// Not Linux. The build-time cfg switch on `target_os` already
+    /// suppresses the cgroup probe on macOS / BSD / Windows, but this
+    /// variant exists so the audit row can be self-explanatory on a
+    /// non-Linux run rather than carrying `None` and forcing the UI
+    /// to look at the platform.
+    NonLinux,
+}
+
+impl DegradedReason {
+    /// Wire string. The audit row carries the result; the M5 UI
+    /// surfaces it to the operator.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DegradedReason::CgroupV2Unavailable => "cgroup_v2_unavailable",
+            DegradedReason::SliceCreationFailed => "slice_creation_failed",
+            DegradedReason::NonLinux => "non_linux",
+        }
+    }
+}
+
+/// B1.3: the runtime-aware posture accessor.
+///
+/// Returns the label the broker should put on the audit row for
+/// *this* run, given the harden profile the process actually
+/// installed. The decision is:
+///   - `StrongSecretless` if cgroup v2 is mounted AND the broker's
+///     session slice was created successfully (the cgroup fence is
+///     in place);
+///   - `IsolatedProcessExposure` with the corresponding
+///     [`DegradedReason`] otherwise.
+///
+/// `Default for PostureLabel` is intentionally NOT updated to call
+/// this: the audit row has to stay opt-in for one release so a
+/// flip in the harness does not silently change every prior
+/// record's label. A future change to `Default` is a one-liner
+/// once the operator opt-in exists; until then, callers that want
+/// the runtime label must call this function explicitly.
+pub fn strong_secretless_enabled(harden: &crate::harden::HardenConfig) -> bool {
+    // Both conditions must hold. A kernel with cgroup v2 mounted
+    // but a broker that failed to create its slice (a permission
+    // problem) is NOT strong: the worker would run outside the
+    // fence the operator asked for.
+    harden.cgroup_v2 && harden.slice_created
+}
+
+/// B1.3: the runtime-aware posture.
+///
+/// See [`strong_secretless_enabled`]. Returns the label and, when
+/// the label is `IsolatedProcessExposure`, the reason it had to
+/// fall back. The reason is `None` on the strong path so the audit
+/// row does not grow a column the strong case never uses.
+pub fn effective_posture(
+    harden: &crate::harden::HardenConfig,
+) -> (PostureLabel, Option<DegradedReason>) {
+    if strong_secretless_enabled(harden) {
+        (PostureLabel::StrongSecretless, None)
+    } else {
+        let reason = if !harden.cgroup_v2 {
+            #[cfg(not(target_os = "linux"))]
+            {
+                DegradedReason::NonLinux
+            }
+            #[cfg(target_os = "linux")]
+            {
+                DegradedReason::CgroupV2Unavailable
+            }
+        } else {
+            // cgroup_v2 was found, but slice creation failed.
+            DegradedReason::SliceCreationFailed
+        };
+        (PostureLabel::IsolatedProcessExposure, Some(reason))
     }
 }
 
@@ -531,5 +624,98 @@ mod tests {
         // The posture label is part of the public surface; tests that
         // refer to it MUST match the literal.
         assert_eq!(POSTURE_LABEL, "ISOLATED_PROCESS_EXPOSURE");
+    }
+
+    // ----- B1.3 tests --------------------------------------------------
+
+    /// Synthetic HardenConfig builder for the B1.3 unit tests. Mirrors
+    /// the public `HardenConfig` shape exactly; the constructor exists
+    /// here because `HardenConfig::empty()` is private to the broker.
+    fn synthetic_harden(cgroup_v2: bool, slice_created: bool) -> crate::harden::HardenConfig {
+        crate::harden::HardenConfig {
+            cgroup_v2,
+            landlock_capable: true,
+            landlock_installed: true,
+            seccomp_installed: true,
+            slice_created,
+            slice_path: if slice_created {
+                Some(std::path::PathBuf::from("/sys/fs/cgroup/asv-broker.test"))
+            } else {
+                None
+            },
+        }
+    }
+
+    #[test]
+    fn degraded_reason_wire_names_are_stable() {
+        // The audit row carries the result; a rename here is a
+        // breaking change for every consumer of the audit log.
+        assert_eq!(
+            DegradedReason::CgroupV2Unavailable.as_str(),
+            "cgroup_v2_unavailable"
+        );
+        assert_eq!(
+            DegradedReason::SliceCreationFailed.as_str(),
+            "slice_creation_failed"
+        );
+        assert_eq!(DegradedReason::NonLinux.as_str(), "non_linux");
+    }
+
+    #[test]
+    fn strong_secretless_enabled_requires_both_conditions() {
+        // Cgroup v2 mounted AND slice created: strong.
+        assert!(strong_secretless_enabled(&synthetic_harden(true, true)));
+        // Cgroup v2 mounted but no slice: NOT strong (permission
+        // problem or similar). The worker would run outside the
+        // fence the operator asked for.
+        assert!(!strong_secretless_enabled(&synthetic_harden(true, false)));
+        // No cgroup v2: not strong even with the slice_created
+        // flag accidentally true (impossible in practice; the
+        // slice creation step requires cgroup v2, but the
+        // accessor must not assume the correlation).
+        assert!(!strong_secretless_enabled(&synthetic_harden(false, true)));
+        // Neither: not strong.
+        assert!(!strong_secretless_enabled(&synthetic_harden(false, false)));
+    }
+
+    #[test]
+    fn effective_posture_returns_strong_when_cgroup_fence_present() {
+        let (label, reason) = effective_posture(&synthetic_harden(true, true));
+        assert_eq!(label, PostureLabel::StrongSecretless);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn effective_posture_returns_isolated_with_reason_when_cgroup_v2_missing() {
+        let (label, reason) = effective_posture(&synthetic_harden(false, false));
+        assert_eq!(label, PostureLabel::IsolatedProcessExposure);
+        #[cfg(target_os = "linux")]
+        assert_eq!(reason, Some(DegradedReason::CgroupV2Unavailable));
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(reason, Some(DegradedReason::NonLinux));
+    }
+
+    #[test]
+    fn effective_posture_returns_isolated_with_reason_when_slice_creation_failed() {
+        // cgroup_v2 is true but slice_created is false. The
+        // effective posture must be IsolatedProcessExposure with
+        // SliceCreationFailed (NOT CgroupV2Unavailable, because
+        // the kernel HAS cgroup v2; the broker failed to set
+        // the slice up).
+        let (label, reason) = effective_posture(&synthetic_harden(true, false));
+        assert_eq!(label, PostureLabel::IsolatedProcessExposure);
+        assert_eq!(reason, Some(DegradedReason::SliceCreationFailed));
+    }
+
+    #[test]
+    fn default_posture_label_is_still_isolated_process_exposure() {
+        // B1.3 feature-flag policy: the Default does NOT call
+        // effective_posture; the audit row stays opt-in for one
+        // release. Pin this so a future flip is a deliberate
+        // change, not an accident.
+        assert_eq!(
+            PostureLabel::default(),
+            PostureLabel::IsolatedProcessExposure
+        );
     }
 }
