@@ -995,6 +995,34 @@ pub struct BrokerState {
     /// without the harden profile reports the protections as absent, because
     /// a process that did not set them has not got them.
     pub self_report: selfreport::SelfReport,
+    /// B1.4: the measured [`crate::harden::HardenConfig`] the broker
+    /// installed at startup, kept for the audit-row path.
+    ///
+    /// `None` for a broker launched without `--harden`: the broker
+    /// never measured cgroup v2, so the runtime posture is unknown
+    /// and the audit row keeps the B1.1 honest label
+    /// (`IsolatedProcessExposure`, no degraded reason). `Some(cfg)`
+    /// for a broker that ran `harden::install`; the field is what
+    /// `worker::spawn` threads into `audit_worker` so the audit
+    /// row can call `effective_posture_for_audit(harden, opt_in)`.
+    ///
+    /// Held in state rather than a `main` local for the same
+    /// reason `self_report` is: the request path needs to read it
+    /// on every worker spawn, and re-querying the kernel on each
+    /// call would answer a different question than the one
+    /// measured at startup.
+    pub harden_config: Option<crate::harden::HardenConfig>,
+    /// B1.4: the operator's `--runtime-posture-aware` opt-in flag.
+    ///
+    /// Default `false`: a broker that was not told to reflect the
+    /// runtime posture keeps the B1.1 audit contract on every row.
+    /// `true` only when the operator passed the flag in the launch
+    /// contract, which the `uat_017` env-quarantine invariant
+    /// forces to be a CLI flag rather than an environment read.
+    /// The field is the *policy*; `harden_config` is the
+    /// *measurement*. Both must be present for the audit row to
+    /// flip.
+    pub runtime_posture_aware: bool,
     /// The CONNECT routes the operator declared, C2.6.
     ///
     /// In state rather than a local in `main`, because `CreateSession` has to
@@ -1077,6 +1105,13 @@ impl Default for BrokerState {
             control_plane: admission::Enrolment::empty(),
             vault_writer: None,
             self_report: selfreport::SelfReport::default(),
+            // B1.4: no harden profile installed, so the audit-row
+            // path has nothing to reflect. runtime_posture_aware
+            // is the operator's opt-in; default is the same
+            // opt-out the launch contract produces when the flag
+            // is absent.
+            harden_config: None,
+            runtime_posture_aware: false,
             // Closed by default, the same posture the listener itself ships
             // with: a broker that was given no route file mints nothing, and a
             // session in it has nothing to present.
@@ -2185,7 +2220,16 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
             }
             let audit = crate::worker::AuditWriter::new(&audit);
 
-            match crate::worker::spawn(&view, &worker, opts, &audit) {
+            // B1.4: the audit row's posture is now policy-gated. The
+            // harden profile is what the kernel measured (None if the
+            // operator never passed --harden), and the opt-in is the
+            // operator's --runtime-posture-aware flag. Both must be
+            // present for the runtime posture to land on the audit
+            // row; otherwise the B1.1 contract is preserved
+            // (IsolatedProcessExposure, no degraded reason).
+            let harden = state.harden_config.as_ref();
+            let opt_in = state.runtime_posture_aware;
+            match crate::worker::spawn(&view, &worker, opts, &audit, harden, opt_in) {
                 Ok(run) => {
                     // The streams returned are already the redactor's output.
                     // The broker never holds the raw pipe, so there is no path
