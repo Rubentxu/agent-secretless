@@ -498,6 +498,17 @@ pub fn spawn(
                 let _ = libc::write(hook_status_fd, marker.as_ptr().cast(), marker.len());
                 return Err(std::io::Error::last_os_error());
             }
+            // B1.2: empty the signal mask, reset tty / job-control
+            // signal dispositions to SIG_DFL, and ask the kernel to
+            // deliver SIGKILL to the child if the broker dies. The
+            // helper is async-signal-safe end-to-end (see its
+            // doc-comment); on any failure we route through the
+            // hook-status marker exactly like setsid.
+            if let Err(_err) = reset_signal_state_for_worker() {
+                let marker = [PRE_EXEC_FAILURE_MARKER];
+                let _ = libc::write(hook_status_fd, marker.as_ptr().cast(), marker.len());
+                return Err(std::io::Error::last_os_error());
+            }
             match child_isolation_hook(&binary, &landlock) {
                 Ok(()) => Ok(()),
                 Err(error) => {
@@ -725,6 +736,131 @@ const PRE_EXEC_FAILURE_MARKER: u8 = 0xA5;
 fn pre_exec_hook_failed(reader: &mut std::os::unix::net::UnixStream) -> bool {
     let mut marker = [0];
     matches!(reader.read(&mut marker), Ok(1)) && marker[0] == PRE_EXEC_FAILURE_MARKER
+}
+
+/// Reset the worker's signal state to a clean daemon shape so it does
+/// not inherit either the broker's blocked-signal set or its custom
+/// signal handlers, and ask the kernel to deliver SIGKILL if the broker
+/// (the child's parent) dies. Run in the forked child between fork and
+/// exec — all four syscalls (sigprocmask, sigaction, prctl) are
+/// async-signal-safe on Linux per signal-safety(7), and the function
+/// returns `Err` on any failure so the caller can route through the
+/// pre_exec hook-status marker and surface as `IsolationUnavailable`.
+///
+/// The three resets are NOT opt-in. The defaults are wrong for a worker:
+///
+/// 1. **Empty signal mask.** The broker should not block anything, but
+///    even so the empty mask is the proof. A future change that blocks
+///    SIGTERM in the broker (e.g. to deliver shutdown only to the
+///    listener thread) would otherwise let the worker inherit that
+///    block and silently miss the broker's own `killpg(SIGTERM)` from
+///    the timeout reaper.
+/// 2. **SIG_DFL for tty / job-control signals.** A daemon's child must
+///    run the kernel's default action, never the broker's handler
+///    (which is broker code, not worker code). The seven signals
+///    covered are SIGHUP, SIGINT, SIGTERM, SIGPIPE, SIGTSTP, SIGTTIN,
+///    SIGTTOU. SIGCHLD is intentionally NOT reset: the kernel default
+///    for SIGCHLD is "ignore" (which is what we want — the broker is
+///    the one calling `wait(2)`, the child should not), and a
+///    sub-process inheriting the broker's SIGCHLD handler would be
+///    pathological only in cases the broker has not yet set up.
+/// 3. **PR_SET_PDEATHSIG = SIGKILL.** Closes the "broker dies, worker
+///    outlives" footgun that the B1.1 process-group reaper does not
+///    cover (the reaper only fires on timeout / graceful shutdown,
+///    not on `SIGKILL` of the broker or a panic that aborts it).
+///
+/// # Errors
+/// Returns the last OS error if any of the four syscalls fail. The
+/// caller is responsible for surfacing the failure to the parent via
+/// the pre_exec hook-status marker.
+#[cfg(target_os = "linux")]
+fn reset_signal_state_for_worker() -> std::io::Result<()> {
+    // 1) Empty the signal mask.
+    // SAFETY: `libc::sigset_t` is a POD type (a fixed-size bitmask
+    // of `_sigset_word`); all-zero is a well-formed empty signal
+    // set on every Linux architecture the broker supports.
+    let empty_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `empty_mask` is a well-formed (zeroed) signal set,
+    // `SIG_SETMASK` is the supported operation, and the old-set
+    // pointer is null (we do not need it). All four arguments are
+    // passed by-value / by-const-pointer as the libc signature
+    // requires. The call is async-signal-safe.
+    if unsafe { libc::sigprocmask(libc::SIG_SETMASK, &empty_mask, std::ptr::null_mut()) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // 2) Reset the tty / job-control signal dispositions to SIG_DFL.
+    //
+    // SAFETY: `libc::SIG_DFL` is the platform-defined constant for the
+    // default disposition (it is the literal 0 on every Linux libc the
+    // broker supports, but the symbol is the right one to use). The
+    // sigaction struct is initialised to all-zero (which is the kernel
+    // default for the sa_mask and sa_restorer fields); sa_flags=0
+    // means no SA_RESTORER, no SA_SIGINFO, no SA_NODEFER, no
+    // SA_RESETHAND — exactly the kernel default. The third argument
+    // (old action) is null because we do not need it. The call is
+    // async-signal-safe.
+    let signals_to_reset: [libc::c_int; 7] = [
+        libc::SIGHUP,
+        libc::SIGINT,
+        libc::SIGTERM,
+        libc::SIGPIPE,
+        libc::SIGTSTP,
+        libc::SIGTTIN,
+        libc::SIGTTOU,
+    ];
+    for &sig in &signals_to_reset {
+        let sa = libc::sigaction {
+            sa_sigaction: libc::SIG_DFL,
+            // SAFETY: same as the empty_mask above; sa_mask is a
+            // sigset_t and all-zero is the kernel's "no signals
+            // masked during this handler" default.
+            sa_mask: unsafe { std::mem::zeroed() },
+            sa_flags: 0,
+            // `sa_restorer` is glibc-private and only used when
+            // SA_RESTORER is set; we set sa_flags=0, so the union
+            // arm we use is `sa_sigaction` (via the const fn
+            // initialiser above). Pre-2.32 glibc and musl both
+            // accept the same layout.
+            #[cfg(any(
+                target_arch = "x86_64",
+                target_arch = "x86",
+                target_arch = "aarch64",
+                target_arch = "riscv64",
+            ))]
+            sa_restorer: None,
+        };
+        // SAFETY: see block comment above. Each `sig` is a real
+        // signal number (libc constant), `sa` is a fully-initialised
+        // sigaction, the third argument is null.
+        if unsafe { libc::sigaction(sig, &sa, std::ptr::null_mut()) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    // 3) PR_SET_PDEATHSIG: ask the kernel to deliver SIGKILL to the
+    // child if its parent (the broker) dies. PR_SET_PDEATHSIG is
+    // arg2-encoded, so the (int) value is the second variadic slot.
+    //
+    // SAFETY: PR_SET_PDEATHSIG is the documented prctl operation
+    // (value 1 in <linux/prctl.h>); the second argument is the
+    // signal to deliver (SIGKILL = 9); the remaining three args are
+    // unused and passed as 0. The call is async-signal-safe.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reset_signal_state_for_worker() -> std::io::Result<()> {
+    // Honest refusal: the signal-mask and tty-signal handling the
+    // B1.2 spec requires is a Linux-only contract. On non-Linux
+    // platforms the worker spawn path returns
+    // `IsolationUnavailable` through the pre_exec hook-status marker
+    // — the `child_isolation_hook` already does this for the
+    // namespace + landlock + seccomp triad, so the platform is
+    // uniformly refused. The helper exists to keep the call site
+    // platform-symmetric (no `#[cfg]` inside `pre_exec`).
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
 // ----- pieces ------------------------------------------------------------
