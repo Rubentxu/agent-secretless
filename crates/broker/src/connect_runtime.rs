@@ -510,11 +510,9 @@ impl SubstitutionAudit for SharedSubstitutionAudit {
             crate::audit::AuditAppendError::Io(io) => {
                 BridgeError::Io(format!("audit durable write failed: {io}"))
             }
-            crate::audit::AuditAppendError::RetentionGap { evicted } => {
-                BridgeError::Io(format!(
-                    "audit ring evicted {evicted} records since the durable write"
-                ))
-            }
+            crate::audit::AuditAppendError::RetentionGap { evicted } => BridgeError::Io(format!(
+                "audit ring evicted {evicted} records since the durable write"
+            )),
         })?;
         Ok(())
     }
