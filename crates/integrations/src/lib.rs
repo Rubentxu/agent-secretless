@@ -87,8 +87,7 @@ pub use curl::{
     Curl, CurlCredential, CurlCredentialEntry, CurlDiscovery, CurlError, CurlFile, CurlOption,
 };
 pub use execute::{
-    decide, AuthorizationVerdict, ExecuteOutcome, ExecuteReceipt, ExecutionAttempt,
-    EXECUTE_SCHEMA,
+    decide, AuthorizationVerdict, ExecuteOutcome, ExecuteReceipt, ExecutionAttempt, EXECUTE_SCHEMA,
 };
 pub use fingerprint::{Drift, FileFingerprint, FingerprintError, FingerprintPolicy};
 pub use gradle::{Gradle, GradleDiscovery, GradleError};

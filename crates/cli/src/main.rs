@@ -7444,10 +7444,7 @@ fn run_integrations_execute(
     write_receipt_and_decide_exit(&receipt, json)
 }
 
-fn write_receipt_and_decide_exit(
-    receipt: &asv_integrations::ExecuteReceipt,
-    json: bool,
-) -> ! {
+fn write_receipt_and_decide_exit(receipt: &asv_integrations::ExecuteReceipt, json: bool) -> ! {
     if json {
         println!(
             "{}",
