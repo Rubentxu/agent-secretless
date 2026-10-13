@@ -26,9 +26,7 @@ use std::time::{Duration, Instant};
 use asv_ipc_protocol::AuditEventDto;
 
 use crate::audit::AuditLog;
-use crate::isolated_exec::{
-    EgressPolicy, SecretInjectionPlan, WorkerRegistry, WorkerTemplate,
-};
+use crate::isolated_exec::{EgressPolicy, SecretInjectionPlan, WorkerRegistry, WorkerTemplate};
 
 /// Why a worker run did not happen or did not finish cleanly. Every
 /// variant is honest about where it stopped: before exec (refusal /
@@ -343,7 +341,9 @@ pub fn spawn(
     let template = match registry.get(name) {
         Some(t) => t,
         None => {
-            audit_worker(audit, harden, opt_in, name, None, None, "refused", None, None);
+            audit_worker(
+                audit, harden, opt_in, name, None, None, "refused", None, None,
+            );
             return Err(SpawnError::UnknownWorker(name.to_string()));
         }
     };
@@ -462,7 +462,17 @@ pub fn spawn(
     {
         Ok(pair) => pair,
         Err(error) => {
-            audit_worker(audit, harden, opt_in, name, Some(template), None, "error", None, None);
+            audit_worker(
+                audit,
+                harden,
+                opt_in,
+                name,
+                Some(template),
+                None,
+                "error",
+                None,
+                None,
+            );
             return Err(error.into());
         }
     };
@@ -1240,8 +1250,7 @@ fn audit_worker(
     // and is unit-tested in `isolated_exec::tests`. The wrapper
     // is the production-side switch.
     let (posture, degraded_reason) = {
-        let (label, reason) =
-            crate::isolated_exec::effective_posture_for_audit(harden, opt_in);
+        let (label, reason) = crate::isolated_exec::effective_posture_for_audit(harden, opt_in);
         (
             label.wire_name().to_string(),
             reason.map(|r| r.as_str().to_string()),
