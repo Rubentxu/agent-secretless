@@ -158,23 +158,31 @@ Verified locally: `pin: 1.97.1, active:
 
 ## Gate results (on pinned toolchain 1.97.1)
 
-To be filled in by the gate run that follows this
-receipt. The expected green state:
+All 7 gates green on `rustc 1.97.1` (rustfmt 1.9.0-stable,
+clippy shipped with 1.97.1):
 
-- `cargo build --workspace`: 0 errors (incremental,
-  cached from B1.5; should be sub-minute)
-- `cargo test -p asv-broker --lib`: 686/686
-- `cargo test -p asv-broker --test uat_040_isolated_worker_runtime`: 21/21
-- `cargo test -p asv-broker --test uat_017_env_scan`: 4/4
-- `python3 scripts/check-clippy-ratchet.py`: 0/0
-- `cargo fmt --all -- --check`: 0 diffs
-- `rustup show active-toolchain`: `1.97.1-x86_64-unknown-linux-gnu (overridden by .../rust-toolchain.toml)`
-- `./scripts/check-rustfmt-pin.sh`: exit 0
+| Gate | Result | Time | Task |
+|---|---|---|---|
+| `cargo build --workspace` | exit 0, 0 errors | 1m29s | 905597oxoj |
+| `cargo test -p asv-broker --lib` | **686/686 passed**, 0 failed, 0 ignored | 43.2s | 045835dhpk |
+| `cargo test -p asv-broker --test uat_040_isolated_worker_runtime` | **21/21 passed**, 0 failed, 0 ignored | 1.82s | 045850om38 |
+| `cargo test -p asv-broker --test uat_017_env_scan` | **4/4 passed**, 0 failed, 0 ignored | 0.06s | 045852npk9 |
+| `python3 scripts/check-clippy-ratchet.py` | 0/0 (baseline 0) | 122s | 914543esgy |
+| `cargo fmt --all -- --check` | 0 diffs | 1.5s | 9145593rr8 |
+| `rustup show active-toolchain` | `1.97.1-x86_64-unknown-linux-gnu (overridden by .../rust-toolchain.toml)` | <1s | local |
+| `./scripts/check-rustfmt-pin.sh` | exit 0 (pin: 1.97.1, rustfmt: 1.9.0-stable) | <1s | local |
 
-If any gate is red, the policy doc and the script are
-not the cause (no code change) — the regression would
-be a toolchain-version-dependent test, which is a
-separate housekeeping issue.
+All numbers above are observed in this gate run on
+2026-10-14, not predicted. The B1.4 row
+`uat_040_runtime_posture_opt_in_flips_audit_row` is
+present in the 21 UAT-040 tests, confirming B1.4 is not
+regressed by the toolchain pin.
+
+The pin is functional end-to-end on the first build.
+No regression. The kind of drift B1.5 paid (arm-collapse,
+method-chain wrap between rustfmt 1.5 and 1.9.0) cannot
+recur because the toolchain is now structurally
+pinned.
 
 ## What B1.6 does NOT include
 
@@ -214,7 +222,7 @@ over-read the scope:
 |---|---|---|
 | `46aed89` | DRAFT spec | `docs/receipts/b1-6-rustfmt-pin-policy-DRAFT.md` |
 | `d9bbd43` | Implementation | `rust-toolchain.toml` + `docs/policies/rustfmt-pin-policy.md` + `scripts/check-rustfmt-pin.sh` |
-| (pending) | Receipt | `docs/receipts/b1-6-rustfmt-pin-policy-receipt.md` (this file) |
+| (this file) | Receipt (gate results filled in) | `docs/receipts/b1-6-rustfmt-pin-policy-receipt.md` |
 | (pending) | Merge to `b1/worker-lifetime` | — |
 | (pending) | Tag `b1.6` | — |
 | (pending) | Push branch + tag | — |
