@@ -105,7 +105,7 @@ El spec ya decide: UAT-035 es normativo de M13 en `14-UAT-ADVERSARIAL.md`
   arranque, usando `RecoveryJournal` tal cual. Ref: `03-ARCHITECTURE.md`.
 - [ ] **T3** Corregir los comentarios que hoy describen un journal inexistente:
   `Cargo.toml` (`[profile.dist]`) y `packaging/asv-brokerd.service:62`.
-- [ ] **T4** E2E efímero: `tests/ephemeral/b1-10/eph_crash_replay.py` — SIGKILL al
+- [x] **T4** E2E efímero: `crates/broker/tests/eph_crash_replay.rs` — SIGKILL al
   brokerd entre mutaciones, reinicio, estado reconciliado.
   AAT: `asv doctor` reporta el replay en lenguaje de operador.
 - [ ] **T5** Borrado de efímeros + receipt + release `b1.10`.
