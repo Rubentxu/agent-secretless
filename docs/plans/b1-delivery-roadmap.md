@@ -88,7 +88,7 @@ con el número de PID (H-03). Ref: `08-IDENTITY-POLICY-CAPABILITIES.md`, ADR-000
   (`lib.rs:389-395`) acepta un proceso distinto cuando el pidfd ya se cerró.
 - [ ] **T2** Guardar el `OwnedFd` en el registro de sesión vía `into_pidfd()`
   (hoy sin llamadores) y re-verificar liveness en cada uso de sesión.
-- [ ] **T3** E2E efímero: `tests/ephemeral/b1-9/eph_pin_liveness.rs` — hijo real que
+- [x] **T3** E2E efímero: `crates/broker/tests/eph_pin_liveness.rs` — hijo real que
   abre sesión, muere; otro proceso recicla el PID y es rechazado.
   AAT: fila de audit dice `pidfd-pinned` solo con pin vivo.
 - [ ] **T4** Borrado de efímeros + receipt + release `b1.9`.
