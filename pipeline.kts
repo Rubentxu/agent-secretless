@@ -128,22 +128,19 @@ pipeline {
         // Cheap, and it fails first on the things a reviewer would notice.
         //
         // This stage ran `cargo clippy … -D warnings` and it was red on main:
-        // eight errors in `asv-broker`, `could not compile … due to 8 previous
-        // errors`. It had been red since `71e9096`, the commit that adopted
-        // PipelineK as the CI authority, because the tree carries clippy debt
-        // that `1e337d7` fixed at a baseline of 263 on purpose.
+        // eight errors in `asv-broker`. `-D warnings` and the ratchet baseline
+        // are mutually exclusive while any debt remains, so the stage enforces
+        // the declared policy — the ratchet — rather than the destination.
         //
-        // `-D warnings` and that baseline are mutually exclusive: `-D warnings`
-        // fails at one warning and the ratchet allows 263. The stage was
-        // enforcing the destination as though it were the present, so nothing
-        // ran it and nothing looked. `-D warnings` is B6 and B8, where the
-        // count reaches zero; until then the declared policy is the ratchet, and
-        // the stage measures that.
+        // The debt the baseline held (263 warnings, set by `1e337d7`) has
+        // since been paid: `scripts/clippy-baseline.txt` reads 0, lowered in
+        // `27a8f1d`, so the ratchet now pins the tree at zero and any new
+        // warning fails this stage. This comment described the 263 state for
+        // two releases after the baseline moved; B1.7 re-derived it.
         //
-        // What this gives up, stated plainly: a count can be satisfied by
+        // What a count gives up, stated plainly: it can be satisfied by
         // trading one lint for another, which a lint-set diff would not allow.
-        // That is a real weakening and it is the deal the baseline describes —
-        // "hold the debt instead of describing it" — not a silent improvement.
+        // That is the deal the baseline describes — not a silent improvement.
         stage("static") {
             sh("cargo fmt --all -- --check")
             sh("python3 scripts/check-clippy-ratchet.py")
@@ -276,13 +273,15 @@ pipeline {
         }
 
         // Enforced, not advisory. This used to record its exit code instead of
-        // failing the run, justified by UAT gate-map defects that were tracked
-        // in the backlog. Those defects are resolved: `check-gates.py` reports
-        // 0 hard defects and 0 warnings with 34/34 UAT carrying a gate and 0
-        // orphaned. An exception that outlives its justification stops guarding
-        // while still looking like a gate, so it was removed rather than
-        // reworded. Future gate-map drift turning this red is the intended
-        // behaviour of a gate, not a reason to reintroduce the exception.
+        // failing the run. The defects that justified the exception are
+        // resolved: `check-gates.py` reports 0 hard defects, 0 orphaned UAT,
+        // and 40/40 UAT carrying a gate. The 5 remaining warnings are the
+        // filename-only claims of historically named test files — accepted
+        // state, with the reasons, in the "UAT claim coverage" row of
+        // `16-SECURITY-RELEASE-GATES.md`; B1.7 closed the two milestone-side
+        // warnings (M14/M15) by making their exit delegation explicit. This
+        // comment previously claimed 34/34 UAT and 0 warnings; it described a
+        // past revision, and B1.7 re-derived it.
         stage("spec-gates") {
             sh("python3 tools/check-gates.py")
         }

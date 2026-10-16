@@ -1,7 +1,5 @@
 # Agent Secretless Vault (ASV)
 
-[![verify](https://github.com/rubentxu/agent-secretless/actions/workflows/verify.yml/badge.svg)](https://github.com/rubentxu/agent-secretless/actions/workflows/verify.yml)
-
 A local credential control plane that lets an AI agent **use an identity without
 ever being handed the credential material**.
 
