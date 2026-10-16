@@ -2641,6 +2641,14 @@ is not met, and the remaining gap is a family rather than a measurement.
 place because this is the state as it stood when Gradle landed, and rewriting it
 would erase the record of what the gap was.)*
 
+**Exit.** M14 has no numbered UAT of its own: its exit criterion — a new
+adapter addable without touching broker or domain — is a property of the
+tree, measured by the R3.A/R3.B suites above rather than by a `UAT-NNN`
+id. Release certification for this milestone is delegated to
+`16-SECURITY-RELEASE-GATES.md` (the R11 full-suite row and the UAT claim
+coverage row), which re-derive their counts from the repository on every
+run.
+
 ### R3.B.3 — curl, the fourth family, and the measurement that closes the criterion
 
 `curl` is the fourth family, and the first one whose **precedence is a choice
@@ -5061,3 +5069,13 @@ registry the broker vouched for; the receipt names both.
 - **`M4-PUBLISH`** and **`M4-OPERATOR-UX`** from the M-list are still
   the next rows; the M15 section is closed above, the M4 family is
   what R5 inherits.
+
+### Exit
+
+M15 has no numbered UAT of its own. The chain it gates —
+`discover → ActionIntent → plan → authorize → execute → receipt` — is
+measured by the R4.B.1/B.2/B.3 suites named above, and the open rows are
+named rather than left implicit. Release certification is delegated to
+`16-SECURITY-RELEASE-GATES.md` (the R11 full-suite row and the UAT claim
+coverage row), which re-derive their counts from the repository on every
+run.
