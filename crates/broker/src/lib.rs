@@ -972,6 +972,7 @@ pub struct BrokerState {
     /// otherwise have to check two files, and the answer would be whichever one
     /// they happened to open.
     pub audit: Arc<Mutex<audit::AuditLog>>,
+    pub audit_write_failures: std::sync::atomic::AtomicU64,
     /// The principals enrolled as the human control plane, per ADR-0015.
     ///
     /// Empty by default, and empty is the state every broker on this machine
@@ -1069,6 +1070,21 @@ pub struct BrokerState {
     pub workers: Arc<crate::isolated_exec::WorkerRegistry>,
 }
 
+impl BrokerState {
+    /// Number of handled requests whose audit record failed its durable
+    /// write. Sticky for the life of the process: a gap that healed does not
+    /// un-happen, and the counter is what `asv status` reports.
+    pub fn audit_write_failures(&self) -> u64 {
+        self.audit_write_failures
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn mark_audit_write_failure(&self) {
+        self.audit_write_failures
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl Default for BrokerState {
     fn default() -> Self {
         Self {
@@ -1102,6 +1118,7 @@ impl Default for BrokerState {
             // be an API server nobody chose.
             k8s_bindings: Vec::new(),
             audit: Arc::new(Mutex::new(audit::AuditLog::default())),
+            audit_write_failures: Default::default(),
             control_plane: admission::Enrolment::empty(),
             vault_writer: None,
             self_report: selfreport::SelfReport::default(),
@@ -1454,7 +1471,14 @@ pub fn handle(state: &BrokerState, peer: &WorkloadIdentity, request: Request) ->
         outcome,
         posture: "SERVICE_BROKERED".to_string(),
     };
-    let _ = audit_chain!(state).append(event, now_secs());
+    if let Err(error) = audit_chain!(state).append(event, now_secs()) {
+        state.mark_audit_write_failure();
+        tracing::error!(
+            error = %error,
+            "this request's audit record did not land in the durable audit log; \
+             the gap is counted and visible via `asv status` until restart"
+        );
+    }
     response
 }
 
@@ -1556,6 +1580,7 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                 }
                 _ => Response::Pong {
                     protocol: PROTOCOL_VERSION,
+                    audit_write_failures: state.audit_write_failures(),
                 },
             }
         }
@@ -5230,6 +5255,39 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_durable_audit_write_is_counted_and_not_silent() {
+        let mut log = audit::AuditLog::new(100);
+        log.set_file_for_tests(
+            std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+                .expect("open read-only sink"),
+        );
+        let state = BrokerState {
+            audit: Arc::new(Mutex::new(log)),
+            ..BrokerState::default()
+        };
+        assert_eq!(state.audit_write_failures(), 0);
+        let response = handle(
+            &state,
+            &peer(),
+            Request::Ping {
+                protocol: PROTOCOL_VERSION,
+            },
+        );
+        // Pong is built before this request's own append fails.
+        assert_eq!(
+            response,
+            Response::Pong {
+                protocol: PROTOCOL_VERSION,
+                audit_write_failures: 0,
+            }
+        );
+        assert_eq!(state.audit_write_failures(), 1);
+        assert!(aud(&state).query(0).is_empty());
+        assert_eq!(aud(&state).dropped(), 0);
+        assert_eq!(aud(&state).verify(), Ok(()));
+    }
+
+    #[test]
     fn every_handled_request_is_audited_once() {
         let state = BrokerState::default();
         handle(
@@ -5256,6 +5314,11 @@ mod tests {
         );
         let records = aud(&state).query(0);
         assert_eq!(records.len(), 3, "one record per handle call");
+        assert_eq!(
+            state.audit_write_failures(),
+            0,
+            "healthy writes stay silent"
+        );
         assert_eq!(records[0].seq, 0);
         assert_eq!(records[2].seq, 2);
         assert_eq!(aud(&state).verify(), Ok(()));
@@ -5393,7 +5456,8 @@ mod tests {
         assert_eq!(
             resp,
             Response::Pong {
-                protocol: PROTOCOL_VERSION
+                protocol: PROTOCOL_VERSION,
+                audit_write_failures: 0,
             }
         );
     }

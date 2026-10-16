@@ -502,6 +502,7 @@ fn a_real_peer_answering_the_wrong_protocol_is_reported_as_incompatible() {
             let _ = std::io::Read::read(&mut stream, &mut request);
             let wrong = asv_ipc_protocol::Response::Pong {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION.wrapping_add(3),
+                audit_write_failures: 0,
             };
             let _ = stream.write_all(&serde_json::to_vec(&wrong).unwrap());
         }
@@ -540,6 +541,7 @@ fn a_real_peer_answering_the_right_protocol_is_accepted() {
             let _ = std::io::Read::read(&mut stream, &mut request);
             let right = asv_ipc_protocol::Response::Pong {
                 protocol: asv_ipc_protocol::PROTOCOL_VERSION,
+                audit_write_failures: 0,
             };
             let _ = stream.write_all(&serde_json::to_vec(&right).unwrap());
         }

@@ -144,10 +144,14 @@ impl ApplicationResult {
 /// where nobody is looking.
 pub fn from_response(response: &Response) -> ApplicationResult {
     match response {
-        Response::Pong { protocol } => ApplicationResult::Ok {
+        Response::Pong {
+            protocol,
+            audit_write_failures,
+        } => ApplicationResult::Ok {
             summary: format!("broker reachable, protocol v{protocol}"),
             data: json!({
                 "reachable": true,
+                "audit_write_failures": audit_write_failures,
                 "protocol": protocol,
                 "protocol_compatible": *protocol == asv_ipc_protocol::PROTOCOL_VERSION,
             }),

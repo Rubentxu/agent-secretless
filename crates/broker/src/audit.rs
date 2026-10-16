@@ -247,6 +247,13 @@ pub fn verify_file(path: &Path) -> Result<(), AuditFileError> {
 }
 
 impl AuditLog {
+    /// Test-only: replace the durable sink to inject deterministic write failures.
+    /// Never call from production code.
+    #[cfg(test)]
+    pub(crate) fn set_file_for_tests(&mut self, file: std::fs::File) {
+        self.file = Some(file);
+    }
+
     /// Creates a log retaining at most `max` records (`0` = unbounded).
     pub fn new(max: u64) -> Self {
         Self {

@@ -707,6 +707,10 @@ pub enum Request {
 pub enum Response {
     Pong {
         protocol: u16,
+        /// Handled requests whose audit record failed its durable write.
+        /// 0 on brokers from before this field existed.
+        #[serde(default)]
+        audit_write_failures: u64,
     },
     /// The broker's own description of itself.
     ///
@@ -1473,6 +1477,30 @@ mod tests {
     use super::*;
 
     const CANARY: &str = "ASV-CANARY-8d3a5b0c-DO-NOT-LEAK";
+
+    #[test]
+    fn pong_without_audit_field_reads_as_zero() {
+        let response: Response =
+            serde_json::from_str(r#"{"result":"pong","protocol":11}"#).unwrap();
+        assert_eq!(
+            response,
+            Response::Pong {
+                protocol: 11,
+                audit_write_failures: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn pong_tolerates_unknown_fields() {
+        let response = Response::Pong {
+            protocol: PROTOCOL_VERSION,
+            audit_write_failures: 7,
+        };
+        let mut value = serde_json::to_value(&response).unwrap();
+        value["future_field"] = serde_json::json!(true);
+        assert_eq!(serde_json::from_value::<Response>(value).unwrap(), response);
+    }
 
     /// M0 Exit: untrusted DTOs cannot become secret-bearing domain types.
     ///

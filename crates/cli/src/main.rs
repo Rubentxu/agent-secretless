@@ -1254,7 +1254,7 @@ pub fn observe_broker_socket_at(socket: &std::path::Path) -> doctor::SocketOutco
         protocol: PROTOCOL_VERSION,
     };
     match call(socket, &request) {
-        Ok(Response::Pong { protocol }) => doctor::SocketOutcome::Answered { protocol },
+        Ok(Response::Pong { protocol, .. }) => doctor::SocketOutcome::Answered { protocol },
         Ok(other) => doctor::SocketOutcome::Unexpected {
             // The variant name only. A `Display` of the response could carry
             // request-derived data, and `doctor` output is the most-copied
@@ -4212,8 +4212,17 @@ fn print_response(response: &Response) {
         Response::MTlsSign { certificate_pem } => {
             println!("{certificate_pem}");
         }
-        Response::Pong { protocol } => {
+        Response::Pong {
+            protocol,
+            audit_write_failures,
+        } => {
             println!("broker reachable, protocol v{protocol}");
+            // The response is matched by reference; copy the count once so the
+            // comparison and the message read the same value.
+            let audit_write_failures = *audit_write_failures;
+            if audit_write_failures > 0 {
+                println!("audit: {audit_write_failures} durable audit write(s) failed since start; those records were not persisted");
+            }
         }
         // The compatibility path (ADR-0008), printed with its posture on the
         // same line as the result. A caller reading only the exit code of a
