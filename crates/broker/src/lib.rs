@@ -117,7 +117,8 @@ pub struct SessionStore {
 struct SessionRecord {
     workspace: String,
     peer_pid: i32,
-    /// Whether the peer's process could be pinned with a pidfd (M4 D4).
+    /// The duplicated pidfd for the peer's process, when the connection could
+    /// be pinned (M4 D4).
     ///
     /// Directed requirement, not a global deny: `main.rs` deliberately makes
     /// an unpinned peer a log-and-continue case, so refusing here would revert
@@ -125,7 +126,15 @@ struct SessionRecord {
     /// is what makes it enforceable: a surrogate is a credential-shaped token,
     /// so minting one for a process we can only weakly attribute is the case
     /// that actually deserves a refusal.
-    pinned: bool,
+    ///
+    /// B1.9 made the pin LIVE: the record owns a duplicate of the connection's
+    /// pidfd (another handle to the same process, released when the record
+    /// dies), so ownership and pin evidence are answered against the process
+    /// itself instead of the integer recorded at creation time. A session
+    /// opened unpinned stores `None` and keeps the weaker PID-only ownership —
+    /// the documented M0 decision, still the conservative direction for
+    /// surrogate minting.
+    pidfd: Option<std::os::fd::OwnedFd>,
     /// The session's public signing key, bound once (ADR-0019).
     ///
     /// Public material, so it is not a secret and this is not a second
@@ -154,6 +163,21 @@ struct SessionRecord {
     /// behind its own `Mutex` because the trait method could only take
     /// `&self`; the trait was the wrong shape, not the state.
     proof_counters: ReplayWindow,
+}
+
+impl SessionRecord {
+    /// Whether the session carries a pin at all — the cheap half of the
+    /// question. Liveness is [`Self::pin_is_alive`].
+    fn pinned(&self) -> bool {
+        self.pidfd.is_some()
+    }
+
+    /// Whether the process the pin refers to is STILL alive (B1.9).
+    fn pin_is_alive(&self) -> bool {
+        self.pidfd
+            .as_ref()
+            .is_some_and(asv_identity::pidfd_is_alive)
+    }
 }
 
 /// The set of counters a session has already spent, held as a sliding window.
@@ -301,25 +325,76 @@ pub enum KeyRegistrationError {
     AlreadyRegistered,
 }
 
+/// Why a session could not be created (B1.9).
+///
+/// One variant today, and it is fail-closed by design: a PINNED peer whose
+/// pin cannot be duplicated (descriptor exhaustion) is refused rather than
+/// silently downgraded to the weaker PID-only ownership. Unpinned peers
+/// never reach it.
+#[derive(Debug, thiserror::Error)]
+pub enum CreateSessionError {
+    #[error(
+        "the peer is pidfd-pinned but the broker could not clone the pin for the \
+         session record (pid {pid}): {source}"
+    )]
+    PinUnavailable {
+        pid: i32,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 impl SessionStore {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Opens a session bound to the calling peer's PID.
+    ///
+    /// Compatibility wrapper over [`Self::try_create`] for callers outside the
+    /// dispatcher (integration fixtures). Unpinned peers and self-pinned test
+    /// processes can never reach the one failure path — duplicating a live
+    /// pin does not fail — and production must call `try_create`.
     pub fn create(&mut self, workspace: String, peer: &WorkloadIdentity) -> AgentSessionId {
+        self.try_create(workspace, peer).expect(
+            "session creation cannot fail for unpinned peers, and external callers \
+             are fixtures pinning the live test process; production uses try_create",
+        )
+    }
+
+    /// Opens a session, carrying the peer's pin into the record (B1.9).
+    ///
+    /// A pinned peer's session owns a DUPLICATE of the connection's pidfd, so
+    /// ownership stays provable against the live process for as long as the
+    /// session lives and releases when the record does. Duplication failure
+    /// refuses the session instead of silently downgrading a pinned peer to
+    /// PID-only ownership.
+    pub fn try_create(
+        &mut self,
+        workspace: String,
+        peer: &WorkloadIdentity,
+    ) -> Result<AgentSessionId, CreateSessionError> {
+        let pidfd = match peer.cloned_pidfd() {
+            Ok(pidfd) => pidfd,
+            Err(asv_identity::IdentityError::PinClone { pid, source }) => {
+                return Err(CreateSessionError::PinUnavailable { pid, source });
+            }
+            Err(other) => {
+                unreachable!("cloned_pidfd only fails with PinClone: {other}")
+            }
+        };
         let id = AgentSessionId::new();
         self.sessions.insert(
             id,
             SessionRecord {
                 workspace,
                 peer_pid: peer.credentials.pid,
-                pinned: peer.is_pidfd_pinned(),
+                pidfd,
                 public_key: None,
                 proof_counters: ReplayWindow::EMPTY,
             },
         );
-        id
+        Ok(id)
     }
 
     /// Binds a public signing key to a session the caller owns (ADR-0019).
@@ -340,12 +415,13 @@ impl SessionStore {
         peer: &WorkloadIdentity,
         public_key_blob: Vec<u8>,
     ) -> Result<(), KeyRegistrationError> {
-        let Some(record) = self.sessions.get_mut(&id) else {
-            return Err(KeyRegistrationError::NotOwner);
-        };
-        if record.peer_pid != peer.credentials.pid {
+        if !self.owns(id, peer) {
             return Err(KeyRegistrationError::NotOwner);
         }
+        let record = self
+            .sessions
+            .get_mut(&id)
+            .expect("session exists; owns() just checked it");
         if record.public_key.is_some() {
             return Err(KeyRegistrationError::AlreadyRegistered);
         }
@@ -360,14 +436,17 @@ impl SessionStore {
             .and_then(|record| record.public_key.as_deref())
     }
 
-    /// Whether the session's peer was pidfd-pinned when it was opened (M4 D4).
+    /// Whether the session carries a pin that still proves the LIVE process.
     ///
-    /// Recorded at creation rather than queried later: pinning is evidence
-    /// about the connection that opened the session, and a later query would
-    /// describe a different moment. A session opened unpinned stays unpinned,
-    /// which is the conservative direction.
+    /// B1.9: this was the connection-time boolean, which described the moment
+    /// the session opened and kept describing it long after its process died.
+    /// The record now owns a duplicate pidfd, so the answer is the kernel's:
+    /// the session is pinned while the process it was pinned to is alive. A
+    /// session opened unpinned stays unpinned (conservative direction).
     pub fn is_pinned(&self, id: AgentSessionId) -> bool {
-        self.sessions.get(&id).is_some_and(|record| record.pinned)
+        self.sessions
+            .get(&id)
+            .is_some_and(SessionRecord::pin_is_alive)
     }
 
     /// Returns the workspace a session was opened against.
@@ -383,11 +462,27 @@ impl SessionStore {
         self.sessions.get(&id).map(|r| r.peer_pid)
     }
 
+    /// Whether `peer` owns the session — the evidence every session-scoped
+    /// verb must answer to (B1.9).
+    ///
+    /// PID equality alone is the weaker half of the answer: the kernel hands
+    /// the broker the peer's pid, and pids are recycled. A session that
+    /// carries a pin owns its answer to the LIVE process the pidfd refers to,
+    /// so a recycled pid fails here even though the integer matches. A
+    /// session opened without a pin keeps the weaker PID-only ownership,
+    /// which is the documented M0 decision.
+    pub fn owns(&self, id: AgentSessionId, peer: &WorkloadIdentity) -> bool {
+        self.sessions.get(&id).is_some_and(|record| {
+            record.peer_pid == peer.credentials.pid
+                && record
+                    .pidfd
+                    .as_ref()
+                    .map_or(true, asv_identity::pidfd_is_alive)
+        })
+    }
+
     pub fn belongs_to(&self, id: AgentSessionId, peer: &WorkloadIdentity) -> bool {
-        self.sessions
-            .get(&id)
-            .map(|record| record.peer_pid == peer.credentials.pid)
-            .unwrap_or(false)
+        self.owns(id, peer)
     }
 
     /// Ends a session. Returns whether it existed, so a caller can distinguish
@@ -404,17 +499,19 @@ impl SessionStore {
         self.sessions.is_empty()
     }
 
-    /// Count of live sessions whose peer was pidfd-pinned at creation.
+    /// Count of live sessions holding a pin.
     ///
     /// This is the UAT-030 zero-live-pin counter. R3 ("PID reuse mitigated
     /// with pidfd/launch record") requires that a broker holding a pin for a
     /// peer cannot outlive the session the pin is bound to: every pin must
-    /// releases when the session ends. `pin_count` is the observable
-    /// surface that makes that property testable from outside the crate.
+    /// releases when the session ends. B1.9 made that structural — the
+    /// record owns the pidfd, so `end` releases the handle — and
+    /// `pin_count` stays the observable surface that makes the property
+    /// testable from outside the crate.
     pub fn pin_count(&self) -> usize {
         self.sessions
             .values()
-            .filter(|record| record.pinned)
+            .filter(|record| record.pinned())
             .count()
     }
 }
@@ -1586,10 +1683,21 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
         }
 
         Request::CreateSession { workspace, .. } => {
-            let id = sessions!(state).create(workspace, peer);
-            Response::SessionCreated {
-                session: id,
-                surrogates: mint_session_surrogates(state, id, peer),
+            // B1.9: the session record owns a duplicate of the connection's
+            // pin, so the refusal below is reachable only when the kernel
+            // refuses the duplicate — a pinned peer is never silently
+            // downgraded to PID-only ownership. `Denied` is the honest code:
+            // the broker is refusing this operation, whatever the resource
+            // reason behind it.
+            match sessions!(state).try_create(workspace, peer) {
+                Ok(id) => Response::SessionCreated {
+                    session: id,
+                    surrogates: mint_session_surrogates(state, id, peer),
+                },
+                Err(error) => Response::Error {
+                    code: ErrorCode::Denied,
+                    message: error.to_string(),
+                },
             }
         }
 
@@ -1635,14 +1743,18 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
             // denial. Checking ownership first would answer "not owned" to an
             // owner who simply revoked twice, which is both wrong and a
             // misleading thing to audit.
-            let Some(owner_pid) = sessions!(state).peer_pid_of(session) else {
+            if sessions!(state).peer_pid_of(session).is_none() {
                 // Fail closed: an unknown session is an error, not a no-op.
                 return Response::Error {
                     code: ErrorCode::InvalidRequest,
                     message: format!("no such session: {session}"),
                 };
-            };
-            if owner_pid != peer.credentials.pid {
+            }
+            // B1.9: the same ownership evidence every other verb answers to.
+            // The trade-off is deliberate — a session whose owner died can no
+            // longer be ended by a recycled PID claiming the same integer,
+            // and the record (with its pin) is released at broker restart.
+            if !sessions!(state).owns(session, peer) {
                 return Response::Error {
                     code: ErrorCode::Denied,
                     message: "session is not owned by the authenticated peer".into(),
@@ -6877,6 +6989,37 @@ mod surrogate_tests {
     /// D4's directed requirement: an unpinned session is still usable for
     /// everything M0 allowed, but it cannot mint a credential-shaped token.
     /// Without this test, "directed" is indistinguishable from "global deny".
+    #[test]
+    fn a_dead_owners_session_is_not_owned_by_the_recycled_pid() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep 30");
+        let creds = asv_identity::PeerCredentials {
+            pid: child.id() as i32,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+        };
+        let mut owner = WorkloadIdentity::from_peer(creds);
+        owner.pin_pidfd().expect("pidfd_open on our own child");
+        let state = BrokerState::default();
+        let session = sess(&state).create("/repo".into(), &owner);
+        let recycled = WorkloadIdentity::from_peer(creds);
+        let alive_owned = sess(&state).belongs_to(session, &recycled);
+        let alive_pinned = sess(&state).is_pinned(session);
+        child.kill().expect("kill child");
+        child.wait().expect("reap child");
+        assert!(alive_owned && alive_pinned, "live owner control");
+        assert!(
+            !sess(&state).belongs_to(session, &recycled),
+            "dead owner's PID must not confer ownership"
+        );
+        assert!(
+            !sess(&state).is_pinned(session),
+            "dead pin must not confer live evidence"
+        );
+    }
+
     #[test]
     fn an_unpinned_session_can_still_create_and_end_sessions() {
         let state = BrokerState::default();

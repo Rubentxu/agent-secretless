@@ -36,8 +36,11 @@ impl fmt::Display for PeerCredentials {
 /// record* the broker created, not in the connection.
 ///
 /// `Clone`/`PartialEq` are intentionally absent: `OwnedFd` is neither, and a
-/// pidfd is a unique kernel handle to one specific process, so copying it would
-/// be semantically wrong even if the type allowed it.
+/// pidfd is a unique kernel handle to one specific process, so copying the
+/// identity would be semantically wrong even if the type allowed it. What IS
+/// deliberate is duplication (`cloned_pidfd`): `dup` yields another handle to
+/// the SAME process, so a session record can own its own reference and release
+/// it independently while both handles observe the same liveness.
 #[derive(Debug)]
 pub struct WorkloadIdentity {
     pub credentials: PeerCredentials,
@@ -94,6 +97,29 @@ impl WorkloadIdentity {
         Ok(())
     }
 
+    /// Duplicates this identity's pidfd for shared ownership (`dup`).
+    ///
+    /// `Ok(None)` for an unpinned identity: the caller keeps today's weaker
+    /// PID-only ownership, which is a documented decision, not an accident.
+    /// `Ok(Some(fd))` hands out another handle to the same process — the
+    /// session record owns it and releases it when the record dies, and both
+    /// handles answer the same liveness question. `Err` means the kernel
+    /// refused the duplicate (descriptor exhaustion): a caller creating a
+    /// session must refuse rather than silently downgrade a pinned peer to
+    /// the weaker ownership.
+    pub fn cloned_pidfd(&self) -> Result<Option<OwnedFd>, IdentityError> {
+        match self.pidfd.as_ref() {
+            None => Ok(None),
+            Some(fd) => fd
+                .try_clone()
+                .map(Some)
+                .map_err(|source| IdentityError::PinClone {
+                    pid: self.credentials.pid,
+                    source,
+                }),
+        }
+    }
+
     /// Consumes the identity and returns the pinned pidfd, if any.
     ///
     /// Taking ownership transfers the kernel handle to the caller that needs to
@@ -134,6 +160,42 @@ pub enum IdentityError {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("could not duplicate the pidfd for pid {pid}: {source}")]
+    PinClone {
+        pid: i32,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Whether the process a pidfd refers to is still alive.
+///
+/// A pidfd becomes readable (`POLLIN`) when the process it refers to
+/// terminates, which is the kernel's own answer to the liveness question
+/// (Linux 5.3+, the same floor as `pidfd_open`). The poll uses a zero
+/// timeout, so the call never blocks: a live process reports no event, and
+/// every reported condition — terminated (`POLLIN`), invalid (`POLLNVAL`),
+/// or anything else the kernel flags — ends the question the same way. A
+/// poll that could not run at all is fail-closed: a pin this process cannot
+/// inspect is not evidence of liveness.
+pub fn pidfd_is_alive(fd: &OwnedFd) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut pollfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = loop {
+        // SAFETY: `poll` takes a valid pointer to `pollfd` and does not
+        // retain it; the count matches the array.
+        let rc = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        if rc < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break rc;
+    };
+    ready == 0
 }
 
 /// Reads kernel peer credentials from a connected Unix socket.
@@ -273,6 +335,72 @@ mod tests {
         let err = identity.pin_pidfd().expect_err("bogus pid must fail");
         assert!(matches!(err, IdentityError::PidfdOpen { pid, .. } if pid == i32::MAX));
         assert!(!identity.is_pidfd_pinned());
+    }
+
+    /// A duplicated pidfd answers the same liveness question as the original:
+    /// both handles refer to the same live process, and both report it alive.
+    #[test]
+    fn cloned_pidfd_is_some_and_alive_for_a_pinned_identity() {
+        let mut identity = WorkloadIdentity::from_peer(PeerCredentials {
+            pid: std::process::id() as i32,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+        });
+        identity.pin_pidfd().expect("pidfd_open on self");
+
+        let first = identity
+            .cloned_pidfd()
+            .expect("clone must not fail")
+            .expect("pinned identity must clone to Some");
+        let second = identity
+            .cloned_pidfd()
+            .expect("clone must not fail")
+            .expect("pinned identity must clone to Some");
+        assert!(pidfd_is_alive(&first));
+        assert!(pidfd_is_alive(&second));
+    }
+
+    /// An unpinned identity has nothing to duplicate: `Ok(None)` is the
+    /// caller's signal to keep the weaker PID-only ownership, not an error.
+    #[test]
+    fn cloned_pidfd_is_none_when_unpinned() {
+        let identity = WorkloadIdentity::from_peer(PeerCredentials {
+            pid: std::process::id() as i32,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+        });
+        assert!(identity
+            .cloned_pidfd()
+            .expect("unpinned clone is not an error")
+            .is_none());
+    }
+
+    /// The duplicated handle tracks the ORIGINAL process, not the duplicator:
+    /// once the pinned process terminates, the clone reports it dead.
+    #[test]
+    fn pidfd_is_alive_is_false_for_a_terminated_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let mut identity = WorkloadIdentity::from_peer(PeerCredentials {
+            pid: child.id() as i32,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+        });
+        identity.pin_pidfd().expect("pidfd_open on our own child");
+        let cloned = identity
+            .cloned_pidfd()
+            .expect("clone must not fail")
+            .expect("pinned identity must clone to Some");
+        assert!(pidfd_is_alive(&cloned), "control: child alive");
+
+        child.kill().expect("kill child");
+        child.wait().expect("reap child");
+        assert!(
+            !pidfd_is_alive(&cloned),
+            "terminated process must not read as alive"
+        );
     }
 
     /// The identity type has no field a peer could populate with a lie, and
