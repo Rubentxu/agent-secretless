@@ -4215,6 +4215,7 @@ fn print_response(response: &Response) {
         Response::Pong {
             protocol,
             audit_write_failures,
+            recovered_journal_intents,
         } => {
             println!("broker reachable, protocol v{protocol}");
             // The response is matched by reference; copy the count once so the
@@ -4222,6 +4223,14 @@ fn print_response(response: &Response) {
             let audit_write_failures = *audit_write_failures;
             if audit_write_failures > 0 {
                 println!("audit: {audit_write_failures} durable audit write(s) failed since start; those records were not persisted");
+            }
+            let recovered_journal_intents = *recovered_journal_intents;
+            if recovered_journal_intents > 0 {
+                println!(
+                    "recovery: {recovered_journal_intents} interrupted vault mutation(s) \
+                     reconciled from the journal at startup; see the broker log for \
+                     which ones landed"
+                );
             }
         }
         // The compatibility path (ADR-0008), printed with its posture on the

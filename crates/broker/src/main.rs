@@ -245,6 +245,11 @@ fn main() -> std::io::Result<()> {
     // destination they cannot audit.
     let mut connect_routes: Option<PathBuf> = None;
     let mut workers_file: Option<PathBuf> = None;
+    // B1.10 / M13 UAT-035: the journal of in-flight vault mutations. It lives
+    // beside the vault by default, because a journal the operator never chose
+    // a place for is a journal that lands somewhere surprising; the flag
+    // exists for deployments that keep state on separate mounts.
+    let mut journal_file: Option<PathBuf> = None;
     // C2.6: Cedar policy text. A route file declares what should be reachable;
     // this is the permission that makes it so. They are separate flags on
     // purpose — a route with no policy rule is refused, and that refusal is the
@@ -326,6 +331,13 @@ fn main() -> std::io::Result<()> {
                 audit_file = args.next().map(PathBuf::from);
                 if audit_file.is_none() {
                     eprintln!("asv: --audit-file requires a path argument");
+                    std::process::exit(1);
+                }
+            }
+            "--journal-file" => {
+                journal_file = args.next().map(PathBuf::from);
+                if journal_file.is_none() {
+                    eprintln!("asv: --journal-file requires a path argument");
                     std::process::exit(1);
                 }
             }
@@ -422,7 +434,7 @@ fn main() -> std::io::Result<()> {
             "--require-dedicated-identity" => require_dedicated_identity = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH] [--audit-max-records N] [--audit-file PATH] [--enrol-principal PATH] [--harden] [--connect-listen ADDR] [--identity-uid N] [--require-dedicated-identity] [--oauth2-clients PATH]"
+                    "usage: asv-brokerd [SOCKET] [--vault PATH] [--passphrase-file PATH] [--audit-max-records N] [--audit-file PATH] [--journal-file PATH] [--enrol-principal PATH] [--harden] [--connect-listen ADDR] [--identity-uid N] [--require-dedicated-identity] [--oauth2-clients PATH]"
                 );
                 eprintln!();
                 eprintln!("  --identity-uid N       the uid this installation expects the");
@@ -835,6 +847,40 @@ fn main() -> std::io::Result<()> {
         // that cannot see its own vault. Loaded here, while the store is still
         // owned by this function; the lending port below only lends by id.
         let inventory = asv_broker::inventory::load(&state, &store);
+
+        // B1.10 / M13 UAT-035: the journal of in-flight vault mutations. It
+        // lives beside the vault by default. Startup is the reconciliation
+        // point: every intent a previous run left behind is replayed against
+        // the loaded inventory and REPORTED — the vault is the source of
+        // truth and its write is atomic, so the journal's product is
+        // visibility, never repair — and then the journal restarts empty. A
+        // crash between the report and the reset re-reports the same intents
+        // on the next start: at-least-once visibility, never lost state.
+        let journal_path = journal_file
+            .clone()
+            .unwrap_or_else(|| vault_path.with_file_name("mutations.journal"));
+        let mut sink = asv_broker::JournalSink::open(&journal_path).unwrap_or_else(|err| {
+            eprintln!(
+                "asv: cannot open the mutation journal at {}: {err}",
+                journal_path.display()
+            );
+            std::process::exit(1);
+        });
+        let recovered = asv_broker::recover_journal(&state, &sink.stored_bytes());
+        if recovered > 0 {
+            tracing::warn!(
+                recovered,
+                "journal intents from the previous run reconciled; see the lines above"
+            );
+        }
+        sink.reset().unwrap_or_else(|err| {
+            eprintln!(
+                "asv: cannot reset the mutation journal at {}: {err}",
+                journal_path.display()
+            );
+            std::process::exit(1);
+        });
+        state.journal = Some(std::sync::Mutex::new(sink));
 
         // ADR-0015/0016: the enrolment record lives beside the vault and is
         // read here, at start, so it survives a restart and names principals

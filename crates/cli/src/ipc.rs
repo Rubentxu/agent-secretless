@@ -147,11 +147,13 @@ pub fn from_response(response: &Response) -> ApplicationResult {
         Response::Pong {
             protocol,
             audit_write_failures,
+            recovered_journal_intents,
         } => ApplicationResult::Ok {
             summary: format!("broker reachable, protocol v{protocol}"),
             data: json!({
                 "reachable": true,
                 "audit_write_failures": audit_write_failures,
+                "recovered_journal_intents": recovered_journal_intents,
                 "protocol": protocol,
                 "protocol_compatible": *protocol == asv_ipc_protocol::PROTOCOL_VERSION,
             }),

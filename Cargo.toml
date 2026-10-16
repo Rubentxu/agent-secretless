@@ -133,11 +133,13 @@ strip = "symbols"
 # be tuned to for local iteration.
 #
 # `panic = "abort"` is inherited from release above, and that is deliberate for
-# a daemon: the broker's journal is fsync'd before the work it describes, so a
-# crash — panicked or killed — is recovered on the next start either way, and
-# `Restart=on-failure` in the systemd unit turns the abort into a restart. What
-# it does remove is the option of catching a panic in-process, which the unit
-# comment in `packaging/asv-brokerd.service` depends on.
+# a daemon: every vault mutation intent is fsync'd to the mutation journal
+# before the write it describes and reconciled against the vault at startup
+# (B1.10, M13 UAT-035), so a crash — panicked or killed — loses nothing and
+# hides nothing, and `Restart=on-failure` in the systemd unit turns the abort
+# into a restart. What it does remove is the option of catching a panic
+# in-process, which the unit comment in `packaging/asv-brokerd.service`
+# depends on.
 [profile.dist]
 inherits = "release"
 lto = "thin"

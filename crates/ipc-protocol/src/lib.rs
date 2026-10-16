@@ -711,6 +711,11 @@ pub enum Response {
         /// 0 on brokers from before this field existed.
         #[serde(default)]
         audit_write_failures: u64,
+        /// Vault mutation intents reconciled from the journal at startup
+        /// (B1.10). 0 on brokers from before this field existed, and on any
+        /// broker whose previous run died between mutations.
+        #[serde(default)]
+        recovered_journal_intents: u64,
     },
     /// The broker's own description of itself.
     ///
@@ -1487,6 +1492,7 @@ mod tests {
             Response::Pong {
                 protocol: 11,
                 audit_write_failures: 0,
+                recovered_journal_intents: 0,
             }
         );
     }
@@ -1496,6 +1502,7 @@ mod tests {
         let response = Response::Pong {
             protocol: PROTOCOL_VERSION,
             audit_write_failures: 7,
+            recovered_journal_intents: 3,
         };
         let mut value = serde_json::to_value(&response).unwrap();
         value["future_field"] = serde_json::json!(true);

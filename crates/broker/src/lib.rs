@@ -1070,6 +1070,13 @@ pub struct BrokerState {
     /// they happened to open.
     pub audit: Arc<Mutex<audit::AuditLog>>,
     pub audit_write_failures: std::sync::atomic::AtomicU64,
+    /// The durable sink for in-flight vault mutation intents (B1.10 / M13
+    /// UAT-035). `None` when the broker runs without a vault — there is
+    /// nothing to journal.
+    pub journal: Option<Mutex<JournalSink>>,
+    /// Intents reconciled from the journal at startup. Sticky for the life of
+    /// the process, surfaced via `Response::Pong` like the audit counter.
+    pub journal_recovered_intents: std::sync::atomic::AtomicU64,
     /// The principals enrolled as the human control plane, per ADR-0015.
     ///
     /// Empty by default, and empty is the state every broker on this machine
@@ -1180,6 +1187,44 @@ impl BrokerState {
         self.audit_write_failures
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// Intents reconciled from the journal at startup (sticky).
+    pub fn journal_recovered_intents(&self) -> u64 {
+        self.journal_recovered_intents
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Records an in-flight vault mutation intent durably, BEFORE the caller
+    /// performs the mutation it describes (B1.10 / M13 UAT-035).
+    ///
+    /// Returns the mark to restore with [`Self::journal_truncate_to`], or
+    /// `None` when the broker runs without a journal — journaling off is the
+    /// documented no-vault state, not an error.
+    pub fn journal_intend(
+        &self,
+        kind: recovery::JournalKind,
+        body: &[u8],
+    ) -> Option<std::io::Result<usize>> {
+        let mut sink = self
+            .journal
+            .as_ref()?
+            .lock()
+            .expect("journal sink is not poisoned");
+        Some(sink.intent(kind, body))
+    }
+
+    /// Drops everything recorded after `mark` and makes the truncation
+    /// durable. Runs on BOTH outcomes of the mutation the intent described —
+    /// success and clean failure each leave no intent behind, so a surviving
+    /// entry always means "in flight when the process died".
+    pub fn journal_truncate_to(&self, mark: usize) -> Option<std::io::Result<()>> {
+        let mut sink = self
+            .journal
+            .as_ref()?
+            .lock()
+            .expect("journal sink is not poisoned");
+        Some(sink.truncate_to(mark))
+    }
 }
 
 impl Default for BrokerState {
@@ -1216,6 +1261,8 @@ impl Default for BrokerState {
             k8s_bindings: Vec::new(),
             audit: Arc::new(Mutex::new(audit::AuditLog::default())),
             audit_write_failures: Default::default(),
+            journal: None,
+            journal_recovered_intents: Default::default(),
             control_plane: admission::Enrolment::empty(),
             vault_writer: None,
             self_report: selfreport::SelfReport::default(),
@@ -1323,6 +1370,181 @@ macro_rules! sessions {
             Err(poisoned) => return Response::from(poisoned),
         }
     };
+}
+
+/// The durable sink for in-flight vault mutation intents (B1.10).
+///
+/// The format is [`recovery::RecoveryJournal`]'s — length-prefixed records
+/// with a per-record CRC, parseable by a forensic reader without the broker's
+/// runtime. The protocol around it is intent-only: an entry is appended and
+/// fsynced BEFORE the mutation it describes, and cleared as soon as the
+/// mutation RETURNS either way, so a surviving entry always means the
+/// mutation was in flight when the process died. The vault write itself is
+/// atomic, so the journal's product is visibility, never repair: at startup
+/// every surviving intent is reconciled against the loaded inventory and
+/// reported, and the journal restarts empty.
+pub struct JournalSink {
+    file: std::fs::File,
+    /// How many bytes of `journal` are already durable in `file`.
+    written: usize,
+    journal: recovery::RecoveryJournal,
+}
+
+impl JournalSink {
+    /// Opens (or creates) the journal file and loads what a previous run left.
+    pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::Read;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let written = bytes.len();
+        Ok(Self {
+            file,
+            written,
+            journal: recovery::RecoveryJournal::from_bytes(bytes),
+        })
+    }
+
+    /// The bytes as the previous run left them — the startup reconciliation
+    /// input, taken before anything resets the file.
+    pub fn stored_bytes(&self) -> Vec<u8> {
+        self.journal.as_bytes().to_vec()
+    }
+
+    /// Appends one intent and makes it durable.
+    ///
+    /// Returns the mark to restore with [`Self::truncate_to`].
+    pub fn intent(&mut self, kind: recovery::JournalKind, body: &[u8]) -> std::io::Result<usize> {
+        let mark = self.written;
+        self.journal
+            .append(kind, body.to_vec())
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        self.persist_new_bytes()?;
+        Ok(mark)
+    }
+
+    /// Drops everything recorded after `mark`, durably.
+    pub fn truncate_to(&mut self, mark: usize) -> std::io::Result<()> {
+        use std::io::{Seek, Write};
+        self.journal =
+            recovery::RecoveryJournal::from_bytes(self.journal.as_bytes()[..mark].to_vec());
+        self.file.seek(std::io::SeekFrom::Start(0))?;
+        let bytes = self.journal.as_bytes().to_vec();
+        self.file.write_all(&bytes)?;
+        self.file.set_len(bytes.len() as u64)?;
+        self.written = bytes.len();
+        self.file.sync_all()
+    }
+
+    /// Empties the journal after startup reconciliation has reported it.
+    /// A crash between the report and this reset re-reports the same intents
+    /// on the next start — at-least-once visibility, never lost state.
+    pub fn reset(&mut self) -> std::io::Result<()> {
+        self.truncate_to(0)
+    }
+
+    fn persist_new_bytes(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        let bytes = self.journal.as_bytes();
+        if bytes.len() > self.written {
+            self.file.write_all(&bytes[self.written..])?;
+            self.written = bytes.len();
+        }
+        // The fsync the profile comment promises: the intent is on the disk,
+        // not merely in the page cache, before the mutation it describes.
+        self.file.sync_all()
+    }
+}
+
+/// Replays a journal left by a previous run and reconciles every intent
+/// against the loaded inventory (B1.10 / M13 UAT-035).
+///
+/// The vault is the source of truth and its write is atomic, so this never
+/// repairs state — its product is visibility: an operator learns exactly
+/// which mutations were in flight when the previous process died, and whether
+/// each landed. A torn tail is discarded and a corrupt record stops the
+/// replay (the module's CRC discipline); only the valid prefix is reported.
+/// Returns the number of reconciled intents and records it on the sticky
+/// counter `asv status` reports.
+pub fn recover_journal(state: &BrokerState, bytes: &[u8]) -> u64 {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let journal = recovery::RecoveryJournal::from_bytes(bytes.to_vec());
+    let mut engine = recovery::CollectingReplay::default();
+    match journal.replay(&mut engine) {
+        Ok(_) => {}
+        Err(error) => tracing::error!(
+            %error,
+            "journal replay stopped at an unusable record; only the valid \
+             prefix is reconciled, and the vault is the source of truth"
+        ),
+    }
+    let mut count = 0u64;
+    for record in &engine.records {
+        // Body vocabulary today: the credential id as it is keyed in the
+        // vault (`to_wire()`). `VaultResealed` carries no id and no check.
+        let id = String::from_utf8_lossy(&record.body).to_string();
+        let present = state
+            .credentials
+            .lock()
+            .expect("credential inventory is not poisoned")
+            .iter()
+            .any(|c| c.id.to_wire() == id);
+        match record.kind {
+            recovery::JournalKind::CredentialAdded => {
+                if present {
+                    tracing::warn!(
+                        credential = %id,
+                        "journal: a credential creation was in flight at the previous \
+                         shutdown and COMPLETED (the vault holds it)"
+                    );
+                } else {
+                    tracing::warn!(
+                        credential = %id,
+                        "journal: a credential creation was in flight at the previous \
+                         shutdown and DID NOT COMPLETE (the vault does not hold it; the \
+                         secret material left with the crashed process — re-issue it)"
+                    );
+                }
+            }
+            recovery::JournalKind::CredentialRevoked => {
+                if present {
+                    tracing::warn!(
+                        credential = %id,
+                        "journal: a credential revocation was in flight at the previous \
+                         shutdown and DID NOT COMPLETE (the vault STILL holds it — \
+                         re-issue the revocation)"
+                    );
+                } else {
+                    tracing::warn!(
+                        credential = %id,
+                        "journal: a credential revocation was in flight at the previous \
+                         shutdown and COMPLETED (the vault no longer holds it)"
+                    );
+                }
+            }
+            recovery::JournalKind::CredentialRotated => tracing::warn!(
+                credential = %id,
+                "journal: a credential rotation was in flight at the previous shutdown; \
+                 the vault is the source of truth for its outcome"
+            ),
+            recovery::JournalKind::VaultResealed => tracing::warn!(
+                "journal: a vault re-seal was in flight at the previous shutdown; \
+                 the vault is the source of truth for its outcome"
+            ),
+        }
+        count += 1;
+    }
+    state
+        .journal_recovered_intents
+        .fetch_add(count, std::sync::atomic::Ordering::SeqCst);
+    count
 }
 
 /// Handles one authenticated request and audits the outcome (R9).
@@ -1678,6 +1900,7 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                 _ => Response::Pong {
                     protocol: PROTOCOL_VERSION,
                     audit_write_failures: state.audit_write_failures(),
+                    recovered_journal_intents: state.journal_recovered_intents(),
                 },
             }
         }
@@ -1876,6 +2099,28 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
             // the file rather than diverging from it. That is `v0.18.1`'s work
             // being spent here, and it is why this call can be treated as the
             // point of no return rather than a best effort.
+            // B1.10 / UAT-035: the intent is durable BEFORE the vault write
+            // and cleared as soon as the write returns either way, so a
+            // surviving entry always means "in flight when the process died".
+            // A journal that cannot record the intent refuses the mutation:
+            // writing without the pre-write claim is the gap the journal
+            // exists to close.
+            let journal_mark = match state.journal_intend(
+                recovery::JournalKind::CredentialAdded,
+                id.to_wire().as_bytes(),
+            ) {
+                None => None,
+                Some(Ok(mark)) => Some(mark),
+                Some(Err(error)) => {
+                    return Response::Error {
+                        code: ErrorCode::Upstream,
+                        message: format!(
+                            "credential could not be stored: the mutation journal \
+                                 refused the intent: {error}"
+                        ),
+                    };
+                }
+            };
             let bytes = secret.expose().to_vec();
             let stored = match writer.create(metadata.clone(), asv_domain::SecretBytes::new(bytes))
             {
@@ -1884,12 +2129,25 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                     // The error is the vault's, and names no secret. The
                     // submitted bytes have already been zeroized by the
                     // `OpaqueSecret` this request owned.
+                    if let Some(mark) = journal_mark {
+                        if let Some(Err(clear)) = state.journal_truncate_to(mark) {
+                            tracing::warn!(%clear, "mutation was refused but its journal \
+                                intent could not be cleared; startup will reconcile it \
+                                as did-not-complete");
+                        }
+                    }
                     return Response::Error {
                         code: ErrorCode::InvalidRequest,
                         message: format!("credential could not be stored: {error}"),
                     };
                 }
             };
+            if let Some(mark) = journal_mark {
+                if let Some(Err(clear)) = state.journal_truncate_to(mark) {
+                    tracing::warn!(%clear, "credential was stored but its journal intent \
+                        could not be cleared; startup will reconcile it as completed");
+                }
+            }
 
             // Only now does the broker's inventory learn about it, and the
             // order is the requirement: the file is the source of truth and the
@@ -1952,8 +2210,34 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
             // vault by `to_wire()` and the vault is a `String`-keyed map, so
             // this must be the same spelling that wrote the record rather than
             // an independently formatted one that would simply not find it.
+            // B1.10: the revocation intent is durable BEFORE the write, on the
+            // same protocol as the create path — a revocation is exactly the
+            // mutation whose disappearance an operator must hear about.
+            let journal_mark = match state.journal_intend(
+                recovery::JournalKind::CredentialRevoked,
+                id.to_wire().as_bytes(),
+            ) {
+                None => None,
+                Some(Ok(mark)) => Some(mark),
+                Some(Err(error)) => {
+                    return Response::Error {
+                        code: ErrorCode::Upstream,
+                        message: format!(
+                            "credential could not be removed: the mutation journal \
+                             refused the intent: {error}"
+                        ),
+                    };
+                }
+            };
             match writer.remove(&id.to_wire()) {
                 Err(asv_vault::VaultError::NotFound(_)) => {
+                    if let Some(mark) = journal_mark {
+                        if let Some(Err(clear)) = state.journal_truncate_to(mark) {
+                            tracing::warn!(%clear, "revocation was refused (no such \
+                                credential) but its journal intent could not be cleared; \
+                                startup will reconcile it");
+                        }
+                    }
                     // Reported, not swallowed, and *only* to a caller
                     // admission has already accepted. That peer is the
                     // operator's own enrolled principal, holding a pidfd and
@@ -1968,6 +2252,13 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                     };
                 }
                 Err(error) => {
+                    if let Some(mark) = journal_mark {
+                        if let Some(Err(clear)) = state.journal_truncate_to(mark) {
+                            tracing::warn!(%clear, "revocation was refused but its journal \
+                                intent could not be cleared; startup will reconcile it \
+                                as did-not-complete");
+                        }
+                    }
                     // The vault's own error, verbatim. It names a condition
                     // and no secret; rewording it would hide which failure
                     // mode an operator is looking at.
@@ -1977,6 +2268,12 @@ fn handle_inner(state: &BrokerState, peer: &WorkloadIdentity, request: Request) 
                     };
                 }
                 Ok(()) => {}
+            }
+            if let Some(mark) = journal_mark {
+                if let Some(Err(clear)) = state.journal_truncate_to(mark) {
+                    tracing::warn!(%clear, "credential was removed but its journal intent \
+                        could not be cleared; startup will reconcile it as completed");
+                }
             }
 
             // The write succeeded, so the mirror may now follow it.
@@ -5391,6 +5688,7 @@ mod tests {
             Response::Pong {
                 protocol: PROTOCOL_VERSION,
                 audit_write_failures: 0,
+                recovered_journal_intents: 0,
             }
         );
         assert_eq!(state.audit_write_failures(), 1);
@@ -5570,6 +5868,7 @@ mod tests {
             Response::Pong {
                 protocol: PROTOCOL_VERSION,
                 audit_write_failures: 0,
+                recovered_journal_intents: 0,
             }
         );
     }
@@ -6989,6 +7288,103 @@ mod surrogate_tests {
     /// D4's directed requirement: an unpinned session is still usable for
     /// everything M0 allowed, but it cannot mint a credential-shaped token.
     /// Without this test, "directed" is indistinguishable from "global deny".
+    #[test]
+    fn a_journal_intent_is_durable_before_the_write_and_cleared_after() {
+        let dir = std::env::temp_dir().join(format!("asv-b10-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("j.log");
+        let _ = std::fs::remove_file(&path);
+        let mut state = BrokerState::default();
+        state.journal = Some(std::sync::Mutex::new(
+            JournalSink::open(&path).expect("open journal"),
+        ));
+
+        // The intent is on disk before the mutation it describes runs.
+        let mark = state
+            .journal_intend(recovery::JournalKind::CredentialAdded, b"cred-x")
+            .expect("journaling is on")
+            .expect("persist");
+        let mut engine = recovery::CollectingReplay::default();
+        recovery::RecoveryJournal::from_bytes(std::fs::read(&path).expect("read"))
+            .replay(&mut engine)
+            .expect("the on-disk journal parses");
+        assert_eq!(engine.records.len(), 1);
+        assert_eq!(
+            engine.records[0].kind,
+            recovery::JournalKind::CredentialAdded
+        );
+        assert_eq!(engine.records[0].body, b"cred-x");
+
+        // And cleared after the mutation returns, on either outcome.
+        state
+            .journal_truncate_to(mark)
+            .expect("journaling is on")
+            .expect("persist clear");
+        assert!(
+            std::fs::read(&path).expect("read").is_empty(),
+            "a surviving intent must mean in-flight-at-crash, nothing else"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_previous_run_intents_are_reconciled_against_the_inventory() {
+        let mut state = BrokerState::default();
+        let mut metadata =
+            asv_domain::CredentialMetadata::new("label", asv_domain::CredentialKind::BearerToken);
+        metadata.id = asv_domain::CredentialId::from_wire("3f2504e0-4f89-41d3-9a0c-0305e82c3301")
+            .expect("canonical uuid");
+        register_inventory_credential(&mut state, metadata);
+
+        let mut journal = recovery::RecoveryJournal::new();
+        journal
+            .append(
+                recovery::JournalKind::CredentialAdded,
+                b"3f2504e0-4f89-41d3-9a0c-0305e82c3301".to_vec(),
+            )
+            .unwrap();
+        journal
+            .append(
+                recovery::JournalKind::CredentialRevoked,
+                b"cred-absent".to_vec(),
+            )
+            .unwrap();
+        journal
+            .append(recovery::JournalKind::VaultResealed, b"".to_vec())
+            .unwrap();
+        let bytes = journal.as_bytes().to_vec();
+
+        assert_eq!(recover_journal(&state, &bytes), 3);
+        assert_eq!(state.journal_recovered_intents(), 3);
+        // At-least-once visibility: a crash between the report and the reset
+        // re-reports the same intents on the next start, and each report
+        // counts.
+        assert_eq!(recover_journal(&state, &bytes), 3);
+        assert_eq!(state.journal_recovered_intents(), 6);
+    }
+
+    #[test]
+    fn a_torn_journal_reconciles_only_its_valid_prefix() {
+        let state = BrokerState::default();
+        let mut journal = recovery::RecoveryJournal::new();
+        journal
+            .append(recovery::JournalKind::CredentialAdded, b"cred-a".to_vec())
+            .unwrap();
+        journal
+            .append(recovery::JournalKind::CredentialRevoked, b"cred-b".to_vec())
+            .unwrap();
+        let mut bytes = journal.as_bytes().to_vec();
+        bytes.truncate(bytes.len() - 3); // torn tail, the UAT-035 shape
+        assert_eq!(recover_journal(&state, &bytes), 1);
+    }
+
+    #[test]
+    fn an_empty_journal_reconciles_nothing() {
+        let state = BrokerState::default();
+        assert_eq!(recover_journal(&state, &[]), 0);
+        assert_eq!(state.journal_recovered_intents(), 0);
+    }
+
     #[test]
     fn a_dead_owners_session_is_not_owned_by_the_recycled_pid() {
         let mut child = std::process::Command::new("sleep")

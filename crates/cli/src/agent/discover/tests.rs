@@ -229,6 +229,7 @@ fn spawn_broker(socket: &std::path::Path, protocol: u16) {
                 _ => asv_ipc_protocol::Response::Pong {
                     protocol,
                     audit_write_failures: 0,
+                    recovered_journal_intents: 0,
                 },
             };
             let _ = stream.write_all(&serde_json::to_vec(&response).unwrap());

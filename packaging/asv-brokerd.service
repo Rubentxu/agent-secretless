@@ -58,8 +58,10 @@
 # `harden` path already sets `PR_SET_NO_NEW_PRIVS` for the same reason.
 #
 # `Restart=on-failure` is lifecycle, not security, and it matters more than it
-# looks: UAT-017 already proves the broker recovers from a crash without
-# losing or double-applying a journalled write, and this is what puts that
+# looks: UAT-017 proves the broker fails closed across a crash, and since
+# B1.10 the broker journals every in-flight vault mutation (fsync'd before
+# the write, reconciled at startup per M13 UAT-035), so the restart loses
+# nothing and reconciles what was in flight — which is what puts that
 # recovery into a real deployment rather than only into a test.
 
 [Unit]
