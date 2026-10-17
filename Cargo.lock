@@ -203,10 +203,7 @@ dependencies = [
 name = "asv-cli"
 version = "0.38.3"
 dependencies = [
- "asv-broker",
- "asv-connector-http",
  "asv-domain",
- "asv-identity",
  "asv-integrations",
  "asv-ipc-protocol",
  "asv-policy",

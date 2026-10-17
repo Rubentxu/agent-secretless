@@ -15,11 +15,14 @@
 | B1.8 Evidencia de auditoría observable | **ENTREGADO** | `b1.8` | `docs/receipts/b1-8-audit-gap-observable-receipt.md` |
 | B1.9 Pin de sesión vivo (pidfd) | **ENTREGADO** | `b1.9` | `docs/receipts/b1-9-live-session-pin-receipt.md` |
 | B1.10 Journal de recuperación cableado | **ENTREGADO** | `b1.10` | `docs/receipts/b1-10-journal-wired-receipt.md` |
-| B1.11 Frontera OAuth2 | siguiente | — | — |
+| B1.11 Frontera OAuth2 | **ENTREGADO** | `b1.11` | `docs/receipts/b1-11-oauth2-boundary-receipt.md` |
+| B2.1 Verticales socket-level | siguiente | — | — |
 
 **Pendiente de decisión del owner:** push de `b1/worker-lifetime` + tags al remoto,
-merge a `main` (53+ commits sobre v0.38.3) y publicación de release. Nada se ha
-empujado todavía.
+merge a `main` (57+ commits sobre v0.38.3) y publicación de release. Nada se ha
+empujado todavía. Estrategia de entrega confirmada por el owner (2026-10-17):
+cadena en rama `b1` — cada bloque cierra con tag `b1.N`; merge/push/release cuando
+el owner lo decida.
 
 ## Dónde estamos (medido sobre el remoto, 2026-10-13)
 
@@ -136,9 +139,15 @@ refresh no corrompa tokens (H-05, H-06). Ref: `15-ROADMAP.md` (M11 / fila R2.B),
   misma regla que ya aplica el camino del resource server (`oauth2_binding.rs:323-331`).
 - [x] **T3** RED + fix refresh: token `a+b` debe sobrevivir una sola codificación
   (`oauth2.rs:633-640` + `:598-609` hoy doble-codifican).
-- [x] **T4** E2E efímero: `tests/ephemeral/b1-11/eph_oauth2_boundary.rs` — flujo
-  whoami contra issuer efímero hostil; AAT: el error del CLI no contiene el secreto.
-- [x] **T5** Borrado de efímeros + receipt + release `b1.11`.
+  espejo de la retirada del efímero: la cobertura permanente vive en `oauth2.rs`
+  (unit) y `oauth2_provider.rs` (TLS real).
+- [x] **T4** E2E efímero: flujo whoami contra issuer hostil — `asv oauth2 whoami`
+  (prosa y `--json`) contra broker real sobre UDS con issuer hostil; AAT: el error
+  del CLI no contiene el secreto. RED observado (secreto en stderr), GREEN tras el fix.
+- [x] **T5** Borrado de efímeros + receipt + release `b1.11`. El efímero vivió en
+  `crates/cli/tests/eph_b1_11_boundary.rs` (convención B1.9/B1.10: solo la raíz
+  `tests/` del crate, y solo ahí existe `CARGO_BIN_EXE_asv`); los tres dev-deps
+  temporales de `asv-cli` se retiraron con él para dejar el tree etiquetado limpio.
 
 ## B2.1 — Verticales socket-level [PARALELIZABLE: 4 agentes, superficies disjuntas]
 

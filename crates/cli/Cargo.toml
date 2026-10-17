@@ -63,21 +63,6 @@ tokio = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
-# B1.11's ephemeral boundary check (`tests/eph_b1_11_boundary.rs`): proving
-# the CLI's own rendering never shows a secret a hostile IdP reflected needs
-# the real `asv` binary and the broker's in-process service plus its RFC 6749
-# loopback fixture in one test. Dev-only; already a workspace member in the
-# lock, and the `test-support` feature is what keeps the fixture out of every
-# shipped build.
-asv-broker = { path = "../broker", features = ["test-support"] }
-# The same ephemeral names `AddressPolicy` and `ResolvedAudience` to pin its
-# fixture issuer to loopback. Present transitively through `asv-broker`;
-# named directly so the test does not reach through another crate's re-exports.
-asv-connector-http = { workspace = true }
-# `peer_credentials` for the ephemeral's one-connection accept loop, which
-# serves the CLI the way `asv-brokerd` would. Also already in the graph
-# through `asv-broker`.
-asv-identity = { workspace = true }
 # `tempfile` is how the shim tests get a private session directory and a
 # private listener socket. Already in the lock through `asv-ssh-agent`'s own
 # dev-dependency, so this promotes an existing entry rather than adding to
