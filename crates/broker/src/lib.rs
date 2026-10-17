@@ -477,7 +477,7 @@ impl SessionStore {
                 && record
                     .pidfd
                     .as_ref()
-                    .map_or(true, asv_identity::pidfd_is_alive)
+                    .is_none_or(asv_identity::pidfd_is_alive)
         })
     }
 
@@ -7294,10 +7294,12 @@ mod surrogate_tests {
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("j.log");
         let _ = std::fs::remove_file(&path);
-        let mut state = BrokerState::default();
-        state.journal = Some(std::sync::Mutex::new(
-            JournalSink::open(&path).expect("open journal"),
-        ));
+        let state = BrokerState {
+            journal: Some(std::sync::Mutex::new(
+                JournalSink::open(&path).expect("open journal"),
+            )),
+            ..Default::default()
+        };
 
         // The intent is on disk before the mutation it describes runs.
         let mark = state
