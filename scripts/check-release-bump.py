@@ -93,7 +93,11 @@ def git(*args: str) -> str:
 
 def last_tag() -> str | None:
     try:
-        return git("describe", "--tags", "--abbrev=0")
+        # Only `v`-prefixed release tags derive versions. The b1.N block tags
+        # mark delivery units on a working branch and are not releases; before
+        # the --match filter, the first b1 tag on the branch made this function
+        # return "b1.10" and the caller crash parsing it as semver.
+        return git("describe", "--tags", "--abbrev=0", "--match", "v*")
     except subprocess.CalledProcessError:
         return None
 
