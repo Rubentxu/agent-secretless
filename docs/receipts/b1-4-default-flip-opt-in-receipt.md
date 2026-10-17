@@ -3,8 +3,8 @@
 **Status**: implementation complete; awaiting user review
 **Branch**: `b1/default-flip-opt-in`
 **Worktree**: `/var/home/rubentxu/Proyectos/rust/agent-secretless-b1-4`
-**Off**: `b1/worker-lifetime` HEAD `9f867b8` (B1.1 + B1.2 + B1.3 merged)
-**Commits**: 6 — `f276f3e` (DRAFT spec), `4dcc589` (spec approved), `4b6f6e2` (code 1/2: plumbing), `39d1b6b` (code 2/2: tests + fmt fix), `28b93e6` (housekeeping: pay B1.2 redundant-closure lint), `b1f72b1` (this receipt)
+**Off**: `b1/worker-lifetime` HEAD `9315507` (B1.1 + B1.2 + B1.3 merged)
+**Commits**: 6 — `0d299f6` (DRAFT spec), `df76be7` (spec approved), `31bade5` (code 1/2: plumbing), `edbb344` (code 2/2: tests + fmt fix), `a673fd1` (housekeeping: pay B1.2 redundant-closure lint), `d09fa0b` (this receipt)
 
 ## What B1.4 ships
 
@@ -93,7 +93,7 @@ $ cargo test -p asv-broker --test uat_017_env_scan
     — uat_017's negative-assertion contract holds)
 
 $ cargo clippy -p asv-broker --all-targets
-   1 warning (pre-existing: B1.2 commit 9461cd0 / 9f867b8 base;
+   1 warning (pre-existing: B1.2 commit 9461cd0 / 9315507 base;
               the B1.4 housekeeping commit pays it)
 
 $ python3 scripts/check-clippy-ratchet.py
@@ -103,7 +103,7 @@ $ python3 scripts/check-clippy-ratchet.py
 $ cargo fmt --all -- --check
    11 diffs (all pre-existing in b1/worker-lifetime; none
    introduced by B1.4; the B1.4-only fmt regression at
-   isolated_exec.rs:198 was fixed in 39d1b6b)
+   isolated_exec.rs:198 was fixed in edbb344)
 ```
 
 ## New tests
@@ -171,7 +171,7 @@ independent of `--harden`.
   the gate.** `python3 scripts/check-clippy-ratchet.py` reported
   `1 / 0` — one warning, baseline zero. The warning is in
   `worker.rs:1867` (`redundant_closure`) and was introduced by
-  B1.2 commit `9461cd0`, present at the merge base `9f867b8` and
+  B1.2 commit `9461cd0`, present at the merge base `9315507` and
   therefore not introduced by B1.4. The ratchet baseline was set
   to 0 in `27a8f1d` ("v0.38.0 housekeeping"), which is *after*
   B1.2, so B1.2 broke the ratchet and the gate was never re-run
@@ -197,7 +197,7 @@ independent of `--harden`.
   pendiente from the B1.1 receipt). B1.4 itself introduced 1
   fmt drift (`isolated_exec.rs:198`, the `(None, _) | (Some(_),
   false) =>` arm of `effective_posture_for_audit`); that was
-  fixed in the `39d1b6b` commit. The pre-existing 11 are NOT
+  fixed in the `edbb344` commit. The pre-existing 11 are NOT
   paid in this block; the user explicitly approved leaving them
   for a separate housekeeping block.
 

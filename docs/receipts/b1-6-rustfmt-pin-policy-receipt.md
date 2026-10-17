@@ -3,7 +3,7 @@
 **Status**: DELIVERED
 **Branch**: `b1/rustfmt-pin-policy`
 **Worktree**: `/var/home/rubentxu/Proyectos/rust/agent-secretless-b1-6`
-**Off**: `b1/worker-lifetime` HEAD `7470749`
+**Off**: `b1/worker-lifetime` HEAD `51a04c8`
 **Tag (pending)**: `b1.6` annotated
 **Receipt (predecessor)**: `docs/receipts/b1-5-fmt-drift-housekeeping-receipt.md`
 **Receipt (this file)**: `docs/receipts/b1-6-rustfmt-pin-policy-receipt.md`
@@ -25,8 +25,8 @@ Three files, 238 lines, 0 lines of code change:
    verification script.
 
 The DRAFT spec is at `docs/receipts/b1-6-rustfmt-pin-policy-DRAFT.md`
-(273 lines) and was committed first as `46aed89`. The
-implementation commit is `d9bbd43`.
+(273 lines) and was committed first as `ead6468`. The
+implementation commit is `993ec2c`.
 
 ## Decisions taken (with rationale)
 
@@ -220,8 +220,8 @@ over-read the scope:
 
 | SHA | Description | Files |
 |---|---|---|
-| `46aed89` | DRAFT spec | `docs/receipts/b1-6-rustfmt-pin-policy-DRAFT.md` |
-| `d9bbd43` | Implementation | `rust-toolchain.toml` + `docs/policies/rustfmt-pin-policy.md` + `scripts/check-rustfmt-pin.sh` |
+| `ead6468` | DRAFT spec | `docs/receipts/b1-6-rustfmt-pin-policy-DRAFT.md` |
+| `993ec2c` | Implementation | `rust-toolchain.toml` + `docs/policies/rustfmt-pin-policy.md` + `scripts/check-rustfmt-pin.sh` |
 | (this file) | Receipt (gate results filled in) | `docs/receipts/b1-6-rustfmt-pin-policy-receipt.md` |
 | (pending) | Merge to `b1/worker-lifetime` | — |
 | (pending) | Tag `b1.6` | — |
@@ -230,7 +230,7 @@ over-read the scope:
 
 ## Source pointers
 
-- B1.5 drift evidence: `docs/receipts/b1-5-fmt-drift-housekeeping-receipt.md` (39 lines, the original 5-file `cargo fmt --all` commit `45c5d84`)
+- B1.5 drift evidence: `docs/receipts/b1-5-fmt-drift-housekeeping-receipt.md` (39 lines, the original 5-file `cargo fmt --all` commit `cf84836`)
 - DRAFT spec: `docs/receipts/b1-6-rustfmt-pin-policy-DRAFT.md` (273 lines)
 - Survey of patterns: `denoland/deno` (Pattern 1, `rust-toolchain.toml` at root), `rust-lang/rustfmt` (Pattern 2, nightly pin), `serde-rs/serde` / `tokio-rs/tokio` / `BurntSushi/ripgrep` (Pattern 3, no pin)
 - MSRV signal: `Cargo.toml` `[workspace.package] rust-version = "1.85"`

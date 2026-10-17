@@ -65,7 +65,7 @@ bodies reach the agent through the token endpoint's error path) and
   `r2b_oauth2_revocation` 5, `oauth2_surrogate_lifecycle` 7, CLI 135,
   `ipc-protocol` 21, `identity` 8; `cargo fmt --check` clean; clippy
   ratchet 0 (two inherited B1.9/B1.10 warnings fixed in passing,
-  `51cb52c`); `cargo build --workspace` green.
+  `88a0758`); `cargo build --workspace` green.
 - **Behavior change, deliberate**: the two pre-B1.11 rows that pinned the
   relay (`a_provider_error_body_is_named`,
   `a_non_conforming_error_body_is_kept_rather_than_discarded`) were
@@ -87,11 +87,11 @@ bodies reach the agent through the token endpoint's error path) and
 
 ## Commits
 
-- `51cb52c` style(broker): restore the clippy ratchet baseline to zero
-- `880f753` fix(broker): provider error bodies stop at the boundary (H-05, H-06)
-- `72ce0c0` test(cli): ephemeral whoami boundary check against a hostile IdP (B1.11)
+- `88a0758` style(broker): restore the clippy ratchet baseline to zero
+- `c6de522` fix(broker): provider error bodies stop at the boundary (H-05, H-06)
+- `a69078b` test(cli): ephemeral whoami boundary check against a hostile IdP (B1.11)
 - close commit (this receipt, release notes, ephemeral retirement)
-- `29d23ae` fix(scripts): check-release-bump measures against the last v-tag
+- `5c1db03` fix(scripts): check-release-bump measures against the last v-tag
 - verification commit (the independent verifier's regression rows, kept)
 
 ## Independent verification
@@ -111,7 +111,7 @@ report). Its regression rows are committed: `provider_error_boundary`
 its honest state: it exits 1 because five commits since `v0.38.3` (four
 merge commits plus one `merge`-typed commit, all pre-dating B1.11) carry
 no Conventional Commits type, and the law refuses to default them to a
-patch. Before `29d23ae` the script could not run at all over this branch
+patch. Before `5c1db03` the script could not run at all over this branch
 (it crashed parsing the `b1.10` block tag as semver), so "green" was never
 a real property of the b1 series. Classifying those five commits and
 bumping the workspace version is the owner's release-time decision, the

@@ -38,7 +38,7 @@ production code changed.**
   repository. The CI authority is PipelineK (`pipeline.kts`); nothing replaced
   the badge.
 
-## Evidence (all commands run on this tree, HEAD `23fcfd9`)
+## Evidence (all commands run on this tree, HEAD `a42b353`)
 
 | Check | Command | Result |
 |---|---|---|

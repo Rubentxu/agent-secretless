@@ -3,7 +3,7 @@
 **Status**: DRAFT
 **Branch**: `b1/fmt-drift-housekeeping`
 **Worktree**: `/var/home/rubentxu/Proyectos/rust/agent-secretless-b1-5`
-**Off**: `b1/worker-lifetime` HEAD `d299fc5` (B1.1 + B1.2 + B1.3 + B1.4 + yank policy DECIDED)
+**Off**: `b1/worker-lifetime` HEAD `d3cdff0` (B1.1 + B1.2 + B1.3 + B1.4 + yank policy DECIDED)
 **Author**: Jcode (autonomous, user pre-approved with "apruebo cualquier criterio"; the B1.5 definition is "fmt drift housekeeping" per the B1.4 receipt's open list)
 
 ## What B1.5 ships

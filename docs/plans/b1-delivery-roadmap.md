@@ -3,7 +3,7 @@
 > **Autoridad.** El plan secuencial vigente sigue siendo
 > `agent-secretless-vault-spec/docs/15-ROADMAP.md` (R0–R10). Este documento NO lo
 > reemplaza: ordena los **bloques de entrega** que cierran los huecos medidos en la
-> auditoría de `6ca2984` y termina de consumir los incrementos abiertos del roadmap.
+> auditoría de `82c1d60` y termina de consumir los incrementos abiertos del roadmap.
 > Respeta y continúa la serie `b1.*` ya abierta en `b1/worker-lifetime`
 > (B1.1–B1.6 con receipts en `docs/receipts/` y notas en `docs/release-notes/`).
 
@@ -29,11 +29,11 @@ el owner lo decida.
 | Qué | Estado |
 |---|---|
 | `origin/main` publicado | `dcc98ae` = **v0.38.3** |
-| Rama `b1/worker-lifetime` | `6ca2984`, **39 commits por integrar a main, 0 por traer** |
+| Rama `b1/worker-lifetime` | `82c1d60`, **39 commits por integrar a main, 0 por traer** |
 | Serie B1 en vuelo | B1.1–B1.6 entregados con tag (`b1.4`, `b1.5`, `b1.6`), receipt y release-notes |
 | Gate `spec-integrity` | **EN ROJO también en main**: `SHA256SUMS` espera `c0646a6b…`/`f28b8029…` y los archivos `15-ROADMAP.md`/`16-SECURITY-RELEASE-GATES.md` hashean `71e8a3d2…`/`7b425701…` |
 | Gate-map | `tools/check-gates.py`: 40/40 UAT con gate, 0 defectos duros, **7 warnings** |
-| Auditoría de `6ca2984` | H-01…H-08 confirmados (ver bloques B1.7–B1.11) |
+| Auditoría de `82c1d60` | H-01…H-08 confirmados (ver bloques B1.7–B1.11) |
 
 ## Cómo se trabaja cada bloque (patron de la casa, ya en uso)
 

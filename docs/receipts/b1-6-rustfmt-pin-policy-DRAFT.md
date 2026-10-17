@@ -3,7 +3,7 @@
 **Status**: DRAFT
 **Branch**: `b1/rustfmt-pin-policy`
 **Worktree**: `/var/home/rubentxu/Proyectos/rust/agent-secretless-b1-6`
-**Off**: `b1/worker-lifetime` HEAD `7470749` (B1.1 + B1.2 + B1.3 + B1.4 + B1.5 + yank policy DECIDED)
+**Off**: `b1/worker-lifetime` HEAD `51a04c8` (B1.1 + B1.2 + B1.3 + B1.4 + B1.5 + yank policy DECIDED)
 **Author**: Jcode (autonomous, user pre-approved with "apruebo cualquier criterio"; B1.6 is the candidate the B1.5 receipt explicitly listed as the next housekeeping block)
 
 ## What B1.6 ships
@@ -38,7 +38,7 @@ Concretely:
 
 ## Inventory of the current state
 
-The repo at `b1/worker-lifetime` HEAD `7470749` has:
+The repo at `b1/worker-lifetime` HEAD `51a04c8` has:
 
 - **No `rust-toolchain.toml`** anywhere in the tree
   (verified by `find . -maxdepth 3 -name 'rust-toolchain*'`).

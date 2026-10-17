@@ -3,8 +3,8 @@
 **Status**: implementation complete; awaiting user review
 **Branch**: `b1/fmt-drift-housekeeping`
 **Worktree**: `/var/home/rubentxu/Proyectos/rust/agent-secretless-b1-5`
-**Off**: `b1/worker-lifetime` HEAD `d299fc5` (B1.1 + B1.2 + B1.3 + B1.4 + yank policy DECIDED)
-**Commits**: 2 — `ffa36a8` (DRAFT spec), `45c5d84` (fmt commit)
+**Off**: `b1/worker-lifetime` HEAD `d3cdff0` (B1.1 + B1.2 + B1.3 + B1.4 + yank policy DECIDED)
+**Commits**: 2 — `755e1c1` (DRAFT spec), `cf84836` (fmt commit)
 
 ## What B1.5 ships
 

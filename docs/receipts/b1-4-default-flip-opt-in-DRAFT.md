@@ -3,7 +3,7 @@
 **Status**: DRAFT (design approved by user on 2026-10-13; implementation in flight)
 **Branch**: `b1/default-flip-opt-in`
 **Worktree**: `/var/home/rubentxu/Proyectos/rust/agent-secretless-b1-4`
-**Off**: `b1/worker-lifetime` HEAD `9f867b8` (B1.1 + B1.2 + B1.3 merged)
+**Off**: `b1/worker-lifetime` HEAD `9315507` (B1.1 + B1.2 + B1.3 merged)
 **Author**: Jcode (autonomous, user pre-approved with "adelante apruebo, intenta paralelizar"; user said "si" on 2026-10-13 to proceed with the design as drafted, including the 3 open questions)
 
 ## What B1.4 ships
