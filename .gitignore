@@ -29,3 +29,6 @@ __pycache__/
 # Local scratch
 *.sock
 .DS_Store
+
+# ODD session working state (feature documents live in memory + docs/)
+odd/
