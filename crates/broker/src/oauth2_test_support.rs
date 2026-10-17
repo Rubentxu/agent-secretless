@@ -206,6 +206,15 @@ struct AsState {
     /// point is that a client must treat it as a refusal, not as a licence to
     /// continue with whatever it had.
     offline: AtomicBool,
+    /// Hostile mode: every token-endpoint error body carries this text in its
+    /// `error_description`. This is what an IdP that reflects credentials back
+    /// looks like from the client's side, and it exists so the broker's
+    /// boundary can be tested against the refusal it must not relay.
+    reflect_in_errors: Mutex<Option<String>>,
+    /// The exact refresh token the next fresh grant hands out, consumed once.
+    /// Real tokens are hex and never contain `+`, so a row that needs one that
+    /// does — the single-encoding property — has to be able to ask for it.
+    next_refresh: Mutex<Option<String>>,
     store: Mutex<Store>,
 }
 
@@ -267,7 +276,13 @@ impl AsState {
         with_refresh: bool,
     ) -> (String, Option<String>) {
         let access = random_token();
-        let refresh = with_refresh.then(random_token);
+        let refresh = with_refresh.then(|| {
+            self.next_refresh
+                .lock()
+                .expect("poisoned")
+                .take()
+                .unwrap_or_else(random_token)
+        });
         let mut store = self.store.lock().expect("poisoned");
         let grant_id = random_token();
         store.grants.insert(
@@ -361,6 +376,8 @@ impl AuthorizationServer {
             ttl,
             override_scope: Mutex::new(None),
             offline: AtomicBool::new(false),
+            reflect_in_errors: Mutex::new(None),
+            next_refresh: Mutex::new(None),
             store: Mutex::new(Store::default()),
         });
         let handler_state = Arc::clone(&state);
@@ -381,6 +398,23 @@ impl AuthorizationServer {
     /// Forces the granted scope to `scope`, whatever the client asks for.
     pub fn override_scope(&self, scope: &str) {
         *self.state.override_scope.lock().expect("poisoned") = Some(scope.to_string());
+    }
+
+    /// Makes every token-endpoint error body carry `text` in its
+    /// `error_description`, form-encoded correctly.
+    ///
+    /// Correctly on purpose: a reflection the client could not parse would not
+    /// reach anyone, and the point of hostile mode is to hand the broker a
+    /// secret it *can* read back, so the only thing standing between the
+    /// secret and the agent is the broker's own refusal to relay it.
+    pub fn reflect_in_errors(&self, text: &str) {
+        *self.state.reflect_in_errors.lock().expect("poisoned") = Some(text.to_string());
+    }
+
+    /// Makes the next fresh grant hand out exactly `token` as its refresh
+    /// token, once.
+    pub fn next_refresh_token(&self, token: &str) {
+        *self.state.next_refresh.lock().expect("poisoned") = Some(token.to_string());
     }
 
     /// The URL of an endpoint on this server.
@@ -522,13 +556,18 @@ fn token(state: &AsState, observed: &Observed) -> OriginResponse {
         }
         "refresh_token" => {
             let Some(refresh) = form.get("refresh_token") else {
-                return error(400, "invalid_request", "refresh_token+is+required");
+                return error(state, 400, "invalid_request", "refresh_token+is+required");
             };
             let store = state.store.lock().expect("poisoned");
             let Some(grant_id) = AsState::grant_of(&store, refresh) else {
                 drop(store);
                 state.record("/token", "invalid_grant", &facts, Some(refresh));
-                return error(400, "invalid_grant", "the+refresh+token+is+not+valid");
+                return error(
+                    state,
+                    400,
+                    "invalid_grant",
+                    "the+refresh+token+is+not+valid",
+                );
             };
             drop(store);
             match state.reissue(&grant_id, refresh) {
@@ -552,7 +591,12 @@ fn token(state: &AsState, observed: &Observed) -> OriginResponse {
                 }
                 None => {
                     state.record("/token", "invalid_grant", &facts, Some(refresh));
-                    error(400, "invalid_grant", "the+refresh+token+is+no+longer+valid")
+                    error(
+                        state,
+                        400,
+                        "invalid_grant",
+                        "the+refresh+token+is+no+longer+valid",
+                    )
                 }
             }
         }
@@ -560,6 +604,7 @@ fn token(state: &AsState, observed: &Observed) -> OriginResponse {
             facts.grant_type = Some(other.to_string());
             state.record("/token", "unsupported_grant_type", &facts, None);
             error(
+                state,
                 400,
                 "unsupported_grant_type",
                 "this+grant+type+is+not+supported",
@@ -580,7 +625,7 @@ fn revoke(state: &AsState, observed: &Observed) -> OriginResponse {
     };
     let form = parse_form(&observed.body);
     let Some(token) = form.get("token") else {
-        return error(400, "invalid_request", "token+is+required");
+        return error(state, 400, "invalid_request", "token+is+required");
     };
     let mut store = state.store.lock().expect("poisoned");
     let found = AsState::grant_of(&store, token);
@@ -636,7 +681,7 @@ fn introspect(state: &AsState, observed: &Observed) -> OriginResponse {
     };
     let form = parse_form(&observed.body);
     let Some(token) = form.get("token") else {
-        return error(400, "invalid_request", "token+is+required");
+        return error(state, 400, "invalid_request", "token+is+required");
     };
     let store = state.store.lock().expect("poisoned");
     let now = Instant::now();
@@ -753,15 +798,12 @@ fn resource(state: &AsState, observed: &Observed) -> OriginResponse {
 /// and shift the halves.
 fn authenticate(state: &AsState, observed: &Observed) -> Result<String, OriginResponse> {
     let invalid = || {
-        OriginResponse::form(
-            401,
-            "error=invalid_client&error_description=client+authentication+failed",
-        )
-        // §5.2: when the client tried to authenticate with the Authorization
-        // header, the server must say so with a 401 and name the schemes it
-        // supports. A 400 here would tell a conforming client its scheme is
-        // wrong when it is not.
-        .with_header("www-authenticate", "Basic realm=\"asv-test-idp\"")
+        error(state, 401, "invalid_client", "client+authentication+failed")
+            // §5.2: when the client tried to authenticate with the Authorization
+            // header, the server must say so with a 401 and name the schemes it
+            // supports. A 400 here would tell a conforming client its scheme is
+            // wrong when it is not.
+            .with_header("www-authenticate", "Basic realm=\"asv-test-idp\"")
     };
     let Some(header) = observed.header("authorization") else {
         state.record("/auth", "no_credentials", &RequestFacts::default(), None);
@@ -831,6 +873,7 @@ fn granted_scope(state: &AsState, requested: &str) -> Result<String, OriginRespo
     for asked in requested.split_whitespace() {
         if !entitled.contains(&asked) {
             return Err(error(
+                state,
                 400,
                 "invalid_scope",
                 "the+requested+scope+exceeds+what+this+client+may+be+granted",
@@ -850,6 +893,7 @@ fn check_audience(state: &AsState, audience: &str) -> Option<OriginResponse> {
         return None;
     }
     Some(error(
+        state,
         400,
         "invalid_target",
         "the+requested+audience+is+not+available+to+this+client",
@@ -857,11 +901,17 @@ fn check_audience(state: &AsState, audience: &str) -> Option<OriginResponse> {
 }
 
 /// An RFC 6749 §5.2 error: a 400 with a form body, and no store directive.
-fn error(status: u16, code: &str, description: &str) -> OriginResponse {
-    OriginResponse::form(
-        status,
-        format!("error={code}&error_description={description}"),
-    )
+///
+/// Every refusal this server sends goes through here, so hostile mode has one
+/// choke point rather than a per-arm decision about what to reflect.
+fn error(state: &AsState, status: u16, code: &str, description: &str) -> OriginResponse {
+    let mut body = format!("error={code}&error_description={description}");
+    if let Some(text) = state.reflect_in_errors.lock().expect("poisoned").as_ref() {
+        let encoded: String = url::form_urlencoded::byte_serialize(text.as_bytes()).collect();
+        body.push('+');
+        body.push_str(&encoded);
+    }
+    OriginResponse::form(status, body)
 }
 
 /// A `WWW-Authenticate: Bearer` refusal, per RFC 6750 §3.

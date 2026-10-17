@@ -90,6 +90,7 @@ pub mod oauth2_port;
 pub mod oauth2_test_support;
 pub mod pg_policy;
 pub mod pg_session;
+pub mod provider_errors;
 pub mod recovery;
 pub mod registry_declaration;
 pub mod selfreport;

@@ -197,14 +197,15 @@ impl OAuth2Config {
 pub enum OAuth2Error {
     /// The provider answered, and the answer was no.
     ///
-    /// `code` is RFC 6749 §5.2's `error` field when the body carried one, so an
-    /// operator sees `invalid_client` rather than "400".
-    #[error("provider rejected the request ({status} {code}): {description}")]
-    ProviderRejected {
-        status: u16,
-        code: String,
-        description: String,
-    },
+    /// The provider refused the request. The status is the broker's own
+    /// observation and the code is from [`crate::provider_errors`]'s closed
+    /// vocabulary; the body the provider wrote is deliberately absent, for
+    /// the reason [`crate::oauth2_binding`] never relays one either — it is
+    /// a stranger's text, and a provider that reflects the client credential
+    /// into it must not be able to reach the agent through an error message
+    /// (audit H-05).
+    #[error("provider rejected the request ({status} {code}); the provider's error body was not relayed")]
+    ProviderRejected { status: u16, code: String },
     /// The provider could not be reached, or the answer did not arrive in
     /// time. Never a success: an issuer that cannot reach its provider has no
     /// token to give, and reporting otherwise is how a broker ends up
@@ -390,7 +391,17 @@ fn parse_endpoint(token_url: &str) -> Result<(url::Url, Authority, u16), OAuth2E
     Ok((url, authority, port))
 }
 
-/// The RFC 6749 §5.2 error body, when the provider sent one.
+/// The RFC 6749 §5.2 error body, reduced to what this broker is willing to
+/// say about it.
+///
+/// Both fields a provider controls used to be relayed as written — the
+/// description up to 200 characters, the code verbatim — which is a channel
+/// a hostile or misconfigured IdP can put anything into, including the
+/// client credential it was just shown. The rule now is the one every
+/// provider-facing surface follows ([`crate::provider_errors`]):
+/// broker-chosen fields only. The status survives because the broker
+/// observed it; the code survives only when it is one this broker names
+/// itself; the body's text never rides along.
 fn provider_rejected(status: u16, body: &str) -> OAuth2Error {
     let field = |name: &str| {
         url::form_urlencoded::parse(body.as_bytes())
@@ -398,21 +409,9 @@ fn provider_rejected(status: u16, body: &str) -> OAuth2Error {
             .map(|(_, value)| value.into_owned())
             .filter(|value| !value.is_empty())
     };
-    let code = field("error").unwrap_or_else(|| "no_error_code".to_string());
-    let description = field("error_description")
-        .or_else(|| {
-            // A provider that answered with something that is not a §5.2 form
-            // is still telling the operator something. Kept, and truncated,
-            // rather than discarded: an empty description on a 502 tells
-            // nobody what the gateway said.
-            let trimmed = body.trim();
-            (!trimmed.is_empty()).then(|| trimmed.chars().take(200).collect())
-        })
-        .unwrap_or_else(|| "no description".to_string());
     OAuth2Error::ProviderRejected {
         status,
-        code,
-        description,
+        code: crate::provider_errors::bounded_code(field("error").as_deref()),
     }
 }
 
@@ -594,7 +593,13 @@ impl ClientCredentialsIssuer {
     }
 
     /// Builds the `grant_type=…` form body.
-    fn request_form(&self, fields: &[(&str, &str)]) -> Zeroizing<String> {
+    ///
+    /// Values arrive as raw bytes and are form-encoded exactly once, here.
+    /// That *once* is the property: a caller handing in a pre-encoded value
+    /// would double-encode it (`a+b` → `a%2Bb` → `a%252Bb`), which is H-06 —
+    /// a working refresh silently broken for any token containing a
+    /// character the encoding escapes.
+    fn request_form(&self, fields: &[(&str, &[u8])]) -> Zeroizing<String> {
         let mut form = Zeroizing::new(String::new());
         for (name, value) in fields {
             if !form.is_empty() {
@@ -602,7 +607,7 @@ impl ClientCredentialsIssuer {
             }
             form.push_str(name);
             form.push('=');
-            push_form_encoded(&mut form, value.as_bytes());
+            push_form_encoded(&mut form, value);
         }
         form
     }
@@ -614,9 +619,9 @@ impl OAuth2Issuer for ClientCredentialsIssuer {
             return Err(OAuth2Error::MalformedToken("empty client_id".into()));
         }
         let form = self.request_form(&[
-            ("grant_type", "client_credentials"),
-            ("scope", scope),
-            ("audience", self.config.audience.as_str()),
+            ("grant_type", b"client_credentials".as_slice()),
+            ("scope", scope.as_bytes()),
+            ("audience", self.config.audience.as_bytes()),
         ]);
         let body = self.transport.post(form.as_str(), &self.config)?;
         // A response that omits `scope` granted exactly what was asked, which
@@ -630,14 +635,13 @@ impl OAuth2Issuer for ClientCredentialsIssuer {
         if refresh_token.is_empty() {
             return Err(OAuth2Error::MalformedToken("empty refresh_token".into()));
         }
-        // The refresh token is itself a long-lived credential, so it is encoded
-        // straight into a wiped buffer rather than through a `String` the
-        // caller could still be holding.
-        let encoded =
-            Zeroizing::new(url::form_urlencoded::byte_serialize(refresh_token).collect::<String>());
+        // Raw bytes, encoded exactly once by `request_form` — pre-encoding
+        // here was H-06's double encoding. The encoded token lives only in
+        // the form's own wiped buffer, so no plain copy of the credential
+        // exists between here and the wire.
         let form = self.request_form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", encoded.as_str()),
+            ("grant_type", b"refresh_token".as_slice()),
+            ("refresh_token", refresh_token),
         ]);
         let body = self.transport.post(form.as_str(), &self.config)?;
         // No scope to check against: the grant is the one the original
@@ -949,7 +953,9 @@ mod tests {
     }
 
     /// An RFC 6749 §5.2 error body becomes a named error, so an operator reads
-    /// `invalid_client` rather than `400`.
+    /// `invalid_client` rather than `400`. Since B1.11 the name is the whole
+    /// report: the description a provider writes is provider-controlled text
+    /// ([`crate::provider_errors`]) and no longer rides along.
     #[test]
     fn a_provider_error_body_is_named() {
         let error = provider_rejected(
@@ -961,28 +967,65 @@ mod tests {
             OAuth2Error::ProviderRejected {
                 status: 401,
                 code: "invalid_client".to_string(),
-                description: "client authentication failed".to_string(),
             }
         );
     }
 
     /// A provider that answers with something that is not a §5.2 form still
-    /// said something, and an empty description would throw it away.
+    /// gets its status reported — that much is the broker's own observation —
+    /// and nothing else, because there is no field a stranger's HTML can be
+    /// trusted to fill.
     #[test]
-    fn a_non_conforming_error_body_is_kept_rather_than_discarded() {
+    fn a_non_conforming_error_body_keeps_only_the_status() {
         let error = provider_rejected(502, "<html>bad gateway</html>");
-        match error {
+        assert_eq!(
+            error,
             OAuth2Error::ProviderRejected {
-                status,
-                code,
-                description,
-            } => {
-                assert_eq!(status, 502);
-                assert_eq!(code, "no_error_code");
-                assert!(description.contains("bad gateway"), "{description}");
+                status: 502,
+                code: "unrecognized_error".to_string(),
+            }
+        );
+        assert!(!error.to_string().contains("bad gateway"));
+    }
+
+    /// H-05, the row this block exists for: a provider that reflects the
+    /// credential it was given in its error body is not a hypothetical — an
+    /// IdP that echoes "client sent secret …" into `error_description` is one
+    /// misconfigured log line away from handing the secret to every agent
+    /// that asked. The description a provider writes is provider-controlled
+    /// text, so none of it may reach a caller of this module.
+    #[test]
+    fn an_error_body_that_reflects_the_secret_is_sanitized() {
+        let secret = "p ss+w&rd:";
+        let body =
+            "error=invalid_client&error_description=client+sent+secret+%22p+ss%2Bw%26rd%3A%22";
+        let whole = provider_rejected(401, body).to_string();
+        assert!(
+            !whole.contains(secret),
+            "the provider's description reached the caller: {whole}"
+        );
+        match provider_rejected(401, body) {
+            OAuth2Error::ProviderRejected { status, code, .. } => {
+                assert_eq!(status, 401);
+                assert_eq!(code, "invalid_client", "the RFC's own name survives");
             }
             other => panic!("expected a rejection, got {other:?}"),
         }
+    }
+
+    /// The `error` code is provider-controlled text too. A hostile or broken
+    /// provider that puts the secret in the *code* field must not get a
+    /// different route to the same leak, so the code a caller sees is bounded
+    /// to the vocabulary this broker names itself.
+    #[test]
+    fn a_hostile_error_code_is_not_relayed_either() {
+        let secret = "p ss+w&rd:";
+        let body = "error=p+ss%2Bw%26rd%3A&error_description=unimportant";
+        let whole = provider_rejected(400, body).to_string();
+        assert!(
+            !whole.contains(secret),
+            "the provider's error code reached the caller: {whole}"
+        );
     }
 
     /// The refresh token leaves the token exactly once, and the surface that

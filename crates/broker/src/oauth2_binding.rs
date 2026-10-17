@@ -318,7 +318,11 @@ impl OAuth2Binding {
         if !status.is_success() {
             // The resource's own error body is deliberately not relayed: it is
             // written by a third party and is not obliged to be free of
-            // anything. The status is the whole of the report.
+            // anything. The status is the whole of the report. This is the
+            // same rule the token endpoint follows since B1.11
+            // ([`crate::provider_errors`]); a provider that reflects
+            // credentials into an error body has no route to the agent
+            // through either surface.
             return Err(IdentityError::Refused {
                 status: status.as_u16(),
             });

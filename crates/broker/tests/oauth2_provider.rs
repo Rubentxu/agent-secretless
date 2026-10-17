@@ -138,6 +138,82 @@ fn a_wrong_secret_is_a_named_refusal() {
     assert_eq!(server.audit_with_outcome("bad_credentials").len(), 1);
 }
 
+/// H-05 at the socket: the fixture turns hostile — it still rejects the wrong
+/// secret correctly, and it reflects the *real* one in the RFC 6749 §5.2
+/// error body. That is the shape of an IdP one misconfigured log line away
+/// from handing a client secret to every agent, and the row asserts the
+/// broker is the layer that refuses to carry it the rest of the way.
+#[test]
+fn a_hostile_error_body_does_not_reach_the_caller() {
+    let real = AsClient::awkward();
+    let server = AuthorizationServer::start(real.clone());
+    server.reflect_in_errors(&real.client_secret);
+    let wrong = AsClient {
+        client_secret: "not-the-real-secret".to_string(),
+        ..real.clone()
+    };
+    let issuer = issuer_for(&server, &wrong);
+
+    match issuer.issue("read:pods") {
+        Err(error) => {
+            let rendered = error.to_string();
+            assert!(
+                !rendered.contains(&real.client_secret),
+                "the hostile body reached the caller: {rendered}"
+            );
+            match &error {
+                OAuth2Error::ProviderRejected { status, code, .. } => {
+                    assert_eq!((*status, code.as_str()), (401, "invalid_client"));
+                }
+                other => panic!("expected invalid_client, got {other:?}"),
+            }
+        }
+        Ok(_) => panic!("the wrong secret must not issue a token"),
+    }
+    // The reflection really happened server-side, so the absence above is the
+    // broker's doing and not a fixture that never reflected.
+    assert_eq!(server.audit_with_outcome("bad_credentials").len(), 1);
+    let observed = server.last_request().expect("a request arrived");
+    assert!(
+        observed.body.contains("grant_type=client_credentials"),
+        "the exchange reached the token endpoint"
+    );
+}
+
+/// H-06: `a+b` is the token that cannot survive two encodings — the second
+/// pass turns `%2B` into `%252B`, the provider hands back `invalid_grant`, and
+/// a working refresh silently breaks. The fixture hands out exactly this
+/// refresh token so the round trip is a real exchange over real TLS.
+#[test]
+fn a_plus_b_refresh_token_survives_a_single_encoding() {
+    let server = AuthorizationServer::start(AsClient::awkward());
+    server.next_refresh_token("a+b");
+    let issuer = issuer_for(&server, &AsClient::awkward());
+
+    let mut first = issuer.issue("read:pods").expect("the provider issues");
+    let refresh = first
+        .take_refresh_token()
+        .expect("the grant carries a refresh token");
+    assert_eq!(
+        refresh.as_slice(),
+        b"a+b",
+        "the fixture must hand out the awkward token for this row to measure encoding"
+    );
+
+    let second = issuer
+        .refresh(&refresh)
+        .expect("a+b must survive exactly one form encoding");
+    assert_ne!(
+        second.expose_access_token(),
+        first.expose_access_token(),
+        "rotation must hand back a different access token"
+    );
+    assert!(
+        second.has_refresh_token(),
+        "rotation hands back a fresh refresh token"
+    );
+}
+
 /// The default client's identifier contains a colon. A broker that base64'd the
 /// raw pair instead of the form-encoded one would split at the wrong place and
 /// land here, which is the failure the encoding rule exists to prevent.
