@@ -91,7 +91,28 @@ bodies reach the agent through the token endpoint's error path) and
 - `880f753` fix(broker): provider error bodies stop at the boundary (H-05, H-06)
 - `72ce0c0` test(cli): ephemeral whoami boundary check against a hostile IdP (B1.11)
 - close commit (this receipt, release notes, ephemeral retirement)
+- `29d23ae` fix(scripts): check-release-bump measures against the last v-tag
+- verification commit (the independent verifier's regression rows, kept)
 
-**Risk: item 2 (security boundary — untrusted IdP error surfaces).**
-Verification: the RED rows above at unit, TLS and E2E layers, plus the
-independent native review of the slice.
+## Independent verification
+
+An independent `gentle-ai-verify` run over the slice confirmed S1–S4 MET
+— including its own falsifications in an isolated copy (sanitization
+reverted → the four rows go RED with the pre-fix text; the pre-encode
+restored → `invalid_grant`) and its own hostile probes (empty, HTML, JSON,
+duplicate fields, 400-char reflections, NUL bytes: no body byte in the
+report). Its regression rows are committed: `provider_error_boundary`
+(broker unit) and `the_whole_awkward_alphabet_is_encoded_exactly_once`
+(observed wire bytes).
+
+## Deviation: the release-law gate fails closed, deliberately
+
+`scripts/check-release-bump.py` is **not green** on this tree, and that is
+its honest state: it exits 1 because five commits since `v0.38.3` (four
+merge commits plus one `merge`-typed commit, all pre-dating B1.11) carry
+no Conventional Commits type, and the law refuses to default them to a
+patch. Before `29d23ae` the script could not run at all over this branch
+(it crashed parsing the `b1.10` block tag as semver), so "green" was never
+a real property of the b1 series. Classifying those five commits and
+bumping the workspace version is the owner's release-time decision, the
+same one pending for the whole branch. **Risk: item 2 (security boundary).**

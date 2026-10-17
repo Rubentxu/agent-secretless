@@ -556,3 +556,29 @@ fn the_issuer_declares_a_finite_token_timeout() {
         "a token request is not an operation that should take half a minute"
     );
 }
+
+/// The whole awkward alphabet crosses the wire exactly once, not just `a+b`:
+/// the row an independent verifier wrote against the observed request body,
+/// which is the place double encoding would be visible.
+#[test]
+fn the_whole_awkward_alphabet_is_encoded_exactly_once() {
+    let server = AuthorizationServer::start(AsClient::awkward());
+    let token = "a%b&c=d e+f/g";
+    server.next_refresh_token(token);
+    let issuer = issuer_for(&server, &AsClient::awkward());
+
+    let mut first = issuer.issue("read:pods").expect("the provider issues");
+    let refresh = first
+        .take_refresh_token()
+        .expect("a grant carries a refresh");
+    assert_eq!(refresh.as_slice(), token.as_bytes());
+    let second = issuer.refresh(&refresh).expect("exactly one encoding");
+    assert_ne!(second.expose_access_token(), first.expose_access_token());
+
+    let wire = server.last_request().expect("a request arrived").body;
+    assert!(
+        wire.contains("refresh_token=a%25b%26c%3Dd+e%2Bf%2Fg"),
+        "wire: {wire}"
+    );
+    assert!(!wire.contains("%25%32%35"), "double encoding: {wire}");
+}

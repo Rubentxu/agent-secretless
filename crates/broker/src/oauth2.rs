@@ -1150,3 +1150,84 @@ mod tests {
         found
     }
 }
+
+/// The boundary rows an independent verifier wrote, kept as regression tests
+/// (B1.11's verification run): the report is broker text under any body
+/// shape, and the code field is closed under any provider word.
+#[cfg(test)]
+mod provider_error_boundary {
+    use super::*;
+
+    fn rendered(status: u16, body: &str) -> String {
+        provider_rejected(status, body).to_string()
+    }
+
+    /// The report is the broker's own words, character for character.
+    #[test]
+    fn the_report_is_broker_text_with_status_and_named_code() {
+        assert_eq!(
+            rendered(401, "error=invalid_client&error_description=x"),
+            "provider rejected the request (401 invalid_client); the provider's error body was not relayed"
+        );
+    }
+
+    /// Boundary and hostile bodies: no shape leaks, status survives.
+    #[test]
+    fn no_body_shape_leaks() {
+        let secret = "p ss+w&rd:";
+        for body in [
+            String::new(),
+            "   ".to_string(),
+            format!(
+                "error=invalid_client&error_description={}",
+                secret.repeat(400)
+            ),
+            format!("error={secret}&error_description={secret}"),
+            format!("error=invalid_client&error={secret}"),
+            format!("error=invalid_client&error_description={secret}&error_description=dup"),
+            format!("{{\"error\":\"invalid_client\",\"error_description\":\"{secret}\"}}"),
+            format!("<html>{secret}</html>"),
+            format!("error_description={secret}"),
+            format!("=error&error=\u{0}{secret}"),
+        ] {
+            let text = rendered(400, &body);
+            assert!(!text.contains(secret), "leak for {body:?}: {text}");
+            assert!(
+                text.starts_with("provider rejected the request (400 "),
+                "{text}"
+            );
+        }
+    }
+
+    /// The code field is closed under any provider word.
+    #[test]
+    fn the_code_is_closed_under_any_provider_word() {
+        for code in crate::provider_errors::TOKEN_ENDPOINT_ERROR_CODES {
+            assert!(rendered(400, &format!("error={code}")).contains(&format!("400 {code})")));
+        }
+        for raw in ["admin", "INVALID_CLIENT", "invalid client", "error", "0"] {
+            let encoded: String = url::form_urlencoded::byte_serialize(raw.as_bytes()).collect();
+            let text = rendered(400, &format!("error={encoded}"));
+            assert!(
+                text.contains("400 unrecognized_error)"),
+                "{raw:?} -> {text}"
+            );
+        }
+    }
+
+    /// Absent or empty `error` is a refusal word, never an empty code.
+    #[test]
+    fn absent_or_empty_error_field_is_a_refusal_word() {
+        for body in [
+            "",
+            "error=",
+            "error_description=boom",
+            "grant_type=refresh_token",
+        ] {
+            assert!(
+                rendered(502, body).contains("502 unrecognized_error)"),
+                "{body:?}"
+            );
+        }
+    }
+}
